@@ -81,7 +81,7 @@ class AutoCalConfig:
 
 
 @dataclass
-class AutoBootConfig:
+class AutoBoostConfig:
     enabled: bool = True
     rate: float = 25.0
     base_s: float = 2.0
@@ -98,7 +98,7 @@ class TrackingConfig:
     rate: RateLimiterConfig = field(default_factory=RateLimiterConfig)
     calib: CalibrationConfig = field(default_factory=CalibrationConfig)
     autocal: AutoCalConfig = field(default_factory=AutoCalConfig)
-    autoboost: AutoBootConfig = field(default_factory=AutoBootConfig)
+    autoboost: AutoBoostConfig = field(default_factory=AutoBoostConfig)
 
 
 # ============================================================
@@ -158,7 +158,7 @@ class TrackingState:
     rate_alt: float = 0.0
 
     # mode
-    current_mode: str = "IDLE"   # IDLE|STABILIZE|TRACK|AUTOBOOT
+    current_mode: str = "IDLE"   # IDLE|STABILIZE|TRACK|AUTOBOOST
     t_mode: Optional[float] = None
 
     # manual calibration columns (px/fullstep) then A_micro in calib cache
