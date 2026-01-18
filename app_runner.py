@@ -17,6 +17,7 @@ from imaging import make_preview_jpeg
 from mount_arduino import ArduinoMount
 
 from tracking import make_tracking_state, tracking_step, tracking_set_params
+from stacking import StackingWorker
 
 
 def _perf() -> float:
@@ -60,6 +61,10 @@ class AppRunner:
         # Tracking subsystem (NUEVO)
         self._tracking_state = make_tracking_state()  # usa defaults de tracking.py
 
+        # Stacking subsystem (NUEVO)
+        self._stacking = StackingWorker(cfg)
+        self._stacking_enabled = bool(cfg.stacking.enabled_init)
+
         # State + outputs (thread-safe)
         self._state = SystemState()
         self._state_lock = threading.Lock()
@@ -102,6 +107,13 @@ class AppRunner:
             tracking_detA=0.0,
         )
 
+        self._set_state_safe(
+            stacking_enabled=self._stacking_enabled,
+            stacking_mode="RUNNING" if self._stacking_enabled else "IDLE",
+            stacking_status="ON" if self._stacking_enabled else "OFF",
+            stacking_on=self._stacking_enabled,
+        )
+
     # -------------------------
     # Lifecycle
     # -------------------------
@@ -111,6 +123,9 @@ class AppRunner:
         self._stop.clear()
         self._thr = threading.Thread(target=self._run, name="AppRunner", daemon=True)
         self._thr.start()
+        if self._stacking_enabled:
+            self._stacking.start()
+            log_info(self.out_log, "Stacking: worker started")
         log_info(self.out_log, "Runner: started")
 
     def stop(self) -> None:
@@ -122,6 +137,10 @@ class AppRunner:
 
         self._shutdown_camera()
         self._shutdown_mount()
+        try:
+            self._stacking.stop()
+        except Exception:
+            pass
 
         log_info(self.out_log, "Runner: stopped")
 
@@ -471,6 +490,51 @@ class AppRunner:
                     tracking_rate_alt=0.0,
                 )
 
+            # 2c) STACKING: enqueue frame for worker (non-blocking)
+            if self._stacking_enabled and (self._cam_stream is not None):
+                fr = self._cam_stream.latest()
+                if fr is not None:
+                    if getattr(fr, "raw", None) is not None:
+                        raw = fr.raw
+                        fmt = str(fr.fmt or "RAW16").upper()
+                        if "RAW" in fmt and "16" in fmt:
+                            fmt = "RAW16"
+                        elif "RAW" in fmt and "8" in fmt:
+                            fmt = "RAW8"
+                        elif "RGB" in fmt:
+                            fmt = "RGB24"
+                        elif "MONO" in fmt and "8" in fmt:
+                            fmt = "MONO8"
+                        elif "MONO" in fmt and "16" in fmt:
+                            fmt = "MONO16"
+                    else:
+                        u8 = fr.u8_view
+                        raw = (u8.astype("uint16") * 257)
+                        fmt = "MONO16"
+
+                    self._stacking.enqueue_frame(raw.copy(), fmt=fmt, t=_now_s())
+
+            # 2d) Publish stacking metrics to SystemState
+            m = self._stacking.engine.metrics
+            self._set_state_safe(
+                stacking_enabled=bool(m.enabled),
+                stacking_mode="RUNNING" if m.enabled else "IDLE",
+                stacking_status="ON" if m.enabled else "OFF",
+                stacking_on=bool(m.enabled),
+                stacking_fps=float(m.stacking_fps),
+                stacking_tiles_used=int(m.tiles_used),
+                stacking_tiles_evicted=int(m.tiles_evicted),
+                stacking_frames_in=int(m.frames_in),
+                stacking_frames_used=int(m.frames_used),
+                stacking_frames_dropped=int(m.frames_dropped),
+                stacking_frames_rejected=int(m.frames_rejected),
+                stacking_last_resp=float(m.last_resp),
+                stacking_last_dx=float(m.last_dx),
+                stacking_last_dy=float(m.last_dy),
+                stacking_last_theta_deg=float(m.last_theta_deg),
+                stacking_preview_jpeg=self._stacking.engine.get_preview_jpeg(),
+            )
+
             # 3) Actualizar preview (throttled)
             self._maybe_update_preview()
 
@@ -640,13 +704,45 @@ class AppRunner:
                 log_info(self.out_log, f"Tracking: SET_PARAMS {list(p.keys())}")
             return
 
+        # ---- Stacking (NUEVO) ----
+        if t == ActionType.STACKING_START:
+            self._stacking_enabled = True
+            self._stacking.start()
+            self._set_state_safe(
+                stacking_enabled=True,
+                stacking_mode="RUNNING",
+                stacking_status="ON",
+                stacking_on=True,
+            )
+            log_info(self.out_log, "Stacking: START")
+            return
+
+        if t == ActionType.STACKING_STOP:
+            self._stacking_enabled = False
+            self._stacking.stop()
+            self._set_state_safe(
+                stacking_enabled=False,
+                stacking_mode="IDLE",
+                stacking_status="OFF",
+                stacking_on=False,
+            )
+            log_info(self.out_log, "Stacking: STOP")
+            return
+
+        if t == ActionType.STACKING_RESET:
+            self._stacking.reset()
+            log_info(self.out_log, "Stacking: RESET")
+            return
+
+        if t == ActionType.STACKING_SET_PARAMS:
+            if isinstance(p, dict):
+                self._stacking.set_params(**p)
+                log_info(self.out_log, f"Stacking: SET_PARAMS {list(p.keys())}")
+            return
+
         # ---- Otros módulos (por ahora no implementados aquí) ----
         if t in (
-            ActionType.STACKING_START,
-            ActionType.STACKING_STOP,
-            ActionType.STACKING_RESET,
             ActionType.STACKING_SAVE,
-            ActionType.STACKING_SET_PARAMS,
             ActionType.PLATESOLVE_RUN,
             ActionType.PLATESOLVE_SET_PARAMS,
             ActionType.MOUNT_SYNC,

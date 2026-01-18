@@ -95,6 +95,21 @@ class SystemState:
     stack_snr: float = 0.0
     stack_runtime_s: float = 0.0
 
+    stacking_enabled: bool = False
+    stacking_mode: str = "IDLE"
+    stacking_fps: float = 0.0
+    stacking_tiles_used: int = 0
+    stacking_tiles_evicted: int = 0
+    stacking_frames_in: int = 0
+    stacking_frames_used: int = 0
+    stacking_frames_dropped: int = 0
+    stacking_frames_rejected: int = 0
+    stacking_last_resp: float = 0.0
+    stacking_last_dx: float = 0.0
+    stacking_last_dy: float = 0.0
+    stacking_last_theta_deg: float = 0.0
+    stacking_preview_jpeg: Optional[bytes] = None
+
     # platesolve metrics (optional)
     solve_status: str = "IDLE"  # IDLE|RUNNING|OK|ERR
     ra_dec: Tuple[float, float] = (0.0, 0.0)
