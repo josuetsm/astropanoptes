@@ -22,6 +22,8 @@ from actions import (
     tracking_start,
     tracking_stop,
     tracking_set_params,
+    stacking_start,
+    stacking_stop,
 )
 from ap_types import Axis
 from logging_utils import log_info
@@ -84,8 +86,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # Tracking ya NO es placeholder
     w_btn_tracking_toggle = W.ToggleButton(description="Tracking", value=False, disabled=False)
 
-    # placeholders (aún no implementados)
-    w_btn_stacking_toggle = W.ToggleButton(description="Stacking", value=False, disabled=True)
+    w_btn_stacking_toggle = W.ToggleButton(description="Stacking", value=False, disabled=False)
     w_btn_save_quick = W.Button(description="Save Stack", disabled=True)
 
     top_left = W.VBox([w_status_camera, w_status_mount, w_status_tracking, w_status_stacking])
@@ -403,7 +404,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     # Placeholder tabs
     # -------------------------
-    w_tab_stacking = W.VBox([W.HTML("<b>Stacking</b> (coming soon)")])
+    w_img_stack = W.Image(format="jpeg", layout=W.Layout(width="100%", max_width="980px"))
+    w_tab_stacking = W.VBox([W.HTML("<b>Stacking</b>"), w_img_stack])
     w_tab_platesolve = W.VBox([W.HTML("<b>PlateSolve</b> (coming soon)")])
     w_tab_goto = W.VBox([W.HTML("<b>GoTo</b> (coming soon)")])
 
@@ -548,6 +550,18 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_btn_tracking_toggle.observe(_on_tracking_toggle, names="value")
 
+    # -------------------------
+    # Bindings: Stacking toggle (Top Bar)
+    # -------------------------
+    def _on_stacking_toggle(change):
+        on = bool(change["new"])
+        if on:
+            runner.enqueue(stacking_start())
+        else:
+            runner.enqueue(stacking_stop())
+
+    w_btn_stacking_toggle.observe(_on_stacking_toggle, names="value")
+
     widgets = {
         # top bar
         "w_status_camera": w_status_camera,
@@ -561,8 +575,11 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_btn_connect_mount": w_btn_connect_mount,
         "w_btn_disconnect_mount": w_btn_disconnect_mount,
         "w_btn_tracking_toggle": w_btn_tracking_toggle,
+        "w_btn_stacking_toggle": w_btn_stacking_toggle,
         # live
         "w_img_live": w_img_live,
+        # stacking tab
+        "w_img_stack": w_img_stack,
         # manual mount control
         "w_dd_ms_az": w_dd_ms_az,
         "w_dd_ms_alt": w_dd_ms_alt,
@@ -662,8 +679,10 @@ class UILoop:
             self.widgets["w_status_tracking"].value = "Tracking: <b>OFF</b>"
 
         # Stacking placeholder
-        if hasattr(st, "stacking_status"):
-            self.widgets["w_status_stacking"].value = f"Stacking: <b>{st.stacking_status}</b>"
+        if hasattr(st, "stacking_mode"):
+            mode = str(getattr(st, "stacking_mode", "IDLE"))
+            fps = float(getattr(st, "stacking_fps", 0.0))
+            self.widgets["w_status_stacking"].value = f"Stacking: <b>{mode}</b> ({fps:.2f} fps)"
         else:
             self.widgets["w_status_stacking"].value = "Stacking: <b>OFF</b>"
 
@@ -697,10 +716,22 @@ class UILoop:
                     btn.value = tracking_enabled
             except Exception:
                 pass
+        if "w_btn_stacking_toggle" in self.widgets:
+            try:
+                btn = self.widgets["w_btn_stacking_toggle"]
+                stacking_enabled = bool(getattr(st, "stacking_enabled", False))
+                if bool(btn.value) != stacking_enabled:
+                    btn.value = stacking_enabled
+            except Exception:
+                pass
 
         jpg = self.runner.get_latest_preview_jpeg()
         if jpg:
             self.widgets["w_img_live"].value = jpg
+
+        stack_jpg = getattr(st, "stacking_preview_jpeg", None)
+        if stack_jpg and "w_img_stack" in self.widgets:
+            self.widgets["w_img_stack"].value = stack_jpg
 
 
 def show_ui(cfg: AppConfig, runner: AppRunner, *, start_loops: bool = True, ui_hz: float = 10.0):

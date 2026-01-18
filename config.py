@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from typing import Literal
 
 
 @dataclass
@@ -71,8 +72,32 @@ class TrackingConfig:
 
 @dataclass
 class StackingConfig:
-    stack_align_source: str = "Use Tracking Delta"
-    stack_resolution: str = "Full-res"
+    enabled_init: bool = False
+
+    # batching / queue
+    batch_size: int = 10
+    max_queue: int = 80  # >= batch_size*4 recomendado
+
+    # alignment
+    align_downsample: int = 4
+    resp_min: float = 0.08
+    outlier_k_mad: float = 3.0
+
+    # drizzle / mosaic
+    drizzle_scale: float = 2.0     # 1.5,2.0,2.5,3.0
+    pixfrac: float = 0.8
+    tile_size_out: int = 512
+    max_tiles: int = 64
+
+    # color
+    color_mode: Literal["mono", "rgb"] = "mono"
+    bayer_pattern: str = "RGGB"
+
+    # preview
+    preview_hz: float = 1.0
+
+    # backend
+    backend: Literal["auto", "cpu", "mps"] = "auto"
 
 
 @dataclass

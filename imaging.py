@@ -9,14 +9,99 @@ import cv2
 
 def downsample_u16(u16: np.ndarray, factor: int) -> np.ndarray:
     """
-    Downsample barato para uint16. Para preview/tracking, lo más barato y estable
-    es stride slicing cuando factor es 2, 3, 4, etc.
-
-    Nota: esto NO hace anti-alias. Es intencional (performance first).
+    Downsample estable para uint16 usando INTER_AREA.
     """
     if factor <= 1:
         return u16
-    return u16[::factor, ::factor]
+    h, w = u16.shape[:2]
+    nh, nw = h // factor, w // factor
+    return cv2.resize(u16, (nw, nh), interpolation=cv2.INTER_AREA)
+
+
+_BAYER_CV2 = {
+    "RGGB": cv2.COLOR_BayerRG2RGB,
+    "BGGR": cv2.COLOR_BayerBG2RGB,
+    "GRBG": cv2.COLOR_BayerGR2RGB,
+    "GBRG": cv2.COLOR_BayerGB2RGB,
+}
+_BAYER_CV2_EA = {
+    "RGGB": cv2.COLOR_BayerRG2RGB_EA,
+    "BGGR": cv2.COLOR_BayerBG2RGB_EA,
+    "GRBG": cv2.COLOR_BayerGR2RGB_EA,
+    "GBRG": cv2.COLOR_BayerGB2RGB_EA,
+}
+
+
+def debayer_cv2(raw: np.ndarray, pattern: str = "RGGB", edge_aware: bool = False) -> np.ndarray:
+    p = (pattern or "RGGB").upper()
+    code = (_BAYER_CV2_EA if edge_aware else _BAYER_CV2).get(p, cv2.COLOR_BayerRG2RGB)
+    return cv2.cvtColor(raw, code)
+
+
+def extract_align_mono_u16(raw: np.ndarray, fmt: str, bayer_pattern: str = "RGGB") -> np.ndarray:
+    """
+    Devuelve mono u16 estable para alineación (ideal: green-only/luma).
+    Soporta:
+      - MONO8/MONO16 (o arrays 2D)
+      - RGB24/RGB48 (arrays 3D)
+      - RAW8/RAW16 Bayer (2D)
+    """
+    f = (fmt or "").upper()
+
+    if raw.ndim == 3 and raw.shape[2] >= 3:
+        g = raw[..., 1]
+        if g.dtype == np.uint8:
+            return (g.astype(np.uint16) * 257)
+        if g.dtype == np.uint16:
+            return g
+        return np.clip(g, 0, 65535).astype(np.uint16)
+
+    if raw.dtype == np.uint16:
+        if "RAW" in f:
+            r = raw
+            g1 = r[0::2, 1::2]
+            g2 = r[1::2, 0::2]
+            g = ((g1.astype(np.uint32) + g2.astype(np.uint32)) // 2).astype(np.uint16)
+            return cv2.resize(g, (raw.shape[1], raw.shape[0]), interpolation=cv2.INTER_LINEAR)
+        return raw
+
+    if raw.dtype == np.uint8:
+        u16 = raw.astype(np.uint16) * 257
+        if "RAW" in f:
+            r = u16
+            g1 = r[0::2, 1::2]
+            g2 = r[1::2, 0::2]
+            g = ((g1.astype(np.uint32) + g2.astype(np.uint32)) // 2).astype(np.uint16)
+            return cv2.resize(g, (raw.shape[1], raw.shape[0]), interpolation=cv2.INTER_LINEAR)
+        return u16
+
+    return np.clip(raw, 0, 65535).astype(np.uint16)
+
+
+def stretch_to_u8(img: np.ndarray, plo: float = 1.0, phi: float = 99.0, gamma: float = 1.0) -> np.ndarray:
+    """
+    Stretch robusto para preview. Soporta (H,W) o (H,W,3) float32.
+    """
+    x = img.astype(np.float32, copy=False)
+
+    if x.ndim == 2:
+        lo, hi = np.percentile(x, (plo, phi))
+        y = (x - lo) / max(1e-6, (hi - lo))
+        y = np.clip(y, 0.0, 1.0)
+        if gamma != 1.0:
+            y = y ** (1.0 / gamma)
+        return (y * 255.0).astype(np.uint8)
+
+    out = np.empty_like(x, dtype=np.uint8)
+    for c in range(3):
+        xc = x[..., c]
+        lo, hi = np.percentile(xc, (plo, phi))
+        y = (xc - lo) / max(1e-6, (hi - lo))
+        y = np.clip(y, 0.0, 1.0)
+        if gamma != 1.0:
+            y = y ** (1.0 / gamma)
+        out[..., c] = (y * 255.0).astype(np.uint8)
+    return out
 
 
 def to_u8_preview(img: np.ndarray) -> np.ndarray:
@@ -158,4 +243,3 @@ def bayer_green_u8_from_u16(u16: np.ndarray, bayer_pattern: str) -> np.ndarray:
     # promedio en 16-bit (evita overflow usando uint32)
     g = ((g1.astype(np.uint32) + g2.astype(np.uint32)) // 2).astype(np.uint16)
     return (g >> 8).astype(np.uint8, copy=False)
-
