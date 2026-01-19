@@ -1,6 +1,7 @@
 # app_runner.py
 from __future__ import annotations
 
+import os
 import queue
 import threading
 import time
@@ -252,8 +253,8 @@ class AppRunner:
         self._shutdown_mount()
         try:
             self._stacking.stop()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_error(self.out_log, "Stacking: stop failed", exc)
 
         log_info(self.out_log, "Runner: stopped")
 
@@ -297,16 +298,23 @@ class AppRunner:
     def _tracking_keyframe_reset(self) -> None:
         try:
             self._tracking_state.key_reg = "PENDING"
-        except Exception:
-            pass
+        except Exception as exc:
+            log_error(self.out_log, "Tracking: failed to reset keyframe", exc)
 
     def _mount_rate_safe(self, az: float, alt: float) -> None:
         if self._mount is None:
             return
         try:
             self._mount.rate(float(az), float(alt))
-        except Exception:
-            pass
+        except Exception as exc:
+            self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
+            log_error(
+                self.out_log,
+                "Mount: RATE failed",
+                exc,
+                throttle_s=2.0,
+                throttle_key="mount_rate",
+            )
 
     # -------------------------
     # Camera
@@ -315,15 +323,15 @@ class AppRunner:
         if self._cam_stream is not None:
             try:
                 self._cam_stream.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(self.out_log, "Camera: stream stop failed", exc)
             self._cam_stream = None
 
         if self._cam_dev is not None:
             try:
                 self._cam_dev.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(self.out_log, "Camera: device close failed", exc)
             self._cam_dev = None
 
         self._set_state_safe(
@@ -462,8 +470,8 @@ class AppRunner:
         if self._mount is not None:
             try:
                 self._mount.disconnect()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(self.out_log, "Mount: disconnect failed", exc)
         self._mount = None
         self._set_state_safe(mount_connected=False, mount_status="DISCONNECTED")
 
@@ -488,7 +496,7 @@ class AppRunner:
         try:
             self._mount.stop()
         except Exception as exc:
-            self._set_state_safe(mount_status="ERR", mount_connected=False)
+            self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
             log_error(self.out_log, "Mount: STOP failed", exc)
 
     def _mount_set_microsteps(self, az_div: int, alt_div: int) -> None:
@@ -499,7 +507,7 @@ class AppRunner:
             self._mount.set_microsteps(int(az_div), int(alt_div))
             log_info(self.out_log, f"Mount: MS set (AZ={int(az_div)} ALT={int(alt_div)})")
         except Exception as exc:
-            self._set_state_safe(mount_status="ERR", mount_connected=False)
+            self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
             log_error(self.out_log, "Mount: MS failed", exc)
 
     def _mount_move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
@@ -514,7 +522,7 @@ class AppRunner:
                 delay_us=int(delay_us),
             )
         except Exception as exc:
-            self._set_state_safe(mount_status="ERR", mount_connected=False)
+            self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
             log_error(self.out_log, "Mount: MOVE steps failed", exc)
 
     # -------------------------
@@ -600,26 +608,33 @@ class AppRunner:
                     frame = fr.raw
                     import numpy as np
 
+                    debug_stats = bool(int(os.getenv("ASTROPANOPTES_PLATESOLVE_STATS", "0") or "0"))
+
                     def _stats(a: np.ndarray, name: str) -> None:
+                        if not debug_stats:
+                            return
                         a = np.asarray(a)
-                        print(f"\n[{name}] shape={a.shape} dtype={a.dtype} C={a.flags['C_CONTIGUOUS']}")
+                        log_info(
+                            self.out_log,
+                            f"[{name}] shape={a.shape} dtype={a.dtype} C={a.flags['C_CONTIGUOUS']}",
+                        )
                         if a.size == 0:
-                            print("  EMPTY")
+                            log_info(self.out_log, "  EMPTY")
                             return
                         if a.ndim == 1:
-                            print(f"  1D buffer: min={a.min()} max={a.max()} mean={a.mean():.3g}")
+                            log_info(self.out_log, f"  1D buffer: min={a.min()} max={a.max()} mean={a.mean():.3g}")
                             return
                     
                         # para imágenes 2D/3D
                         flat = a.reshape(-1)
                         p = np.percentile(flat, [0, 1, 5, 50, 95, 99, 100])
-                        print(f"  min/p1/p5/p50/p95/p99/max = {p}")
-                        print(f"  mean={flat.mean():.3g} std={flat.std():.3g}")
+                        log_info(self.out_log, f"  min/p1/p5/p50/p95/p99/max = {p}")
+                        log_info(self.out_log, f"  mean={flat.mean():.3g} std={flat.std():.3g}")
                         # fracción saturada (para u16/u8)
                         if a.dtype == np.uint16:
-                            print(f"  sat65535={np.mean(flat == 65535):.4f}")
+                            log_info(self.out_log, f"  sat65535={np.mean(flat == 65535):.4f}")
                         if a.dtype == np.uint8:
-                            print(f"  sat255={np.mean(flat == 255):.4f}")
+                            log_info(self.out_log, f"  sat255={np.mean(flat == 255):.4f}")
                 
                     _stats(fr.raw, "fr.raw")
                     if hasattr(fr, "u16") and fr.u16 is not None:
@@ -713,14 +728,14 @@ class AppRunner:
                 try:
                     self._set_state_safe(tracking_enabled=False)
                     self._mount_rate_safe(0.0, 0.0)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(self.out_log, "GoTo: failed to pause tracking", exc)
             if was_stacking:
                 try:
                     self._stacking_enabled = False
                     self._set_state_safe(stacking_enabled=False, stacking_mode="IDLE", stacking_status="OFF", stacking_on=False)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(self.out_log, "GoTo: failed to pause stacking", exc)
 
             self._set_state_safe(goto_busy=True, goto_status=kind.upper())
             self._goto_cancel.clear()
@@ -807,8 +822,8 @@ class AppRunner:
                         goto_J11=float(J[1, 1]),
                         goto_synced=bool(getattr(self._goto.model, "synced", False)),
                     )
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(self.out_log, "GoTo: failed to update J matrix", exc)
 
             except Exception as exc:
                 log_error(self.out_log, f"GoTo worker failed ({kind})", exc)
@@ -821,15 +836,15 @@ class AppRunner:
                         self._stacking_enabled = True
                         self._stacking.start()
                         self._set_state_safe(stacking_enabled=True, stacking_mode="RUNNING", stacking_status="ON", stacking_on=True)
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(self.out_log, "GoTo: failed to resume stacking", exc)
 
                 if was_tracking:
                     try:
                         self._set_state_safe(tracking_enabled=True)
                         self._tracking_keyframe_reset()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(self.out_log, "GoTo: failed to resume tracking", exc)
 
                 self._set_state_safe(goto_busy=False)
 
@@ -875,7 +890,8 @@ class AppRunner:
                     try:
                         self._mount.rate(float(out.rate_az), float(out.rate_alt))
                     except Exception as exc:
-                        log_error(self.out_log, "Tracking: mount.rate failed", exc)
+                        self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
+                        log_error(self.out_log, "Tracking: mount.rate failed", exc, throttle_s=2.0, throttle_key="tracking_mount_rate")
 
                     self._set_state_safe(
                         tracking_mode=str(out.mode),
@@ -1011,6 +1027,7 @@ class AppRunner:
                         ActionType.MOUNT_MOVE_STEPS,
                     ):
                         self._set_state_safe(mount_status="ERR", mount_connected=False)
+                        self._set_state_safe(tracking_enabled=False, tracking_mode="IDLE")
 
                 log_error(self.out_log, f"Action failed: {act.type}", exc)
 
@@ -1176,8 +1193,8 @@ class AppRunner:
             self._goto_cancel.set()
             try:
                 self._mount_stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(self.out_log, "GoTo: cancel mount stop failed", exc)
             self._set_state_safe(goto_busy=False, goto_status='CANCELLED')
             return
 
