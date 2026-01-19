@@ -23,3 +23,6 @@ myenv/
 
 # Logs
 *.log
+
+# Ignore Jupyter notebooks
+*.ipynb
