@@ -31,7 +31,7 @@ from actions import (
     stacking_stop,
 )
 from ap_types import Axis
-from logging_utils import log_info
+from logging_utils import log_info, log_error
 
 
 def _clamp_int(x: Any, lo: int, hi: int) -> int:
@@ -380,15 +380,15 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         # refleja en toggle
         try:
             w_btn_tracking_toggle.value = True
-        except Exception:
-            pass
+        except Exception as exc:
+            log_error(w_out_log, "UI: failed to update tracking toggle (start)", exc, throttle_s=5.0, throttle_key="ui_track_toggle_start")
 
     def _on_track_stop(_btn):
         runner.enqueue(tracking_stop())
         try:
             w_btn_tracking_toggle.value = False
-        except Exception:
-            pass
+        except Exception as exc:
+            log_error(w_out_log, "UI: failed to update tracking toggle (stop)", exc, throttle_s=5.0, throttle_key="ui_track_toggle_stop")
 
     w_btn_track_start.on_click(_on_track_start)
     w_btn_track_stop.on_click(_on_track_stop)
@@ -1117,7 +1117,8 @@ class UILoop:
                 every_s = float(self.widgets["w_tf_ps_every_s"].value)
                 target = str(self.widgets["w_txt_ps_target"].value).strip()
                 source = str(self.widgets["w_dd_ps_source"].value)
-            except Exception:
+            except Exception as exc:
+                log_info(w_out_log, f"UI: platesolve auto params fallback ({exc})", throttle_s=10.0, throttle_key="ui_ps_auto_fallback")
                 auto_on, every_s, target, source = False, 15.0, "", "live"
 
             if auto_on and (not ps_busy) and target:
@@ -1126,8 +1127,8 @@ class UILoop:
                     if hasattr(self.runner, "_platesolve_request"):
                         try:
                             self.runner._platesolve_request(source=source, target=target)
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            log_error(w_out_log, "UI: failed to enqueue platesolve request", exc, throttle_s=5.0, throttle_key="ui_ps_request")
                     self._ps_last_req_t = float(now)
 
         # opcional: mantener toggle en sync si cambia por fuera
@@ -1136,16 +1137,16 @@ class UILoop:
                 btn = self.widgets["w_btn_tracking_toggle"]
                 if bool(btn.value) != tracking_enabled:
                     btn.value = tracking_enabled
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(w_out_log, "UI: failed to sync tracking toggle", exc, throttle_s=5.0, throttle_key="ui_sync_tracking_toggle")
         if "w_btn_stacking_toggle" in self.widgets:
             try:
                 btn = self.widgets["w_btn_stacking_toggle"]
                 stacking_enabled = bool(getattr(st, "stacking_enabled", False))
                 if bool(btn.value) != stacking_enabled:
                     btn.value = stacking_enabled
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(w_out_log, "UI: failed to sync stacking toggle", exc, throttle_s=5.0, throttle_key="ui_sync_stacking_toggle")
 
         jpg = self.runner.get_latest_preview_jpeg()
         if jpg:

@@ -8,6 +8,7 @@ import queue
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional, Any, List, Literal
 
+import importlib.util
 import numpy as np
 import cv2
 
@@ -112,14 +113,11 @@ class WarpBackend:
         self._device = None
 
         if mode in ("auto", "mps"):
-            try:
+            if importlib.util.find_spec("torch") is not None:
                 import torch  # type: ignore
                 if torch.backends.mps.is_available():
                     self._torch = torch
                     self._device = torch.device("mps")
-            except Exception:
-                self._torch = None
-                self._device = None
 
     @property
     def name(self) -> str:

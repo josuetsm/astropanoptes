@@ -25,6 +25,7 @@ from scipy.spatial import cKDTree
 from astroquery.gaia import Gaia
 from astroquery.simbad import Simbad
 from astropy_healpix import HEALPix
+from logging_utils import log_error
 
 
 # ============================================================
@@ -195,8 +196,8 @@ class PlatesolveResult:
 def _chmod_600(p: Path) -> None:
     try:
         os.chmod(p, 0o600)
-    except Exception:
-        pass
+    except Exception as exc:
+        log_error(None, f"Platesolve: failed to chmod 600 ({p})", exc, throttle_s=10.0, throttle_key="platesolve_chmod")
 
 
 def _load_json(path: Path) -> dict:
@@ -233,7 +234,8 @@ def load_gaia_auth() -> Optional[Tuple[str, str]]:
         pw = str(data.get("password", "")).strip()
         if user and pw:
             return (user, pw)
-    except Exception:
+    except Exception as exc:
+        log_error(None, "Platesolve: failed to load Gaia auth", exc, throttle_s=10.0, throttle_key="platesolve_gaia_auth_load")
         return None
     return None
 
@@ -602,8 +604,8 @@ def gaia_healpix_cone_with_mag(
                 progress_cb("gaia:logout", {})
             try:
                 Gaia.logout()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(None, "Platesolve: Gaia logout failed", exc, throttle_s=10.0, throttle_key="platesolve_gaia_logout")
 
     if not parts:
         return Table(names=list(columns))
@@ -1002,7 +1004,8 @@ def platesolve_sweep(
             simbad_retries=int(cfg.simbad_retries),
             simbad_backoff_s=float(cfg.simbad_backoff_s),
         )
-    except Exception:
+    except Exception as exc:
+        log_error(None, "Platesolve: target parse failed", exc)
         return PlatesolveResult(
             success=False,
             status="TARGET_PARSE_ERROR",
@@ -1100,7 +1103,8 @@ def platesolve_sweep(
             guides=[],
             metrics={"missing": float(len(e.missing_paths))},
         )
-    except Exception:
+    except Exception as exc:
+        log_error(None, "Platesolve: Gaia load failed", exc)
         return PlatesolveResult(
             success=False,
             status="GAIA_LOAD_ERROR",

@@ -1,17 +1,117 @@
 # camera_poa.py
 from __future__ import annotations
 
+import ctypes.util
+import sys
 import threading
 import time
+from enum import IntEnum
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 
-import pyPOACamera  # user-provided SDK wrapper
+def _poa_lib_present() -> bool:
+    root = Path(__file__).resolve().parent
+    if sys.platform.startswith("linux"):
+        return bool(ctypes.util.find_library("PlayerOneCamera")) or any(root.glob("libPlayerOneCamera*.so*"))
+    if sys.platform == "darwin":
+        return bool(ctypes.util.find_library("PlayerOneCamera")) or any(root.glob("libPlayerOneCamera*.dylib"))
+    return True
+
+
+POA_AVAILABLE = _poa_lib_present()
+POA_UNAVAILABLE_REASON = "SDK library missing"
+
+
+if POA_AVAILABLE:
+    import pyPOACamera  # user-provided SDK wrapper
+else:
+
+    class _POAImgFormat(IntEnum):
+        POA_RAW8 = 0
+        POA_RAW16 = 1
+        POA_RGB24 = 2
+        POA_MONO8 = 3
+
+    class _POAErrors(IntEnum):
+        POA_OK = 0
+        POA_ERROR = 1
+
+    class _MissingPOACamera:
+        POAImgFormat = _POAImgFormat
+        POAErrors = _POAErrors
+
+        @staticmethod
+        def GetCameraCount() -> int:
+            return 0
+
+        @staticmethod
+        def GetCameraProperties(_index: int):
+            return _POAErrors.POA_ERROR, None
+
+        @staticmethod
+        def OpenCamera(_cam_id: int):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def InitCamera(_cam_id: int):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def CloseCamera(_cam_id: int):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def StopExposure(_cam_id: int):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def StartExposure(_cam_id: int, _is_dark: bool):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def SetImageStartPos(_cam_id: int, _x: int, _y: int):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def SetImageSize(_cam_id: int, _w: int, _h: int):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def SetImageBin(_cam_id: int, _bin: int):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def SetImageFormat(_cam_id: int, _fmt: int):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def GetImageSize(_cam_id: int):
+            return _POAErrors.POA_ERROR, 0, 0
+
+        @staticmethod
+        def SetExp(_cam_id: int, _exp_us: int, _auto: bool):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def SetGain(_cam_id: int, _gain: int, _auto: bool):
+            return _POAErrors.POA_ERROR
+
+        @staticmethod
+        def ImageReady(_cam_id: int):
+            return _POAErrors.POA_ERROR, False
+
+        @staticmethod
+        def GetImageData(_cam_id: int, _buf, _timeout: int):
+            return _POAErrors.POA_ERROR
+
+    pyPOACamera = _MissingPOACamera()
 
 from ap_types import Frame
 from config import CameraConfig, PreviewConfig
+from logging_utils import log_error
 
 
 # -------------------------
@@ -48,7 +148,8 @@ def _bayerpattern_to_str(bp: Any) -> str:
         if hasattr(bp, "name"):
             return str(bp.name)
         return str(bp)
-    except Exception:
+    except Exception as exc:
+        log_error(None, "Camera: failed to decode bayer pattern", exc, throttle_s=10.0, throttle_key="camera_bayerpattern")
         return "UNKNOWN"
 
 
@@ -113,6 +214,8 @@ class POACameraDevice:
         return self._info
 
     def open(self, index: int = 0) -> CameraInfo:
+        if not POA_AVAILABLE:
+            raise RuntimeError(f"pyPOACamera no disponible: {POA_UNAVAILABLE_REASON}")
         n = pyPOACamera.GetCameraCount()
         if n <= 0:
             raise RuntimeError("No se detectan cámaras (GetCameraCount=0).")
@@ -168,10 +271,12 @@ class POACameraDevice:
             return
         try:
             self.stop()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_error(None, "Camera: stop failed during close", exc, throttle_s=5.0, throttle_key="camera_stop_close")
         try:
-            pyPOACamera.CloseCamera(self.cam_id)
+            err = pyPOACamera.CloseCamera(self.cam_id)
+            if err != pyPOACamera.POAErrors.POA_OK:
+                log_error(None, f"Camera: CloseCamera failed (err={err})", throttle_s=5.0, throttle_key="camera_close")
         finally:
             self._opened = False
             self._cam_id = None
@@ -188,6 +293,8 @@ class POACameraDevice:
         if not self._opened:
             raise RuntimeError("Camera not opened")
 
+        if not POA_AVAILABLE:
+            raise RuntimeError(f"pyPOACamera no disponible: {POA_IMPORT_ERROR}")
         pyPOACamera.StopExposure(self.cam_id)
 
         # ROI
@@ -346,8 +453,8 @@ class CameraStream:
         if self._dev is not None:
             try:
                 self._dev.stop()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(None, "CameraStream: device stop failed", exc, throttle_s=5.0, throttle_key="camera_stream_stop")
 
         self._dev = None
         self._cfg = None
@@ -371,7 +478,8 @@ class CameraStream:
             return None
         try:
             return self._dev.info
-        except Exception:
+        except Exception as exc:
+            log_error(None, "CameraStream: failed to read camera info", exc, throttle_s=10.0, throttle_key="camera_info")
             return None
 
     def _run(self) -> None:
@@ -414,8 +522,9 @@ class CameraStream:
             t_cap = _perf()
             try:
                 dev.read_into(buf, timeout_ms=1000)
-            except Exception:
+            except Exception as exc:
                 # si falla, contamos como drop y seguimos
+                log_error(None, "CameraStream: read failed", exc, throttle_s=5.0, throttle_key="camera_read")
                 self._dropped += 1
                 continue
 
