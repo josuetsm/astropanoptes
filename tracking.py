@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import cv2
+from logging_utils import log_error
 
 
 # ============================================================
@@ -329,7 +330,8 @@ def auto_reset(state: TrackingState, *, src: str = "none", theta: Optional[np.nd
     a.detA = float(np.linalg.det(a.A))
     try:
         a.condA = float(np.linalg.cond(a.A))
-    except Exception:
+    except Exception as exc:
+        log_error(None, "Tracking: failed to compute condition number", exc, throttle_s=10.0, throttle_key="tracking_cond")
         a.condA = 1e9
     a.last_upd_t = None
 
@@ -354,7 +356,8 @@ def _auto_recompute_pinv(state: TrackingState) -> None:
 
     try:
         cond = float(np.linalg.cond(a.A))
-    except Exception:
+    except Exception as exc:
+        log_error(None, "Tracking: failed to compute condition number (auto)", exc, throttle_s=10.0, throttle_key="tracking_cond_auto")
         cond = 1e9
     a.condA = cond
 
@@ -364,7 +367,8 @@ def _auto_recompute_pinv(state: TrackingState) -> None:
     try:
         a.A_pinv = compute_A_pinv_dls(a.A, lam_eff)
         a.ok = True
-    except Exception:
+    except Exception as exc:
+        log_error(None, "Tracking: failed to compute A_pinv (auto)", exc, throttle_s=10.0, throttle_key="tracking_pinv_auto")
         a.A_pinv = None
         a.ok = False
 
@@ -466,7 +470,8 @@ def calib_set_A_micro(state: TrackingState, A_micro: np.ndarray, *, src: str = "
 
     try:
         pinv = compute_A_pinv_dls(A, float(state.cfg.calib.lambda_dls))
-    except Exception:
+    except Exception as exc:
+        log_error(None, "Tracking: failed to compute A_pinv (manual)", exc, throttle_s=10.0, throttle_key="tracking_pinv_manual")
         pinv = None
 
     state.cal_A_pinv = pinv
@@ -579,7 +584,8 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
                 try:
                     state.cal_A_pinv = compute_A_pinv_dls(arr, float(cfg.calib.lambda_dls))
                     state.cal_det = float(np.linalg.det(arr))
-                except Exception:
+                except Exception as exc:
+                    log_error(None, "Tracking: failed to update manual calibration A_pinv", exc, throttle_s=10.0, throttle_key="tracking_calib_A")
                     state.cal_A_pinv = None
                     state.cal_det = 0.0
             elif k == "calib_b":
@@ -590,7 +596,8 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
                 if state.cal_A_micro is not None:
                     try:
                         state.cal_A_pinv = compute_A_pinv_dls(state.cal_A_micro, float(cfg.calib.lambda_dls))
-                    except Exception:
+                    except Exception as exc:
+                        log_error(None, "Tracking: failed to recompute manual calibration pinv", exc, throttle_s=10.0, throttle_key="tracking_calib_lambda")
                         state.cal_A_pinv = None
                 _auto_recompute_pinv(state)
             elif k == "autocal_enabled":
@@ -604,7 +611,8 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
             else:
                 # ignore extras
                 pass
-        except Exception:
+        except Exception as exc:
+            log_error(None, f"Tracking: failed to apply param {k}", exc, throttle_s=5.0, throttle_key=f"tracking_param_{k}")
             continue
 
 

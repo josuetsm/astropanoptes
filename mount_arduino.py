@@ -10,6 +10,7 @@ import serial
 import serial.tools.list_ports
 
 from ap_types import Axis
+from logging_utils import log_error, log_info
 
 
 # =========================
@@ -27,7 +28,8 @@ def list_serial_ports() -> list[str]:
 def _safe_lower(s: str) -> str:
     try:
         return (s or "").lower()
-    except Exception:
+    except Exception as exc:
+        log_error(None, "Mount: failed to normalize string", exc, throttle_s=10.0, throttle_key="mount_safe_lower")
         return ""
 
 
@@ -115,8 +117,8 @@ class ArduinoController:
             try:
                 if self._ser is not None:
                     self._ser.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(None, "Mount: failed to close existing serial connection", exc, throttle_s=5.0, throttle_key="mount_close_existing")
             self._ser = None
 
             try:
@@ -133,12 +135,13 @@ class ArduinoController:
                 try:
                     ser.reset_input_buffer()
                     ser.reset_output_buffer()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(None, "Mount: failed to reset serial buffers", exc, throttle_s=5.0, throttle_key="mount_reset_buffers")
 
                 self._ser = ser
             except Exception as e:
                 self._ser = None
+                log_error(None, "Mount: failed to connect", e, throttle_s=5.0, throttle_key="mount_connect")
                 return f"Arduino error al conectar ({e})"
 
         # fuera del lock: usar send()
@@ -162,8 +165,8 @@ class ArduinoController:
             try:
                 if ser is not None:
                     ser.close()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(None, "Mount: failed to close serial connection", exc, throttle_s=5.0, throttle_key="mount_close")
 
     def _ensure_connected(self) -> bool:
         if self.is_connected:
@@ -199,7 +202,8 @@ class ArduinoController:
                 while len(lines) < int(max_lines) and (time.time() - t0) < float(max_time_s):
                     try:
                         b = ser.readline()
-                    except Exception:
+                    except Exception as exc:
+                        log_error(None, "Mount: failed to read serial line", exc, throttle_s=5.0, throttle_key="mount_readline")
                         break
                     if not b:
                         break
@@ -210,8 +214,8 @@ class ArduinoController:
                 try:
                     if old_timeout is not None:
                         ser.timeout = old_timeout
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(None, "Mount: failed to restore serial timeout", exc, throttle_s=5.0, throttle_key="mount_timeout_restore")
 
         return lines
 
@@ -223,7 +227,7 @@ class ArduinoController:
         if not cmd:
             return ""
         if not self._ensure_connected():
-            return ""
+            raise RuntimeError("Mount not connected")
 
         if reset_input is None:
             reset_input = bool(self.cfg.reset_input_on_send)
@@ -231,39 +235,41 @@ class ArduinoController:
         with self._lock:
             ser = self._ser
             if ser is None or not bool(getattr(ser, "is_open", True)):
-                return ""
+                raise RuntimeError("Mount serial not open")
 
             try:
                 if reset_input:
                     try:
                         ser.reset_input_buffer()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(None, "Mount: failed to reset input buffer", exc, throttle_s=5.0, throttle_key="mount_reset_input")
 
                 ser.write((cmd + "\n").encode("ascii", errors="ignore"))
                 if self.cfg.flush_on_send:
                     try:
                         ser.flush()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(None, "Mount: failed to flush serial buffer", exc, throttle_s=5.0, throttle_key="mount_flush")
 
                 t0 = time.time()
                 while True:
                     try:
                         line = ser.readline().decode(errors="ignore").strip()
-                    except Exception:
+                    except Exception as exc:
+                        log_error(None, "Mount: failed to read serial response", exc, throttle_s=5.0, throttle_key="mount_read_response")
                         line = ""
                     if line:
                         return line
                     if (time.time() - t0) > float(timeout_s):
                         return ""
-            except Exception:
+            except Exception as exc:
+                log_error(None, "Mount: send failed", exc, throttle_s=5.0, throttle_key="mount_send")
                 try:
                     ser.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(None, "Mount: failed to close serial after send error", exc, throttle_s=5.0, throttle_key="mount_close_after_send")
                 self._ser = None
-                return ""
+                raise
 
     def send_fast(self, cmd: str, *, reset_input: bool = True, read_timeout_s: float = 0.01) -> str:
         """
@@ -276,26 +282,26 @@ class ArduinoController:
         if not cmd:
             return ""
         if not self._ensure_connected():
-            return ""
+            raise RuntimeError("Mount not connected")
 
         with self._lock:
             ser = self._ser
             if ser is None or not bool(getattr(ser, "is_open", True)):
-                return ""
+                raise RuntimeError("Mount serial not open")
 
             try:
                 if reset_input:
                     try:
                         ser.reset_input_buffer()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(None, "Mount: failed to reset input buffer (fast)", exc, throttle_s=5.0, throttle_key="mount_reset_input_fast")
 
                 ser.write((cmd + "\n").encode("ascii", errors="ignore"))
                 if self.cfg.flush_on_send:
                     try:
                         ser.flush()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(None, "Mount: failed to flush serial buffer (fast)", exc, throttle_s=5.0, throttle_key="mount_flush_fast")
 
                 old_timeout = getattr(ser, "timeout", None)
                 try:
@@ -305,17 +311,18 @@ class ArduinoController:
                     try:
                         if old_timeout is not None:
                             ser.timeout = old_timeout
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(None, "Mount: failed to restore serial timeout (fast)", exc, throttle_s=5.0, throttle_key="mount_timeout_restore_fast")
 
                 return line or ""
-            except Exception:
+            except Exception as exc:
+                log_error(None, "Mount: send_fast failed", exc, throttle_s=5.0, throttle_key="mount_send_fast")
                 try:
                     ser.close()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(None, "Mount: failed to close serial after send_fast error", exc, throttle_s=5.0, throttle_key="mount_close_after_send_fast")
                 self._ser = None
-                return ""
+                raise
 
     # ----------------------------
     # High-level commands
@@ -402,7 +409,12 @@ class ArduinoMount:
     def connect(self, port: str, baud: int = 115200) -> str:
         self.cfg.port = str(port)
         self.cfg.baud = int(baud)
-        return self.ctrl.connect()
+        msg = self.ctrl.connect()
+        if "error" in _safe_lower(msg):
+            log_error(None, f"Mount: connect failed ({msg})", throttle_s=5.0, throttle_key="mount_connect_result")
+        else:
+            log_info(None, f"Mount: connect result ({msg})", throttle_s=2.0, throttle_key="mount_connect_result_ok")
+        return msg
 
     def disconnect(self) -> None:
         self.stop()
@@ -445,8 +457,8 @@ class ArduinoMount:
         # (El AppRunner ya hace stop() antes de llamar, pero aquí es idempotente.)
         try:
             self.ctrl.stop()
-        except Exception:
-            pass
+        except Exception as exc:
+            log_error(None, "Mount: failed to stop before move", exc, throttle_s=5.0, throttle_key="mount_stop_before_move")
 
         return self.ctrl.move(ax, dr, int(steps), int(delay_us))
 
@@ -465,6 +477,9 @@ class ArduinoMount:
             self.ctrl.rate(v, 0.0)
         else:
             self.ctrl.rate(0.0, v)
+
+    def rate(self, v_az: float, v_alt: float) -> str:
+        return self.ctrl.rate(float(v_az), float(v_alt))
 
     def nudge(self, axis: Axis, direction: int, rate: float, duration_ms: int) -> None:
         """
@@ -499,8 +514,8 @@ class ArduinoMount:
                 # siempre detener
                 try:
                     self.ctrl.stop()
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(None, "Mount: failed to stop after nudge", exc, throttle_s=5.0, throttle_key="mount_stop_after_nudge")
 
         with self._nudge_lock:
             # cancelar nudge anterior si existía
