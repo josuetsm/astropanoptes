@@ -352,7 +352,11 @@ class ArduinoController:
 
         steps_i = max(0, int(steps))
         delay_i = max(0, int(delay_us))
-        return self.send(f"MOVE {axis} {direction} {steps_i} {delay_i}", timeout_s=3.50)
+        # MOVE es blocking en firmware; timeout debe escalar con la duración esperada
+        # Aproximación: cada microstep hace HIGH+LOW con delay_us => ~2*delay_us por paso
+        est_s = (float(steps_i) * 2.0 * float(delay_i)) / 1.0e6
+        timeout_s = max(3.50, est_s + 1.5)
+        return self.send(f"MOVE {axis} {direction} {steps_i} {delay_i}", timeout_s=float(timeout_s))
 
     def status(self) -> str:
         return self.send("STATUS", timeout_s=0.30)

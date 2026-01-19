@@ -48,6 +48,10 @@ class ActionType(str, Enum):
     MOUNT_SYNC = "MOUNT_SYNC"
     MOUNT_GOTO = "MOUNT_GOTO"
 
+    # goto
+    GOTO_CALIBRATE = "GOTO_CALIBRATE"
+    GOTO_CANCEL = "GOTO_CANCEL"
+
 
 @dataclass(frozen=True)
 class Action:
@@ -196,5 +200,18 @@ def mount_sync() -> Action:
     return Action(ActionType.MOUNT_SYNC, {}, _now())
 
 
-def mount_goto(target: Dict[str, Any]) -> Action:
-    return Action(ActionType.MOUNT_GOTO, {"target": dict(target)}, _now())
+def mount_goto(target: Any, **kwargs: Any) -> Action:
+    payload = {"target": target}
+    payload.update(dict(kwargs))
+    return Action(ActionType.MOUNT_GOTO, payload, _now())
+
+# -------------------------
+# Factories: GoTo (extras)
+# -------------------------
+
+def goto_calibrate(params: Dict[str, Any]) -> Action:
+    return Action(ActionType.GOTO_CALIBRATE, {"params": dict(params)}, _now())
+
+
+def goto_cancel() -> Action:
+    return Action(ActionType.GOTO_CANCEL, {}, _now())

@@ -111,7 +111,26 @@ class SystemState:
     stacking_preview_jpeg: Optional[bytes] = None
 
     # platesolve metrics (optional)
-    solve_status: str = "IDLE"  # IDLE|RUNNING|OK|ERR
-    ra_dec: Tuple[float, float] = (0.0, 0.0)
-    rotation_deg: float = 0.0
-    scale_arcsec_px: float = 0.0
+    platesolve_status: str = "IDLE"
+    platesolve_busy: bool = False
+    platesolve_last_ok: bool = False
+    platesolve_theta_deg: float = 0.0
+    platesolve_dx_px: float = 0.0
+    platesolve_dy_px: float = 0.0
+    platesolve_resp: float = 0.0
+    platesolve_n_inliers: int = 0
+    platesolve_rms_px: float = 0.0
+    platesolve_overlay: Any = None
+    platesolve_guides: Any = None
+    platesolve_center_ra_deg: float = 0.0
+    platesolve_center_dec_deg: float = 0.0
+
+    # goto metrics (optional)
+    goto_busy: bool = False
+    goto_status: str = "IDLE"
+    goto_synced: bool = False
+    goto_last_error_arcsec: float = 0.0
+    goto_J00: float = 0.0
+    goto_J01: float = 0.0
+    goto_J10: float = 0.0
+    goto_J11: float = 0.0

@@ -20,6 +20,10 @@ from actions import (
     mount_stop,
     mount_set_microsteps,   # NEW
     mount_move_steps,       # NEW
+    mount_sync,
+    mount_goto,
+    goto_calibrate,
+    goto_cancel,
     tracking_start,
     tracking_stop,
     tracking_set_params,
@@ -109,7 +113,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     # Live View (siempre visible)
     # -------------------------
-    w_img_live = W.Image(format="jpeg", layout=W.Layout(width="100%", max_width="980px"))
+    w_img_live = W.Image(format="jpeg", layout=W.Layout(width="100%", max_width="500px"))
     w_live_box = W.VBox([w_img_live])
 
     # -------------------------
@@ -440,7 +444,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # Solver params (subconjunto razonable)
     w_bi_ps_downsample = W.BoundedIntText(
         description="downsample",
-        value=2,
+        value=1,
         min=1,
         max=8,
         step=1,
@@ -496,8 +500,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_min_inliers = W.BoundedIntText(
         description="min_inliers",
-        value=10,
-        min=3,
+        value=1,
+        min=1,
         max=200,
         step=1,
         layout=W.Layout(width="260px"),
@@ -622,7 +626,135 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     # Placeholder tabs
     # -------------------------
-    w_tab_goto = W.VBox([W.HTML("<b>GoTo</b> (coming soon)")])
+    # -------------------------
+    # GoTo tab
+    # -------------------------
+    w_lbl_goto_status = W.HTML("<b>GoTo</b>: IDLE")
+
+    w_dd_goto_mode = W.Dropdown(
+        options=[
+            ("Objeto / nombre", "name"),
+            ("Planeta", "planet"),
+            ("RA/DEC", "radec"),
+            ("Alt/Az", "altaz"),
+        ],
+        value="name",
+        description="Modo:",
+        disabled=False,
+        layout=W.Layout(width="260px"),
+    )
+
+    w_txt_goto_name = W.Text(value="", description="Obj:", layout=W.Layout(width="360px"))
+    w_dd_goto_planet = W.Dropdown(
+        options=["moon","mercury","venus","mars","jupiter","saturn","uranus","neptune"],
+        value="mars",
+        description="Planeta:",
+        layout=W.Layout(width="260px"),
+    )
+    w_tf_goto_ra = W.FloatText(value=0.0, description="RA°:", layout=W.Layout(width="200px"))
+    w_tf_goto_dec = W.FloatText(value=0.0, description="Dec°:", layout=W.Layout(width="200px"))
+    w_tf_goto_az = W.FloatText(value=0.0, description="Az°:", layout=W.Layout(width="200px"))
+    w_tf_goto_alt = W.FloatText(value=45.0, description="Alt°:", layout=W.Layout(width="200px"))
+
+    w_bt_goto_tol = W.BoundedFloatText(value=10.0, min=0.5, max=3600.0, step=0.5, description="Tol (arcsec):", layout=W.Layout(width="220px"))
+    w_bi_goto_max_iters = W.BoundedIntText(value=6, min=1, max=50, step=1, description="Iters:", layout=W.Layout(width="160px"))
+    w_bt_goto_gain = W.BoundedFloatText(value=0.85, min=0.1, max=2.0, step=0.05, description="Gain:", layout=W.Layout(width="160px"))
+    w_bt_goto_settle_s = W.BoundedFloatText(value=0.25, min=0.0, max=10.0, step=0.05, description="Settle(s):", layout=W.Layout(width="170px"))
+
+    # Calibración
+    w_bi_calib_samples = W.BoundedIntText(value=8, min=2, max=80, step=1, description="Muestras:", layout=W.Layout(width="180px"))
+    w_dd_calib_units = W.Dropdown(options=[("Grados", "deg"), ("Pasos", "steps")], value="deg", description="Unidad:", layout=W.Layout(width="190px"))
+    w_bt_calib_small = W.BoundedFloatText(value=1.0, min=0.1, max=30.0, step=0.1, description="Paso 1:", layout=W.Layout(width="160px"))
+    w_bt_calib_big = W.BoundedFloatText(value=5.0, min=0.1, max=60.0, step=0.1, description="Paso 2:", layout=W.Layout(width="160px"))
+
+    # Reusa delays de la pestaña mount/manual
+    w_bi_goto_delay_us = W.BoundedIntText(value=1800, min=50, max=50000, step=50, description="delay_us:", layout=W.Layout(width="200px"))
+
+    w_btn_goto_sync = W.Button(description="Sync", button_style="info", layout=W.Layout(width="100px"))
+    w_btn_goto_run = W.Button(description="GoTo", button_style="success", layout=W.Layout(width="100px"))
+    w_btn_goto_calib = W.Button(description="Calibrate", button_style="warning", layout=W.Layout(width="120px"))
+    w_btn_goto_cancel = W.Button(description="Cancel", button_style="danger", layout=W.Layout(width="110px"))
+
+    w_box_goto_name = W.HBox([w_txt_goto_name])
+    w_box_goto_planet = W.HBox([w_dd_goto_planet])
+    w_box_goto_radec = W.HBox([w_tf_goto_ra, w_tf_goto_dec])
+    w_box_goto_altaz = W.HBox([w_tf_goto_az, w_tf_goto_alt])
+
+    w_box_goto_target = W.VBox([w_box_goto_name])
+
+    def _goto_mode_changed(change):
+        m = str(change["new"])
+        if m == "name":
+            w_box_goto_target.children = [w_box_goto_name]
+        elif m == "planet":
+            w_box_goto_target.children = [w_box_goto_planet]
+        elif m == "radec":
+            w_box_goto_target.children = [w_box_goto_radec]
+        else:
+            w_box_goto_target.children = [w_box_goto_altaz]
+
+    w_dd_goto_mode.observe(_goto_mode_changed, names="value")
+
+    def _build_goto_target() -> Any:
+        m = str(w_dd_goto_mode.value)
+        if m == "name":
+            return str(w_txt_goto_name.value).strip()
+        if m == "planet":
+            return str(w_dd_goto_planet.value).strip()
+        if m == "radec":
+            return {"ra_deg": float(w_tf_goto_ra.value), "dec_deg": float(w_tf_goto_dec.value)}
+        return {"az_deg": float(w_tf_goto_az.value), "alt_deg": float(w_tf_goto_alt.value)}
+
+    def _enqueue_goto_sync():
+        runner.enqueue(mount_sync())
+
+    def _enqueue_goto_run():
+        target = _build_goto_target()
+        runner.enqueue(
+            mount_goto(
+                target,
+                tol_arcsec=float(w_bt_goto_tol.value),
+                max_iters=int(w_bi_goto_max_iters.value),
+                gain=float(w_bt_goto_gain.value),
+                settle_s=float(w_bt_goto_settle_s.value),
+                delay_us=int(w_bi_goto_delay_us.value),
+            )
+        )
+
+    def _enqueue_goto_calib():
+        params = {
+            "samples": int(w_bi_calib_samples.value),
+            "units": str(w_dd_calib_units.value),
+            "step_small": float(w_bt_calib_small.value),
+            "step_big": float(w_bt_calib_big.value),
+            "delay_us": int(w_bi_goto_delay_us.value),
+        }
+        runner.enqueue(goto_calibrate(params))
+
+    def _enqueue_goto_cancel():
+        runner.enqueue(goto_cancel())
+
+    w_btn_goto_sync.on_click(lambda _: _enqueue_goto_sync())
+    w_btn_goto_run.on_click(lambda _: _enqueue_goto_run())
+    w_btn_goto_calib.on_click(lambda _: _enqueue_goto_calib())
+    w_btn_goto_cancel.on_click(lambda _: _enqueue_goto_cancel())
+
+    w_box_goto_buttons = W.HBox([w_btn_goto_sync, w_btn_goto_run, w_btn_goto_calib, w_btn_goto_cancel])
+    w_box_goto_params = W.HBox([w_bt_goto_tol, w_bi_goto_max_iters, w_bt_goto_gain, w_bt_goto_settle_s])
+    w_box_goto_calib = W.HBox([w_bi_calib_samples, w_dd_calib_units, w_bt_calib_small, w_bt_calib_big])
+    w_box_goto_delay = W.HBox([w_bi_goto_delay_us])
+
+    w_tab_goto = W.VBox([
+        w_lbl_goto_status,
+        W.HBox([w_dd_goto_mode]),
+        w_box_goto_target,
+        w_box_goto_params,
+        w_box_goto_delay,
+        w_box_goto_buttons,
+        W.HTML("<hr/>"),
+        W.HTML("<b>Calibración</b> (muestras aleatorias)") ,
+        w_box_goto_calib,
+    ])
     w_tab_logs = W.VBox([W.HTML("<b>Logs</b>"), w_out_log])
 
     w_tabs = W.Tab(children=[w_tab_camera, w_tab_mount, w_tab_tracking, w_tab_stacking, w_tab_platesolve, w_tab_goto, w_tab_logs])
@@ -813,6 +945,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_tf_ps_theta_step": w_tf_ps_theta_step,
         "w_tf_ps_match_max": w_tf_ps_match_max,
         "w_bi_ps_min_inliers": w_bi_ps_min_inliers,
+        # goto tab
+        "w_lbl_goto_status": w_lbl_goto_status,
         # manual mount control
         "w_dd_ms_az": w_dd_ms_az,
         "w_dd_ms_alt": w_dd_ms_alt,
@@ -924,6 +1058,21 @@ class UILoop:
             f"FPS cap: {st.fps_capture:.2f} | view: {st.fps_view:.2f} | loop: {st.fps_control_loop:.2f}"
         )
         self.widgets["w_lbl_frame_ms"].value = f"frame_ms: {st.frame_ms:.2f}"
+        # GoTo status (si existe)
+        if "w_lbl_goto_status" in self.widgets:
+            busy = bool(getattr(st, "goto_busy", False))
+            status = str(getattr(st, "goto_status", "IDLE"))
+            synced = bool(getattr(st, "goto_synced", False))
+            err_as = float(getattr(st, "goto_last_error_arcsec", 0.0))
+            J00 = float(getattr(st, "goto_J00", 0.0))
+            J01 = float(getattr(st, "goto_J01", 0.0))
+            J10 = float(getattr(st, "goto_J10", 0.0))
+            J11 = float(getattr(st, "goto_J11", 0.0))
+            self.widgets["w_lbl_goto_status"].value = (
+                f"<b>GoTo</b>: {status} | busy={busy} | synced={synced} | "
+                f"err={err_as:.1f}\" | J=[[{J00:.6g},{J01:.6g}],[{J10:.6g},{J11:.6g}]]"
+            )
+
 
         # tracking info panel (si existe)
         if "w_lbl_track_info" in self.widgets:
