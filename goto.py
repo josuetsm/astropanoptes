@@ -59,6 +59,7 @@ from platesolve import (
     platesolve_from_live,
     parse_target_to_icrs,
 )
+from logging_utils import log_error, log_info
 
 import astropy.units as u
 from astropy.coordinates import AltAz, SkyCoord, get_body, solar_system_ephemeris
@@ -523,7 +524,20 @@ class GoToController:
             if rad is not None:
                 try:
                     cfg2 = replace(platesolve_cfg, search_radius_deg=float(rad))
-                except Exception:
+                except Exception as exc:
+                    log_info(
+                        None,
+                        f"GoTo: failed to apply platesolve radius override ({rad}); using default",
+                        throttle_s=5.0,
+                        throttle_key="goto_radius_fallback",
+                    )
+                    log_error(
+                        None,
+                        "GoTo: platesolve config override failed",
+                        exc,
+                        throttle_s=5.0,
+                        throttle_key="goto_radius_fallback_exc",
+                    )
                     cfg2 = platesolve_cfg
 
             res = platesolve_from_live(
@@ -574,8 +588,8 @@ class GoToController:
             try:
                 tracking_pause(True)
                 was_tracking = True
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(None, "GoTo: failed to pause tracking", exc)
 
         try:
             # Resolve target once to ICRS; we will recompute AltAz each iter.
@@ -663,8 +677,8 @@ class GoToController:
                 if stop is not None:
                     try:
                         stop()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(None, "GoTo: stop failed before move", exc)
 
                 self._exec_steps(move_steps, Axis.AZ, float(dsteps[0]), delay_us=int(self.cfg.slew_delay_us_az))
                 self._exec_steps(move_steps, Axis.ALT, float(dsteps[1]), delay_us=int(self.cfg.slew_delay_us_alt))
@@ -672,8 +686,8 @@ class GoToController:
                 if stop is not None:
                     try:
                         stop()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(None, "GoTo: stop failed after move", exc)
 
                 # Settle
                 time.sleep(max(0.0, float(self.cfg.settle_s)))
@@ -717,13 +731,13 @@ class GoToController:
             if was_tracking and tracking_pause is not None:
                 try:
                     tracking_pause(False)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(None, "GoTo: failed to resume tracking", exc)
                 if tracking_keyframe_reset is not None:
                     try:
                         tracking_keyframe_reset()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(None, "GoTo: failed to reset tracking keyframe", exc)
 
     def _exec_steps(self, move_steps: MoveStepsFn, axis: Axis, signed_steps: float, *, delay_us: int) -> None:
         s = int(round(float(signed_steps)))
@@ -790,8 +804,8 @@ class GoToController:
             try:
                 tracking_pause(True)
                 was_tracking = True
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(None, "GoTo: failed to pause tracking (calibration)", exc)
 
         try:
             if obstime is None:
@@ -881,8 +895,8 @@ class GoToController:
                     if stop is not None:
                         try:
                             stop()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            log_error(None, "GoTo: stop failed before calibration move", exc)
 
                     # Move
                     self._exec_steps(move_steps, Axis.AZ, float(dsteps[0]), delay_us=int(self.cfg.slew_delay_us_az))
@@ -891,8 +905,8 @@ class GoToController:
                     if stop is not None:
                         try:
                             stop()
-                        except Exception:
-                            pass
+                        except Exception as exc:
+                            log_error(None, "GoTo: stop failed after calibration move", exc)
 
                     time.sleep(max(0.0, float(self.cfg.settle_s)))
 
@@ -944,13 +958,13 @@ class GoToController:
             if was_tracking and tracking_pause is not None:
                 try:
                     tracking_pause(False)
-                except Exception:
-                    pass
+                except Exception as exc:
+                    log_error(None, "GoTo: failed to resume tracking (calibration)", exc)
                 if tracking_keyframe_reset is not None:
                     try:
                         tracking_keyframe_reset()
-                    except Exception:
-                        pass
+                    except Exception as exc:
+                        log_error(None, "GoTo: failed to reset tracking keyframe (calibration)", exc)
 
 
 # ============================================================
