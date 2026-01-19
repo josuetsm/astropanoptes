@@ -30,6 +30,10 @@ from platesolve import (
 )
 
 
+# GoTo (nuevo)
+from goto import GoToController, GoToConfig, GoToModel, MountKinematics
+
+
 def _perf() -> float:
     return time.perf_counter()
 
@@ -85,6 +89,22 @@ class AppRunner:
         # Config platesolve (se puede setear desde UI por action)
         self._platesolve_cfg = self._build_default_platesolve_config(cfg)
         self._platesolve_observer = ObserverConfig()  # Santiago por default en tu platesolve.py
+
+        # GoTo subsystem (no bloquea loop)
+        kin = MountKinematics(
+            motor_full_steps_per_rev=200,
+            microsteps_az=int(getattr(cfg.mount, 'ms_az', 64)),
+            microsteps_alt=int(getattr(cfg.mount, 'ms_alt', 64)),
+            motor_pulley_teeth=20,
+            ring_radius_m_az=0.24,
+            ring_radius_m_alt=0.235,
+        )
+        self._goto = GoToController(cfg=GoToConfig(observer=self._platesolve_observer), model=GoToModel(kin=kin))
+        self._goto_lock = threading.Lock()
+        self._goto_thr: Optional[threading.Thread] = None
+        self._goto_cancel = threading.Event()
+        self._goto_pending: Optional[Dict[str, Any]] = None
+        self._last_platesolve_result: Optional[Any] = None
 
         # State + outputs (thread-safe)
         self._state = SystemState()
@@ -151,6 +171,18 @@ class AppRunner:
             platesolve_guides=[],
             platesolve_center_ra_deg=0.0,
             platesolve_center_dec_deg=0.0,
+        )
+
+        # GoTo fields
+        self._set_state_safe(
+            goto_busy=False,
+            goto_status="IDLE",
+            goto_synced=False,
+            goto_last_error_arcsec=0.0,
+            goto_J00=float(self._goto.model.J_deg_per_step[0,0]),
+            goto_J01=float(self._goto.model.J_deg_per_step[0,1]),
+            goto_J10=float(self._goto.model.J_deg_per_step[1,0]),
+            goto_J11=float(self._goto.model.J_deg_per_step[1,1]),
         )
 
     # -------------------------
@@ -565,7 +597,35 @@ class AppRunner:
                         continue
 
                     # Elegimos u8_view o u16; platesolve soporta RGB/BGR/gray -> convierte a gray
-                    frame = fr.u8_view
+                    frame = fr.raw
+                    import numpy as np
+
+                    def _stats(a: np.ndarray, name: str) -> None:
+                        a = np.asarray(a)
+                        print(f"\n[{name}] shape={a.shape} dtype={a.dtype} C={a.flags['C_CONTIGUOUS']}")
+                        if a.size == 0:
+                            print("  EMPTY")
+                            return
+                        if a.ndim == 1:
+                            print(f"  1D buffer: min={a.min()} max={a.max()} mean={a.mean():.3g}")
+                            return
+                    
+                        # para imágenes 2D/3D
+                        flat = a.reshape(-1)
+                        p = np.percentile(flat, [0, 1, 5, 50, 95, 99, 100])
+                        print(f"  min/p1/p5/p50/p95/p99/max = {p}")
+                        print(f"  mean={flat.mean():.3g} std={flat.std():.3g}")
+                        # fracción saturada (para u16/u8)
+                        if a.dtype == np.uint16:
+                            print(f"  sat65535={np.mean(flat == 65535):.4f}")
+                        if a.dtype == np.uint8:
+                            print(f"  sat255={np.mean(flat == 255):.4f}")
+                
+                    _stats(fr.raw, "fr.raw")
+                    if hasattr(fr, "u16") and fr.u16 is not None:
+                        _stats(fr.u16, "fr.u16")
+                    _stats(fr.u8_view, "fr.u8_view")
+
                     result = platesolve_from_live(
                         frame,
                         target=target,
@@ -591,6 +651,11 @@ class AppRunner:
                     platesolve_center_dec_deg=float(result.center_dec_deg),
                 )
 
+                # Cache para GoTo sync/calibrate (solo si OK)
+                if bool(result.success):
+                    self._last_platesolve_result = result
+
+
             except Exception as exc:
                 self._set_state_safe(
                     platesolve_busy=False,
@@ -606,6 +671,167 @@ class AppRunner:
         with self._platesolve_lock:
             self._platesolve_pending = {"source": str(source), "target": target}
         self._platesolve_start_worker_if_needed()
+
+
+
+    # -------------------------
+    # GoTo worker
+    # -------------------------
+    def _goto_start_worker_if_needed(self) -> None:
+        if self._goto_thr is not None and self._goto_thr.is_alive():
+            return
+        self._goto_cancel.clear()
+        self._goto_thr = threading.Thread(target=self._goto_worker, name="GoToWorker", daemon=True)
+        self._goto_thr.start()
+
+    def _goto_request(self, *, kind: str, target: Any, params: Dict[str, Any]) -> None:
+        with self._goto_lock:
+            self._goto_pending = {"kind": str(kind), "target": target, "params": dict(params)}
+        self._goto_start_worker_if_needed()
+
+    def _goto_worker(self) -> None:
+        """Ejecuta GoTo/Calibración en background para no bloquear el control loop."""
+        while not self._stop.is_set():
+            with self._goto_lock:
+                req = self._goto_pending
+                self._goto_pending = None
+
+            if req is None:
+                time.sleep(0.05)
+                continue
+
+            kind = str(req.get("kind", "goto"))
+            target = req.get("target", None)
+            params = dict(req.get("params", {}) or {})
+
+            # Latch current modes
+            was_tracking = bool(getattr(self.get_state(), "tracking_enabled", False))
+            was_stacking = bool(self._stacking_enabled)
+
+            # Pause tracking/stacking during operation
+            if was_tracking:
+                try:
+                    self._set_state_safe(tracking_enabled=False)
+                    self._mount_rate_safe(0.0, 0.0)
+                except Exception:
+                    pass
+            if was_stacking:
+                try:
+                    self._stacking_enabled = False
+                    self._set_state_safe(stacking_enabled=False, stacking_mode="IDLE", stacking_status="OFF", stacking_on=False)
+                except Exception:
+                    pass
+
+            self._set_state_safe(goto_busy=True, goto_status=kind.upper())
+            self._goto_cancel.clear()
+
+            def should_cancel() -> bool:
+                return self._goto_cancel.is_set() or self._stop.is_set()
+
+            def get_live_frame():
+                if self._cam_stream is None:
+                    return None
+                fr = self._cam_stream.latest()
+                if fr is None:
+                    return None
+                return fr.u8_view
+
+            def move_steps(axis: Axis, direction: int, steps: int, delay_us: int):
+                if self._mount is None:
+                    raise RuntimeError("mount not connected")
+                return self._mount.move_steps(axis, direction, steps, delay_us)
+
+            def stop():
+                if self._mount is not None:
+                    return self._mount.stop()
+                return None
+
+            try:
+                if kind == "goto":
+                    # Expect target dict from UI/actions
+                    # params may include: delay_us, tol_arcsec, max_iters, max_step_deg, gain
+                    delay_us = int(params.get("delay_us", 1800))
+                    tol_arcsec = float(params.get("tol_arcsec", 10.0))
+                    max_iters = int(params.get("max_iters", 8))
+                    gain = float(params.get("gain", 0.9))
+                    max_step_deg = float(params.get("max_step_deg", 5.0))
+
+                    self._goto.cfg = replace(self._goto.cfg, tol_arcsec=tol_arcsec, max_iters=max_iters, gain=gain, max_step_deg=max_step_deg)
+
+                    ok, last_err = self._goto.goto_blocking(
+                        target,
+                        get_live_frame=get_live_frame,
+                        move_steps=move_steps,
+                        stop=stop,
+                        platesolve_cfg=self._platesolve_cfg,
+                        delay_us=delay_us,
+                        should_cancel=should_cancel,
+                        status_cb=lambda s: self._set_state_safe(goto_status=str(s)),
+                        error_cb=lambda e: self._set_state_safe(goto_last_error_arcsec=float(e)),
+                    )
+                    self._set_state_safe(goto_last_error_arcsec=float(last_err), goto_status="GOTO_OK" if ok else "GOTO_ERR")
+
+                elif kind == "calibrate":
+                    # Calibrate requires a prior sync/platesolve; we use the current live frame + small dithers
+                    delay_us = int(params.get("delay_us", 1800))
+                    n_samples = int(params.get("n_samples", 12))
+                    unit = str(params.get("step_unit", "deg"))
+                    mags = params.get("step_magnitudes", None)
+                    if not mags:
+                        mags = [1.0, 5.0]
+
+                    self._goto.calibrate_blocking(
+                        get_live_frame=get_live_frame,
+                        move_steps=move_steps,
+                        stop=stop,
+                        platesolve_cfg=self._platesolve_cfg,
+                        n_samples=n_samples,
+                        step_unit=unit,
+                        step_magnitudes=mags,
+                        delay_us=delay_us,
+                        should_cancel=should_cancel,
+                        status_cb=lambda s: self._set_state_safe(goto_status=str(s)),
+                    )
+                    self._set_state_safe(goto_status="CAL_OK")
+
+                else:
+                    self._set_state_safe(goto_status=f"ERR_KIND_{kind}")
+
+                # Update J in state (best effort)
+                try:
+                    J = self._goto.model.J_deg_per_step
+                    self._set_state_safe(
+                        goto_J00=float(J[0, 0]),
+                        goto_J01=float(J[0, 1]),
+                        goto_J10=float(J[1, 0]),
+                        goto_J11=float(J[1, 1]),
+                        goto_synced=bool(getattr(self._goto.model, "synced", False)),
+                    )
+                except Exception:
+                    pass
+
+            except Exception as exc:
+                log_error(self.out_log, f"GoTo worker failed ({kind})", exc)
+                self._set_state_safe(goto_status="ERR_EXCEPTION")
+
+            finally:
+                # Restore stacking/tracking
+                if was_stacking:
+                    try:
+                        self._stacking_enabled = True
+                        self._stacking.start()
+                        self._set_state_safe(stacking_enabled=True, stacking_mode="RUNNING", stacking_status="ON", stacking_on=True)
+                    except Exception:
+                        pass
+
+                if was_tracking:
+                    try:
+                        self._set_state_safe(tracking_enabled=True)
+                        self._tracking_keyframe_reset()
+                    except Exception:
+                        pass
+
+                self._set_state_safe(goto_busy=False)
 
     # -------------------------
     # Main loop
@@ -900,6 +1126,7 @@ class AppRunner:
                 log_info(self.out_log, f"Platesolve: SET_PARAMS {list(p.keys())}")
             return
 
+
         if t == ActionType.PLATESOLVE_RUN:
             # Payload esperado:
             #  - source: "live" o "stack"
@@ -919,5 +1146,40 @@ class AppRunner:
             log_info(self.out_log, f"Platesolve: RUN source={source}")
             return
 
-        # ---- Otros ----
+        # ---- GoTo ----
+        if t == ActionType.MOUNT_SYNC:
+            # Sync usando el último platesolve OK
+            sol = getattr(self, '_last_platesolve_result', None)
+            if sol is None or not bool(getattr(sol, 'success', False)):
+                log_info(self.out_log, 'GoTo: sync failed (no successful platesolve cached)')
+                self._set_state_safe(goto_synced=False, goto_status='SYNC_ERR')
+                return
+            ok = False
+            try:
+                ok = bool(self._goto.sync_from_platesolve(sol))
+            except Exception as exc:
+                log_error(self.out_log, 'GoTo: sync exception', exc)
+            self._set_state_safe(goto_synced=bool(ok), goto_status='SYNC_OK' if ok else 'SYNC_ERR')
+            return
+
+        if t == ActionType.MOUNT_GOTO:
+            target = p.get('target', {})
+            self._goto_request(kind='goto', target=target, params=p)
+            return
+
+        if t == ActionType.GOTO_CALIBRATE:
+            params = p.get('params', {})
+            self._goto_request(kind='calibrate', target=None, params=params)
+            return
+
+        if t == ActionType.GOTO_CANCEL:
+            self._goto_cancel.set()
+            try:
+                self._mount_stop()
+            except Exception:
+                pass
+            self._set_state_safe(goto_busy=False, goto_status='CANCELLED')
+            return
+
+        # ---- Otros ----        # ---- Otros ----
         log_info(self.out_log, f"Unknown or unhandled action type: {t}")

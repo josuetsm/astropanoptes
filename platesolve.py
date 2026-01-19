@@ -294,8 +294,8 @@ def simbad_coord_for_object_name(
             if tab is None or len(tab) == 0:
                 raise TargetParseError(f"SIMBAD did not find: {name}")
 
-            ra_raw = tab["RA"][0]
-            dec_raw = tab["DEC"][0]
+            ra_raw = tab["ra"][0]
+            dec_raw = tab["dec"][0]
             ra_s = ra_raw.decode("utf-8") if isinstance(ra_raw, (bytes, bytearray)) else str(ra_raw)
             dec_s = dec_raw.decode("utf-8") if isinstance(dec_raw, (bytes, bytearray)) else str(dec_raw)
 
@@ -1036,7 +1036,7 @@ def platesolve_sweep(
 
     overlay: List[OverlayItem] = [OverlayItem(float(x), float(y), "det", None) for x, y in det_xy]
 
-    if len(det_xy) < max(8, int(cfg.min_inliers)):
+    if len(det_xy) < max(1, int(cfg.min_inliers)):
         return PlatesolveResult(
             success=False,
             status="NOT_ENOUGH_DETECTIONS",
@@ -1289,6 +1289,8 @@ def platesolve_sweep(
 # Convenience wrappers for app_runner.py
 # ============================================================
 
+
+    
 def platesolve_from_live(
     frame: np.ndarray,
     *,
@@ -1297,7 +1299,7 @@ def platesolve_from_live(
     observer: ObserverConfig = ObserverConfig(),
     obstime: Optional[Time] = None,
     progress_cb: Optional[ProgressCB] = None,
-) -> PlatesolveResult:
+) -> PlatesolveResult:        
     return platesolve_sweep(
         frame,
         target=target,
