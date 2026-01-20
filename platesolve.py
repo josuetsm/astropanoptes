@@ -749,7 +749,7 @@ def _downsample(img: np.ndarray, factor: int) -> np.ndarray:
     f = int(max(1, factor))
     if f == 1:
         return img
-    return img[::f, ::f]
+    return np.ascontiguousarray(img[::f, ::f])
 
 
 def detect_stars_sep(
