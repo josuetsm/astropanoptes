@@ -186,8 +186,10 @@ def stacking_save(out_dir: str, basename: str, fmt: str) -> Action:
 # -------------------------
 # Factories: PlateSolve
 # -------------------------
-def platesolve_run() -> Action:
-    return Action(ActionType.PLATESOLVE_RUN, {}, _now())
+def platesolve_run(source: str, target: Any, **kwargs: Any) -> Action:
+    payload = {"source": str(source), "target": target}
+    payload.update(dict(kwargs))
+    return Action(ActionType.PLATESOLVE_RUN, payload, _now())
 
 def platesolve_set_params(**kwargs: Any) -> Action:
     return Action(ActionType.PLATESOLVE_SET_PARAMS, dict(kwargs), _now())
