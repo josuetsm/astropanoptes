@@ -8,7 +8,6 @@ import queue
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional, Any, List, Literal
 
-import importlib.util
 import numpy as np
 import cv2
 
@@ -25,7 +24,7 @@ from imaging import (
 # ============================================================
 
 ColorMode = Literal["mono", "rgb"]
-BackendMode = Literal["auto", "cpu", "mps"]
+BackendMode = Literal["cpu"]
 
 
 @dataclass
@@ -103,26 +102,15 @@ class TileCanvas:
 
 
 # ============================================================
-# Backend selection (CPU now; MPS hook)
+# Backend selection (CPU only)
 # ============================================================
 
 class WarpBackend:
-    def __init__(self, mode: BackendMode = "auto"):
+    def __init__(self, mode: BackendMode = "cpu"):
         self.mode = mode
-        self._torch = None
-        self._device = None
-
-        if mode in ("auto", "mps"):
-            if importlib.util.find_spec("torch") is not None:
-                import torch  # type: ignore
-                if torch.backends.mps.is_available():
-                    self._torch = torch
-                    self._device = torch.device("mps")
 
     @property
     def name(self) -> str:
-        if self._torch is not None and self._device is not None:
-            return "mps"
         return "cpu"
 
     def warp_affine_tile(
@@ -261,7 +249,7 @@ class StackEngine:
     enabled: bool = False
     color_mode: ColorMode = "mono"
     canvas: Optional[TileCanvas] = None
-    backend: WarpBackend = field(default_factory=lambda: WarpBackend("auto"))
+    backend: WarpBackend = field(default_factory=lambda: WarpBackend("cpu"))
 
     # preview snapshot
     _preview_jpeg: Optional[bytes] = None
