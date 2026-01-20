@@ -21,9 +21,9 @@ class CameraConfig:
     img_format: str = "RAW16"  # recomendado para stacking a color
 
     # exposure/gain
-    exp_ms: float = 1.0
+    exp_ms: float = 100.0
     gain: int = 360
-    auto_gain: bool = True
+    auto_gain: bool = False
 
     # camera gamma (si aplica en SDK)
     gamma: float = 1.0
