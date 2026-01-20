@@ -202,6 +202,7 @@ class AppRunner:
         # Valores por defecto: AJÚSTALOS según tu hardware real o setéalos por UI.
         pixel_size_m = getattr(getattr(cfg, "platesolve", None), "pixel_size_m", None)
         focal_m = getattr(getattr(cfg, "platesolve", None), "focal_m", None)
+        debug_input_stats = bool(getattr(getattr(cfg, "platesolve", None), "debug_input_stats", False))
 
         if pixel_size_m is None:
             # Ejemplo típico: 2.9 um
@@ -213,6 +214,7 @@ class AppRunner:
         return PlatesolveConfig(
             pixel_size_m=float(pixel_size_m),
             focal_m=float(focal_m),
+            debug_input_stats=debug_input_stats,
             # resto se queda en defaults del dataclass
         )
 
@@ -608,7 +610,7 @@ class AppRunner:
                     frame = fr.raw
                     import numpy as np
 
-                    debug_stats = bool(int(os.getenv("ASTROPANOPTES_PLATESOLVE_STATS", "0") or "0"))
+                    debug_stats = bool(getattr(self._platesolve_cfg, "debug_input_stats", False))
 
                     def _stats(a: np.ndarray, name: str) -> None:
                         if not debug_stats:
