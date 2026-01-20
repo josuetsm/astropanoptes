@@ -27,6 +27,7 @@ from actions import (
     tracking_set_params,
     stacking_start,
     stacking_stop,
+    stacking_reset,
     platesolve_run,
     platesolve_set_params,
 )
@@ -87,6 +88,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_btn_connect_mount = W.Button(description="Connect Mount", button_style="success")
     w_btn_disconnect_mount = W.Button(description="Disconnect Mount", button_style="")
+    w_btn_stop_mount = W.Button(description="STOP Mount", button_style="danger")
 
     # Tracking ya NO es placeholder
     w_btn_tracking_toggle = W.ToggleButton(description="Tracking", value=False, disabled=False)
@@ -102,6 +104,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             w_btn_disconnect_camera,
             w_btn_connect_mount,
             w_btn_disconnect_mount,
+            w_btn_stop_mount,
             w_btn_tracking_toggle,
             w_btn_stacking_toggle,
             w_btn_save_quick,
@@ -409,7 +412,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # Stacking tab (existing)
     # -------------------------
     w_img_stack = W.Image(format="jpeg", layout=W.Layout(width="100%", max_width="980px"))
-    w_tab_stacking = W.VBox([W.HTML("<b>Stacking</b>"), w_img_stack])
+    w_btn_stack_reset = W.Button(description="Reset Stack", button_style="warning", layout=W.Layout(width="140px"))
+    w_tab_stacking = W.VBox([W.HTML("<b>Stacking</b>"), W.HBox([w_btn_stack_reset]), w_img_stack])
 
     # ============================================================
     # TAB PLATESOLVE (integrado)
@@ -860,12 +864,16 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     def _on_stop(_btn):
         runner.enqueue(mount_stop())
 
+    def _on_stop_top(_btn):
+        runner.enqueue(mount_stop())
+
     w_btn_apply_ms.on_click(_on_apply_ms)
     w_btn_az_left.on_click(_on_az_left)
     w_btn_az_right.on_click(_on_az_right)
     w_btn_alt_up.on_click(_on_alt_up)
     w_btn_alt_down.on_click(_on_alt_down)
     w_btn_stop.on_click(_on_stop)
+    w_btn_stop_mount.on_click(_on_stop_top)
 
     # -------------------------
     # Bindings: Tracking toggle (Top Bar)
@@ -899,6 +907,11 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_btn_stacking_toggle.observe(_on_stacking_toggle, names="value")
 
+    def _on_stacking_reset(_btn):
+        runner.enqueue(stacking_reset())
+
+    w_btn_stack_reset.on_click(_on_stacking_reset)
+
     widgets = {
         # top bar
         "w_status_camera": w_status_camera,
@@ -911,6 +924,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_btn_disconnect_camera": w_btn_disconnect_camera,
         "w_btn_connect_mount": w_btn_connect_mount,
         "w_btn_disconnect_mount": w_btn_disconnect_mount,
+        "w_btn_stop_mount": w_btn_stop_mount,
         "w_btn_tracking_toggle": w_btn_tracking_toggle,
         "w_btn_stacking_toggle": w_btn_stacking_toggle,
         "w_btn_save_quick": w_btn_save_quick,
@@ -918,6 +932,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_img_live": w_img_live,
         # stacking tab
         "w_img_stack": w_img_stack,
+        "w_btn_stack_reset": w_btn_stack_reset,
         # platesolve tab
         "w_txt_ps_target": w_txt_ps_target,
         "w_dd_ps_source": w_dd_ps_source,
