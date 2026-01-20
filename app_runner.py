@@ -5,6 +5,7 @@ import os
 import queue
 import threading
 import time
+from dataclasses import replace
 from typing import Optional, Any, Dict, List
 
 from ap_types import SystemState, Axis
@@ -86,6 +87,9 @@ class AppRunner:
         self._platesolve_thr: Optional[threading.Thread] = None
         self._platesolve_cancel = threading.Event()
         self._platesolve_pending: Optional[Dict[str, Any]] = None
+        self._platesolve_last_auto_t = 0.0
+        self._platesolve_auto_target: str = ""
+        self._platesolve_auto_source: str = "live"
 
         # Config platesolve (se puede setear desde UI por action)
         self._platesolve_cfg = self._build_default_platesolve_config(cfg)
@@ -484,6 +488,7 @@ class AppRunner:
         try:
             self._mount.stop()
             self._mount.set_microsteps(int(az_div), int(alt_div))
+            self._goto.model.set_microsteps(int(az_div), int(alt_div))
             log_info(self.out_log, f"Mount: MS set (AZ={int(az_div)} ALT={int(alt_div)})")
         except Exception as exc:
             self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
@@ -500,6 +505,7 @@ class AppRunner:
                 steps=int(steps),
                 delay_us=int(delay_us),
             )
+            self._goto.model.note_manual_move(axis, int(direction), int(steps))
         except Exception as exc:
             self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
             log_error(self.out_log, "Mount: MOVE steps failed", exc)
@@ -550,7 +556,7 @@ class AppRunner:
                     continue
 
                 if source == "stack":
-                    stack = self._stacking.engine.get_latest_stack()  # debes exponerlo si no existe
+                    stack = self._stacking.engine.get_latest_stack_frame()
                     if stack is None:
                         self._set_state_safe(
                             platesolve_busy=False,
@@ -666,6 +672,22 @@ class AppRunner:
             self._platesolve_pending = {"source": str(source), "target": target}
         self._platesolve_start_worker_if_needed()
 
+    def _maybe_autosolve(self) -> None:
+        cfg = self._platesolve_cfg
+        if not bool(getattr(cfg, "auto_solve", False)):
+            return
+        target = str(self._platesolve_auto_target or "").strip()
+        if not target:
+            return
+        source = str(self._platesolve_auto_source or "live")
+        st = self.get_state()
+        if bool(getattr(st, "platesolve_busy", False)):
+            return
+        now = _perf()
+        if (now - float(self._platesolve_last_auto_t)) < max(2.0, float(getattr(cfg, "solve_every_s", 15.0))):
+            return
+        self._platesolve_request(source=source, target=target)
+        self._platesolve_last_auto_t = float(now)
 
 
     # -------------------------
@@ -767,24 +789,42 @@ class AppRunner:
 
                 elif kind == "calibrate":
                     # Calibrate requires a prior sync/platesolve; we use the current live frame + small dithers
+                    if "n_samples" not in params and "samples" in params:
+                        params["n_samples"] = params.get("samples")
+                    if "step_unit" not in params and "units" in params:
+                        params["step_unit"] = params.get("units")
+                    if "step_magnitudes" not in params:
+                        step_small = params.get("step_small", None)
+                        step_big = params.get("step_big", None)
+                        if step_small is not None or step_big is not None:
+                            mags_legacy = []
+                            if step_small is not None:
+                                mags_legacy.append(float(step_small))
+                            if step_big is not None:
+                                mags_legacy.append(float(step_big))
+                            params["step_magnitudes"] = mags_legacy
+
                     delay_us = int(params.get("delay_us", 1800))
                     n_samples = int(params.get("n_samples", 12))
                     unit = str(params.get("step_unit", "deg"))
-                    mags = params.get("step_magnitudes", None)
-                    if not mags:
-                        mags = [1.0, 5.0]
+                    mags = params.get("step_magnitudes") or [1.0, 5.0]
+
+                    self._goto.cfg = replace(
+                        self._goto.cfg,
+                        slew_delay_us_az=delay_us,
+                        slew_delay_us_alt=delay_us,
+                    )
+                    step_magnitudes_steps = mags if unit == "steps" else None
+                    step_magnitudes_deg = mags if unit != "steps" else (1.0, 5.0)
 
                     self._goto.calibrate_blocking(
                         get_live_frame=get_live_frame,
                         move_steps=move_steps,
                         stop=stop,
                         platesolve_cfg=self._platesolve_cfg,
-                        n_samples=n_samples,
-                        step_unit=unit,
-                        step_magnitudes=mags,
-                        delay_us=delay_us,
-                        should_cancel=should_cancel,
-                        status_cb=lambda s: self._set_state_safe(goto_status=str(s)),
+                        step_magnitudes_deg=step_magnitudes_deg,
+                        step_magnitudes_steps=step_magnitudes_steps,
+                        samples_per_mag=n_samples,
                     )
                     self._set_state_safe(goto_status="CAL_OK")
 
@@ -940,6 +980,9 @@ class AppRunner:
                 stacking_last_theta_deg=float(getattr(m, "last_theta_deg", 0.0)),
                 stacking_preview_jpeg=self._stacking.engine.get_preview_jpeg(),
             )
+
+            # 2e) platesolve autosolve scheduling (if enabled)
+            self._maybe_autosolve()
 
             # 3) preview
             self._maybe_update_preview()
@@ -1115,11 +1158,19 @@ class AppRunner:
             # Permite actualizar PlatesolveConfig desde UI sin reimportar
             # Ej: {'pixel_size_m': 2.9e-6, 'focal_m': 0.9, 'gmax': 14.5, ...}
             if isinstance(p, dict):
+                payload = dict(p)
+                if "auto_target" in payload:
+                    self._platesolve_auto_target = str(payload.pop("auto_target") or "")
+                if "auto_source" in payload:
+                    self._platesolve_auto_source = str(payload.pop("auto_source") or "live")
+
                 # Rebuild dataclass con campos existentes
                 d = dict(self._platesolve_cfg.__dict__)
-                d.update(p)
+                for k, v in payload.items():
+                    if k in d:
+                        d[k] = v
                 self._platesolve_cfg = PlatesolveConfig(**d)
-                log_info(self.out_log, f"Platesolve: SET_PARAMS {list(p.keys())}")
+                log_info(self.out_log, f"Platesolve: SET_PARAMS {list(payload.keys())}")
             return
 
 

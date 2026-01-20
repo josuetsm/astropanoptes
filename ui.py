@@ -1,6 +1,5 @@
 from __future__ import annotations
 
-from dataclasses import replace
 import time
 import threading
 from typing import Dict, Any, Optional
@@ -10,7 +9,6 @@ from IPython.display import display
 
 from config import AppConfig
 from app_runner import AppRunner
-from platesolve import PlatesolveConfig
 from actions import (
     camera_connect,
     camera_disconnect,
@@ -29,6 +27,8 @@ from actions import (
     tracking_set_params,
     stacking_start,
     stacking_stop,
+    platesolve_run,
+    platesolve_set_params,
 )
 from ap_types import Axis
 from logging_utils import log_info, log_error
@@ -376,17 +376,16 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     def _on_track_start(_btn):
         _send_track_params()
-        runner.enqueue(tracking_start())
-        # refleja en toggle
         try:
-            w_btn_tracking_toggle.value = True
+            if not bool(w_btn_tracking_toggle.value):
+                w_btn_tracking_toggle.value = True
         except Exception as exc:
             log_error(w_out_log, "UI: failed to update tracking toggle (start)", exc, throttle_s=5.0, throttle_key="ui_track_toggle_start")
 
     def _on_track_stop(_btn):
-        runner.enqueue(tracking_stop())
         try:
-            w_btn_tracking_toggle.value = False
+            if bool(w_btn_tracking_toggle.value):
+                w_btn_tracking_toggle.value = False
         except Exception as exc:
             log_error(w_out_log, "UI: failed to update tracking toggle (stop)", exc, throttle_s=5.0, throttle_key="ui_track_toggle_stop")
 
@@ -539,53 +538,36 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_lbl_ps_status = W.HTML(value="PlateSolve: idle")
 
-    def _ps_set_runner_cfg(_=None) -> None:
-        """
-        Actualiza runner._platesolve_cfg (PlatesolveConfig, idealmente frozen)
-        usando replace(). No encola acción: se aplica directo a runner.
-        """
-        if not hasattr(runner, "_platesolve_cfg"):
-            # No logueo para no spamear; el status se verá en logs si lo necesitas
-            return
-        try:
-            base: PlatesolveConfig = getattr(runner, "_platesolve_cfg")
+    def _ps_send_params(_=None) -> None:
+        # Conversión:
+        # pixel_size_m debe incorporar binning si el solver trabaja en pixels "binned"
+        pixel_size_m = float(w_tf_ps_pixel_um.value) * 1e-6 * float(int(w_bi_ps_binning.value))
+        focal_m = float(w_tf_ps_focal_mm.value) / 1000.0
 
-            # Conversión:
-            # pixel_size_m debe incorporar binning si el solver trabaja en pixels "binned"
-            pixel_size_m = float(w_tf_ps_pixel_um.value) * 1e-6 * float(int(w_bi_ps_binning.value))
-            focal_m = float(w_tf_ps_focal_mm.value) / 1000.0
-
-            new_cfg = replace(
-                base,
-                pixel_size_m=float(pixel_size_m),
-                focal_m=float(focal_m),
-                downsample=int(w_bi_ps_downsample.value),
-                max_det=int(w_bi_ps_max_det.value),
-                det_thresh_sigma=float(w_tf_ps_det_sigma.value),
-                det_minarea=int(w_bi_ps_minarea.value),
-                gmax=float(w_tf_ps_gmax.value),
-                theta_step_deg=float(w_tf_ps_theta_step.value),
-                match_max_px=float(w_tf_ps_match_max.value),
-                min_inliers=int(w_bi_ps_min_inliers.value),
-            )
-            setattr(runner, "_platesolve_cfg", new_cfg)
-        except Exception as exc:
-            log_info(w_out_log, f"PlateSolve: config update failed: {exc}")
+        params = {
+            "pixel_size_m": float(pixel_size_m),
+            "focal_m": float(focal_m),
+            "downsample": int(w_bi_ps_downsample.value),
+            "max_det": int(w_bi_ps_max_det.value),
+            "det_thresh_sigma": float(w_tf_ps_det_sigma.value),
+            "det_minarea": int(w_bi_ps_minarea.value),
+            "gmax": float(w_tf_ps_gmax.value),
+            "theta_step_deg": float(w_tf_ps_theta_step.value),
+            "match_max_px": float(w_tf_ps_match_max.value),
+            "min_inliers": int(w_bi_ps_min_inliers.value),
+            "auto_solve": bool(w_tb_ps_auto.value),
+            "solve_every_s": float(w_tf_ps_every_s.value),
+            "auto_target": str(w_txt_ps_target.value),
+            "auto_source": str(w_dd_ps_source.value),
+        }
+        runner.enqueue(platesolve_set_params(**params))
 
     def _ps_request_once() -> None:
         target = str(w_txt_ps_target.value).strip()
         if not target:
             log_info(w_out_log, "PlateSolve: missing target")
             return
-        if not hasattr(runner, "_platesolve_request"):
-            log_info(w_out_log, "PlateSolve: runner has no _platesolve_request")
-            return
-
-        _ps_set_runner_cfg()
-        try:
-            runner._platesolve_request(source=str(w_dd_ps_source.value), target=target)
-        except Exception as exc:
-            log_info(w_out_log, f"PlateSolve: request failed: {exc}")
+        runner.enqueue(platesolve_run(source=str(w_dd_ps_source.value), target=target))
 
     def _on_ps_solve(_btn):
         _ps_request_once()
@@ -606,7 +588,11 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         w_tf_ps_match_max,
         w_bi_ps_min_inliers,
     ]:
-        _w.observe(_ps_set_runner_cfg, names="value")
+        _w.observe(_ps_send_params, names="value")
+    w_tb_ps_auto.observe(_ps_send_params, names="value")
+    w_tf_ps_every_s.observe(_ps_send_params, names="value")
+    w_dd_ps_source.observe(_ps_send_params, names="value")
+    w_txt_ps_target.observe(_ps_send_params, names="value")
 
     w_tab_platesolve = W.VBox(
         [
@@ -723,10 +709,9 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     def _enqueue_goto_calib():
         params = {
-            "samples": int(w_bi_calib_samples.value),
-            "units": str(w_dd_calib_units.value),
-            "step_small": float(w_bt_calib_small.value),
-            "step_big": float(w_bt_calib_big.value),
+            "n_samples": int(w_bi_calib_samples.value),
+            "step_unit": str(w_dd_calib_units.value),
+            "step_magnitudes": [float(w_bt_calib_small.value), float(w_bt_calib_big.value)],
             "delay_us": int(w_bi_goto_delay_us.value),
         }
         runner.enqueue(goto_calibrate(params))
@@ -887,6 +872,9 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     def _on_tracking_toggle(change):
         on = bool(change["new"])
+        current = bool(getattr(runner.get_state(), "tracking_enabled", False))
+        if on == current:
+            return
         if on:
             # empujar params actuales antes de iniciar
             _send_track_params()
@@ -901,6 +889,9 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     def _on_stacking_toggle(change):
         on = bool(change["new"])
+        current = bool(getattr(runner.get_state(), "stacking_enabled", False))
+        if on == current:
+            return
         if on:
             runner.enqueue(stacking_start())
         else:
@@ -1002,7 +993,6 @@ class UILoop:
         self.max_hz = max(0.5, float(max_hz))
         self._stop = threading.Event()
         self._thr: Optional[threading.Thread] = None
-        self._ps_last_req_t: float = 0.0
 
     def start(self) -> None:
         if self._thr is not None:
@@ -1090,7 +1080,7 @@ class UILoop:
             else:
                 self.widgets["w_lbl_track_info"].value = "Tracking: idle"
 
-        # Platesolve status + autosolve (si existe)
+        # Platesolve status (si existe)
         if "w_lbl_ps_status" in self.widgets:
             ps_status = str(getattr(st, "platesolve_status", "IDLE"))
             ps_busy = bool(getattr(st, "platesolve_busy", False))
@@ -1110,26 +1100,6 @@ class UILoop:
                 f"theta={th:+.2f}° dx={dx:+.2f} dy={dy:+.2f} | "
                 f"resp={resp:.3f} inliers={nin} rms={rms:.2f}px"
             )
-
-            # Auto: lanza request periódicamente (no bloquea).
-            try:
-                auto_on = bool(self.widgets["w_tb_ps_auto"].value)
-                every_s = float(self.widgets["w_tf_ps_every_s"].value)
-                target = str(self.widgets["w_txt_ps_target"].value).strip()
-                source = str(self.widgets["w_dd_ps_source"].value)
-            except Exception as exc:
-                log_info(w_out_log, f"UI: platesolve auto params fallback ({exc})", throttle_s=10.0, throttle_key="ui_ps_auto_fallback")
-                auto_on, every_s, target, source = False, 15.0, "", "live"
-
-            if auto_on and (not ps_busy) and target:
-                now = time.perf_counter()
-                if (now - float(self._ps_last_req_t)) >= max(2.0, every_s):
-                    if hasattr(self.runner, "_platesolve_request"):
-                        try:
-                            self.runner._platesolve_request(source=source, target=target)
-                        except Exception as exc:
-                            log_error(w_out_log, "UI: failed to enqueue platesolve request", exc, throttle_s=5.0, throttle_key="ui_ps_request")
-                    self._ps_last_req_t = float(now)
 
         # opcional: mantener toggle en sync si cambia por fuera
         if "w_btn_tracking_toggle" in self.widgets:
