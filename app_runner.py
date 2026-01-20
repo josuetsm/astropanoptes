@@ -191,48 +191,9 @@ class AppRunner:
     # -------------------------
     def _build_default_platesolve_config(self, cfg: AppConfig) -> PlatesolveConfig:
         """
-        Construye un PlatesolveConfig razonable.
-
-        Nota: aquí NO invento campos de AppConfig. Si en tu AppConfig existe
-        cfg.platesolve.<...>, puedes mapearlos aquí. Si no, quedan defaults.
-
-        Lo único realmente crítico es pixel_size_m y focal_m.
-        Si no están en cfg, deja valores conservadores y los seteas desde UI.
+        Reusa el PlatesolveConfig único definido en AppConfig.
         """
-        # Valores por defecto: AJÚSTALOS según tu hardware real o setéalos por UI.
-        ps_cfg = getattr(cfg, "platesolve", None)
-        pixel_size_m = getattr(ps_cfg, "pixel_size_m", None)
-        focal_m = getattr(ps_cfg, "focal_m", None)
-        debug_input_stats = bool(getattr(ps_cfg, "debug_input_stats", False))
-
-        if pixel_size_m is None:
-            pixel_um = getattr(ps_cfg, "pixel_um", None)
-            binning = int(getattr(ps_cfg, "binning", 1) or 1)
-            if pixel_um is not None:
-                pixel_size_m = float(pixel_um) * 1e-6 * binning
-            else:
-                pixel_size_m = None
-
-        if focal_m is None:
-            focal_mm = getattr(ps_cfg, "focal_mm", None)
-            if focal_mm is not None:
-                focal_m = float(focal_mm) * 1e-3
-            else:
-                focal_m = None
-
-        if pixel_size_m is None:
-            # Ejemplo típico: 2.9 um
-            pixel_size_m = 2.9e-6
-        if focal_m is None:
-            # Ejemplo típico: 900 mm
-            focal_m = 0.9
-
-        return PlatesolveConfig(
-            pixel_size_m=float(pixel_size_m),
-            focal_m=float(focal_m),
-            debug_input_stats=debug_input_stats,
-            # resto se queda en defaults del dataclass
-        )
+        return cfg.platesolve
 
     # -------------------------
     # Lifecycle
