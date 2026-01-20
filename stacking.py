@@ -317,6 +317,44 @@ class StackEngine:
         with self._preview_lock:
             return self._preview_jpeg
 
+    def get_latest_stack_frame(
+        self,
+        *,
+        kind: str = "mono",
+        strategy: str = "median_tile",
+        out_dtype: Optional[np.dtype] = np.uint8,
+    ) -> Optional[np.ndarray]:
+        if self.canvas is None or len(self.canvas.tiles) == 0:
+            return None
+
+        if str(strategy) != "median_tile":
+            return None
+
+        keys = list(self.canvas.tiles.keys())
+        txs = np.array([k[0] for k in keys], dtype=np.int32)
+        tys = np.array([k[1] for k in keys], dtype=np.int32)
+        k_med = (int(np.median(txs)), int(np.median(tys)))
+        if k_med not in self.canvas.tiles:
+            k_med = keys[0]
+
+        tile = self.canvas.tiles[k_med]
+        w = np.maximum(tile.w, 1e-6)
+
+        if self.color_mode == "mono":
+            img = (tile.sum / w).astype(np.float32, copy=False)
+        else:
+            img = (tile.sum / w[..., None]).astype(np.float32, copy=False)
+            if str(kind) == "mono":
+                img = img.mean(axis=2)
+
+        if out_dtype is None:
+            return img
+        if out_dtype == np.uint8:
+            return stretch_to_u8(img)
+        if out_dtype == np.float32:
+            return img.astype(np.float32, copy=False)
+        return img.astype(out_dtype, copy=False)
+
     # ---------- Core batch step ----------
 
     def step_batch(self, batch: List[Dict[str, Any]]) -> None:
