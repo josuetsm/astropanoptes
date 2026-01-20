@@ -97,7 +97,7 @@ class StackingConfig:
     preview_hz: float = 1.0
 
     # backend
-    backend: Literal["auto", "cpu", "mps"] = "auto"
+    backend: Literal["cpu"] = "cpu"
 
 
 @dataclass
