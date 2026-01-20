@@ -26,6 +26,7 @@ from astroquery.gaia import Gaia
 from astroquery.simbad import Simbad
 from astropy_healpix import HEALPix
 from logging_utils import log_error
+from config import PlatesolveConfig
 
 
 # ============================================================
@@ -97,57 +98,6 @@ class ObserverConfig:
             lon=self.lon_deg * u.deg,
             height=self.height_m * u.m,
         )
-
-
-@dataclass(frozen=True)
-class PlatesolveConfig:
-    # Instrument
-    pixel_size_m: float
-    focal_m: float
-
-    # Debug
-    debug_input_stats: bool = False
-
-    # Image processing
-    downsample: int = 2
-    max_det: int = 250
-    det_thresh_sigma: float = 6.0
-    det_minarea: int = 5
-    point_sigma: float = 1.2  # sigma for gaussian blur of point-maps
-
-    # Gaia cache + query
-    cache_dir: str = "~/.cache/gaia_cones"
-    table_name: str = "gaiadr3.gaia_source"
-    columns: Tuple[str, ...] = ("source_id", "ra", "dec", "phot_g_mean_mag")
-    gmax: float = 14.5
-    nside: int = 64
-    order: str = "ring"
-    prefer_parquet: bool = True
-    row_limit: int = -1
-    retries: int = 3
-    backoff_s: float = 3.0
-
-    # Solve (Option C)
-    theta_step_deg: float = 15.0
-    theta_refine_step_deg: float = 3.0
-    theta_refine_span_deg: float = 12.0
-
-    # Matching
-    match_max_px: float = 3.5  # in downsampled pixels
-    min_inliers: int = 10
-
-    # Search area (Gaia cone radius)
-    search_radius_deg: Optional[float] = None
-    search_radius_factor: float = 1.4  # radius ~= factor * (diag/2)
-
-    # Download missing tiles
-    download_missing_tiles: bool = True
-
-    # Guides / labeling
-    guide_n: int = 3
-    simbad_radius_arcsec: float = 2.0
-    simbad_retries: int = 3
-    simbad_backoff_s: float = 0.6
 
 
 @dataclass(frozen=True)
