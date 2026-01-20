@@ -20,17 +20,19 @@ from imaging import (
 )
 
 # ============================================================
-# Config / Types
+# Types
 # ============================================================
 
 ColorMode = Literal["mono", "rgb"]
-BackendMode = Literal["cpu"]
+
+_EPS = 1e-9
 
 
 @dataclass
 class StackingMetrics:
     enabled: bool = False
-    backend: str = "cpu"
+
+    # drizzle / mosaic
     scale: float = 2.0
     pixfrac: float = 0.8
     tile_size_out: int = 512
@@ -80,14 +82,12 @@ class TileCanvas:
         return Tile(sum=s, w=w)
 
     def get_or_create(self, key: Tuple[int, int], now: float) -> Tile:
-        if key in self.tiles:
-            t = self.tiles[key]
+        t = self.tiles.get(key)
+        if t is not None:
             t.last_used_t = now
             return t
 
-        # If exceeding max_tiles, evict LRU tile.
         if len(self.tiles) >= self.max_tiles:
-            # Evict least-recently-used
             lru_key = min(self.tiles.items(), key=lambda kv: kv[1].last_used_t)[0]
             del self.tiles[lru_key]
             self.tiles_evicted += 1
@@ -97,96 +97,85 @@ class TileCanvas:
         self.tiles[key] = t
         return t
 
-    def tiles_used(self) -> int:
+    def num_tiles(self) -> int:
         return len(self.tiles)
 
 
 # ============================================================
-# Backend selection (CPU only)
-# ============================================================
-
-class WarpBackend:
-    def __init__(self, mode: BackendMode = "cpu"):
-        self.mode = mode
-
-    @property
-    def name(self) -> str:
-        return "cpu"
-
-    def warp_affine_tile(
-        self,
-        src: np.ndarray,
-        M_dst_to_src: np.ndarray,
-        dsize: Tuple[int, int],
-        is_color: bool,
-    ) -> np.ndarray:
-        """
-        Return warped tile image (float32).
-        Uses CPU OpenCV by default.
-        M_dst_to_src must be 2x3 mapping from dst coords -> src coords (OpenCV WARP_INVERSE_MAP).
-        """
-        flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
-        if not is_color:
-            warped = cv2.warpAffine(
-                src, M_dst_to_src, dsize, flags=flags, borderMode=cv2.BORDER_CONSTANT, borderValue=0
-            )
-        else:
-            warped = cv2.warpAffine(
-                src, M_dst_to_src, dsize, flags=flags, borderMode=cv2.BORDER_CONSTANT, borderValue=(0, 0, 0)
-            )
-        return warped.astype(np.float32, copy=False)
-
-    def warp_mask_tile(
-        self,
-        src_shape: Tuple[int, int],
-        M_dst_to_src: np.ndarray,
-        dsize: Tuple[int, int],
-    ) -> np.ndarray:
-        """
-        Warp a ones-mask to compute valid pixels; returns float32 mask in [0,1].
-        """
-        h, w = src_shape
-        ones = np.ones((h, w), dtype=np.uint8)
-        flags = cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP
-        m = cv2.warpAffine(ones, M_dst_to_src, dsize, flags=flags, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-        return (m > 0).astype(np.float32, copy=False)
-
-
-# ============================================================
-# Alignment (batch) utilities
+# Alignment utilities (robust, CPU-only)
 # ============================================================
 
 def _mad(x: np.ndarray) -> float:
     med = np.median(x)
-    return float(np.median(np.abs(x - med))) + 1e-9
+    return float(np.median(np.abs(x - med))) + _EPS
 
 
-def _phasecorr_shift(a: np.ndarray, b: np.ndarray) -> Tuple[float, float, float]:
+def _robust_norm_u16(x_u16: np.ndarray) -> np.ndarray:
     """
-    Estimate shift (dx, dy) such that b(x,y) aligns to a(x,y).
-    Returns (dx, dy, resp). Uses cv2.phaseCorrelate on float32.
-    Note: OpenCV returns shift (dx, dy) where (x+dx, y+dy).
+    Robust normalization for phase correlation:
+      z = clip((x - median)/MAD, [-6, +6])
+    Improves stability under gradients/noise and varying exposure.
     """
-    a32 = a.astype(np.float32, copy=False)
-    b32 = b.astype(np.float32, copy=False)
+    x = x_u16.astype(np.float32, copy=False)
+    med = float(np.median(x))
+    mad = float(np.median(np.abs(x - med))) + _EPS
+    z = (x - med) / mad
+    return np.clip(z, -6.0, 6.0, out=z)
 
-    # Hanning window improves robustness
-    win = cv2.createHanningWindow((a32.shape[1], a32.shape[0]), cv2.CV_32F)
-    (dx, dy), resp = cv2.phaseCorrelate(a32, b32, win)
+
+def _phasecorr(a_f32: np.ndarray, b_f32: np.ndarray) -> Tuple[float, float, float]:
+    """
+    OpenCV phase correlation: returns shift (dx,dy) and response.
+    """
+    win = cv2.createHanningWindow((a_f32.shape[1], a_f32.shape[0]), cv2.CV_32F)
+    (dx, dy), resp = cv2.phaseCorrelate(a_f32, b_f32, win)
     return float(dx), float(dy), float(resp)
 
 
-def _estimate_theta_deg_logpolar(a: np.ndarray, b: np.ndarray) -> Tuple[float, float]:
+def _warp_shift(b: np.ndarray, dx: float, dy: float) -> np.ndarray:
     """
-    Optional: estimate small rotation via log-polar phase correlation.
-    Returns (theta_deg, resp). Keep as a hook: can be enabled later.
+    Warp b by a pure translation so output is b shifted by (dx,dy).
     """
-    # For now, return 0 with resp=0 (disabled by default in step_batch)
-    return 0.0, 0.0
+    M = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+    h, w = b.shape[:2]
+    return cv2.warpAffine(b, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
+
+
+def _corr_score(a: np.ndarray, b: np.ndarray) -> float:
+    """
+    Similarity score for sign disambiguation: normalized dot product over overlap.
+    """
+    a_f = a.astype(np.float32, copy=False)
+    b_f = b.astype(np.float32, copy=False)
+    m = (a_f != 0).astype(np.float32) * (b_f != 0).astype(np.float32)
+    denom = float(np.sqrt(np.sum((a_f * m) ** 2) * np.sum((b_f * m) ** 2)) + _EPS)
+    if denom <= 0.0:
+        return -1e9
+    return float(np.sum(a_f * b_f * m) / denom)
+
+
+def _phasecorr_shift_validated(a_u16: np.ndarray, b_u16: np.ndarray) -> Tuple[float, float, float]:
+    """
+    Estimate shift to align b onto a, and disambiguate sign by scoring correlation
+    after applying +/- shift (on the small alignment images).
+
+    Returns (dx, dy, resp) where shifting b by (dx,dy) best aligns to a.
+    """
+    a_n = _robust_norm_u16(a_u16)
+    b_n = _robust_norm_u16(b_u16)
+
+    dx, dy, resp = _phasecorr(a_n, b_n)
+
+    b_plus = _warp_shift(b_n, dx, dy)
+    b_minus = _warp_shift(b_n, -dx, -dy)
+
+    if _corr_score(a_n, b_minus) > _corr_score(a_n, b_plus):
+        return -dx, -dy, resp
+    return dx, dy, resp
 
 
 # ============================================================
-# Transform helpers
+# Affine / tiling helpers
 # ============================================================
 
 def _build_dst_to_src_affine(
@@ -199,30 +188,21 @@ def _build_dst_to_src_affine(
     theta_rad: float,
 ) -> np.ndarray:
     """
-    Build a 2x3 affine matrix that maps DEST (tile-local output coords) -> SRC (frame coords),
+    2x3 affine matrix mapping DEST(tile-local output coords) -> SRC(frame coords),
     for cv2.warpAffine with WARP_INVERSE_MAP.
-    Output coords are in drizzle grid (already scaled).
-    Global output coord: u = tile_u0 + x_out, v = tile_v0 + y_out.
-    Forward model (src->global_out): [u;v] = scale * (R*[x;y] + [dx;dy])
-    So inverse (global_out->src): [x;y] = R^-1 * ([u;v]/scale - [dx;dy])
+
+    Forward model (src->global_out):
+        [u; v] = scale * ( R*[x; y] + [dx; dy] )
+
+    Inverse (global_out->src):
+        [x; y] = R^T * ([u; v]/scale - [dx; dy])
+
+    tile-local dest:
+        u = tile_u0 + x_out, v = tile_v0 + y_out
     """
     c = math.cos(theta_rad)
     s = math.sin(theta_rad)
-
-    # R^-1 = R^T for rotation
-    # [x;y] = R^T * ([u;v]/scale - [dx;dy])
-    # Expand for tile-local (x_out, y_out):
-    # u = tile_u0 + x_out, v = tile_v0 + y_out
-
     inv_scale = 1.0 / scale
-
-    # Let U = (tile_u0 + x_out)*inv_scale - dx
-    # Let V = (tile_v0 + y_out)*inv_scale - dy
-    # x =  c*U + s*V
-    # y = -s*U + c*V
-
-    # x = c*(inv_scale*x_out + tile_u0*inv_scale - dx) + s*(inv_scale*y_out + tile_v0*inv_scale - dy)
-    #   = (c*inv_scale)*x_out + (s*inv_scale)*y_out + c*(tile_u0*inv_scale - dx) + s*(tile_v0*inv_scale - dy)
 
     a11 = c * inv_scale
     a12 = s * inv_scale
@@ -232,9 +212,120 @@ def _build_dst_to_src_affine(
     b1 = c * (tile_u0 * inv_scale - dx) + s * (tile_v0 * inv_scale - dy)
     b2 = -s * (tile_u0 * inv_scale - dx) + c * (tile_v0 * inv_scale - dy)
 
-    M = np.array([[a11, a12, b1],
-                  [a21, a22, b2]], dtype=np.float32)
-    return M
+    return np.array([[a11, a12, b1],
+                     [a21, a22, b2]], dtype=np.float32)
+
+
+def _warp_affine_tile(src: np.ndarray, M: np.ndarray, dsize: Tuple[int, int], is_color: bool) -> np.ndarray:
+    flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
+    border_value = (0, 0, 0) if is_color else 0
+    warped = cv2.warpAffine(
+        src, M, dsize, flags=flags,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=border_value
+    )
+    return warped.astype(np.float32, copy=False)
+
+
+def _warp_mask_tile(src_shape: Tuple[int, int], M: np.ndarray, dsize: Tuple[int, int]) -> np.ndarray:
+    """
+    Warp a ones-mask to compute valid pixels; returns float32 mask in {0,1}.
+    """
+    h, w = src_shape
+    ones = np.ones((h, w), dtype=np.uint8)
+    flags = cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP
+    m = cv2.warpAffine(
+        ones, M, dsize, flags=flags,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0
+    )
+    return (m > 0).astype(np.float32, copy=False)
+
+
+def _dst_tile_fully_inside_src(M_dst_to_src: np.ndarray, dsize: Tuple[int, int], src_w: int, src_h: int) -> bool:
+    """
+    If the entire destination tile maps inside the source bounds, we can skip warping the mask.
+    """
+    tw, th = dsize
+    corners = np.array(
+        [[0.0, 0.0, 1.0],
+         [tw - 1.0, 0.0, 1.0],
+         [0.0, th - 1.0, 1.0],
+         [tw - 1.0, th - 1.0, 1.0]],
+        dtype=np.float32
+    )
+    src_xy = corners @ M_dst_to_src.T  # (4,2)
+    x = src_xy[:, 0]
+    y = src_xy[:, 1]
+    return bool(
+        (x.min() >= 0.0) and (y.min() >= 0.0) and (x.max() <= (src_w - 1.0)) and (y.max() <= (src_h - 1.0))
+    )
+
+
+def _corners_bbox_out(
+    w: int,
+    h: int,
+    *,
+    scale: float,
+    dx: float,
+    dy: float,
+    theta_rad: float,
+) -> Tuple[float, float, float, float]:
+    """
+    Bounding box in output coords for transformed source frame.
+    """
+    c = math.cos(theta_rad)
+    s = math.sin(theta_rad)
+
+    corners = np.array(
+        [[0.0, 0.0],
+         [float(w - 1), 0.0],
+         [0.0, float(h - 1)],
+         [float(w - 1), float(h - 1)]],
+        dtype=np.float32
+    )
+    x = corners[:, 0]
+    y = corners[:, 1]
+    xr = c * x - s * y
+    yr = s * x + c * y
+    u = scale * (xr + dx)
+    v = scale * (yr + dy)
+    return float(u.min()), float(v.min()), float(u.max()), float(v.max())
+
+
+def _to_stack_src(
+    raw: np.ndarray,
+    fmt: str,
+    *,
+    color_mode: ColorMode,
+    bayer_pattern: str,
+    pixfrac: float,
+) -> Tuple[np.ndarray, Tuple[int, int], bool]:
+    """
+    Convert input frame into float32 source for warping/accumulation.
+    Returns (src_f32, (h,w), is_color).
+    """
+    fmt_u = str(fmt).upper()
+
+    if color_mode == "mono":
+        mono_u16 = extract_align_mono_u16(raw, fmt_u, bayer_pattern=bayer_pattern)
+        src = mono_u16.astype(np.float32, copy=False)
+        if pixfrac > 0.7:
+            src = cv2.GaussianBlur(src, (0, 0), sigmaX=0.6, sigmaY=0.6)
+        return src, mono_u16.shape, False
+
+    # rgb stacking
+    if fmt_u.startswith("RAW"):
+        rgb = debayer_cv2(raw, pattern=bayer_pattern, edge_aware=False)
+    elif fmt_u.startswith("RGB"):
+        rgb = raw
+        assert rgb.ndim == 3 and rgb.shape[2] == 3, f"Expected RGB frame (H,W,3), got shape={rgb.shape}"
+    else:
+        mono_u16 = extract_align_mono_u16(raw, fmt_u, bayer_pattern=bayer_pattern)
+        rgb = np.repeat(mono_u16[..., None], 3, axis=2)
+
+    src = rgb.astype(np.float32, copy=False)
+    if pixfrac > 0.7:
+        src = cv2.GaussianBlur(src, (0, 0), sigmaX=0.6, sigmaY=0.6)
+    return src, (src.shape[0], src.shape[1]), True
 
 
 # ============================================================
@@ -249,29 +340,27 @@ class StackEngine:
     enabled: bool = False
     color_mode: ColorMode = "mono"
     canvas: Optional[TileCanvas] = None
-    backend: WarpBackend = field(default_factory=lambda: WarpBackend("cpu"))
 
     # preview snapshot
     _preview_jpeg: Optional[bytes] = None
     _preview_lock: threading.Lock = field(default_factory=threading.Lock)
 
-    # alignment reference for batches
-    _key_align: Optional[np.ndarray] = None
+    # persistent alignment reference (downsampled mono u16)
+    _ref_align_u16: Optional[np.ndarray] = None
+    _ref_ema: float = 0.08  # conservative reference update
 
     def configure_from_cfg(self) -> None:
         scfg = self.cfg.stacking
         self.color_mode = scfg.color_mode
-        self.backend = WarpBackend(scfg.backend)
         self.canvas = TileCanvas(
             tile_size=scfg.tile_size_out,
             max_tiles=scfg.max_tiles,
             color_mode=scfg.color_mode,
         )
-        self.metrics.scale = scfg.drizzle_scale
-        self.metrics.pixfrac = scfg.pixfrac
-        self.metrics.tile_size_out = scfg.tile_size_out
-        self.metrics.max_tiles = scfg.max_tiles
-        self.metrics.backend = self.backend.name
+        self.metrics.scale = float(scfg.drizzle_scale)
+        self.metrics.pixfrac = float(scfg.pixfrac)
+        self.metrics.tile_size_out = int(scfg.tile_size_out)
+        self.metrics.max_tiles = int(scfg.max_tiles)
 
     def start(self) -> None:
         if self.canvas is None:
@@ -287,7 +376,9 @@ class StackEngine:
         if self.canvas is not None:
             self.canvas.tiles.clear()
             self.canvas.tiles_evicted = 0
-        self._key_align = None
+
+        self._ref_align_u16 = None
+
         with self._preview_lock:
             self._preview_jpeg = None
 
@@ -303,14 +394,10 @@ class StackEngine:
         self.metrics.stacking_fps = 0.0
 
     def set_params(self, **kwargs: Any) -> None:
-        """
-        Update selected parameters dynamically.
-        """
         scfg = self.cfg.stacking
         for k, v in kwargs.items():
             if hasattr(scfg, k):
                 setattr(scfg, k, v)
-        # reconfigure canvas/backend if relevant
         self.configure_from_cfg()
 
     def get_preview_jpeg(self) -> Optional[bytes]:
@@ -324,9 +411,8 @@ class StackEngine:
         strategy: str = "median_tile",
         out_dtype: Optional[np.dtype] = np.uint8,
     ) -> Optional[np.ndarray]:
-        if self.canvas is None or len(self.canvas.tiles) == 0:
+        if self.canvas is None or self.canvas.num_tiles() == 0:
             return None
-
         if str(strategy) != "median_tile":
             return None
 
@@ -355,7 +441,9 @@ class StackEngine:
             return img.astype(np.float32, copy=False)
         return img.astype(out_dtype, copy=False)
 
-    # ---------- Core batch step ----------
+    # --------------------------------------------------------
+    # Core batch step
+    # --------------------------------------------------------
 
     def step_batch(self, batch: List[Dict[str, Any]]) -> None:
         """
@@ -364,83 +452,87 @@ class StackEngine:
           - fmt: str ("RAW8","RAW16","MONO8","MONO16","RGB24","RGB48", etc.)
           - t: float timestamp
         """
-        if not self.enabled or self.canvas is None:
+        if not self.enabled or self.canvas is None or not batch:
             return
 
         scfg = self.cfg.stacking
         t0 = time.perf_counter()
-
         self.metrics.frames_in += len(batch)
 
-        # 1) Build alignment images (mono u16), downsample.
-        align_imgs: List[np.ndarray] = []
+        # 1) Alignment images (mono u16), downsample.
+        align_u16: List[np.ndarray] = []
         for item in batch:
             raw = item["raw"]
             fmt = item.get("fmt", "MONO16")
-            mono_u16 = extract_align_mono_u16(raw, fmt, bayer_pattern=scfg.bayer_pattern)
+            mono_u16 = extract_align_mono_u16(raw, str(fmt).upper(), bayer_pattern=scfg.bayer_pattern)
             small = downsample_u16(mono_u16, factor=scfg.align_downsample)
-            align_imgs.append(small)
+            assert small.ndim == 2, f"align image must be 2D, got shape={small.shape}"
+            align_u16.append(small)
 
-        # 2) Choose keyframe within batch: use first, or best by self-consistency.
-        key_idx = 0
-        key = align_imgs[key_idx]
-        self._key_align = key
+        # 2) Persistent reference (stabilizes across batches).
+        if self._ref_align_u16 is None:
+            self._ref_align_u16 = align_u16[0].copy()
+        ref_u16 = self._ref_align_u16
 
-        # 3) Estimate per-frame shift (dx,dy) and resp vs key.
+        # 3) Shifts relative to reference.
         dxs = np.zeros(len(batch), dtype=np.float32)
         dys = np.zeros(len(batch), dtype=np.float32)
         resps = np.zeros(len(batch), dtype=np.float32)
 
-        for i, img in enumerate(align_imgs):
-            if i == key_idx:
-                dxs[i] = 0.0
-                dys[i] = 0.0
-                resps[i] = 1.0
-                continue
-            dx, dy, resp = _phasecorr_shift(key, img)
-            # shift estimated on downsampled grid -> scale up to full-res pixels
+        for i, img_u16 in enumerate(align_u16):
+            dx, dy, resp = _phasecorr_shift_validated(ref_u16, img_u16)
             dxs[i] = dx * scfg.align_downsample
             dys[i] = dy * scfg.align_downsample
             resps[i] = resp
 
-        # 4) Robust filtering (median/MAD) + resp_min.
+        # 4) Robust gating: response + shift outliers (radial MAD).
+        resp_min = float(scfg.resp_min)
+        k_mad = float(scfg.outlier_k_mad)
+        mad_floor_px = 0.35  # prevents collapse when motion is tiny
+
         med_dx = float(np.median(dxs))
         med_dy = float(np.median(dys))
-        mad_dx = _mad(dxs)
-        mad_dy = _mad(dys)
+        dist = np.sqrt((dxs - med_dx) ** 2 + (dys - med_dy) ** 2).astype(np.float32, copy=False)
+        mad_dist = max(_mad(dist), mad_floor_px)
 
-        used_indices: List[int] = []
+        used: List[int] = []
         for i in range(len(batch)):
-            if resps[i] < scfg.resp_min:
+            if float(resps[i]) < resp_min:
                 continue
-            if abs(float(dxs[i]) - med_dx) > scfg.outlier_k_mad * mad_dx:
+            if float(dist[i]) > (k_mad * mad_dist):
                 continue
-            if abs(float(dys[i]) - med_dy) > scfg.outlier_k_mad * mad_dy:
-                continue
-            used_indices.append(i)
+            used.append(i)
 
-        if len(used_indices) == 0:
+        if not used:
             self.metrics.frames_rejected += len(batch)
             return
 
-        self.metrics.frames_rejected += (len(batch) - len(used_indices))
+        self.metrics.frames_rejected += (len(batch) - len(used))
 
-        # 5) Rotation estimation (optional hook): keep 0 for now
-        theta_deg = 0.0
+        # 5) Reference update (EMA in reference coordinates) using best-response frame.
+        i_best = int(max(used, key=lambda j: float(resps[j])))
+        dx_small = float(dxs[i_best]) / float(scfg.align_downsample)
+        dy_small = float(dys[i_best]) / float(scfg.align_downsample)
+
+        best_small = align_u16[i_best].astype(np.float32, copy=False)
+        aligned_best = _warp_shift(best_small, dx_small, dy_small)
+
+        ref_f = ref_u16.astype(np.float32, copy=False)
+        ema = float(np.clip(self._ref_ema, 0.0, 0.5))
+        ref_new = (1.0 - ema) * ref_f + ema * aligned_best
+        self._ref_align_u16 = np.clip(ref_new, 0.0, 65535.0).astype(np.uint16)
+
+        # 6) Accumulate accepted frames into tiles (drizzle grid). Rotation hook kept at zero.
+        scale = float(scfg.drizzle_scale)
+        tile_size = int(scfg.tile_size_out)
+        pixfrac = float(scfg.pixfrac)
         theta_rad = 0.0
+        theta_deg = 0.0
 
-        # 6) Accumulate each accepted frame into tiles (drizzle scale)
-        scale = scfg.drizzle_scale
-        tile_size = scfg.tile_size_out
+        now = time.time()
+        dsize = (tile_size, tile_size)
 
-        # origin: choose (0,0) at first batch keyframe, i.e. key frame centered at positive coords.
-        # For simplicity, we use origin = (0,0) in output; tiles can be negative indices.
-        # In practice you may want to set origin so initial frame lies in tile (0,0) region.
-        # We'll anchor origin by shifting so that frame top-left maps near (0,0) when dx,dy ~0.
-        # Here: origin is implicit in tile_u0/tile_v0; we let negative tiles exist.
-        # (UI can render a viewport later.)
-
-        for i in used_indices:
+        for i in used:
             raw = batch[i]["raw"]
             fmt = batch[i].get("fmt", "MONO16")
 
@@ -448,60 +540,33 @@ class StackEngine:
             dy = float(dys[i])
             resp = float(resps[i])
 
-            # frame weight: simple mapping (can refine later)
-            w_frame = float(np.clip((resp - scfg.resp_min) / max(1e-6, (1.0 - scfg.resp_min)), 0.0, 1.0))
+            w_frame = float(np.clip((resp - resp_min) / max(1e-6, (1.0 - resp_min)), 0.0, 1.0))
             if w_frame <= 0.0:
                 continue
 
-            # Build source image for stacking
-            if self.color_mode == "mono":
-                src_u16 = extract_align_mono_u16(raw, fmt, bayer_pattern=scfg.bayer_pattern)
-                # drizzle "pixfrac" approximation: prefilter a bit when pixfrac is high
-                src = src_u16.astype(np.float32, copy=False)
-                if scfg.pixfrac > 0.7:
-                    src = cv2.GaussianBlur(src, (0, 0), sigmaX=0.6, sigmaY=0.6)
-                src_is_color = False
-                src_shape = src_u16.shape
-            else:
-                # Debayer if raw Bayer; if already RGB, accept it
-                if fmt.startswith("RAW"):
-                    rgb = debayer_cv2(raw, pattern=scfg.bayer_pattern, edge_aware=False)
-                elif fmt.startswith("RGB"):
-                    rgb = raw
-                else:
-                    # mono -> fake RGB (replicate)
-                    rgb = np.repeat(raw[..., None], 3, axis=2)
-                src = rgb.astype(np.float32, copy=False)
-                if scfg.pixfrac > 0.7:
-                    src = cv2.GaussianBlur(src, (0, 0), sigmaX=0.6, sigmaY=0.6)
-                src_is_color = True
-                src_shape = (src.shape[0], src.shape[1])
+            src, (h, w), src_is_color = _to_stack_src(
+                raw, str(fmt),
+                color_mode=self.color_mode,
+                bayer_pattern=scfg.bayer_pattern,
+                pixfrac=pixfrac,
+            )
 
-            h, w = src_shape
+            u_min, v_min, u_max, v_max = _corners_bbox_out(
+                w, h, scale=scale, dx=dx, dy=dy, theta_rad=theta_rad
+            )
 
-            # Determine approximate bbox in output (scaled) to know tiles touched.
-            # Forward mapping of src corners, assuming small theta:
-            # u = scale*(x + dx), v = scale*(y + dy) when theta=0
-            # We'll compute bbox conservatively.
-            u_min = scale * (0.0 + dx)
-            v_min = scale * (0.0 + dy)
-            u_max = scale * ((w - 1) + dx)
-            v_max = scale * ((h - 1) + dy)
-
-            # Convert to tile indices
             tx0 = int(math.floor(u_min / tile_size))
             ty0 = int(math.floor(v_min / tile_size))
             tx1 = int(math.floor(u_max / tile_size))
             ty1 = int(math.floor(v_max / tile_size))
 
-            now = time.time()
             for ty in range(ty0, ty1 + 1):
                 for tx in range(tx0, tx1 + 1):
                     tile = self.canvas.get_or_create((tx, ty), now)
                     tile.hits += 1
 
-                    tile_u0 = tx * tile_size
-                    tile_v0 = ty * tile_size
+                    tile_u0 = float(tx * tile_size)
+                    tile_v0 = float(ty * tile_size)
 
                     M = _build_dst_to_src_affine(
                         tile_u0=tile_u0,
@@ -512,9 +577,12 @@ class StackEngine:
                         theta_rad=theta_rad,
                     )
 
-                    dsize = (tile_size, tile_size)
-                    warped = self.backend.warp_affine_tile(src, M, dsize, is_color=src_is_color)
-                    mask = self.backend.warp_mask_tile((h, w), M, dsize) * w_frame
+                    warped = _warp_affine_tile(src, M, dsize, is_color=src_is_color)
+
+                    if _dst_tile_fully_inside_src(M, dsize, src_w=w, src_h=h):
+                        mask = np.full((tile_size, tile_size), w_frame, dtype=np.float32)
+                    else:
+                        mask = _warp_mask_tile((h, w), M, dsize) * w_frame
 
                     if self.color_mode == "mono":
                         tile.sum += warped * mask
@@ -522,33 +590,30 @@ class StackEngine:
                         tile.sum += warped * mask[..., None]
                     tile.w += mask
 
-        # Update metrics
-        self.metrics.frames_used += len(used_indices)
-        self.metrics.tiles_used = self.canvas.tiles_used()
+        # 7) Metrics + preview.
+        self.metrics.frames_used += len(used)
+        self.metrics.tiles_used = self.canvas.num_tiles()
         self.metrics.tiles_evicted = self.canvas.tiles_evicted
-        self.metrics.last_resp = float(np.median(resps[used_indices]))
-        self.metrics.last_dx = float(np.median(dxs[used_indices]))
-        self.metrics.last_dy = float(np.median(dys[used_indices]))
+        self.metrics.last_resp = float(np.median(resps[used]))
+        self.metrics.last_dx = float(np.median(dxs[used]))
+        self.metrics.last_dy = float(np.median(dys[used]))
         self.metrics.last_theta_deg = float(theta_deg)
 
         dt = time.perf_counter() - t0
         if dt > 1e-6:
-            # approximate "fps" in terms of frames processed
-            self.metrics.stacking_fps = 0.9 * self.metrics.stacking_fps + 0.1 * (len(used_indices) / dt)
+            fps_now = float(len(used) / dt)
+            self.metrics.stacking_fps = 0.9 * self.metrics.stacking_fps + 0.1 * fps_now
 
-        # Preview update (slow)
         now_t = time.time()
-        if (now_t - self.metrics.last_preview_t) >= (1.0 / max(1e-6, scfg.preview_hz)):
+        if (now_t - self.metrics.last_preview_t) >= (1.0 / max(1e-6, float(scfg.preview_hz))):
             self.metrics.last_preview_t = now_t
             self._update_preview_jpeg()
 
     def _update_preview_jpeg(self) -> None:
         """
-        Build a small preview from currently most-used tiles.
-        Strategy: pick a tile near median of keys and render its normalized image.
-        This keeps it simple; UI can later do a viewport compositor.
+        Build a lightweight preview from a representative tile (median of keys).
         """
-        if self.canvas is None or len(self.canvas.tiles) == 0:
+        if self.canvas is None or self.canvas.num_tiles() == 0:
             with self._preview_lock:
                 self._preview_jpeg = None
             return
@@ -566,15 +631,25 @@ class StackEngine:
         if self.color_mode == "mono":
             img = (tile.sum / w).astype(np.float32, copy=False)
             u8 = stretch_to_u8(img)
-            # downsample for preview
-            u8s = cv2.resize(u8, (u8.shape[1] // 2, u8.shape[0] // 2), interpolation=cv2.INTER_AREA)
+            u8s = cv2.resize(
+                u8,
+                (max(1, u8.shape[1] // 2), max(1, u8.shape[0] // 2)),
+                interpolation=cv2.INTER_AREA,
+            )
             ok, jpg = cv2.imencode(".jpg", u8s, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
         else:
             img = (tile.sum / w[..., None]).astype(np.float32, copy=False)
-            # stretch per-channel (simple) and convert to u8
             u8 = stretch_to_u8(img)  # supports (H,W,3)
-            u8s = cv2.resize(u8, (u8.shape[1] // 2, u8.shape[0] // 2), interpolation=cv2.INTER_AREA)
-            ok, jpg = cv2.imencode(".jpg", cv2.cvtColor(u8s, cv2.COLOR_RGB2BGR), [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            u8s = cv2.resize(
+                u8,
+                (max(1, u8.shape[1] // 2), max(1, u8.shape[0] // 2)),
+                interpolation=cv2.INTER_AREA,
+            )
+            ok, jpg = cv2.imencode(
+                ".jpg",
+                cv2.cvtColor(u8s, cv2.COLOR_RGB2BGR),
+                [int(cv2.IMWRITE_JPEG_QUALITY), 85],
+            )
 
         with self._preview_lock:
             self._preview_jpeg = jpg.tobytes() if ok else None
@@ -587,8 +662,8 @@ class StackEngine:
 class StackingWorker:
     """
     Owns a StackEngine and a queue.
-    Call .enqueue_frame(...) from AppRunner loop (non-blocking),
-    and let .thread() consume and process in batches.
+    Call enqueue_frame(...) from AppRunner loop (non-blocking),
+    and let the worker consume and process in batches.
     """
 
     def __init__(self, cfg: AppConfig):
@@ -599,6 +674,9 @@ class StackingWorker:
         self._q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=cfg.stacking.max_queue)
         self._stop = threading.Event()
         self._thr: Optional[threading.Thread] = None
+
+        if bool(cfg.stacking.enabled_init):
+            self.start()
 
     def start(self) -> None:
         self.engine.start()
@@ -620,24 +698,21 @@ class StackingWorker:
     def enqueue_frame(self, raw: np.ndarray, fmt: str, t: Optional[float] = None) -> None:
         if not self.engine.enabled:
             return
-        item = {"raw": raw, "fmt": fmt, "t": float(t if t is not None else time.time())}
+        item = {"raw": raw, "fmt": fmt, "t": float(time.time() if t is None else t)}
         try:
             self._q.put_nowait(item)
         except queue.Full:
             self.engine.metrics.frames_dropped += 1
 
     def _run(self) -> None:
-        batch_size = self.cfg.stacking.batch_size
+        batch_size = int(self.cfg.stacking.batch_size)
         while not self._stop.is_set():
             batch: List[Dict[str, Any]] = []
             try:
-                # Block briefly for first item
-                item = self._q.get(timeout=0.1)
-                batch.append(item)
+                batch.append(self._q.get(timeout=0.1))
             except queue.Empty:
                 continue
 
-            # Drain up to batch_size quickly
             for _ in range(batch_size - 1):
                 try:
                     batch.append(self._q.get_nowait())
