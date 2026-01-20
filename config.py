@@ -107,6 +107,7 @@ class PlateSolveConfig:
     binning: int = 1
     auto_solve: bool = False
     solve_every_s: float = 15.0
+    debug_input_stats: bool = False
 
 #@dataclass
 #class GoToConfig:

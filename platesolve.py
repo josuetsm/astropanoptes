@@ -105,6 +105,9 @@ class PlatesolveConfig:
     pixel_size_m: float
     focal_m: float
 
+    # Debug
+    debug_input_stats: bool = False
+
     # Image processing
     downsample: int = 2
     max_det: int = 250
