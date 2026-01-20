@@ -415,10 +415,10 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # ============================================================
     # TAB PLATESOLVE (integrado)
     # ============================================================
-    # Instrument params -> se convierten a SI dentro de PlatesolveConfig
+    # Instrument params -> se convierten a SI para PlatesolveConfig
     w_tf_ps_focal_mm = W.BoundedFloatText(
         description="focal (mm)",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "focal_mm", 900.0)),
+        value=float(getattr(getattr(cfg, "platesolve", object()), "focal_m", 0.9)) * 1000.0,
         min=10.0,
         max=50000.0,
         step=1.0,
@@ -426,7 +426,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_pixel_um = W.BoundedFloatText(
         description="pixel (µm)",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "pixel_um", 2.9)),
+        value=float(getattr(getattr(cfg, "platesolve", object()), "pixel_size_m", 2.9e-6)) * 1e6,
         min=0.5,
         max=30.0,
         step=0.1,
@@ -434,7 +434,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_binning = W.BoundedIntText(
         description="binning",
-        value=int(getattr(getattr(cfg, "platesolve", object()), "binning", 1)),
+        value=1,
         min=1,
         max=8,
         step=1,
