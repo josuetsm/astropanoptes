@@ -447,7 +447,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # Solver params (subconjunto razonable)
     w_bi_ps_downsample = W.BoundedIntText(
         description="downsample",
-        value=1,
+        value=int(getattr(getattr(cfg, "platesolve", object()), "downsample", 2)),
         min=1,
         max=8,
         step=1,
@@ -455,7 +455,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_max_det = W.BoundedIntText(
         description="max_det",
-        value=250,
+        value=int(getattr(getattr(cfg, "platesolve", object()), "max_det", 250)),
         min=20,
         max=2000,
         step=10,
@@ -463,7 +463,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_det_sigma = W.BoundedFloatText(
         description="det_sigma",
-        value=6.0,
+        value=float(getattr(getattr(cfg, "platesolve", object()), "det_thresh_sigma", 6.0)),
         min=0.5,
         max=50.0,
         step=0.5,
@@ -471,31 +471,75 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_minarea = W.BoundedIntText(
         description="minarea",
-        value=5,
+        value=int(getattr(getattr(cfg, "platesolve", object()), "det_minarea", 5)),
         min=1,
         max=200,
         step=1,
         layout=W.Layout(width="220px"),
     )
+    w_tf_ps_point_sigma = W.BoundedFloatText(
+        description="point_sigma",
+        value=float(getattr(getattr(cfg, "platesolve", object()), "point_sigma", 1.2)),
+        min=0.2,
+        max=10.0,
+        step=0.1,
+        layout=W.Layout(width="220px"),
+    )
     w_tf_ps_gmax = W.BoundedFloatText(
         description="gmax",
-        value=14.5,
+        value=float(getattr(getattr(cfg, "platesolve", object()), "gmax", 14.5)),
         min=6.0,
         max=20.0,
         step=0.1,
         layout=W.Layout(width="220px"),
     )
+    w_cb_ps_use_radius = W.Checkbox(
+        description="use search_radius_deg",
+        value=getattr(getattr(cfg, "platesolve", object()), "search_radius_deg", None) is not None,
+    )
+    w_tf_ps_search_radius_deg = W.BoundedFloatText(
+        description="search_radius_deg",
+        value=float(getattr(getattr(cfg, "platesolve", object()), "search_radius_deg", 2.0) or 2.0),
+        min=0.1,
+        max=30.0,
+        step=0.1,
+        layout=W.Layout(width="260px"),
+    )
+    w_tf_ps_search_radius_factor = W.BoundedFloatText(
+        description="search_radius_factor",
+        value=float(getattr(getattr(cfg, "platesolve", object()), "search_radius_factor", 1.4)),
+        min=0.5,
+        max=10.0,
+        step=0.1,
+        layout=W.Layout(width="260px"),
+    )
     w_tf_ps_theta_step = W.BoundedFloatText(
         description="theta_step (deg)",
-        value=15.0,
+        value=float(getattr(getattr(cfg, "platesolve", object()), "theta_step_deg", 15.0)),
         min=0.5,
         max=60.0,
         step=0.5,
         layout=W.Layout(width="260px"),
     )
+    w_tf_ps_theta_refine_span = W.BoundedFloatText(
+        description="theta_refine_span",
+        value=float(getattr(getattr(cfg, "platesolve", object()), "theta_refine_span_deg", 12.0)),
+        min=0.5,
+        max=60.0,
+        step=0.5,
+        layout=W.Layout(width="260px"),
+    )
+    w_tf_ps_theta_refine_step = W.BoundedFloatText(
+        description="theta_refine_step",
+        value=float(getattr(getattr(cfg, "platesolve", object()), "theta_refine_step_deg", 3.0)),
+        min=0.1,
+        max=10.0,
+        step=0.1,
+        layout=W.Layout(width="260px"),
+    )
     w_tf_ps_match_max = W.BoundedFloatText(
         description="match_max_px",
-        value=3.5,
+        value=float(getattr(getattr(cfg, "platesolve", object()), "match_max_px", 3.5)),
         min=0.5,
         max=25.0,
         step=0.1,
@@ -503,11 +547,27 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_min_inliers = W.BoundedIntText(
         description="min_inliers",
-        value=1,
+        value=int(getattr(getattr(cfg, "platesolve", object()), "min_inliers", 10)),
         min=1,
         max=200,
         step=1,
         layout=W.Layout(width="260px"),
+    )
+    w_bi_ps_guide_n = W.BoundedIntText(
+        description="guide_n",
+        value=int(getattr(getattr(cfg, "platesolve", object()), "guide_n", 3)),
+        min=0,
+        max=20,
+        step=1,
+        layout=W.Layout(width="220px"),
+    )
+    w_tf_ps_simbad_radius_arcsec = W.BoundedFloatText(
+        description="simbad_radius\"",
+        value=float(getattr(getattr(cfg, "platesolve", object()), "simbad_radius_arcsec", 2.0)),
+        min=0.1,
+        max=30.0,
+        step=0.1,
+        layout=W.Layout(width="220px"),
     )
 
     # Controls
@@ -541,6 +601,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
 
     w_lbl_ps_status = W.HTML(value="PlateSolve: idle")
+    w_img_platesolve = W.Image(format="jpeg", layout=W.Layout(width="100%", max_width="980px"))
+    w_html_platesolve = W.HTML(value="")
 
     def _ps_send_params(_=None) -> None:
         # Conversión:
@@ -555,10 +617,17 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             "max_det": int(w_bi_ps_max_det.value),
             "det_thresh_sigma": float(w_tf_ps_det_sigma.value),
             "det_minarea": int(w_bi_ps_minarea.value),
+            "point_sigma": float(w_tf_ps_point_sigma.value),
             "gmax": float(w_tf_ps_gmax.value),
+            "search_radius_deg": float(w_tf_ps_search_radius_deg.value) if w_cb_ps_use_radius.value else None,
+            "search_radius_factor": float(w_tf_ps_search_radius_factor.value),
             "theta_step_deg": float(w_tf_ps_theta_step.value),
+            "theta_refine_span_deg": float(w_tf_ps_theta_refine_span.value),
+            "theta_refine_step_deg": float(w_tf_ps_theta_refine_step.value),
             "match_max_px": float(w_tf_ps_match_max.value),
             "min_inliers": int(w_bi_ps_min_inliers.value),
+            "guide_n": int(w_bi_ps_guide_n.value),
+            "simbad_radius_arcsec": float(w_tf_ps_simbad_radius_arcsec.value),
             "auto_solve": bool(w_tb_ps_auto.value),
             "solve_every_s": float(w_tf_ps_every_s.value),
             "auto_target": str(w_txt_ps_target.value),
@@ -587,10 +656,18 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         w_bi_ps_max_det,
         w_tf_ps_det_sigma,
         w_bi_ps_minarea,
+        w_tf_ps_point_sigma,
         w_tf_ps_gmax,
+        w_cb_ps_use_radius,
+        w_tf_ps_search_radius_deg,
+        w_tf_ps_search_radius_factor,
         w_tf_ps_theta_step,
+        w_tf_ps_theta_refine_span,
+        w_tf_ps_theta_refine_step,
         w_tf_ps_match_max,
         w_bi_ps_min_inliers,
+        w_bi_ps_guide_n,
+        w_tf_ps_simbad_radius_arcsec,
     ]:
         _w.observe(_ps_send_params, names="value")
     w_tb_ps_auto.observe(_ps_send_params, names="value")
@@ -606,9 +683,13 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             W.HTML("<b>Instrument</b>"),
             W.HBox([w_tf_ps_focal_mm, w_tf_ps_pixel_um, w_bi_ps_binning]),
             W.HTML("<b>Solver</b>"),
-            W.HBox([w_bi_ps_downsample, w_bi_ps_max_det, w_tf_ps_det_sigma, w_bi_ps_minarea]),
-            W.HBox([w_tf_ps_gmax, w_tf_ps_theta_step, w_tf_ps_match_max, w_bi_ps_min_inliers]),
+            W.HBox([w_bi_ps_downsample, w_bi_ps_max_det, w_tf_ps_det_sigma, w_bi_ps_minarea, w_tf_ps_point_sigma]),
+            W.HBox([w_tf_ps_gmax, w_cb_ps_use_radius, w_tf_ps_search_radius_deg, w_tf_ps_search_radius_factor]),
+            W.HBox([w_tf_ps_theta_step, w_tf_ps_theta_refine_span, w_tf_ps_theta_refine_step]),
+            W.HBox([w_tf_ps_match_max, w_bi_ps_min_inliers, w_bi_ps_guide_n, w_tf_ps_simbad_radius_arcsec]),
             w_lbl_ps_status,
+            w_html_platesolve,
+            w_img_platesolve,
         ],
         layout=W.Layout(border="1px solid #eee", padding="8px", gap="6px"),
     )
@@ -940,6 +1021,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_tb_ps_auto": w_tb_ps_auto,
         "w_tf_ps_every_s": w_tf_ps_every_s,
         "w_lbl_ps_status": w_lbl_ps_status,
+        "w_img_platesolve": w_img_platesolve,
+        "w_html_platesolve": w_html_platesolve,
         "w_tf_ps_focal_mm": w_tf_ps_focal_mm,
         "w_tf_ps_pixel_um": w_tf_ps_pixel_um,
         "w_bi_ps_binning": w_bi_ps_binning,
@@ -947,10 +1030,18 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_bi_ps_max_det": w_bi_ps_max_det,
         "w_tf_ps_det_sigma": w_tf_ps_det_sigma,
         "w_bi_ps_minarea": w_bi_ps_minarea,
+        "w_tf_ps_point_sigma": w_tf_ps_point_sigma,
         "w_tf_ps_gmax": w_tf_ps_gmax,
+        "w_cb_ps_use_radius": w_cb_ps_use_radius,
+        "w_tf_ps_search_radius_deg": w_tf_ps_search_radius_deg,
+        "w_tf_ps_search_radius_factor": w_tf_ps_search_radius_factor,
         "w_tf_ps_theta_step": w_tf_ps_theta_step,
+        "w_tf_ps_theta_refine_span": w_tf_ps_theta_refine_span,
+        "w_tf_ps_theta_refine_step": w_tf_ps_theta_refine_step,
         "w_tf_ps_match_max": w_tf_ps_match_max,
         "w_bi_ps_min_inliers": w_bi_ps_min_inliers,
+        "w_bi_ps_guide_n": w_bi_ps_guide_n,
+        "w_tf_ps_simbad_radius_arcsec": w_tf_ps_simbad_radius_arcsec,
         # goto tab
         "w_lbl_goto_status": w_lbl_goto_status,
         # manual mount control
@@ -1115,6 +1206,43 @@ class UILoop:
                 f"theta={th:+.2f}° dx={dx:+.2f} dy={dy:+.2f} | "
                 f"resp={resp:.3f} inliers={nin} rms={rms:.2f}px"
             )
+        if "w_html_platesolve" in self.widgets:
+            debug_info = dict(getattr(st, "platesolve_debug_info", {}) or {})
+            if debug_info:
+                ordered = [
+                    "status",
+                    "response",
+                    "n_det",
+                    "gaia_rows",
+                    "n_inliers",
+                    "rms_px",
+                    "theta_deg",
+                    "dx_px",
+                    "dy_px",
+                    "radius_deg",
+                    "scale_arcsec_per_px",
+                    "downsample",
+                ]
+
+                def _fmt_value(val: Any) -> str:
+                    if isinstance(val, float):
+                        return f"{val:.4g}"
+                    return str(val)
+
+                lines = []
+                for key in ordered:
+                    if key not in debug_info:
+                        continue
+                    val = debug_info.get(key)
+                    if val is None:
+                        continue
+                    lines.append(f"<li><b>{key}</b>: {_fmt_value(val)}</li>")
+                if lines:
+                    self.widgets["w_html_platesolve"].value = "<ul>" + "".join(lines) + "</ul>"
+                else:
+                    self.widgets["w_html_platesolve"].value = ""
+            else:
+                self.widgets["w_html_platesolve"].value = ""
 
         # opcional: mantener toggle en sync si cambia por fuera
         if "w_btn_tracking_toggle" in self.widgets:
@@ -1140,6 +1268,10 @@ class UILoop:
         stack_jpg = getattr(st, "stacking_preview_jpeg", None)
         if stack_jpg and "w_img_stack" in self.widgets:
             self.widgets["w_img_stack"].value = stack_jpg
+
+        ps_jpg = getattr(st, "platesolve_debug_jpeg", None)
+        if ps_jpg and "w_img_platesolve" in self.widgets:
+            self.widgets["w_img_platesolve"].value = ps_jpg
 
 
 def show_ui(cfg: AppConfig, runner: AppRunner, *, start_loops: bool = True, ui_hz: float = 10.0):
