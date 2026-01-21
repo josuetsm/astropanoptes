@@ -8,6 +8,9 @@ import time
 from dataclasses import replace
 from typing import Optional, Any, Dict, List
 
+import cv2
+import numpy as np
+
 from ap_types import SystemState, Axis
 from config import AppConfig, CameraConfig, PreviewConfig
 from actions import Action, ActionType
@@ -174,6 +177,8 @@ class AppRunner:
             platesolve_rms_px=0.0,
             platesolve_overlay=[],
             platesolve_guides=[],
+            platesolve_debug_jpeg=None,
+            platesolve_debug_info=None,
             platesolve_center_ra_deg=0.0,
             platesolve_center_dec_deg=0.0,
         )
@@ -525,6 +530,89 @@ class AppRunner:
             )
             self._platesolve_thr.start()
 
+    def _render_platesolve_debug_jpeg(
+        self,
+        frame: Optional[np.ndarray],
+        overlay: Optional[List[Any]],
+        downsample: int,
+    ) -> Optional[bytes]:
+        if frame is None:
+            return None
+        gray = frame
+        if getattr(gray, "ndim", 0) == 3:
+            if gray.shape[2] == 1:
+                gray = gray[:, :, 0]
+            else:
+                gray = gray[:, :, :3].astype(np.float32).mean(axis=2)
+        gray = np.asarray(gray, dtype=np.float32)
+        if gray.ndim != 2:
+            return None
+
+        ds = int(max(1, downsample))
+        if ds > 1:
+            h, w = gray.shape[:2]
+            gray = cv2.resize(gray, (max(1, w // ds), max(1, h // ds)), interpolation=cv2.INTER_AREA)
+
+        p1, p99 = np.percentile(gray, [1.0, 99.0])
+        if p99 <= p1:
+            p1 = float(gray.min()) if gray.size else 0.0
+            p99 = float(gray.max()) if gray.size else 1.0
+        scale = 255.0 / max(1e-6, float(p99 - p1))
+        u8 = np.clip((gray - p1) * scale, 0, 255).astype(np.uint8)
+        img = cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+
+        if overlay:
+            h, w = img.shape[:2]
+            colors = {
+                "det": (255, 0, 0),
+                "match": (0, 255, 0),
+                "guide": (0, 0, 255),
+            }
+            for item in overlay:
+                x = int(round(float(getattr(item, "x", 0.0))))
+                y = int(round(float(getattr(item, "y", 0.0))))
+                if x < 0 or y < 0 or x >= w or y >= h:
+                    continue
+                kind = str(getattr(item, "kind", "det"))
+                color = colors.get(kind, (255, 255, 0))
+                radius = 5 if kind == "guide" else 4 if kind == "match" else 3
+                cv2.circle(img, (x, y), radius, color, 1, lineType=cv2.LINE_AA)
+                label = getattr(item, "label", None)
+                if kind == "guide" and label:
+                    cv2.putText(
+                        img,
+                        str(label),
+                        (x + 6, y - 6),
+                        cv2.FONT_HERSHEY_SIMPLEX,
+                        0.4,
+                        color,
+                        1,
+                        lineType=cv2.LINE_AA,
+                    )
+
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+        if not ok:
+            return None
+        return bytes(buf.tobytes())
+
+    def _build_platesolve_debug_info(self, result: Any) -> Dict[str, Any]:
+        metrics = dict(getattr(result, "metrics", {}) or {})
+        info = {
+            "status": str(getattr(result, "status", "")),
+            "response": float(getattr(result, "response", 0.0)),
+            "n_det": metrics.get("n_det"),
+            "gaia_rows": metrics.get("gaia_rows"),
+            "n_inliers": int(getattr(result, "n_inliers", 0)),
+            "rms_px": float(getattr(result, "rms_px", 0.0)),
+            "theta_deg": float(getattr(result, "theta_deg", 0.0)),
+            "dx_px": float(getattr(result, "dx_px", 0.0)),
+            "dy_px": float(getattr(result, "dy_px", 0.0)),
+            "radius_deg": metrics.get("radius_deg"),
+            "scale_arcsec_per_px": metrics.get("scale_arcsec_per_px"),
+            "downsample": int(getattr(result, "downsample", metrics.get("downsample", 0) or 0)),
+        }
+        return info
+
     def _platesolve_worker(self) -> None:
         """
         Worker que ejecuta plate solving sin bloquear el loop principal.
@@ -541,7 +629,12 @@ class AppRunner:
                 continue
 
             # Marcar busy
-            self._set_state_safe(platesolve_busy=True, platesolve_status="RUNNING")
+            self._set_state_safe(
+                platesolve_busy=True,
+                platesolve_status="RUNNING",
+                platesolve_debug_jpeg=None,
+                platesolve_debug_info=None,
+            )
 
             try:
                 source = str(req.get("source", "live")).lower().strip()
@@ -552,6 +645,8 @@ class AppRunner:
                         platesolve_busy=False,
                         platesolve_status="ERR_NO_TARGET",
                         platesolve_last_ok=False,
+                        platesolve_debug_jpeg=None,
+                        platesolve_debug_info={"status": "ERR_NO_TARGET"},
                     )
                     continue
 
@@ -562,6 +657,8 @@ class AppRunner:
                             platesolve_busy=False,
                             platesolve_status="ERR_NO_STACK",
                             platesolve_last_ok=False,
+                            platesolve_debug_jpeg=None,
+                            platesolve_debug_info={"status": "ERR_NO_STACK"},
                         )
                         continue
                     frame = stack
@@ -578,6 +675,8 @@ class AppRunner:
                             platesolve_busy=False,
                             platesolve_status="ERR_NO_CAMERA",
                             platesolve_last_ok=False,
+                            platesolve_debug_jpeg=None,
+                            platesolve_debug_info={"status": "ERR_NO_CAMERA"},
                         )
                         continue
                     fr = self._cam_stream.latest()
@@ -586,12 +685,13 @@ class AppRunner:
                             platesolve_busy=False,
                             platesolve_status="ERR_NO_FRAME",
                             platesolve_last_ok=False,
+                            platesolve_debug_jpeg=None,
+                            platesolve_debug_info={"status": "ERR_NO_FRAME"},
                         )
                         continue
 
                     # Elegimos u8_view o u16; platesolve soporta RGB/BGR/gray -> convierte a gray
                     frame = fr.raw
-                    import numpy as np
 
                     debug_stats = bool(getattr(self._platesolve_cfg, "debug_input_stats", False))
 
@@ -634,6 +734,13 @@ class AppRunner:
                         progress_cb=None,
                     )
 
+                debug_jpeg = self._render_platesolve_debug_jpeg(
+                    frame,
+                    list(getattr(result, "overlay", []) or []),
+                    int(getattr(result, "downsample", self._platesolve_cfg.downsample)),
+                )
+                debug_info = self._build_platesolve_debug_info(result)
+
                 # Publicar resultado (si existen campos)
                 self._set_state_safe(
                     platesolve_busy=False,
@@ -647,6 +754,8 @@ class AppRunner:
                     platesolve_rms_px=float(result.rms_px),
                     platesolve_overlay=list(result.overlay),
                     platesolve_guides=list(result.guides),
+                    platesolve_debug_jpeg=debug_jpeg,
+                    platesolve_debug_info=debug_info,
                     platesolve_center_ra_deg=float(result.center_ra_deg),
                     platesolve_center_dec_deg=float(result.center_dec_deg),
                 )
