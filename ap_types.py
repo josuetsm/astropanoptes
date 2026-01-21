@@ -122,6 +122,8 @@ class SystemState:
     platesolve_rms_px: float = 0.0
     platesolve_overlay: Any = None
     platesolve_guides: Any = None
+    platesolve_debug_jpeg: Optional[bytes] = None
+    platesolve_debug_info: Optional[Dict[str, Any]] = None
     platesolve_center_ra_deg: float = 0.0
     platesolve_center_dec_deg: float = 0.0
 
