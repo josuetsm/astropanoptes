@@ -1,113 +1,20 @@
 # camera_poa.py
 from __future__ import annotations
 
-import ctypes.util
-import sys
 import threading
 import time
-from enum import IntEnum
 from dataclasses import dataclass
-from pathlib import Path
 from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 
-def _poa_lib_present() -> bool:
-    root = Path(__file__).resolve().parent
-    if sys.platform.startswith("linux"):
-        return bool(ctypes.util.find_library("PlayerOneCamera")) or any(root.glob("libPlayerOneCamera*.so*"))
-    if sys.platform == "darwin":
-        return bool(ctypes.util.find_library("PlayerOneCamera")) or any(root.glob("libPlayerOneCamera*.dylib"))
-    return True
-
-
-POA_AVAILABLE = _poa_lib_present()
-POA_UNAVAILABLE_REASON = "SDK library missing"
-
-
-if POA_AVAILABLE:
+try:
     import pyPOACamera  # user-provided SDK wrapper
+except Exception as exc:
+    pyPOACamera = None
+    POA_UNAVAILABLE_REASON = str(exc)
 else:
-
-    class _POAImgFormat(IntEnum):
-        POA_RAW8 = 0
-        POA_RAW16 = 1
-        POA_RGB24 = 2
-        POA_MONO8 = 3
-
-    class _POAErrors(IntEnum):
-        POA_OK = 0
-        POA_ERROR = 1
-
-    class _MissingPOACamera:
-        POAImgFormat = _POAImgFormat
-        POAErrors = _POAErrors
-
-        @staticmethod
-        def GetCameraCount() -> int:
-            return 0
-
-        @staticmethod
-        def GetCameraProperties(_index: int):
-            return _POAErrors.POA_ERROR, None
-
-        @staticmethod
-        def OpenCamera(_cam_id: int):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def InitCamera(_cam_id: int):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def CloseCamera(_cam_id: int):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def StopExposure(_cam_id: int):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def StartExposure(_cam_id: int, _is_dark: bool):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def SetImageStartPos(_cam_id: int, _x: int, _y: int):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def SetImageSize(_cam_id: int, _w: int, _h: int):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def SetImageBin(_cam_id: int, _bin: int):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def SetImageFormat(_cam_id: int, _fmt: int):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def GetImageSize(_cam_id: int):
-            return _POAErrors.POA_ERROR, 0, 0
-
-        @staticmethod
-        def SetExp(_cam_id: int, _exp_us: int, _auto: bool):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def SetGain(_cam_id: int, _gain: int, _auto: bool):
-            return _POAErrors.POA_ERROR
-
-        @staticmethod
-        def ImageReady(_cam_id: int):
-            return _POAErrors.POA_ERROR, False
-
-        @staticmethod
-        def GetImageData(_cam_id: int, _buf, _timeout: int):
-            return _POAErrors.POA_ERROR
-
-    pyPOACamera = _MissingPOACamera()
+    POA_UNAVAILABLE_REASON = ""
 
 from ap_types import Frame
 from config import CameraConfig, PreviewConfig
@@ -128,7 +35,13 @@ def _sleep_s(s: float) -> None:
     time.sleep(s)
 
 
+def _require_poa() -> None:
+    if pyPOACamera is None:
+        raise RuntimeError(f"pyPOACamera no disponible: {POA_UNAVAILABLE_REASON}")
+
+
 def _imgfmt_from_str(name: str) -> pyPOACamera.POAImgFormat:
+    _require_poa()
     n = (name or "").strip().upper()
     if n in ("RAW8", "POA_RAW8"):
         return pyPOACamera.POAImgFormat.POA_RAW8
@@ -214,8 +127,7 @@ class POACameraDevice:
         return self._info
 
     def open(self, index: int = 0) -> CameraInfo:
-        if not POA_AVAILABLE:
-            raise RuntimeError(f"pyPOACamera no disponible: {POA_UNAVAILABLE_REASON}")
+        _require_poa()
         n = pyPOACamera.GetCameraCount()
         if n <= 0:
             raise RuntimeError("No se detectan cámaras (GetCameraCount=0).")
@@ -293,8 +205,7 @@ class POACameraDevice:
         if not self._opened:
             raise RuntimeError("Camera not opened")
 
-        if not POA_AVAILABLE:
-            raise RuntimeError(f"pyPOACamera no disponible: {POA_IMPORT_ERROR}")
+        _require_poa()
         pyPOACamera.StopExposure(self.cam_id)
 
         # ROI
