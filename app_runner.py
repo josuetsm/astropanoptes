@@ -23,6 +23,8 @@ from mount_arduino import ArduinoMount
 from tracking import make_tracking_state, tracking_step, tracking_set_params
 from stacking import StackingWorker
 
+from app_unzipped.hotpixels import build_hotpixel_mask, save_hotpixel_mask
+
 # Platesolve (nuevo)
 # Se asume que platesolve.py está al mismo nivel que app_runner.py
 from platesolve import (
@@ -153,6 +155,11 @@ class AppRunner:
         self._platesolve_last_auto_t = 0.0
         self._platesolve_auto_target: str = ""
         self._platesolve_auto_source: str = "live"
+
+        # Hotpixel calibration (thread dedicado)
+        self._hotpix_lock = threading.Lock()
+        self._hotpix_thr: Optional[threading.Thread] = None
+        self._hotpix_cancel = threading.Event()
 
         # Config platesolve (se puede setear desde UI por action)
         self._platesolve_cfg = self._build_default_platesolve_config(cfg)
@@ -299,6 +306,16 @@ class AppRunner:
         with self._platesolve_lock:
             self._platesolve_thr = None
             self._platesolve_pending = None
+
+        # detener hotpixel calibration thread si existe
+        self._hotpix_cancel.set()
+        thr_hp = None
+        with self._hotpix_lock:
+            thr_hp = self._hotpix_thr
+        if thr_hp is not None:
+            thr_hp.join(timeout=2.0)
+        with self._hotpix_lock:
+            self._hotpix_thr = None
 
         thr = self._thr
         if thr is not None:
@@ -1064,6 +1081,134 @@ class AppRunner:
         self._platesolve_request(source=source, target=target)
         self._platesolve_last_auto_t = float(now)
 
+    # -------------------------
+    # Hotpixel calibration
+    # -------------------------
+    def _hotpix_start_worker_if_needed(
+        self,
+        *,
+        n_frames: int,
+        thr_k: float,
+        min_hits_frac: float,
+        max_component_area: int,
+        out_path_base: str,
+    ) -> None:
+        with self._hotpix_lock:
+            if self._hotpix_thr is not None and self._hotpix_thr.is_alive():
+                log_info(self.out_log, "Hotpix: calibration already running")
+                return
+            self._hotpix_cancel.clear()
+            self._hotpix_thr = threading.Thread(
+                target=self._hotpix_worker,
+                name="hotpix-calibration",
+                daemon=True,
+                kwargs={
+                    "n_frames": n_frames,
+                    "thr_k": thr_k,
+                    "min_hits_frac": min_hits_frac,
+                    "max_component_area": max_component_area,
+                    "out_path_base": out_path_base,
+                },
+            )
+            self._hotpix_thr.start()
+
+    def _hotpix_worker(
+        self,
+        *,
+        n_frames: int,
+        thr_k: float,
+        min_hits_frac: float,
+        max_component_area: int,
+        out_path_base: str,
+    ) -> None:
+        if self._cam_stream is None:
+            log_info(self.out_log, "Hotpix: camera stream not available")
+            return
+
+        frames: List[np.ndarray] = []
+        last_seq = -1
+        cam_stats = self._cam_stream.stats()
+        fps_capture = float(cam_stats.get("fps_capture", 0.0))
+        timeout_s = max(5.0, (n_frames / max(1.0, fps_capture)) * 3.0)
+        deadline = _perf() + timeout_s
+        last_frame: Optional[Frame] = None
+
+        while len(frames) < n_frames and _perf() < deadline:
+            if self._stop.is_set() or self._hotpix_cancel.is_set():
+                return
+            fr = self._cam_stream.latest()
+            if fr is None or fr.seq == last_seq:
+                time.sleep(0.002)
+                continue
+            last_seq = fr.seq
+            last_frame = fr
+
+            raw = fr.raw
+            fmt = str(fr.fmt or "")
+            fmt_upper = fmt.upper()
+
+            if raw is None or not hasattr(raw, "ndim"):
+                log_info(self.out_log, "Hotpix: frame missing raw data")
+                return
+
+            if raw.ndim != 2:
+                log_info(self.out_log, f"Hotpix: frame not 2D (shape={getattr(raw, 'shape', None)})")
+                return
+
+            if raw.dtype == np.uint16:
+                frame_u16 = raw.copy()
+            elif raw.dtype == np.uint8 or "RAW8" in fmt_upper or "MONO8" in fmt_upper:
+                frame_u16 = raw.astype(np.uint16) * 257
+            elif "RAW16" in fmt_upper:
+                frame_u16 = raw.astype(np.uint16, copy=False).copy()
+            else:
+                log_info(self.out_log, f"Hotpix: unsupported frame dtype={raw.dtype} fmt={fmt}")
+                return
+
+            frames.append(frame_u16)
+
+        if len(frames) < n_frames:
+            log_info(self.out_log, f"Hotpix: calibration timed out ({len(frames)}/{n_frames} frames)")
+            return
+
+        try:
+            mask = build_hotpixel_mask(
+                frames,
+                thr_k=float(thr_k),
+                min_hits_frac=float(min_hits_frac),
+                max_component_area=int(max_component_area),
+            )
+        except Exception as exc:
+            log_error(self.out_log, "Hotpix: failed to build mask", exc)
+            return
+
+        cam_cfg = self._pending_camera_cfg
+        frame_meta = last_frame.meta if last_frame and last_frame.meta else {}
+        roi = frame_meta.get("roi")
+
+        meta = {
+            "roi": list(roi) if roi is not None else None,
+            "exp_ms": float(getattr(cam_cfg, "exp_ms", 0.0)),
+            "gain": int(getattr(cam_cfg, "gain", 0)),
+            "fmt": str(getattr(last_frame, "fmt", "")) if last_frame is not None else "",
+            "camera_model": frame_meta.get("camera_model"),
+            "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
+            "thr_k": float(thr_k),
+            "min_hits_frac": float(min_hits_frac),
+            "max_component_area": int(max_component_area),
+            "n_frames": int(n_frames),
+        }
+
+        try:
+            npy_path, json_path = save_hotpixel_mask(mask, meta, out_path_base)
+            self._stacking.engine.load_hotpix_mask_if_available(out_path_base)
+            log_info(
+                self.out_log,
+                f"Hotpix: mask saved ({npy_path.name}, {json_path.name}) and reloaded for stacking",
+            )
+        except Exception as exc:
+            log_error(self.out_log, "Hotpix: failed to save mask", exc)
+
 
     # -------------------------
     # GoTo worker
@@ -1527,6 +1672,24 @@ class AppRunner:
             if isinstance(p, dict):
                 self._stacking.set_params(**p)
                 log_info(self.out_log, f"Stacking: SET_PARAMS {list(p.keys())}")
+            return
+
+        if t == ActionType.HOTPIX_CALIBRATE:
+            if self._cam_stream is None:
+                log_info(self.out_log, "Hotpix: calibration skipped (camera stream inactive)")
+                return
+            n_frames = int(p.get("n_frames", 30))
+            thr_k = float(p.get("thr_k", 8.0))
+            min_hits_frac = float(p.get("min_hits_frac", 0.7))
+            max_component_area = int(p.get("max_component_area", 4))
+            out_path_base = str(p.get("out_path_base", "./hotpixel_mask"))
+            self._hotpix_start_worker_if_needed(
+                n_frames=n_frames,
+                thr_k=thr_k,
+                min_hits_frac=min_hits_frac,
+                max_component_area=max_component_area,
+                out_path_base=out_path_base,
+            )
             return
 
         # ---- Platesolve ----
