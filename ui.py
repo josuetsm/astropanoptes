@@ -39,7 +39,8 @@ from logging_utils import log_info, log_error
 def _clamp_int(x: Any, lo: int, hi: int) -> int:
     try:
         v = int(x)
-    except Exception:
+    except Exception as exc:
+        log_error(None, f"UI: failed to parse int input {x!r}", exc, throttle_s=5.0, throttle_key="ui_clamp_int")
         v = lo
     if v < lo:
         v = lo
@@ -51,7 +52,8 @@ def _clamp_int(x: Any, lo: int, hi: int) -> int:
 def _clamp_float(x: Any, lo: float, hi: float) -> float:
     try:
         v = float(x)
-    except Exception:
+    except Exception as exc:
+        log_error(None, f"UI: failed to parse float input {x!r}", exc, throttle_s=5.0, throttle_key="ui_clamp_float")
         v = lo
     if v < lo:
         v = lo

@@ -514,7 +514,8 @@ def build_guides_from_solution(
         if hasattr(gc, "resolve_coord_name"):
             try:
                 name = str(gc.resolve_coord_name(SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs"), cfg=cfg))
-            except Exception:
+            except Exception as exc:
+                log_error(None, "Platesolve: failed to resolve Gaia coord name", exc)
                 name = "GAIA"
 
         guides.append(GuideStar(name=name, ra_deg=ra, dec_deg=dec, gmag=gmag, x=x_ds, y=y_ds))
