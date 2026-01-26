@@ -19,7 +19,7 @@ from sklearn.neighbors import KDTree
 from itertools import combinations, permutations
 
 from logging_utils import log_error
-from app_unzipped.hotpixels import hotpix_prefilter_base
+from hotpixels import hotpix_prefilter_base
 from config import PlatesolveConfig
 
 # IMPORTANT: all Gaia/cache/auth logic must live in gaia_cache.py
