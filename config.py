@@ -119,6 +119,10 @@ class PlatesolveConfig:
     det_thresh_sigma: float = 3.5
     det_minarea: int = 5
     point_sigma: float = 1.2  # sigma for gaussian blur of point-maps
+    sep_bw: int = 64
+    sep_bh: int = 64
+    sep_thresh_sigma: float = 3.5
+    sep_minarea: int = 5
 
     # Gaia cache + query
     cache_dir: str = "~/.cache/gaia_cones"
@@ -136,10 +140,18 @@ class PlatesolveConfig:
     theta_step_deg: float = 15.0
     theta_refine_step_deg: float = 3.0
     theta_refine_span_deg: float = 12.0
+    triplet_tol_arcsec: float = 3.0
+    triplet_sigma_arcsec: float = 0.6
+    triplet_max_trials: int = 500
+    max_i_scan: int = 2000
 
     # Matching
     match_max_px: float = 3.5  # in downsampled pixels
+    match_tol_arcsec: float = 5.0
+    pred_margin_arcsec: float = 25.0
     min_inliers: int = 3
+    N_det: int = 30
+    N_seed: int = 3
 
     # Search area (Gaia cone radius)
     search_radius_deg: float | None = 1.0

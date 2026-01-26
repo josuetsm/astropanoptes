@@ -668,7 +668,7 @@ class AppRunner:
             "dx_px": float(getattr(result, "dx_px", 0.0)),
             "dy_px": float(getattr(result, "dy_px", 0.0)),
             "radius_deg": metrics.get("radius_deg"),
-            "scale_arcsec_per_px": metrics.get("scale_arcsec_per_px"),
+            "scale_arcsec_per_px": float(getattr(result, "scale_arcsec_per_px", metrics.get("scale_arcsec_per_px", 0.0))),
             "downsample": int(getattr(result, "downsample", metrics.get("downsample", 0) or 0)),
         }
         return info
