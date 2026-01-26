@@ -7,7 +7,7 @@ from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import cv2
-from app_unzipped.hotpixels import hotpix_prefilter_base
+from hotpixels import hotpix_prefilter_base
 from logging_utils import log_error
 
 

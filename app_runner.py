@@ -23,7 +23,7 @@ from mount_arduino import ArduinoMount
 from tracking import make_tracking_state, tracking_step, tracking_set_params
 from stacking import StackingWorker
 
-from app_unzipped.hotpixels import build_hotpixel_mask, save_hotpixel_mask
+from hotpixels import build_hotpixel_mask, save_hotpixel_mask
 
 # Platesolve (nuevo)
 # Se asume que platesolve.py está al mismo nivel que app_runner.py
