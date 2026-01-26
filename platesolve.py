@@ -25,6 +25,9 @@ from config import PlatesolveConfig
 # IMPORTANT: all Gaia/cache/auth logic must live in gaia_cache.py
 import gaia_cache as gc
 
+load_gaia_auth = gc.load_gaia_auth
+save_gaia_auth = gc.save_gaia_auth
+
 
 # ============================================================
 # Public API surface
@@ -41,6 +44,8 @@ __all__ = [
     "platesolve_from_live",
     "platesolve_from_stack",
     "pixel_to_radec",
+    "load_gaia_auth",
+    "save_gaia_auth",
 ]
 
 
@@ -182,11 +187,9 @@ def parse_target_to_icrs(
         if not s:
             raise TargetParseError("Empty target string.")
 
-        # If it contains letters, treat as name. Delegate to gaia_cache if it provides a resolver.
+        # If it contains letters, treat as name. Delegate to gaia_cache resolver.
         if any(ch.isalpha() for ch in s):
-            if hasattr(gc, "resolve_name_to_icrs"):
-                return gc.resolve_name_to_icrs(s).icrs
-            raise TargetParseError("Name targets require gaia_cache.resolve_name_to_icrs(name).")
+            return gc.resolve_name_to_icrs(s).icrs
 
         parts = s.replace(",", " ").split()
         if len(parts) >= 2:
