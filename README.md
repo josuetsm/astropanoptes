@@ -95,17 +95,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
    - En `ui.py` hay botones/estados deshabilitados para stacking.
    - Falta un módulo que: alinee frames, integre/guarde resultados, y exponga métricas.
 
-2) **Plate solving**
-   - `actions.py` declara `PLATESOLVE_*` y `SystemState` guarda `ra/dec` + escala/rotación.
-   - `config.py` define parámetros de focal/pixel/solve interval.
-   - No hay aún un `platesolve.py` ni integración con astrometry (ASTAP, astrometry.net, etc.).
-
-3) **GoTo / Sync astronómico**
-   - `actions.py` expone `MOUNT_SYNC` y `MOUNT_GOTO`.
-   - `config.py` tiene comentarios para un posible `GoToConfig`.
-   - Falta módulo que traduzca coordenadas (RA/DEC -> pasos) y sincronice la montura.
-
-4) **Gestión de calibraciones persistentes**
+2) **Gestión de calibraciones persistentes**
    - `tracking.py` soporta autocal y bootstrap en memoria.
    - No existe aún persistencia a disco ni herramientas de export/import.
 
