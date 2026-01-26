@@ -102,6 +102,10 @@ class GuideStar:
 class PlatesolveResult:
     success: bool
     status: str
+    theta_deg: float
+    dx_px: float
+    dy_px: float
+    response: float
 
     # similarity / plate model (close to your notebook logic)
     # scale (arcsec/px), rotation matrix (2x2), translation (2,)
@@ -111,6 +115,7 @@ class PlatesolveResult:
 
     n_inliers: int
     rms_arcsec: float
+    rms_px: float
 
     center_ra_deg: float
     center_dec_deg: float
@@ -616,11 +621,16 @@ def platesolve_sweep(
         return PlatesolveResult(
             success=False,
             status="TARGET_PARSE_ERROR",
+            theta_deg=0.0,
+            dx_px=0.0,
+            dy_px=0.0,
+            response=0.0,
             scale_arcsec_per_px=0.0,
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
             rms_arcsec=float("inf"),
+            rms_px=float("inf"),
             center_ra_deg=0.0,
             center_dec_deg=0.0,
             downsample=int(getattr(cfg, "downsample", 1)),
@@ -652,11 +662,16 @@ def platesolve_sweep(
         return PlatesolveResult(
             success=False,
             status="NOT_ENOUGH_DETECTIONS",
+            theta_deg=0.0,
+            dx_px=0.0,
+            dy_px=0.0,
+            response=0.0,
             scale_arcsec_per_px=0.0,
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
             rms_arcsec=float("inf"),
+            rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
             downsample=int(ds),
@@ -697,11 +712,16 @@ def platesolve_sweep(
         return PlatesolveResult(
             success=False,
             status="NEED_GAIA_AUTH",
+            theta_deg=0.0,
+            dx_px=0.0,
+            dy_px=0.0,
+            response=0.0,
             scale_arcsec_per_px=float(arcsec_per_px_ds),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
             rms_arcsec=float("inf"),
+            rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
             downsample=int(ds),
@@ -715,11 +735,16 @@ def platesolve_sweep(
         return PlatesolveResult(
             success=False,
             status="GAIA_CACHE_MISS",
+            theta_deg=0.0,
+            dx_px=0.0,
+            dy_px=0.0,
+            response=0.0,
             scale_arcsec_per_px=float(arcsec_per_px_ds),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
             rms_arcsec=float("inf"),
+            rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
             downsample=int(ds),
@@ -733,11 +758,16 @@ def platesolve_sweep(
         return PlatesolveResult(
             success=False,
             status="GAIA_LOAD_ERROR",
+            theta_deg=0.0,
+            dx_px=0.0,
+            dy_px=0.0,
+            response=0.0,
             scale_arcsec_per_px=float(arcsec_per_px_ds),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
             rms_arcsec=float("inf"),
+            rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
             downsample=int(ds),
@@ -750,11 +780,16 @@ def platesolve_sweep(
         return PlatesolveResult(
             success=False,
             status="GAIA_TOO_SMALL",
+            theta_deg=0.0,
+            dx_px=0.0,
+            dy_px=0.0,
+            response=0.0,
             scale_arcsec_per_px=float(arcsec_per_px_ds),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
             rms_arcsec=float("inf"),
+            rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
             downsample=int(ds),
@@ -786,11 +821,16 @@ def platesolve_sweep(
         return PlatesolveResult(
             success=False,
             status="NOT_ENOUGH_SEEDS",
+            theta_deg=0.0,
+            dx_px=0.0,
+            dy_px=0.0,
+            response=0.0,
             scale_arcsec_per_px=float(arcsec_per_px_ds),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
             rms_arcsec=float("inf"),
+            rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
             downsample=int(ds),
@@ -891,11 +931,16 @@ def platesolve_sweep(
         return PlatesolveResult(
             success=False,
             status="NO_TRIPLET_CANDIDATES",
+            theta_deg=0.0,
+            dx_px=0.0,
+            dy_px=0.0,
+            response=0.0,
             scale_arcsec_per_px=float(arcsec_per_px_ds),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
             rms_arcsec=float("inf"),
+            rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
             downsample=int(ds),
@@ -974,11 +1019,16 @@ def platesolve_sweep(
         return PlatesolveResult(
             success=False,
             status="VALIDATION_FAILED",
+            theta_deg=0.0,
+            dx_px=0.0,
+            dy_px=0.0,
+            response=0.0,
             scale_arcsec_per_px=float(arcsec_per_px_ds),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
             rms_arcsec=float("inf"),
+            rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
             downsample=int(ds),
@@ -1034,6 +1084,13 @@ def platesolve_sweep(
     min_inliers = int(getattr(cfg, "min_inliers", 3))
     success = bool(best["num_inliers"] >= min_inliers)
 
+    offset_lon, offset_lat = best_center.spherical_offsets_to(center_icrs)
+    offset_arcsec = np.array([offset_lon.to_value(u.arcsec), offset_lat.to_value(u.arcsec)], dtype=np.float64)
+    offset_px = (offset_arcsec / max(1e-9, float(s))) @ R
+    theta_deg = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
+    rms_px = float(best["rms_inliers"] / max(1e-9, float(s)))
+    response = float(best["num_inliers"]) / max(1.0, rms_px)
+
     metrics = {
         "source": 1.0 if source == "live" else 2.0,
         "n_det": float(img_xy_all.shape[0]),
@@ -1046,16 +1103,23 @@ def platesolve_sweep(
         "max_trials": float(len(to_eval)),
         "n_inliers": float(best["num_inliers"]),
         "rms_inliers_arcsec": float(best["rms_inliers"]),
+        "scale_arcsec_per_px": float(s),
+        "downsample": float(ds),
     }
 
     return PlatesolveResult(
         success=success,
         status="OK" if success else "LOW_INLIERS",
+        theta_deg=theta_deg,
+        dx_px=float(offset_px[0]),
+        dy_px=float(offset_px[1]),
+        response=response,
         scale_arcsec_per_px=float(s),
         R_2x2=((float(R[0, 0]), float(R[0, 1])), (float(R[1, 0]), float(R[1, 1]))),
         t_arcsec=(float(t_arcsec[0]), float(t_arcsec[1])),
         n_inliers=int(best["num_inliers"]),
         rms_arcsec=float(best["rms_inliers"]),
+        rms_px=rms_px,
         center_ra_deg=float(best_center.ra.deg),
         center_dec_deg=float(best_center.dec.deg),
         downsample=int(ds),
