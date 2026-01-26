@@ -8,9 +8,12 @@ from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 
+from logging_utils import log_error
+
 try:
     import pyPOACamera  # user-provided SDK wrapper
 except Exception as exc:
+    log_error(None, "Camera: failed to import pyPOACamera", exc)
     pyPOACamera = None
     POA_UNAVAILABLE_REASON = str(exc)
 else:
@@ -18,7 +21,6 @@ else:
 
 from ap_types import Frame
 from config import CameraConfig, PreviewConfig
-from logging_utils import log_error
 
 
 # -------------------------

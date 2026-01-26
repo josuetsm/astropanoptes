@@ -563,7 +563,8 @@ class AppRunner:
             if getattr(fr, "raw", None) is not None:
                 try:
                     bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
-                except Exception:
+                except Exception as exc:
+                    log_error(self.out_log, "Live SEP: failed to read bayer pattern metadata", exc, throttle_s=10.0, throttle_key="live_sep_bayer")
                     bayer = "RGGB"
                 raw_gray = extract_align_mono_u16(fr.raw, str(fr.fmt or "RAW16"), bayer_pattern=bayer)
             else:
@@ -1413,7 +1414,8 @@ class AppRunner:
                     # Obtener un mono uint16 robusto para tracking (evita usar u8_view cuando el stream es RAW16)
                     try:
                         bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
-                    except Exception:
+                    except Exception as exc:
+                        log_error(self.out_log, "Tracking: failed to read bayer pattern metadata", exc, throttle_s=10.0, throttle_key="tracking_bayer")
                         bayer = "RGGB"
                     frame_u16 = extract_align_mono_u16(fr.raw, str(fr.fmt or "RAW16"), bayer_pattern=bayer)
 
@@ -1424,7 +1426,8 @@ class AppRunner:
                             now_t=_now_s(),
                             tracking_enabled=True,
                         )
-                    except TypeError:
+                    except TypeError as exc:
+                        log_error(self.out_log, "Tracking: falling back to legacy tracking_step signature", exc, throttle_s=60.0, throttle_key="tracking_step_signature")
                         out = tracking_step(self._tracking_state, frame_u16)
 
                     try:
