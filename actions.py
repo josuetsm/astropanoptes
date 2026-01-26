@@ -41,6 +41,7 @@ class ActionType(str, Enum):
     STACKING_RESET = "STACKING_RESET"
     STACKING_SAVE = "STACKING_SAVE"
     STACKING_SET_PARAMS = "STACKING_SET_PARAMS"
+    HOTPIX_CALIBRATE = "HOTPIX_CALIBRATE"
 
     # platesolve (OBLIGATORIO)
     PLATESOLVE_RUN = "PLATESOLVE_RUN"
@@ -185,6 +186,28 @@ def stacking_save(out_dir: str, basename: str, fmt: str) -> Action:
         _now(),
     )
 
+
+# -------------------------
+# Factories: Hot pixels
+# -------------------------
+def hotpix_calibrate(
+    n_frames: int,
+    thr_k: float,
+    min_hits_frac: float,
+    max_component_area: int,
+    out_path_base: str,
+) -> Action:
+    return Action(
+        ActionType.HOTPIX_CALIBRATE,
+        {
+            "n_frames": int(n_frames),
+            "thr_k": float(thr_k),
+            "min_hits_frac": float(min_hits_frac),
+            "max_component_area": int(max_component_area),
+            "out_path_base": str(out_path_base),
+        },
+        _now(),
+    )
 
 # -------------------------
 # Factories: PlateSolve
