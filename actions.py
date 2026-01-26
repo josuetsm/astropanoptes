@@ -52,6 +52,9 @@ class ActionType(str, Enum):
     GOTO_CALIBRATE = "GOTO_CALIBRATE"
     GOTO_CANCEL = "GOTO_CANCEL"
 
+    # live overlay
+    LIVE_SEP_SET_PARAMS = "LIVE_SEP_SET_PARAMS"
+
 
 @dataclass(frozen=True)
 class Action:
@@ -217,3 +220,10 @@ def goto_calibrate(params: Dict[str, Any]) -> Action:
 
 def goto_cancel() -> Action:
     return Action(ActionType.GOTO_CANCEL, {}, _now())
+
+
+# -------------------------
+# Factories: Live overlay (SEP)
+# -------------------------
+def live_sep_set_params(**kwargs: Any) -> Action:
+    return Action(ActionType.LIVE_SEP_SET_PARAMS, dict(kwargs), _now())
