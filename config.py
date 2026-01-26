@@ -101,6 +101,19 @@ class StackingConfig:
 
 
 @dataclass
+class HotPixelsConfig:
+    enabled: bool = False
+    base_ksize: int = 3
+    mask_enabled_for_stacking: bool = False
+    mask_path_base: str = "./hotpixel_mask"
+    mask_ksize: int = 3
+    thr_k: float = 8.0
+    min_hits_frac: float = 0.7
+    max_component_area: int = 4
+    calib_frames: int = 30
+
+
+@dataclass
 class PlatesolveConfig:
     # Instrument (SI)
     pixel_size_m: float = 2.9e-6
@@ -179,6 +192,7 @@ class AppConfig:
     mount: MountConfig = field(default_factory=MountConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     stacking: StackingConfig = field(default_factory=StackingConfig)
+    hotpixels: HotPixelsConfig = field(default_factory=HotPixelsConfig)
     platesolve: PlatesolveConfig = field(default_factory=PlatesolveConfig)
 #    goto: GoToConfig = field(default_factory=GoToConfig)
     
