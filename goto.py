@@ -701,7 +701,8 @@ class GoToController:
                 J = self.model.J_deg_per_step
                 try:
                     invJ = np.linalg.inv(J)
-                except np.linalg.LinAlgError:
+                except np.linalg.LinAlgError as exc:
+                    log_error(None, "GoTo: singular J matrix during solve", exc, throttle_s=5.0, throttle_key="goto_invJ")
                     st.status = "ERR_SINGULAR_MODEL"
                     return st
 
@@ -928,7 +929,8 @@ class GoToController:
 
                         try:
                             invJ = np.linalg.inv(J)
-                        except np.linalg.LinAlgError:
+                        except np.linalg.LinAlgError as exc:
+                            log_error(None, "GoTo: singular J matrix during calibration; resetting mechanics", exc, throttle_s=5.0, throttle_key="goto_calib_invJ")
                             # fall back to diagonal mechanics
                             self.model.init_from_mechanics()
                             J = self.model.J_deg_per_step
