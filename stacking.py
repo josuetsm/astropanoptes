@@ -11,6 +11,7 @@ from typing import Dict, Tuple, Optional, Any, List, Literal
 import numpy as np
 import cv2
 
+from app_unzipped.hotpixels import hotpix_prefilter_base
 from config import AppConfig
 from imaging import (
     downsample_u16,
@@ -110,13 +111,13 @@ def _mad(x: np.ndarray) -> float:
     return float(np.median(np.abs(x - med))) + _EPS
 
 
-def _robust_norm_u16(x_u16: np.ndarray) -> np.ndarray:
+def _robust_norm_f32(x_in: np.ndarray) -> np.ndarray:
     """
     Robust normalization for phase correlation:
       z = clip((x - median)/MAD, [-6, +6])
     Improves stability under gradients/noise and varying exposure.
     """
-    x = x_u16.astype(np.float32, copy=False)
+    x = x_in.astype(np.float32, copy=False)
     med = float(np.median(x))
     mad = float(np.median(np.abs(x - med))) + _EPS
     z = (x - med) / mad
@@ -161,8 +162,10 @@ def _phasecorr_shift_validated(a_u16: np.ndarray, b_u16: np.ndarray) -> Tuple[fl
 
     Returns (dx, dy, resp) where shifting b by (dx,dy) best aligns to a.
     """
-    a_n = _robust_norm_u16(a_u16)
-    b_n = _robust_norm_u16(b_u16)
+    a_base = hotpix_prefilter_base(a_u16, ksize=3)
+    b_base = hotpix_prefilter_base(b_u16, ksize=3)
+    a_n = _robust_norm_f32(a_base)
+    b_n = _robust_norm_f32(b_base)
 
     dx, dy, resp = _phasecorr(a_n, b_n)
 
