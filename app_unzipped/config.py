@@ -2,6 +2,8 @@ from __future__ import annotations
 
 from dataclasses import dataclass, field
 
+from config import PlatesolveConfig as _PlatesolveConfig
+
 
 @dataclass
 class HotPixelsConfig:
@@ -17,5 +19,12 @@ class HotPixelsConfig:
 
 
 @dataclass
+class PlatesolveConfig(_PlatesolveConfig):
+    N_seed: int = 3
+    search_radius_deg: float | None = 1.0
+
+
+@dataclass
 class AppConfig:
     hotpixels: HotPixelsConfig = field(default_factory=HotPixelsConfig)
+    platesolve: PlatesolveConfig = field(default_factory=PlatesolveConfig)

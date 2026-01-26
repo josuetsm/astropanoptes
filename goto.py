@@ -120,6 +120,67 @@ def _now_time() -> Time:
     return Time.now()
 
 
+_BRIGHT_START_STARS: Tuple[Dict[str, float | str], ...] = (
+    {"name": "Sirius", "ra_deg": 101.28715533, "dec_deg": -16.71611586, "gmag": -1.46},
+    {"name": "Canopus", "ra_deg": 95.987877, "dec_deg": -52.695661, "gmag": -0.74},
+    {"name": "Arcturus", "ra_deg": 213.915300, "dec_deg": 19.182409, "gmag": -0.05},
+    {"name": "Vega", "ra_deg": 279.234735, "dec_deg": 38.783689, "gmag": 0.03},
+    {"name": "Capella", "ra_deg": 79.172328, "dec_deg": 45.997991, "gmag": 0.08},
+    {"name": "Rigel", "ra_deg": 78.634467, "dec_deg": -8.201638, "gmag": 0.12},
+    {"name": "Procyon", "ra_deg": 114.825493, "dec_deg": 5.224993, "gmag": 0.38},
+    {"name": "Betelgeuse", "ra_deg": 88.792939, "dec_deg": 7.407064, "gmag": 0.50},
+    {"name": "Aldebaran", "ra_deg": 68.980163, "dec_deg": 16.509302, "gmag": 0.86},
+    {"name": "Antares", "ra_deg": 247.351917, "dec_deg": -26.432003, "gmag": 0.96},
+    {"name": "Spica", "ra_deg": 201.298248, "dec_deg": -11.161323, "gmag": 0.98},
+    {"name": "Fomalhaut", "ra_deg": 344.412750, "dec_deg": -29.621837, "gmag": 1.16},
+    {"name": "Achernar", "ra_deg": 24.428600, "dec_deg": -57.236800, "gmag": 0.46},
+    {"name": "Acrux", "ra_deg": 186.649563, "dec_deg": -63.099093, "gmag": 0.77},
+)
+
+
+def pick_bright_start_star(
+    observer: ObserverConfig,
+    obstime: Optional[Time],
+    *,
+    min_alt_deg: float = 15.0,
+) -> Optional[Dict[str, float | str]]:
+    """Pick a bright, currently visible star to use for the first sync."""
+    if obstime is None:
+        obstime = _now_time()
+
+    altaz_frame = AltAz(obstime=obstime, location=observer.location())
+    candidates: List[Dict[str, float | str]] = []
+    fallback: List[Dict[str, float | str]] = []
+
+    for star in _BRIGHT_START_STARS:
+        coord = SkyCoord(
+            ra=float(star["ra_deg"]) * u.deg,
+            dec=float(star["dec_deg"]) * u.deg,
+            frame="icrs",
+        )
+        altaz = coord.transform_to(altaz_frame)
+        alt_deg = float(altaz.alt.deg)
+        az_deg = float(altaz.az.deg)
+        payload: Dict[str, float | str] = {
+            "name": str(star["name"]),
+            "ra_deg": float(star["ra_deg"]),
+            "dec_deg": float(star["dec_deg"]),
+            "gmag": float(star["gmag"]),
+            "alt_deg": alt_deg,
+            "az_deg": az_deg,
+        }
+        if alt_deg > 0.0:
+            fallback.append(payload)
+        if alt_deg >= float(min_alt_deg):
+            candidates.append(payload)
+
+    if candidates:
+        return max(candidates, key=lambda item: float(item["alt_deg"]))
+    if fallback:
+        return max(fallback, key=lambda item: float(item["alt_deg"]))
+    return None
+
+
 # ============================================================
 # Kinematics + model
 # ============================================================
@@ -324,7 +385,7 @@ class GoToConfig:
 
     # Platesolve retry strategy (expands search radius)
     # None => use cfg.search_radius_deg (or its default estimate)
-    platesolve_radius_deg_seq: Tuple[Optional[float], ...] = (None, 1.0, 2.5, 5.0)
+    platesolve_radius_deg_seq: Tuple[Optional[float], ...] = (1.0, 2.5, 5.0)
 
     # After each correction iteration, solve near:
     #   - predicted center (recommended)
