@@ -17,7 +17,7 @@ from actions import Action, ActionType
 from logging_utils import log_info, log_error
 
 from camera_poa import POACameraDevice, CameraStream
-from imaging import make_preview_jpeg
+from imaging import make_preview_jpeg, extract_align_mono_u16
 from mount_arduino import ArduinoMount
 
 from tracking import make_tracking_state, tracking_step, tracking_set_params
@@ -45,6 +45,66 @@ def _perf() -> float:
 
 def _now_s() -> float:
     return time.time()
+
+
+from pathlib import Path
+import json
+import re
+import datetime as _dt
+
+def _safe_slug(self, s: str) -> str:
+    s = (s or "").strip()
+    s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", s)
+    return s[:80] if s else "target"
+
+def _platesolve_dump_dir(self) -> Path:
+    # carpeta fija, fácil de encontrar
+    d = Path("platesolve_dumps")
+    d.mkdir(parents=True, exist_ok=True)
+    return d
+
+def _dump_platesolve_snapshot(
+    self,
+    *,
+    source: str,
+    target: Any,
+    frame_raw: np.ndarray,
+    fmt: str,
+    meta: dict,
+    u8_view: Optional[np.ndarray] = None,
+) -> Optional[str]:
+    """
+    Guarda un snapshot reproducible. Devuelve la ruta base (sin extensión) o None si falla.
+    """
+    try:
+        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+        slug = self._safe_slug(str(target))
+        base = self._platesolve_dump_dir() / f"{ts}_{source}_{slug}"
+
+        # Guardar RAW como .npy (exacto, rápido, sin pérdidas)
+        np.save(str(base) + "_raw.npy", np.ascontiguousarray(frame_raw))
+
+        # Guardar u8_view opcional (útil para inspección rápida)
+        if u8_view is not None:
+            np.save(str(base) + "_u8.npy", np.ascontiguousarray(u8_view))
+
+        # Metadatos en JSON
+        info = {
+            "ts": ts,
+            "source": str(source),
+            "target": target,
+            "fmt": str(fmt),
+            "shape": list(frame_raw.shape),
+            "dtype": str(frame_raw.dtype),
+            "meta": meta or {},
+        }
+        with open(str(base) + "_meta.json", "w", encoding="utf-8") as f:
+            json.dump(info, f, ensure_ascii=False, indent=2)
+
+        return str(base)
+    except Exception as exc:
+        log_error(self.out_log, "Platesolve: failed to dump snapshot", exc)
+        return None
 
 
 class AppRunner:
@@ -575,7 +635,7 @@ class AppRunner:
                     continue
                 kind = str(getattr(item, "kind", "det"))
                 color = colors.get(kind, (255, 255, 0))
-                radius = 5 if kind == "guide" else 4 if kind == "match" else 3
+                radius = 10 if kind == "guide" else 8 if kind == "match" else 7
                 cv2.circle(img, (x, y), radius, color, 1, lineType=cv2.LINE_AA)
                 label = getattr(item, "label", None)
                 if kind == "guide" and label:
@@ -617,17 +677,88 @@ class AppRunner:
         """
         Worker que ejecuta plate solving sin bloquear el loop principal.
         Toma requests desde self._platesolve_pending (la última gana).
+    
+        Además, en cada solve guarda un "snapshot" reproducible en disco:
+          - raw (exacto desde la cámara o stack) + meta + config + target/source
+          - u8_view (si existe) para inspección rápida
+          - debug_jpeg + debug_info/result para reproducir el diagnóstico
         """
+        from pathlib import Path
+        import json
+        import re
+        import datetime as _dt
+    
+        def _safe_slug(s: str) -> str:
+            s = (s or "").strip()
+            s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", s)
+            return s[:80] if s else "target"
+    
+        def _dump_dir() -> Path:
+            d = Path("platesolve_dumps")
+            d.mkdir(parents=True, exist_ok=True)
+            return d
+    
+        def _dump_snapshot(
+            *,
+            source: str,
+            target: Any,
+            raw: np.ndarray,
+            fmt: str,
+            meta: Dict[str, Any],
+            u8_view: Optional[np.ndarray],
+            cfg: PlatesolveConfig,
+            observer: ObserverConfig,
+            extra: Optional[Dict[str, Any]] = None,
+        ) -> Optional[str]:
+            """
+            Guarda:
+              - *_raw.npy (exacto)
+              - *_u8.npy (opcional)
+              - *_meta.json (metadatos + cfg/observer + request)
+            Devuelve base path (sin extensión) o None.
+            """
+            try:
+                ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+                base = _dump_dir() / f"{ts}_{str(source)}_{_safe_slug(str(target))}"
+    
+                raw_c = np.ascontiguousarray(raw)
+                np.save(str(base) + "_raw.npy", raw_c)
+    
+                if u8_view is not None:
+                    np.save(str(base) + "_u8.npy", np.ascontiguousarray(u8_view))
+    
+                info = {
+                    "ts": ts,
+                    "source": str(source),
+                    "target": target,
+                    "fmt": str(fmt),
+                    "shape": list(raw_c.shape),
+                    "dtype": str(raw_c.dtype),
+                    "meta": meta or {},
+                    "platesolve_cfg": dict(getattr(cfg, "__dict__", {}) or {}),
+                    "observer": dict(getattr(observer, "__dict__", {}) or {}),
+                }
+                if extra:
+                    info["extra"] = extra
+    
+                with open(str(base) + "_meta.json", "w", encoding="utf-8") as f:
+                    json.dump(info, f, ensure_ascii=False, indent=2)
+    
+                return str(base)
+            except Exception as exc:
+                log_error(self.out_log, "Platesolve: failed to dump snapshot", exc)
+                return None
+    
         while not self._stop.is_set() and not self._platesolve_cancel.is_set():
             req: Optional[Dict[str, Any]] = None
             with self._platesolve_lock:
                 req = self._platesolve_pending
                 self._platesolve_pending = None
-
+    
             if req is None:
                 time.sleep(0.05)
                 continue
-
+    
             # Marcar busy
             self._set_state_safe(
                 platesolve_busy=True,
@@ -635,11 +766,13 @@ class AppRunner:
                 platesolve_debug_jpeg=None,
                 platesolve_debug_info=None,
             )
-
+    
+            dump_base: Optional[str] = None
+    
             try:
                 source = str(req.get("source", "live")).lower().strip()
                 target = req.get("target", None)
-
+    
                 if target is None:
                     self._set_state_safe(
                         platesolve_busy=False,
@@ -649,7 +782,10 @@ class AppRunner:
                         platesolve_debug_info={"status": "ERR_NO_TARGET"},
                     )
                     continue
-
+    
+                # -------------------------
+                # Obtener frame + snapshot
+                # -------------------------
                 if source == "stack":
                     stack = self._stacking.engine.get_latest_stack_frame()
                     if stack is None:
@@ -661,7 +797,23 @@ class AppRunner:
                             platesolve_debug_info={"status": "ERR_NO_STACK"},
                         )
                         continue
-                    frame = stack
+    
+                    # RAW para reproducir (exacto)
+                    raw_in = np.ascontiguousarray(stack)
+                    dump_base = _dump_snapshot(
+                        source="stack",
+                        target=target,
+                        raw=raw_in,
+                        fmt="STACK",
+                        meta={"note": "latest stack frame"},
+                        u8_view=None,
+                        cfg=self._platesolve_cfg,
+                        observer=self._platesolve_observer,
+                    )
+    
+                    # Frame para solver (para stack asumimos ya mono/stackeado)
+                    frame = raw_in
+    
                     result = platesolve_from_stack(
                         frame,
                         target=target,
@@ -669,6 +821,7 @@ class AppRunner:
                         observer=self._platesolve_observer,
                         progress_cb=None,
                     )
+    
                 else:
                     if self._cam_stream is None:
                         self._set_state_safe(
@@ -679,6 +832,7 @@ class AppRunner:
                             platesolve_debug_info={"status": "ERR_NO_CAMERA"},
                         )
                         continue
+    
                     fr = self._cam_stream.latest()
                     if fr is None:
                         self._set_state_safe(
@@ -689,43 +843,58 @@ class AppRunner:
                             platesolve_debug_info={"status": "ERR_NO_FRAME"},
                         )
                         continue
-
-                    # Elegimos u8_view o u16; platesolve soporta RGB/BGR/gray -> convierte a gray
-                    frame = fr.raw
-
+    
+                    # RAW exacto + meta para reproducir mañana
+                    fmt = str(getattr(fr, "fmt", "") or "RAW16")
+                    meta = dict(getattr(fr, "meta", {}) or {})
+                    raw_in = np.ascontiguousarray(fr.raw)
+                    u8_in = np.ascontiguousarray(fr.u8_view) if hasattr(fr, "u8_view") else None
+    
+                    dump_base = _dump_snapshot(
+                        source="live",
+                        target=target,
+                        raw=raw_in,
+                        fmt=fmt,
+                        meta=meta,
+                        u8_view=u8_in,
+                        cfg=self._platesolve_cfg,
+                        observer=self._platesolve_observer,
+                    )
+    
+                    # Frame para solver: mono estable (evita mosaico Bayer directo en SEP)
+                    bayer = str((meta or {}).get("bayer_pattern", "RGGB"))
+                    frame = extract_align_mono_u16(raw_in, fmt, bayer_pattern=bayer)
+    
+                    # Debug de stats de entrada (opcional)
                     debug_stats = bool(getattr(self._platesolve_cfg, "debug_input_stats", False))
-
+    
                     def _stats(a: np.ndarray, name: str) -> None:
                         if not debug_stats:
                             return
                         a = np.asarray(a)
-                        log_info(
-                            self.out_log,
-                            f"[{name}] shape={a.shape} dtype={a.dtype} C={a.flags['C_CONTIGUOUS']}",
-                        )
+                        log_info(self.out_log, f"[{name}] shape={a.shape} dtype={a.dtype} C={a.flags['C_CONTIGUOUS']}")
                         if a.size == 0:
                             log_info(self.out_log, "  EMPTY")
                             return
                         if a.ndim == 1:
                             log_info(self.out_log, f"  1D buffer: min={a.min()} max={a.max()} mean={a.mean():.3g}")
                             return
-                    
-                        # para imágenes 2D/3D
                         flat = a.reshape(-1)
                         p = np.percentile(flat, [0, 1, 5, 50, 95, 99, 100])
                         log_info(self.out_log, f"  min/p1/p5/p50/p95/p99/max = {p}")
                         log_info(self.out_log, f"  mean={flat.mean():.3g} std={flat.std():.3g}")
-                        # fracción saturada (para u16/u8)
                         if a.dtype == np.uint16:
                             log_info(self.out_log, f"  sat65535={np.mean(flat == 65535):.4f}")
                         if a.dtype == np.uint8:
                             log_info(self.out_log, f"  sat255={np.mean(flat == 255):.4f}")
-                
-                    _stats(fr.raw, "fr.raw")
+    
+                    _stats(raw_in, "fr.raw")
                     if hasattr(fr, "u16") and fr.u16 is not None:
                         _stats(fr.u16, "fr.u16")
-                    _stats(fr.u8_view, "fr.u8_view")
-
+                    if hasattr(fr, "u8_view") and fr.u8_view is not None:
+                        _stats(fr.u8_view, "fr.u8_view")
+                    _stats(frame, "frame(mono_u16)")
+    
                     result = platesolve_from_live(
                         frame,
                         target=target,
@@ -733,38 +902,51 @@ class AppRunner:
                         observer=self._platesolve_observer,
                         progress_cb=None,
                     )
-
+    
+                # -------------------------
+                # Debug outputs (jpeg + info)
+                # -------------------------
                 debug_jpeg = self._render_platesolve_debug_jpeg(
                     frame,
                     list(getattr(result, "overlay", []) or []),
                     int(getattr(result, "downsample", self._platesolve_cfg.downsample)),
                 )
                 debug_info = self._build_platesolve_debug_info(result)
-
+    
+                # Guardar debug outputs junto al snapshot (si existe dump_base)
+                if dump_base:
+                    try:
+                        if debug_jpeg:
+                            with open(dump_base + "_debug.jpg", "wb") as f:
+                                f.write(debug_jpeg)
+                        with open(dump_base + "_result.json", "w", encoding="utf-8") as f:
+                            json.dump(debug_info, f, ensure_ascii=False, indent=2)
+                    except Exception as exc:
+                        log_error(self.out_log, "Platesolve: failed to dump debug outputs", exc)
+    
                 # Publicar resultado (si existen campos)
                 self._set_state_safe(
                     platesolve_busy=False,
-                    platesolve_status=result.status,
-                    platesolve_last_ok=bool(result.success),
-                    platesolve_theta_deg=float(result.theta_deg),
-                    platesolve_dx_px=float(result.dx_px),
-                    platesolve_dy_px=float(result.dy_px),
-                    platesolve_resp=float(result.response),
-                    platesolve_n_inliers=int(result.n_inliers),
-                    platesolve_rms_px=float(result.rms_px),
-                    platesolve_overlay=list(result.overlay),
-                    platesolve_guides=list(result.guides),
+                    platesolve_status=getattr(result, "status", "UNKNOWN"),
+                    platesolve_last_ok=bool(getattr(result, "success", False)),
+                    platesolve_theta_deg=float(getattr(result, "theta_deg", 0.0)),
+                    platesolve_dx_px=float(getattr(result, "dx_px", 0.0)),
+                    platesolve_dy_px=float(getattr(result, "dy_px", 0.0)),
+                    platesolve_resp=float(getattr(result, "response", 0.0)),
+                    platesolve_n_inliers=int(getattr(result, "n_inliers", 0)),
+                    platesolve_rms_px=float(getattr(result, "rms_px", 0.0)),
+                    platesolve_overlay=list(getattr(result, "overlay", []) or []),
+                    platesolve_guides=list(getattr(result, "guides", []) or []),
                     platesolve_debug_jpeg=debug_jpeg,
                     platesolve_debug_info=debug_info,
-                    platesolve_center_ra_deg=float(result.center_ra_deg),
-                    platesolve_center_dec_deg=float(result.center_dec_deg),
+                    platesolve_center_ra_deg=float(getattr(result, "center_ra_deg", 0.0)),
+                    platesolve_center_dec_deg=float(getattr(result, "center_dec_deg", 0.0)),
                 )
-
+    
                 # Cache para GoTo sync/calibrate (solo si OK)
-                if bool(result.success):
+                if bool(getattr(result, "success", False)):
                     self._last_platesolve_result = result
-
-
+    
             except Exception as exc:
                 self._set_state_safe(
                     platesolve_busy=False,
@@ -772,6 +954,7 @@ class AppRunner:
                     platesolve_last_ok=False,
                 )
                 log_error(self.out_log, "Platesolve: failed", exc)
+
 
     def _platesolve_request(self, *, source: str, target: Any) -> None:
         """
@@ -999,11 +1182,12 @@ class AppRunner:
             if tracking_on and (self._cam_stream is not None) and (self._mount is not None):
                 fr = self._cam_stream.latest()
                 if fr is not None:
-                    if hasattr(fr, "u16") and fr.u16 is not None:
-                        frame_u16 = fr.u16
-                    else:
-                        u8 = fr.u8_view
-                        frame_u16 = (u8.astype("uint16") * 257)
+                    # Obtener un mono uint16 robusto para tracking (evita usar u8_view cuando el stream es RAW16)
+                    try:
+                        bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
+                    except Exception:
+                        bayer = "RGGB"
+                    frame_u16 = extract_align_mono_u16(fr.raw, str(fr.fmt or "RAW16"), bayer_pattern=bayer)
 
                     try:
                         out = tracking_step(

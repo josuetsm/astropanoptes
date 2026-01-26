@@ -26,3 +26,6 @@ myenv/
 
 # Ignore Jupyter notebooks
 *.ipynb
+
+# Dumps temporales de plate solving
+platesolve_dumps/
