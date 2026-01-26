@@ -13,7 +13,7 @@ from typing import Dict, Tuple, Optional, Any, List, Literal
 import numpy as np
 import cv2
 
-from app_unzipped.hotpixels import hotpix_prefilter_base, apply_hotpixel_mask_replace
+from hotpixels import hotpix_prefilter_base, apply_hotpixel_mask_replace
 from config import AppConfig
 from imaging import (
     downsample_u16,
