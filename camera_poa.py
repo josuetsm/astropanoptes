@@ -47,10 +47,6 @@ def _imgfmt_from_str(name: str) -> pyPOACamera.POAImgFormat:
         return pyPOACamera.POAImgFormat.POA_RAW8
     if n in ("RAW16", "POA_RAW16"):
         return pyPOACamera.POAImgFormat.POA_RAW16
-    if n in ("RGB24", "POA_RGB24"):
-        return pyPOACamera.POAImgFormat.POA_RGB24
-    if n in ("MONO8", "POA_MONO8"):
-        return pyPOACamera.POAImgFormat.POA_MONO8
     # fallback seguro
     return pyPOACamera.POAImgFormat.POA_RAW16
 
@@ -446,7 +442,7 @@ class CameraStream:
             if fmt in (pyPOACamera.POAImgFormat.POA_RAW8, pyPOACamera.POAImgFormat.POA_MONO8):
                 u8 = buf[: w * h].reshape(h, w)
                 u8_view = u8
-                raw = None  # si quieres guardar raw8 para stacking, se habilita luego
+                raw = u8
             elif fmt == pyPOACamera.POAImgFormat.POA_RAW16:
                 # reinterpretación little-endian
                 u16 = buf[: w * h * 2].view("<u2").reshape(h, w)
