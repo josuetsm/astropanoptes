@@ -1,17 +1,19 @@
 # stacking.py
 from __future__ import annotations
 
+import json
 import math
 import time
 import threading
 import queue
+from pathlib import Path
 from dataclasses import dataclass, field
 from typing import Dict, Tuple, Optional, Any, List, Literal
 
 import numpy as np
 import cv2
 
-from app_unzipped.hotpixels import hotpix_prefilter_base
+from app_unzipped.hotpixels import hotpix_prefilter_base, apply_hotpixel_mask_replace
 from config import AppConfig
 from imaging import (
     downsample_u16,
@@ -19,6 +21,7 @@ from imaging import (
     debayer_cv2,
     stretch_to_u8,
 )
+from logging_utils import log_error, log_info
 
 # ============================================================
 # Types
@@ -352,6 +355,10 @@ class StackEngine:
     _ref_align_u16: Optional[np.ndarray] = None
     _ref_ema: float = 0.08  # conservative reference update
 
+    _hotpix_mask: Optional[np.ndarray] = None
+    _hotpix_meta: Optional[Dict[str, Any]] = None
+    _hotpix_log_once: bool = False
+
     def configure_from_cfg(self) -> None:
         scfg = self.cfg.stacking
         self.color_mode = scfg.color_mode
@@ -364,6 +371,11 @@ class StackEngine:
         self.metrics.pixfrac = float(scfg.pixfrac)
         self.metrics.tile_size_out = int(scfg.tile_size_out)
         self.metrics.max_tiles = int(scfg.max_tiles)
+        self._hotpix_log_once = False
+
+        hotpix_cfg = getattr(self.cfg, "hotpixels", None)
+        if hotpix_cfg is not None:
+            self.load_hotpix_mask_if_available(hotpix_cfg.mask_path_base)
 
     def start(self) -> None:
         if self.canvas is None:
@@ -381,6 +393,7 @@ class StackEngine:
             self.canvas.tiles_evicted = 0
 
         self._ref_align_u16 = None
+        self._hotpix_log_once = False
 
         with self._preview_lock:
             self._preview_jpeg = None
@@ -406,6 +419,84 @@ class StackEngine:
     def get_preview_jpeg(self) -> Optional[bytes]:
         with self._preview_lock:
             return self._preview_jpeg
+
+    def load_hotpix_mask_if_available(self, path_base: str) -> None:
+        base = Path(path_base).expanduser()
+        npy_path = base.with_suffix(".npy")
+        json_path = base.with_suffix(".json")
+
+        if not npy_path.exists() or not json_path.exists():
+            self._hotpix_mask = None
+            self._hotpix_meta = None
+            return
+
+        try:
+            mask = np.load(npy_path).astype(bool)
+            meta = json.loads(json_path.read_text())
+        except Exception as exc:
+            log_error(
+                None,
+                f"Hotpixel mask load failed at {base}: {exc}",
+                exc,
+                throttle_key="hotpix-mask-load-error",
+            )
+            self._hotpix_mask = None
+            self._hotpix_meta = None
+            return
+
+        if mask.ndim != 2:
+            log_info(None, f"Hotpixel mask invalid (expected 2D, got shape={mask.shape}).")
+            self._hotpix_mask = None
+            self._hotpix_meta = None
+            return
+
+        meta_shape = meta.get("shape")
+        if meta_shape is not None:
+            if not isinstance(meta_shape, (list, tuple)) or len(meta_shape) != 2:
+                log_info(None, f"Hotpixel mask invalid (metadata shape={meta_shape}).")
+                self._hotpix_mask = None
+                self._hotpix_meta = None
+                return
+            if tuple(meta_shape) != mask.shape:
+                log_info(
+                    None,
+                    f"Hotpixel mask invalid (metadata shape={meta_shape} != mask shape={mask.shape}).",
+                )
+                self._hotpix_mask = None
+                self._hotpix_meta = None
+                return
+
+        expected_roi = None
+        if hasattr(self.cfg, "camera") and getattr(self.cfg.camera, "use_roi", False):
+            expected_roi = [
+                int(self.cfg.camera.roi_x),
+                int(self.cfg.camera.roi_y),
+                int(self.cfg.camera.roi_w),
+                int(self.cfg.camera.roi_h),
+            ]
+
+        meta_roi = meta.get("roi")
+        if meta_roi is not None and not isinstance(meta_roi, (list, tuple)):
+            log_info(None, f"Hotpixel mask invalid (metadata roi={meta_roi}).")
+            self._hotpix_mask = None
+            self._hotpix_meta = None
+            return
+        if expected_roi is None and meta_roi not in (None, []):
+            log_info(None, f"Hotpixel mask invalid (unexpected ROI metadata {meta_roi}).")
+            self._hotpix_mask = None
+            self._hotpix_meta = None
+            return
+        if expected_roi is not None and list(meta_roi or []) != expected_roi:
+            log_info(
+                None,
+                f"Hotpixel mask invalid (ROI mismatch, expected {expected_roi}, got {meta_roi}).",
+            )
+            self._hotpix_mask = None
+            self._hotpix_meta = None
+            return
+
+        self._hotpix_mask = mask
+        self._hotpix_meta = meta
 
     def get_latest_stack_frame(
         self,
@@ -538,6 +629,48 @@ class StackEngine:
         for i in used:
             raw = batch[i]["raw"]
             fmt = batch[i].get("fmt", "MONO16")
+            hotpix_cfg = getattr(self.cfg, "hotpixels", None)
+            mask_enabled = bool(hotpix_cfg and hotpix_cfg.mask_enabled_for_stacking)
+            if mask_enabled:
+                if self._hotpix_mask is None:
+                    if not self._hotpix_log_once:
+                        log_info(
+                            None,
+                            "Hotpixel mask not available; stacking raw frames without replacement.",
+                            throttle_key="hotpix-mask-missing-once",
+                        )
+                        self._hotpix_log_once = True
+                elif raw.ndim != 2:
+                    if not self._hotpix_log_once:
+                        log_info(
+                            None,
+                            "Hotpixel mask not applied (expected 2D frame).",
+                            throttle_key="hotpix-mask-invalid-frame-once",
+                        )
+                        self._hotpix_log_once = True
+                elif raw.dtype != np.uint16:
+                    if not self._hotpix_log_once:
+                        log_info(
+                            None,
+                            f"Hotpixel mask not applied (expected uint16, got {raw.dtype}).",
+                            throttle_key="hotpix-mask-invalid-dtype-once",
+                        )
+                        self._hotpix_log_once = True
+                elif raw.shape != self._hotpix_mask.shape:
+                    log_info(
+                        None,
+                        f"Hotpixel mask invalid for frame (mask shape={self._hotpix_mask.shape}, frame shape={raw.shape}).",
+                    )
+                    self._hotpix_mask = None
+                    self._hotpix_meta = None
+                    if not self._hotpix_log_once:
+                        self._hotpix_log_once = True
+                else:
+                    raw = apply_hotpixel_mask_replace(
+                        raw,
+                        self._hotpix_mask,
+                        ksize=int(hotpix_cfg.mask_ksize),
+                    )
 
             dx = float(dxs[i])
             dy = float(dys[i])
