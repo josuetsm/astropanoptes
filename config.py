@@ -116,7 +116,7 @@ class PlatesolveConfig:
     # Image processing
     downsample: int = 2
     max_det: int = 250
-    det_thresh_sigma: float = 6.0
+    det_thresh_sigma: float = 3.5
     det_minarea: int = 5
     point_sigma: float = 1.2  # sigma for gaussian blur of point-maps
 
@@ -124,7 +124,7 @@ class PlatesolveConfig:
     cache_dir: str = "~/.cache/gaia_cones"
     table_name: str = "gaiadr3.gaia_source"
     columns: tuple[str, ...] = ("source_id", "ra", "dec", "phot_g_mean_mag")
-    gmax: float = 14.5
+    gmax: float = 17.0
     nside: int = 64
     order: str = "ring"
     prefer_parquet: bool = True
@@ -139,10 +139,10 @@ class PlatesolveConfig:
 
     # Matching
     match_max_px: float = 3.5  # in downsampled pixels
-    min_inliers: int = 10
+    min_inliers: int = 3
 
     # Search area (Gaia cone radius)
-    search_radius_deg: float | None = None
+    search_radius_deg: float | None = 1.0
     search_radius_factor: float = 1.4  # radius ~= factor * (diag/2)
 
     # Download missing tiles

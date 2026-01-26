@@ -444,6 +444,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         layout=W.Layout(width="200px"),
     )
 
+    w_bi_ps_binning.disabled = True  # CameraStream fuerza binning=1; evitamos inconsistencia
+
     # Solver params (subconjunto razonable)
     w_bi_ps_downsample = W.BoundedIntText(
         description="downsample",
@@ -607,7 +609,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     def _ps_send_params(_=None) -> None:
         # Conversión:
         # pixel_size_m debe incorporar binning si el solver trabaja en pixels "binned"
-        pixel_size_m = float(w_tf_ps_pixel_um.value) * 1e-6 * float(int(w_bi_ps_binning.value))
+        pixel_size_m = float(w_tf_ps_pixel_um.value) * 1e-6  # binning fijo=1 en CameraStream
         focal_m = float(w_tf_ps_focal_mm.value) / 1000.0
 
         params = {
