@@ -69,6 +69,11 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
   - Utilidades rápidas para preview: downsample por stride, stretch por percentiles, JPEG encode.
   - Extracción rápida del canal verde desde Bayer RAW16.
 
+### 3.1) Calibración de hotpixels
+- La calibración de hotpixels genera una máscara con múltiples frames RAW para su uso en stacking.
+- **Idealmente** se calibra con la tapa puesta o un fondo oscuro (sin luz parásita).
+- La operación se ejecuta en background y **no bloquea** el loop principal de captura/preview.
+
 ### 4) Tracking y control de montura
 - **`tracking.py`**
   - Tracking incremental por correlación de fase.
