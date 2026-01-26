@@ -31,6 +31,7 @@ import os
 import json
 import hashlib
 import time
+import re
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union, List, Dict
 
@@ -53,6 +54,112 @@ except Exception:
 _DEFAULT_CACHE_DIR = Path(os.environ.get("GAIA_CONE_CACHE_DIR", "~/.cache/gaia_cones")).expanduser()
 DEFAULT_TABLE = "gaiadr3.gaia_source"
 DEFAULT_COLUMNS = ("source_id", "ra", "dec", "phot_g_mean_mag")
+
+_DEFAULT_AUTH_PATH = Path(os.environ.get(
+    "GAIA_AUTH_FILE",
+    "~/.config/astropanoptes/gaia_auth.json",
+)).expanduser()
+_REPO_ROOT = Path(__file__).resolve().parent
+
+
+def _gaia_auth_path(auth_file: Optional[Union[str, Path]] = None) -> Path:
+    if auth_file:
+        return Path(auth_file).expanduser()
+    env_path = os.environ.get("GAIA_AUTH_FILE")
+    if env_path:
+        return Path(env_path).expanduser()
+    return _DEFAULT_AUTH_PATH
+
+
+def _gaia_env_user_pass() -> Tuple[Optional[str], Optional[str]]:
+    user = os.environ.get("GAIA_USER") or os.environ.get("GAIA_USERNAME")
+    password = os.environ.get("GAIA_PASS") or os.environ.get("GAIA_PASSWORD")
+    return user, password
+
+
+def _repo_relpath(path: Path) -> Optional[Path]:
+    try:
+        return path.resolve().relative_to(_REPO_ROOT)
+    except ValueError:
+        return None
+
+
+def _ensure_gitignore_entry(rel_path: Path) -> None:
+    gitignore = _REPO_ROOT / ".gitignore"
+    entry = rel_path.as_posix()
+    if gitignore.exists():
+        existing = gitignore.read_text(encoding="utf-8").splitlines()
+        if entry in existing:
+            return
+    with gitignore.open("a", encoding="utf-8") as handle:
+        if gitignore.stat().st_size > 0:
+            handle.write("\n")
+        handle.write(f"{entry}\n")
+
+
+def load_gaia_auth(auth_file: Optional[Union[str, Path]] = None) -> Optional[Tuple[str, str]]:
+    """
+    Load Gaia credentials from environment variables or an optional JSON file.
+    Environment variables take precedence over file content.
+    """
+    user, password = _gaia_env_user_pass()
+    if user and password:
+        return user, password
+
+    path = _gaia_auth_path(auth_file)
+    if not path.exists():
+        return None
+
+    data = json.loads(path.read_text(encoding="utf-8"))
+    user = data.get("user") or data.get("username")
+    password = data.get("password")
+    if user and password:
+        return str(user), str(password)
+    return None
+
+
+def save_gaia_auth(
+    user: str,
+    password: str,
+    auth_file: Optional[Union[str, Path]] = None,
+) -> Path:
+    """
+    Save Gaia credentials to JSON outside the repo by default.
+    If the target path is inside the repo, add it to .gitignore.
+    """
+    path = _gaia_auth_path(auth_file)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = {"user": str(user), "password": str(password)}
+    path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+    try:
+        os.chmod(path, 0o600)
+    except OSError:
+        pass
+
+    rel_path = _repo_relpath(path)
+    if rel_path is not None:
+        _ensure_gitignore_entry(rel_path)
+    return path
+
+
+def resolve_name_to_icrs(name: str) -> SkyCoord:
+    """
+    Resolve a target name to ICRS.
+    Supports 'Gaia DR2 <source_id>' via gaiadr2.gaia_source, otherwise falls back to SIMBAD.
+    """
+    match = re.match(r"^\s*Gaia\s*DR2\s+(\d+)\s*$", name, re.IGNORECASE)
+    if match:
+        source_id = int(match.group(1))
+        query = f"SELECT ra, dec FROM gaiadr2.gaia_source WHERE source_id = {source_id}"
+        job = Gaia.launch_job_async(query, background=False, dump_to_file=False, verbose=False)
+        results = job.get_results()
+        if len(results) < 1:
+            raise ValueError(f"Gaia DR2 source not found: {source_id}")
+        ra = float(results["ra"][0])
+        dec = float(results["dec"][0])
+        return SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs")
+
+    return SkyCoord.from_name(name).icrs
 
 
 # -------------------------
