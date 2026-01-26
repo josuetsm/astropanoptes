@@ -35,6 +35,7 @@ import re
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union, List, Dict
 
+from logging_utils import log_error
 from astroquery.gaia import Gaia
 from astropy.coordinates import SkyCoord, Angle
 import astropy.units as u
@@ -45,7 +46,8 @@ from astropy_healpix import HEALPix
 try:
     import pyarrow  # type: ignore  # noqa: F401
     _HAS_PARQUET = True
-except Exception:
+except Exception as exc:
+    log_error(None, "Gaia cache: failed to import pyarrow; parquet disabled", exc)
     _HAS_PARQUET = False
 
 # -------------------------
@@ -80,7 +82,8 @@ def _gaia_env_user_pass() -> Tuple[Optional[str], Optional[str]]:
 def _repo_relpath(path: Path) -> Optional[Path]:
     try:
         return path.resolve().relative_to(_REPO_ROOT)
-    except ValueError:
+    except ValueError as exc:
+        log_error(None, "Gaia cache: failed to resolve repo-relative path", exc)
         return None
 
 
@@ -133,8 +136,8 @@ def save_gaia_auth(
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
     try:
         os.chmod(path, 0o600)
-    except OSError:
-        pass
+    except OSError as exc:
+        log_error(None, "Gaia cache: failed to chmod auth file", exc)
 
     rel_path = _repo_relpath(path)
     if rel_path is not None:
@@ -293,6 +296,7 @@ def gaia_cone_with_mag(
                     raise
                 if verbose:
                     print(f"[gaia_cache] retry {attempt}: {type(e).__name__} -> {e}")
+                log_error(None, f"Gaia cache: query retry {attempt} failed", e)
                 time.sleep(backoff_s * attempt)
 
     finally:
@@ -301,15 +305,16 @@ def gaia_cone_with_mag(
                 print("[gaia_cache] Logout del Gaia Archive.")
             try:
                 Gaia.logout()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(None, "Gaia cache: logout failed", exc)
 
     # dedup por source_id
     if "source_id" in tab.colnames:
         try:
             import pandas as pd
             tab = Table.from_pandas(tab.to_pandas().drop_duplicates(subset=["source_id"]))
-        except Exception:
+        except Exception as exc:
+            log_error(None, "Gaia cache: pandas dedup failed; falling back to python", exc)
             seen = set()
             keep = []
             for i, sid in enumerate(tab["source_id"]):
@@ -375,6 +380,7 @@ def _query_healpix_tile_async(
                 raise
             if verbose:
                 print(f"[gaia_healpix] retry {attempt}: {type(e).__name__} -> {e}")
+            log_error(None, f"Gaia healpix: query retry {attempt} failed", e)
             time.sleep(backoff_s * attempt)
 
 
@@ -475,8 +481,8 @@ def gaia_healpix_cone_with_mag(
                 print("[gaia_healpix] Logout del Gaia Archive.")
             try:
                 Gaia.logout()
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(None, "Gaia healpix: logout failed", exc)
 
     if not parts:
         return Table(names=list(columns), dtype=[float] * len(columns))
@@ -488,7 +494,8 @@ def gaia_healpix_cone_with_mag(
         try:
             import pandas as pd
             full = Table.from_pandas(full.to_pandas().drop_duplicates(subset=["source_id"]))
-        except Exception:
+        except Exception as exc:
+            log_error(None, "Gaia healpix: pandas dedup failed; falling back to python", exc)
             seen = set()
             keep = []
             for j, sid in enumerate(full["source_id"]):
