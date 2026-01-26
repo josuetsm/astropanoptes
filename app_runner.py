@@ -11,7 +11,7 @@ from typing import Optional, Any, Dict, List
 import cv2
 import numpy as np
 
-from ap_types import SystemState, Axis
+from ap_types import SystemState, Axis, Frame
 from config import AppConfig, CameraConfig, PreviewConfig
 from actions import Action, ActionType
 from logging_utils import log_info, log_error
@@ -193,6 +193,14 @@ class AppRunner:
         # Cache de parámetros “pendientes”
         self._pending_camera_cfg: CameraConfig = cfg.camera
         self._pending_preview_cfg: PreviewConfig = cfg.preview
+        self._live_sep_overlay_enabled = False
+        self._live_sep_params = {
+            "sep_bw": int(getattr(cfg.platesolve, "sep_bw", 64)),
+            "sep_bh": int(getattr(cfg.platesolve, "sep_bh", 64)),
+            "sep_thresh_sigma": float(getattr(cfg.platesolve, "sep_thresh_sigma", 3.5)),
+            "sep_minarea": int(getattr(cfg.platesolve, "sep_minarea", 5)),
+            "max_det": int(getattr(cfg.platesolve, "max_det", 250)),
+        }
 
         # Estado inicial
         self._set_state_safe(camera_status="DISCONNECTED", camera_connected=False)
@@ -480,21 +488,36 @@ class AppRunner:
 
         try:
             u = fr.u8_view
+            ds = int(self._pending_preview_cfg.ds)
+            overlay_enabled = bool(self._live_sep_overlay_enabled)
+            from imaging import encode_jpeg  # evita ciclos
 
             if u.ndim == 3 and u.shape[2] == 3:
-                ds = int(self._pending_preview_cfg.ds)
-                u2 = u[::ds, ::ds, :] if ds > 1 else u
-                from imaging import encode_jpeg  # evita ciclos
-                jpg = encode_jpeg(u2, quality=int(self._pending_preview_cfg.jpeg_quality))
+                u8_preview = u[::ds, ::ds, :] if ds > 1 else u
+                if overlay_enabled:
+                    u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
+                jpg = encode_jpeg(u8_preview, quality=int(self._pending_preview_cfg.jpeg_quality))
             else:
-                jpg, _ = make_preview_jpeg(
-                    u,
-                    ds=int(self._pending_preview_cfg.ds),
-                    plo=float(self._pending_preview_cfg.stretch_plo),
-                    phi=float(self._pending_preview_cfg.stretch_phi),
-                    jpeg_quality=int(self._pending_preview_cfg.jpeg_quality),
-                    sample_stride=4,
-                )
+                if overlay_enabled:
+                    _, u8_preview = make_preview_jpeg(
+                        u,
+                        ds=ds,
+                        plo=float(self._pending_preview_cfg.stretch_plo),
+                        phi=float(self._pending_preview_cfg.stretch_phi),
+                        jpeg_quality=int(self._pending_preview_cfg.jpeg_quality),
+                        sample_stride=4,
+                    )
+                    u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
+                    jpg = encode_jpeg(u8_preview, quality=int(self._pending_preview_cfg.jpeg_quality))
+                else:
+                    jpg, _ = make_preview_jpeg(
+                        u,
+                        ds=ds,
+                        plo=float(self._pending_preview_cfg.stretch_plo),
+                        phi=float(self._pending_preview_cfg.stretch_phi),
+                        jpeg_quality=int(self._pending_preview_cfg.jpeg_quality),
+                        sample_stride=4,
+                    )
 
             with self._preview_lock:
                 self._latest_preview_jpeg = jpg
@@ -510,6 +533,66 @@ class AppRunner:
 
         except Exception as exc:
             log_error(self.out_log, "Preview: failed", exc)
+
+    def _apply_live_sep_overlay(self, fr: Frame, u8_preview: np.ndarray, ds: int) -> np.ndarray:
+        try:
+            from platesolve import detect_sep_objects
+        except Exception as exc:
+            log_error(self.out_log, "Live SEP: failed to import detect_sep_objects", exc, throttle_s=5.0, throttle_key="live_sep_import")
+            return u8_preview
+
+        try:
+            raw_gray = None
+            if getattr(fr, "raw", None) is not None:
+                try:
+                    bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
+                except Exception:
+                    bayer = "RGGB"
+                raw_gray = extract_align_mono_u16(fr.raw, str(fr.fmt or "RAW16"), bayer_pattern=bayer)
+            else:
+                raw_gray = fr.u8_view
+
+            if raw_gray is None:
+                return u8_preview
+
+            if getattr(raw_gray, "ndim", 0) == 3:
+                raw_gray = raw_gray[:, :, :3].astype(np.float32).mean(axis=2)
+
+            ds = int(max(1, ds))
+            if ds > 1:
+                raw_gray = raw_gray[::ds, ::ds]
+
+            params = dict(self._live_sep_params)
+            _, obj_xy, _ = detect_sep_objects(
+                raw_gray,
+                sep_bw=int(params.get("sep_bw", 64)),
+                sep_bh=int(params.get("sep_bh", 64)),
+                sep_thresh_sigma=float(params.get("sep_thresh_sigma", 3.5)),
+                sep_minarea=int(params.get("sep_minarea", 5)),
+                max_sources=int(params.get("max_det", 250)),
+                progress_cb=None,
+            )
+
+            if obj_xy is None or len(obj_xy) == 0:
+                return u8_preview
+
+            if u8_preview.ndim == 2:
+                img = cv2.cvtColor(u8_preview, cv2.COLOR_GRAY2BGR)
+            else:
+                img = u8_preview.copy()
+
+            h, w = img.shape[:2]
+            for x, y in obj_xy:
+                ix = int(round(float(x)))
+                iy = int(round(float(y)))
+                if ix < 0 or iy < 0 or ix >= w or iy >= h:
+                    continue
+                cv2.circle(img, (ix, iy), 6, (0, 255, 255), 1, lineType=cv2.LINE_AA)
+
+            return img
+        except Exception as exc:
+            log_error(self.out_log, "Live SEP: overlay failed", exc, throttle_s=2.0, throttle_key="live_sep_overlay")
+            return u8_preview
 
     # -------------------------
     # Mount
@@ -1464,6 +1547,17 @@ class AppRunner:
                         d[k] = v
                 self._platesolve_cfg = PlatesolveConfig(**d)
                 log_info(self.out_log, f"Platesolve: SET_PARAMS {list(payload.keys())}")
+            return
+
+        # ---- Live SEP overlay ----
+        if t == ActionType.LIVE_SEP_SET_PARAMS:
+            if isinstance(p, dict):
+                enabled = p.get("enabled", self._live_sep_overlay_enabled)
+                self._live_sep_overlay_enabled = bool(enabled)
+                for key in ("sep_bw", "sep_bh", "sep_thresh_sigma", "sep_minarea", "max_det"):
+                    if key in p:
+                        self._live_sep_params[key] = p.get(key)
+                log_info(self.out_log, "Live SEP: params updated")
             return
 
 

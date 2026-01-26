@@ -30,6 +30,7 @@ from actions import (
     stacking_reset,
     platesolve_run,
     platesolve_set_params,
+    live_sep_set_params,
 )
 from ap_types import Axis
 from logging_utils import log_info, log_error
@@ -117,7 +118,83 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # Live View (siempre visible)
     # -------------------------
     w_img_live = W.Image(format="jpeg", layout=W.Layout(width="100%", max_width="500px"))
-    w_live_box = W.VBox([w_img_live])
+
+    w_tb_live_sep = W.ToggleButton(
+        description="SEP Overlay",
+        value=False,
+        disabled=False,
+        layout=W.Layout(width="140px"),
+    )
+    w_bi_live_sep_bw = W.BoundedIntText(
+        description="sep_bw",
+        value=int(getattr(getattr(cfg, "platesolve", object()), "sep_bw", 64)),
+        min=4,
+        max=512,
+        step=1,
+        layout=W.Layout(width="180px"),
+    )
+    w_bi_live_sep_bh = W.BoundedIntText(
+        description="sep_bh",
+        value=int(getattr(getattr(cfg, "platesolve", object()), "sep_bh", 64)),
+        min=4,
+        max=512,
+        step=1,
+        layout=W.Layout(width="180px"),
+    )
+    w_tf_live_sep_sigma = W.BoundedFloatText(
+        description="sep_sigma",
+        value=float(getattr(getattr(cfg, "platesolve", object()), "sep_thresh_sigma", 3.5)),
+        min=0.1,
+        max=20.0,
+        step=0.1,
+        layout=W.Layout(width="200px"),
+    )
+    w_bi_live_sep_minarea = W.BoundedIntText(
+        description="sep_minarea",
+        value=int(getattr(getattr(cfg, "platesolve", object()), "sep_minarea", 5)),
+        min=1,
+        max=500,
+        step=1,
+        layout=W.Layout(width="220px"),
+    )
+    w_bi_live_sep_max_det = W.BoundedIntText(
+        description="max_det",
+        value=int(getattr(getattr(cfg, "platesolve", object()), "max_det", 250)),
+        min=1,
+        max=5000,
+        step=5,
+        layout=W.Layout(width="200px"),
+    )
+
+    def _send_live_sep_params(_=None) -> None:
+        runner.enqueue(
+            live_sep_set_params(
+                enabled=bool(w_tb_live_sep.value),
+                sep_bw=int(w_bi_live_sep_bw.value),
+                sep_bh=int(w_bi_live_sep_bh.value),
+                sep_thresh_sigma=float(w_tf_live_sep_sigma.value),
+                sep_minarea=int(w_bi_live_sep_minarea.value),
+                max_det=int(w_bi_live_sep_max_det.value),
+            )
+        )
+
+    w_tb_live_sep.observe(_send_live_sep_params, names="value")
+    w_bi_live_sep_bw.observe(_send_live_sep_params, names="value")
+    w_bi_live_sep_bh.observe(_send_live_sep_params, names="value")
+    w_tf_live_sep_sigma.observe(_send_live_sep_params, names="value")
+    w_bi_live_sep_minarea.observe(_send_live_sep_params, names="value")
+    w_bi_live_sep_max_det.observe(_send_live_sep_params, names="value")
+
+    w_live_overlay_controls = W.VBox(
+        [
+            W.HTML("<b>Live SEP Overlay</b>"),
+            W.HBox([w_tb_live_sep, w_bi_live_sep_max_det]),
+            W.HBox([w_bi_live_sep_bw, w_bi_live_sep_bh, w_tf_live_sep_sigma, w_bi_live_sep_minarea]),
+        ],
+        layout=W.Layout(border="1px solid #eee", padding="6px", gap="6px", max_width="980px"),
+    )
+
+    w_live_box = W.VBox([w_img_live, w_live_overlay_controls])
 
     # -------------------------
     # Manual Mount Control (siempre visible)  [MOVE + microsteps + delay_us]
@@ -1013,6 +1090,12 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_btn_save_quick": w_btn_save_quick,
         # live
         "w_img_live": w_img_live,
+        "w_tb_live_sep": w_tb_live_sep,
+        "w_bi_live_sep_bw": w_bi_live_sep_bw,
+        "w_bi_live_sep_bh": w_bi_live_sep_bh,
+        "w_tf_live_sep_sigma": w_tf_live_sep_sigma,
+        "w_bi_live_sep_minarea": w_bi_live_sep_minarea,
+        "w_bi_live_sep_max_det": w_bi_live_sep_max_det,
         # stacking tab
         "w_img_stack": w_img_stack,
         "w_btn_stack_reset": w_btn_stack_reset,
