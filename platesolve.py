@@ -19,6 +19,7 @@ from sklearn.neighbors import KDTree
 from itertools import combinations, permutations
 
 from logging_utils import log_error
+from app_unzipped.hotpixels import hotpix_prefilter_base
 from config import PlatesolveConfig
 
 # IMPORTANT: all Gaia/cache/auth logic must live in gaia_cache.py
@@ -225,22 +226,6 @@ def stretch01(img: np.ndarray) -> np.ndarray:
     return np.clip(out, 0, 1)
 
 
-def median3_u16(img: np.ndarray) -> np.ndarray:
-    """cv2.medianBlur requires uint8/uint16"""
-    if img.dtype == np.uint8 or img.dtype == np.uint16:
-        img_u = img
-    else:
-        # be conservative: if float, clip to uint16 range
-        if np.issubdtype(img.dtype, np.floating):
-            x = np.asarray(img)
-            x = np.nan_to_num(x, nan=0.0, posinf=0.0, neginf=0.0)
-            x = np.clip(x, 0.0, 65535.0)
-            img_u = x.astype(np.uint16)
-        else:
-            img_u = img.astype(np.uint16)
-    return cv2.medianBlur(img_u, 3).astype(np.float32)
-
-
 def detect_sep_objects(
     raw_gray: np.ndarray,
     *,
@@ -263,7 +248,7 @@ def detect_sep_objects(
     raw = np.asarray(raw_gray)
     disp = stretch01(raw)
 
-    img_med = median3_u16(raw)
+    img_med = hotpix_prefilter_base(raw, ksize=3)
     bkg = sep.Background(img_med, bw=int(sep_bw), bh=int(sep_bh))
     img_sub = img_med - bkg.back()
     img_det = np.maximum(img_sub, 0.0)

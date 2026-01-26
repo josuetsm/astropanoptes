@@ -7,6 +7,7 @@ from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import cv2
+from app_unzipped.hotpixels import hotpix_prefilter_base
 from logging_utils import log_error
 
 
@@ -21,6 +22,11 @@ class TrackingPreprocConfig:
     sigma_hp: float = 10.0
     sigma_smooth: float = 2.0
     bright_percentile: float = 99.3
+
+
+@dataclass
+class HotPixelsConfig:
+    base_ksize: int = 3
 
 
 @dataclass
@@ -94,6 +100,7 @@ class AutoBoostConfig:
 @dataclass
 class TrackingConfig:
     preproc: TrackingPreprocConfig = field(default_factory=TrackingPreprocConfig)
+    hotpixels: HotPixelsConfig = field(default_factory=HotPixelsConfig)
     keyframe: KeyframeConfig = field(default_factory=KeyframeConfig)
     pi: PIConfig = field(default_factory=PIConfig)
     rate: RateLimiterConfig = field(default_factory=RateLimiterConfig)
@@ -224,29 +231,30 @@ def compute_A_pinv_dls(A: np.ndarray, lam: float) -> np.ndarray:
 # ============================================================
 
 def preprocess_for_phasecorr(frame_u16: np.ndarray, state: TrackingState, *, update_bg: bool = True) -> np.ndarray:
-    cfg = state.cfg.preproc
-    x = frame_u16.astype(np.float32)
+    cfg = state.cfg
+    pre = cfg.preproc
+    x = hotpix_prefilter_base(frame_u16, ksize=cfg.hotpixels.base_ksize)
 
-    if cfg.subtract_bg_ema:
+    if pre.subtract_bg_ema:
         if state.bg_ema is None:
             state.bg_ema = x.copy()
         else:
             if update_bg:
-                a = float(cfg.bg_ema_alpha)
+                a = float(pre.bg_ema_alpha)
                 state.bg_ema = (1.0 - a) * state.bg_ema + a * x
         x = x - state.bg_ema
 
-    if cfg.sigma_hp and cfg.sigma_hp > 0:
-        low = cv2.GaussianBlur(x, (0, 0), float(cfg.sigma_hp))
+    if pre.sigma_hp and pre.sigma_hp > 0:
+        low = cv2.GaussianBlur(x, (0, 0), float(pre.sigma_hp))
         x = x - low
 
     x = np.maximum(x, 0.0)
 
-    if cfg.sigma_smooth and cfg.sigma_smooth > 0:
-        x = cv2.GaussianBlur(x, (0, 0), float(cfg.sigma_smooth))
+    if pre.sigma_smooth and pre.sigma_smooth > 0:
+        x = cv2.GaussianBlur(x, (0, 0), float(pre.sigma_smooth))
 
     samp = x[::4, ::4] if (x.shape[0] > 64 and x.shape[1] > 64) else x
-    thr = float(np.percentile(samp, float(cfg.bright_percentile)))
+    thr = float(np.percentile(samp, float(pre.bright_percentile)))
     mask = x >= thr
 
     reg = np.zeros_like(x, dtype=np.float32)
