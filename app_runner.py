@@ -17,7 +17,7 @@ import cv2
 import numpy as np
 
 from ap_types import SystemState, Axis, Frame
-from config import AppConfig, CameraConfig, PreviewConfig
+from config import AppConfig
 from actions import Action, ActionType
 from logging_utils import log_info, log_error
 
@@ -76,7 +76,15 @@ class AppRunner:
     """
 
     def __init__(self, cfg: AppConfig, out_log=None) -> None:
-        self.cfg = cfg
+        self.default_cfg = cfg
+        self.cfg = replace(cfg)
+        self.cfg.camera = replace(cfg.camera)
+        self.cfg.preview = replace(cfg.preview)
+        self.cfg.mount = replace(cfg.mount)
+        self.cfg.tracking = replace(cfg.tracking)
+        self.cfg.stacking = replace(cfg.stacking)
+        self.cfg.hotpixels = replace(cfg.hotpixels)
+        self.cfg.platesolve = replace(cfg.platesolve)
         self.out_log = out_log
 
         self._actions: "queue.Queue[Action]" = queue.Queue()
@@ -92,8 +100,8 @@ class AppRunner:
         self._tracking_state = make_tracking_state()
 
         # Stacking subsystem
-        self._stacking = StackingWorker(cfg)
-        self._stacking_enabled = bool(cfg.stacking.enabled_init)
+        self._stacking = StackingWorker(self.cfg)
+        self._stacking_enabled = bool(self.cfg.stacking.enabled_init)
 
         # Platesolve subsystem (thread dedicado)
         self._platesolve_lock = threading.Lock()
@@ -109,16 +117,14 @@ class AppRunner:
         self._hotpix_thr: Optional[threading.Thread] = None
         self._hotpix_cancel = threading.Event()
 
-        # Config platesolve (defaults + runtime copy, actualizable desde UI por action)
-        self._platesolve_defaults = cfg.platesolve
-        self._platesolve_cfg = self._copy_platesolve_config(cfg.platesolve)
+        # Config platesolve (runtime copy, actualizable desde UI por action)
         self._platesolve_observer = ObserverConfig()  # Santiago por default en tu platesolve.py
 
         # GoTo subsystem (no bloquea loop)
         kin = MountKinematics(
             motor_full_steps_per_rev=200,
-            microsteps_az=int(cfg.mount.ms_az),
-            microsteps_alt=int(cfg.mount.ms_alt),
+            microsteps_az=int(self.cfg.mount.ms_az),
+            microsteps_alt=int(self.cfg.mount.ms_alt),
             motor_pulley_teeth=20,
             ring_radius_m_az=0.24,
             ring_radius_m_alt=0.235,
@@ -146,16 +152,14 @@ class AppRunner:
         self._t_fps_loop0 = _perf()
         self._n_loop = 0
 
-        # Cache de parámetros “pendientes”
-        self._pending_camera_cfg: CameraConfig = cfg.camera
-        self._pending_preview_cfg: PreviewConfig = cfg.preview
+        # Parámetros de overlay en vivo (SEP)
         self._live_sep_overlay_enabled = False
         self._live_sep_params = {
-            "sep_bw": int(cfg.platesolve.sep_bw),
-            "sep_bh": int(cfg.platesolve.sep_bh),
-            "sep_thresh_sigma": float(cfg.platesolve.sep_thresh_sigma),
-            "sep_minarea": int(cfg.platesolve.sep_minarea),
-            "max_det": int(cfg.platesolve.max_det),
+            "sep_bw": int(self.cfg.platesolve.sep_bw),
+            "sep_bh": int(self.cfg.platesolve.sep_bh),
+            "sep_thresh_sigma": float(self.cfg.platesolve.sep_thresh_sigma),
+            "sep_minarea": int(self.cfg.platesolve.sep_minarea),
+            "max_det": int(self.cfg.platesolve.max_det),
         }
 
         # Estado inicial
@@ -230,7 +234,7 @@ class AppRunner:
 
     def _get_platesolve_cfg_snapshot(self) -> PlatesolveConfig:
         with self._platesolve_cfg_lock:
-            return self._copy_platesolve_config(self._platesolve_cfg)
+            return self._copy_platesolve_config(self.cfg.platesolve)
 
     # -------------------------
     # Lifecycle
@@ -375,7 +379,7 @@ class AppRunner:
             info = dev.open(camera_index)
 
             stream = CameraStream(ring=3)
-            stream.start(dev, self._pending_camera_cfg, self._pending_preview_cfg)
+            stream.start(dev, self.cfg.camera, self.cfg.preview)
 
             self._cam_dev = dev
             self._cam_stream = stream
@@ -398,53 +402,108 @@ class AppRunner:
         n = (name or "").strip()
 
         if n in ("exp_ms", "exposure_ms"):
-            self._pending_camera_cfg.exp_ms = float(value)
+            self.cfg.camera.exp_ms = float(value)
         elif n in ("gain",):
-            self._pending_camera_cfg.gain = int(value)
+            self.cfg.camera.gain = int(value)
         elif n in ("auto_gain",):
-            self._pending_camera_cfg.auto_gain = bool(value)
+            self.cfg.camera.auto_gain = bool(value)
         elif n in ("img_format",):
-            self._pending_camera_cfg.img_format = str(value)
+            self.cfg.camera.img_format = str(value)
         elif n in ("use_roi",):
-            self._pending_camera_cfg.use_roi = bool(value)
+            self.cfg.camera.use_roi = bool(value)
         elif n in ("roi_x",):
-            self._pending_camera_cfg.roi_x = int(value)
+            self.cfg.camera.roi_x = int(value)
         elif n in ("roi_y",):
-            self._pending_camera_cfg.roi_y = int(value)
+            self.cfg.camera.roi_y = int(value)
         elif n in ("roi_w",):
-            self._pending_camera_cfg.roi_w = int(value)
+            self.cfg.camera.roi_w = int(value)
         elif n in ("roi_h",):
-            self._pending_camera_cfg.roi_h = int(value)
+            self.cfg.camera.roi_h = int(value)
         elif n in ("binning", "bin_hw"):
-            self._pending_camera_cfg.binning = int(value)
+            self.cfg.camera.binning = int(value)
         elif n in ("preview_view_hz",):
-            self._pending_preview_cfg.view_hz = float(value)
+            self.cfg.preview.view_hz = float(value)
         elif n in ("preview_ds",):
-            self._pending_preview_cfg.ds = int(value)
+            self.cfg.preview.ds = int(value)
         elif n in ("preview_jpeg_quality",):
-            self._pending_preview_cfg.jpeg_quality = int(value)
+            self.cfg.preview.jpeg_quality = int(value)
         elif n in ("preview_stretch_plo",):
-            self._pending_preview_cfg.stretch_plo = float(value)
+            self.cfg.preview.stretch_plo = float(value)
         elif n in ("preview_stretch_phi",):
-            self._pending_preview_cfg.stretch_phi = float(value)
+            self.cfg.preview.stretch_phi = float(value)
         else:
             log_info(self.out_log, f"Camera: param ignorado (no soportado aún): {n}={value}")
             return
 
-        if self._cam_dev is not None and self._cam_stream is not None:
-            try:
-                cam_index = int(self._pending_camera_cfg.camera_index)
-                log_info(self.out_log, f"Camera: reconfigure (restart stream) due to {n} change")
-                self._connect_camera(cam_index)
-            except Exception as exc:
-                self._set_state_safe(camera_status="ERR")
-                log_error(self.out_log, "Camera: failed to apply param (restart)", exc)
+        self._restart_camera_stream_if_active(reason=f"{n} change")
+
+    def _restart_camera_stream_if_active(self, *, reason: str) -> None:
+        if self._cam_dev is None or self._cam_stream is None:
+            return
+        try:
+            cam_index = int(self.cfg.camera.camera_index)
+            log_info(self.out_log, f"Camera: reconfigure (restart stream) due to {reason}")
+            self._connect_camera(cam_index)
+        except Exception as exc:
+            self._set_state_safe(camera_status="ERR")
+            log_error(self.out_log, "Camera: failed to apply config (restart)", exc)
+
+    def _reset_camera_defaults(self) -> None:
+        self.cfg.camera = replace(self.default_cfg.camera)
+        self._restart_camera_stream_if_active(reason="camera defaults reset")
+
+    def _reset_preview_defaults(self) -> None:
+        self.cfg.preview = replace(self.default_cfg.preview)
+        self._restart_camera_stream_if_active(reason="preview defaults reset")
+
+    def _reset_mount_defaults(self) -> None:
+        self.cfg.mount = replace(self.default_cfg.mount)
+        if self._mount is not None and self._mount.is_connected():
+            self._mount_set_microsteps(self.cfg.mount.ms_az, self.cfg.mount.ms_alt)
+        with self._goto_lock:
+            self._goto.model.kin.microsteps_az = int(self.cfg.mount.ms_az)
+            self._goto.model.kin.microsteps_alt = int(self.cfg.mount.ms_alt)
+            self._goto.model.init_from_mechanics()
+            self._set_state_safe(
+                goto_J00=float(self._goto.model.J_deg_per_step[0, 0]),
+                goto_J01=float(self._goto.model.J_deg_per_step[0, 1]),
+                goto_J10=float(self._goto.model.J_deg_per_step[1, 0]),
+                goto_J11=float(self._goto.model.J_deg_per_step[1, 1]),
+            )
+
+    def _reset_tracking_defaults(self) -> None:
+        self.cfg.tracking = replace(self.default_cfg.tracking)
+        tracking_set_params(
+            self._tracking_state,
+            sigma_hp=self.cfg.tracking.sigma_hp,
+            resp_min=self.cfg.tracking.resp_min,
+        )
+        self._tracking_keyframe_reset()
+
+    def _reset_stacking_defaults(self) -> None:
+        self.cfg.stacking = replace(self.default_cfg.stacking)
+        self._stacking.engine.configure_from_cfg()
+
+    def _reset_hotpixels_defaults(self) -> None:
+        self.cfg.hotpixels = replace(self.default_cfg.hotpixels)
+        self._stacking.engine.configure_from_cfg()
+
+    def _reset_platesolve_defaults(self) -> None:
+        with self._platesolve_cfg_lock:
+            self.cfg.platesolve = replace(self.default_cfg.platesolve)
+        self._live_sep_params = {
+            "sep_bw": int(self.cfg.platesolve.sep_bw),
+            "sep_bh": int(self.cfg.platesolve.sep_bh),
+            "sep_thresh_sigma": float(self.cfg.platesolve.sep_thresh_sigma),
+            "sep_minarea": int(self.cfg.platesolve.sep_minarea),
+            "max_det": int(self.cfg.platesolve.max_det),
+        }
 
     def _maybe_update_preview(self) -> None:
         if self._cam_stream is None:
             return
 
-        view_hz = float(self._pending_preview_cfg.view_hz)
+        view_hz = float(self.cfg.preview.view_hz)
         if view_hz <= 0.1:
             view_hz = 0.1
 
@@ -457,7 +516,7 @@ class AppRunner:
             return
 
         try:
-            ds = int(self._pending_preview_cfg.ds)
+            ds = int(self.cfg.preview.ds)
             overlay_enabled = bool(self._live_sep_overlay_enabled)
 
             if getattr(fr, "raw", None) is not None:
@@ -470,20 +529,20 @@ class AppRunner:
                     _, u8_preview = make_preview_jpeg(
                         green_u8,
                         ds=ds,
-                        plo=float(self._pending_preview_cfg.stretch_plo),
-                        phi=float(self._pending_preview_cfg.stretch_phi),
-                        jpeg_quality=int(self._pending_preview_cfg.jpeg_quality),
+                        plo=float(self.cfg.preview.stretch_plo),
+                        phi=float(self.cfg.preview.stretch_phi),
+                        jpeg_quality=int(self.cfg.preview.jpeg_quality),
                         sample_stride=4,
                     )
                     u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
-                    jpg = encode_jpeg(u8_preview, quality=int(self._pending_preview_cfg.jpeg_quality))
+                    jpg = encode_jpeg(u8_preview, quality=int(self.cfg.preview.jpeg_quality))
                 else:
                     jpg, _ = make_preview_jpeg(
                         green_u8,
                         ds=ds,
-                        plo=float(self._pending_preview_cfg.stretch_plo),
-                        phi=float(self._pending_preview_cfg.stretch_phi),
-                        jpeg_quality=int(self._pending_preview_cfg.jpeg_quality),
+                        plo=float(self.cfg.preview.stretch_plo),
+                        phi=float(self.cfg.preview.stretch_phi),
+                        jpeg_quality=int(self.cfg.preview.jpeg_quality),
                         sample_stride=4,
                     )
             else:
@@ -492,26 +551,26 @@ class AppRunner:
                     u8_preview = u[::ds, ::ds, :] if ds > 1 else u
                     if overlay_enabled:
                         u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
-                    jpg = encode_jpeg(u8_preview, quality=int(self._pending_preview_cfg.jpeg_quality))
+                    jpg = encode_jpeg(u8_preview, quality=int(self.cfg.preview.jpeg_quality))
                 else:
                     if overlay_enabled:
                         _, u8_preview = make_preview_jpeg(
                             u,
                             ds=ds,
-                            plo=float(self._pending_preview_cfg.stretch_plo),
-                            phi=float(self._pending_preview_cfg.stretch_phi),
-                            jpeg_quality=int(self._pending_preview_cfg.jpeg_quality),
+                            plo=float(self.cfg.preview.stretch_plo),
+                            phi=float(self.cfg.preview.stretch_phi),
+                            jpeg_quality=int(self.cfg.preview.jpeg_quality),
                             sample_stride=4,
                         )
                         u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
-                        jpg = encode_jpeg(u8_preview, quality=int(self._pending_preview_cfg.jpeg_quality))
+                        jpg = encode_jpeg(u8_preview, quality=int(self.cfg.preview.jpeg_quality))
                     else:
                         jpg, _ = make_preview_jpeg(
                             u,
                             ds=ds,
-                            plo=float(self._pending_preview_cfg.stretch_plo),
-                            phi=float(self._pending_preview_cfg.stretch_phi),
-                            jpeg_quality=int(self._pending_preview_cfg.jpeg_quality),
+                            plo=float(self.cfg.preview.stretch_plo),
+                            phi=float(self.cfg.preview.stretch_phi),
+                            jpeg_quality=int(self.cfg.preview.jpeg_quality),
                             sample_stride=4,
                         )
 
@@ -1178,7 +1237,7 @@ class AppRunner:
             log_error(self.out_log, "Hotpix: failed to build mask", exc)
             return
 
-        cam_cfg = self._pending_camera_cfg
+        cam_cfg = self.cfg.camera
         frame_meta = last_frame.meta if last_frame and last_frame.meta else {}
         roi = frame_meta.get("roi")
 
@@ -1577,7 +1636,7 @@ class AppRunner:
         # ---- Camera ----
         if t == ActionType.CAMERA_CONNECT:
             idx = int(p.get("camera_index", 0))
-            self._pending_camera_cfg.camera_index = idx
+            self.cfg.camera.camera_index = idx
             self._connect_camera(idx)
             return
 
@@ -1590,6 +1649,16 @@ class AppRunner:
             name = str(p.get("name", ""))
             value = p.get("value", None)
             self._apply_camera_param(name, value)
+            return
+
+        if t == ActionType.RESET_CAMERA_DEFAULTS:
+            self._reset_camera_defaults()
+            log_info(self.out_log, "Camera: RESET_DEFAULTS")
+            return
+
+        if t == ActionType.RESET_PREVIEW_DEFAULTS:
+            self._reset_preview_defaults()
+            log_info(self.out_log, "Preview: RESET_DEFAULTS")
             return
 
         # ---- Mount ----
@@ -1624,6 +1693,11 @@ class AppRunner:
             self._tracking_keyframe_reset()
             return
 
+        if t == ActionType.RESET_MOUNT_DEFAULTS:
+            self._reset_mount_defaults()
+            log_info(self.out_log, "Mount: RESET_DEFAULTS")
+            return
+
         # ---- Tracking ----
         if t == ActionType.TRACKING_START:
             self._set_state_safe(tracking_enabled=True)
@@ -1642,6 +1716,11 @@ class AppRunner:
             if isinstance(p, dict):
                 tracking_set_params(self._tracking_state, **p)
                 log_info(self.out_log, f"Tracking: SET_PARAMS {list(p.keys())}")
+            return
+
+        if t == ActionType.RESET_TRACKING_DEFAULTS:
+            self._reset_tracking_defaults()
+            log_info(self.out_log, "Tracking: RESET_DEFAULTS")
             return
 
         # ---- Stacking ----
@@ -1668,6 +1747,11 @@ class AppRunner:
             if isinstance(p, dict):
                 self._stacking.set_params(**p)
                 log_info(self.out_log, f"Stacking: SET_PARAMS {list(p.keys())}")
+            return
+
+        if t == ActionType.RESET_STACKING_DEFAULTS:
+            self._reset_stacking_defaults()
+            log_info(self.out_log, "Stacking: RESET_DEFAULTS")
             return
 
         # Save stacked mosaic (raw + stretch)
@@ -1704,6 +1788,11 @@ class AppRunner:
             )
             return
 
+        if t == ActionType.RESET_HOTPIXELS_DEFAULTS:
+            self._reset_hotpixels_defaults()
+            log_info(self.out_log, "Hotpix: RESET_DEFAULTS")
+            return
+
         # ---- Platesolve ----
         if t == ActionType.PLATESOLVE_SET_PARAMS:
             # Permite actualizar PlatesolveConfig desde UI sin reimportar
@@ -1715,12 +1804,17 @@ class AppRunner:
 
                 # Rebuild dataclass con campos existentes
                 with self._platesolve_cfg_lock:
-                    d = dict(self._platesolve_cfg.__dict__)
+                    d = dict(self.cfg.platesolve.__dict__)
                     for k, v in payload.items():
                         if k in d:
                             d[k] = v
-                    self._platesolve_cfg = PlatesolveConfig(**d)
+                    self.cfg.platesolve = PlatesolveConfig(**d)
                 log_info(self.out_log, f"Platesolve: SET_PARAMS {list(payload.keys())}")
+            return
+
+        if t == ActionType.RESET_PLATESOLVE_DEFAULTS:
+            self._reset_platesolve_defaults()
+            log_info(self.out_log, "Platesolve: RESET_DEFAULTS")
             return
 
         # ---- Live SEP overlay ----
