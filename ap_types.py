@@ -13,12 +13,6 @@ class Axis(str, Enum):
     ALT = "alt"
 
 
-class TrackSource(str, Enum):
-    LUMA = "luma"
-    GREEN = "green"
-    FULL = "full"
-
-
 class DisplayMode(str, Enum):
     RAW = "Raw"
     AUTOSTRETCH = "AutoStretch"
@@ -31,8 +25,8 @@ class Frame:
     """
     Frame lógico del sistema.
 
-    - u8_view: imagen barata (uint8) para preview/tracking (H x W)
-    - raw: frame full-res (p.ej. uint16 o uint8) opcional para stacking/platesolve
+    - raw: frame full-res (uint16 Bayer) para todo el pipeline geométrico
+    - u8_view: vista opcional para preview legacy (si existe)
     """
     t_capture: float
     seq: int
@@ -40,8 +34,8 @@ class Frame:
     h: int
     fmt: str
 
-    u8_view: np.ndarray
-    raw: Optional[np.ndarray] = None
+    raw: np.ndarray
+    u8_view: Optional[np.ndarray] = None
 
     meta: Optional[Dict[str, Any]] = None  # exp_ms, gain, binning, roi, etc.
 

@@ -45,11 +45,9 @@ def _require_poa() -> None:
 def _imgfmt_from_str(name: str) -> pyPOACamera.POAImgFormat:
     _require_poa()
     n = (name or "").strip().upper()
-    if n in ("RAW8", "POA_RAW8"):
-        return pyPOACamera.POAImgFormat.POA_RAW8
     if n in ("RAW16", "POA_RAW16"):
         return pyPOACamera.POAImgFormat.POA_RAW16
-    # fallback seguro
+    # fallback seguro (RAW16 único permitido)
     return pyPOACamera.POAImgFormat.POA_RAW16
 
 
@@ -218,7 +216,7 @@ class POACameraDevice:
         if bin_hw < 1:
             bin_hw = 1
 
-        img_fmt = _imgfmt_from_str(cfg.img_format)
+        img_fmt = pyPOACamera.POAImgFormat.POA_RAW16
 
         # aplicar
         pyPOACamera.SetImageStartPos(self.cam_id, x, y)
@@ -299,10 +297,7 @@ class CameraStream:
     - No hace JPEG, no hace UI.
     - Publica el último frame disponible vía latest().
 
-    Nota: para performance, entrega u8_view barato:
-    - RAW8/MONO8: reshape
-    - RAW16: view <u2 y luego >>8 (genera u8_view)
-    - RGB24: reshape HxWx3
+    Nota: el pipeline solo usa RAW16; u8_view queda opcional para compatibilidad.
     """
 
     def __init__(self, ring: int = 3) -> None:
@@ -441,26 +436,13 @@ class CameraStream:
             seq = self._seq
 
             # construir vistas sin copias grandes cuando se puede
-            if fmt in (pyPOACamera.POAImgFormat.POA_RAW8, pyPOACamera.POAImgFormat.POA_MONO8):
-                u8 = buf[: w * h].reshape(h, w)
-                u8_view = u8
-                raw = u8
-            elif fmt == pyPOACamera.POAImgFormat.POA_RAW16:
-                # reinterpretación little-endian
-                u16 = buf[: w * h * 2].view("<u2").reshape(h, w)
-                # vista barata para preview/tracking
-                u8_view = (u16 >> 8).astype(np.uint8, copy=False)
-                # RAW full-res para stacking (sin copia; OJO: referencia al buffer ring)
-                raw = u16
-            elif fmt == pyPOACamera.POAImgFormat.POA_RGB24:
-                rgb = buf[: w * h * 3].reshape(h, w, 3)
-                u8_view = rgb  # para preview directo (pero pesa más)
-                raw = rgb
-            else:
-                # fallback: tratar como RAW16
-                u16 = buf[: w * h * 2].view("<u2").reshape(h, w)
-                u8_view = (u16 >> 8).astype(np.uint8, copy=False)
-                raw = u16
+            if fmt != pyPOACamera.POAImgFormat.POA_RAW16:
+                raise RuntimeError(f"CameraStream: unexpected format {fmt} (RAW16 required)")
+
+            # reinterpretación little-endian
+            u16 = buf[: w * h * 2].view("<u2").reshape(h, w)
+            raw = u16
+            u8_view = None
 
             # Importante: raw/u8_view apuntan a memoria del ring buffer.
             # El consumidor debe copiar si necesita persistir.
@@ -470,8 +452,8 @@ class CameraStream:
                 w=w,
                 h=h,
                 fmt=fmt.name,
-                u8_view=u8_view,
                 raw=raw,
+                u8_view=u8_view,
                 meta=dict(meta_common),
             )
 
