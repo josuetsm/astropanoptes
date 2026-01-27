@@ -17,7 +17,8 @@ from actions import Action, ActionType
 from logging_utils import log_info, log_error
 
 from camera_poa import POACameraDevice, CameraStream
-from imaging import make_preview_jpeg, extract_align_mono_u16
+from imaging import ensure_raw16_bayer, bayer_green_u8_from_u16
+from preview import make_preview_jpeg, encode_jpeg
 from mount_arduino import ArduinoMount
 
 from tracking import make_tracking_state, tracking_step, tracking_set_params
@@ -504,20 +505,16 @@ class AppRunner:
             return
 
         try:
-            u = fr.u8_view
             ds = int(self._pending_preview_cfg.ds)
             overlay_enabled = bool(self._live_sep_overlay_enabled)
-            from imaging import encode_jpeg  # evita ciclos
 
-            if u.ndim == 3 and u.shape[2] == 3:
-                u8_preview = u[::ds, ::ds, :] if ds > 1 else u
-                if overlay_enabled:
-                    u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
-                jpg = encode_jpeg(u8_preview, quality=int(self._pending_preview_cfg.jpeg_quality))
-            else:
+            if getattr(fr, "raw", None) is not None:
+                raw16 = ensure_raw16_bayer(fr.raw)
+                bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
+                green_u8 = bayer_green_u8_from_u16(raw16, bayer)
                 if overlay_enabled:
                     _, u8_preview = make_preview_jpeg(
-                        u,
+                        green_u8,
                         ds=ds,
                         plo=float(self._pending_preview_cfg.stretch_plo),
                         phi=float(self._pending_preview_cfg.stretch_phi),
@@ -528,13 +525,41 @@ class AppRunner:
                     jpg = encode_jpeg(u8_preview, quality=int(self._pending_preview_cfg.jpeg_quality))
                 else:
                     jpg, _ = make_preview_jpeg(
-                        u,
+                        green_u8,
                         ds=ds,
                         plo=float(self._pending_preview_cfg.stretch_plo),
                         phi=float(self._pending_preview_cfg.stretch_phi),
                         jpeg_quality=int(self._pending_preview_cfg.jpeg_quality),
                         sample_stride=4,
                     )
+            else:
+                u = fr.u8_view
+                if u.ndim == 3 and u.shape[2] == 3:
+                    u8_preview = u[::ds, ::ds, :] if ds > 1 else u
+                    if overlay_enabled:
+                        u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
+                    jpg = encode_jpeg(u8_preview, quality=int(self._pending_preview_cfg.jpeg_quality))
+                else:
+                    if overlay_enabled:
+                        _, u8_preview = make_preview_jpeg(
+                            u,
+                            ds=ds,
+                            plo=float(self._pending_preview_cfg.stretch_plo),
+                            phi=float(self._pending_preview_cfg.stretch_phi),
+                            jpeg_quality=int(self._pending_preview_cfg.jpeg_quality),
+                            sample_stride=4,
+                        )
+                        u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
+                        jpg = encode_jpeg(u8_preview, quality=int(self._pending_preview_cfg.jpeg_quality))
+                    else:
+                        jpg, _ = make_preview_jpeg(
+                            u,
+                            ds=ds,
+                            plo=float(self._pending_preview_cfg.stretch_plo),
+                            phi=float(self._pending_preview_cfg.stretch_phi),
+                            jpeg_quality=int(self._pending_preview_cfg.jpeg_quality),
+                            sample_stride=4,
+                        )
 
             with self._preview_lock:
                 self._latest_preview_jpeg = jpg
@@ -561,12 +586,9 @@ class AppRunner:
         try:
             raw_gray = None
             if getattr(fr, "raw", None) is not None:
-                try:
-                    bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
-                except Exception as exc:
-                    log_error(self.out_log, "Live SEP: failed to read bayer pattern metadata", exc, throttle_s=10.0, throttle_key="live_sep_bayer")
-                    bayer = "RGGB"
-                raw_gray = extract_align_mono_u16(fr.raw, str(fr.fmt or "RAW16"), bayer_pattern=bayer)
+                bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
+                raw16 = ensure_raw16_bayer(fr.raw)
+                raw_gray = bayer_green_u8_from_u16(raw16, bayer)
             else:
                 raw_gray = fr.u8_view
 
@@ -962,9 +984,12 @@ class AppRunner:
                         observer=self._platesolve_observer,
                     )
     
-                    # Frame para solver: mono estable (evita mosaico Bayer directo en SEP)
+                    # Frame para solver: usar verde (half-res) y reescalar a full-res para SEP
                     bayer = str((meta or {}).get("bayer_pattern", "RGGB"))
-                    frame = extract_align_mono_u16(raw_in, fmt, bayer_pattern=bayer)
+                    raw16 = ensure_raw16_bayer(raw_in)
+                    green_u8 = bayer_green_u8_from_u16(raw16, bayer)
+                    green_full = cv2.resize(green_u8, (raw16.shape[1], raw16.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    frame = green_full.astype(np.uint16) << 8
     
                     # Debug de stats de entrada (opcional)
                     debug_stats = bool(getattr(self._platesolve_cfg, "debug_input_stats", False))
@@ -1144,29 +1169,8 @@ class AppRunner:
             last_seq = fr.seq
             last_frame = fr
 
-            raw = fr.raw
-            fmt = str(fr.fmt or "")
-            fmt_upper = fmt.upper()
-
-            if raw is None or not hasattr(raw, "ndim"):
-                log_info(self.out_log, "Hotpix: frame missing raw data")
-                return
-
-            if raw.ndim != 2:
-                log_info(self.out_log, f"Hotpix: frame not 2D (shape={getattr(raw, 'shape', None)})")
-                return
-
-            if raw.dtype == np.uint16:
-                frame_u16 = raw.copy()
-            elif raw.dtype == np.uint8 or "RAW8" in fmt_upper or "MONO8" in fmt_upper:
-                frame_u16 = raw.astype(np.uint16) * 257
-            elif "RAW16" in fmt_upper:
-                frame_u16 = raw.astype(np.uint16, copy=False).copy()
-            else:
-                log_info(self.out_log, f"Hotpix: unsupported frame dtype={raw.dtype} fmt={fmt}")
-                return
-
-            frames.append(frame_u16)
+            raw16 = ensure_raw16_bayer(fr.raw)
+            frames.append(raw16.copy())
 
         if len(frames) < n_frames:
             log_info(self.out_log, f"Hotpix: calibration timed out ({len(frames)}/{n_frames} frames)")
@@ -1412,12 +1416,11 @@ class AppRunner:
                 fr = self._cam_stream.latest()
                 if fr is not None:
                     # Obtener un mono uint16 robusto para tracking (evita usar u8_view cuando el stream es RAW16)
-                    try:
-                        bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
-                    except Exception as exc:
-                        log_error(self.out_log, "Tracking: failed to read bayer pattern metadata", exc, throttle_s=10.0, throttle_key="tracking_bayer")
-                        bayer = "RGGB"
-                    frame_u16 = extract_align_mono_u16(fr.raw, str(fr.fmt or "RAW16"), bayer_pattern=bayer)
+                    bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
+                    raw16 = ensure_raw16_bayer(fr.raw)
+                    green_u8 = bayer_green_u8_from_u16(raw16, bayer)
+                    green_full = cv2.resize(green_u8, (raw16.shape[1], raw16.shape[0]), interpolation=cv2.INTER_LINEAR)
+                    frame_u16 = green_full.astype(np.uint16) << 8
 
                     try:
                         out = tracking_step(
@@ -1464,25 +1467,8 @@ class AppRunner:
             if self._stacking_enabled and (self._cam_stream is not None):
                 fr = self._cam_stream.latest()
                 if fr is not None:
-                    if getattr(fr, "raw", None) is not None:
-                        raw = fr.raw
-                        fmt = str(fr.fmt or "RAW16").upper()
-                        if "RAW" in fmt and "16" in fmt:
-                            fmt = "RAW16"
-                        elif "RAW" in fmt and "8" in fmt:
-                            fmt = "RAW8"
-                        elif "RGB" in fmt:
-                            fmt = "RGB24"
-                        elif "MONO" in fmt and "8" in fmt:
-                            fmt = "MONO8"
-                        elif "MONO" in fmt and "16" in fmt:
-                            fmt = "MONO16"
-                    else:
-                        u8 = fr.u8_view
-                        raw = (u8.astype("uint16") * 257)
-                        fmt = "MONO16"
-
-                    self._stacking.enqueue_frame(raw.copy(), fmt=fmt, t=_now_s())
+                    raw16 = ensure_raw16_bayer(fr.raw)
+                    self._stacking.enqueue_frame(raw16.copy(), t=_now_s())
 
             # 2d) publish stacking metrics
             m = self._stacking.engine.metrics
