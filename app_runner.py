@@ -18,7 +18,7 @@ from logging_utils import log_info, log_error
 
 from camera_poa import POACameraDevice, CameraStream
 from imaging import ensure_raw16_bayer, bayer_green_u8_from_u16
-from preview import make_preview_jpeg, encode_jpeg
+from preview import make_preview_jpeg, encode_jpeg, stretch_to_u8
 from mount_arduino import ArduinoMount
 
 from tracking import make_tracking_state, tracking_step, tracking_set_params
@@ -1067,6 +1067,88 @@ class AppRunner:
         self._platesolve_last_auto_t = float(now)
 
     # -------------------------
+    # Stacking save helper
+    # -------------------------
+    def _save_stacking(self, out_dir: str, basename: str, fmt: str) -> None:
+        """
+        Assemble the current mosaic of stacked tiles and save it to disk.
+
+        Two files are produced:
+          - a raw floating-point numpy array (.npy) capturing the full
+            dynamic range of the mosaic;
+          - a stretched PNG image (.png) for quick viewing.
+        The output directory is created if necessary.  Errors are logged but
+        otherwise ignored.
+
+        Parameters
+        ----------
+        out_dir : str
+            Directory in which to save the files.
+        basename : str
+            Base name for the output files; suffixes `_raw.npy` and
+            `_stretch.png` will be appended.
+        fmt : str
+            Ignored; included for API compatibility.
+        """
+        eng = self._stacking.engine
+        try:
+            if eng.canvas is None or eng.canvas.num_tiles() == 0:
+                log_info(self.out_log, "Stacking: save skipped (no data)")
+                return
+
+            canvas = eng.canvas
+            tile_size = canvas.tile_size
+            keys = list(canvas.tiles.keys())
+            txs = [k[0] for k in keys]
+            tys = [k[1] for k in keys]
+            tx_min, tx_max = min(txs), max(txs)
+            ty_min, ty_max = min(tys), max(tys)
+            width = (tx_max - tx_min + 1) * tile_size
+            height = (ty_max - ty_min + 1) * tile_size
+            if eng.color_mode == "mono":
+                out = np.zeros((height, width), dtype=np.float32)
+                wgt = np.zeros((height, width), dtype=np.float32)
+            else:
+                out = np.zeros((height, width, 3), dtype=np.float32)
+                wgt = np.zeros((height, width), dtype=np.float32)
+            for (tx, ty), tile in canvas.tiles.items():
+                x0 = (tx - tx_min) * tile_size
+                y0 = (ty - ty_min) * tile_size
+                tile_sum = tile.sum.astype(np.float32, copy=False)
+                tile_w = tile.w.astype(np.float32, copy=False)
+                if eng.color_mode == "mono":
+                    out[y0 : y0 + tile_size, x0 : x0 + tile_size] += tile_sum
+                    wgt[y0 : y0 + tile_size, x0 : x0 + tile_size] += tile_w
+                else:
+                    out[y0 : y0 + tile_size, x0 : x0 + tile_size] += tile_sum
+                    wgt[y0 : y0 + tile_size, x0 : x0 + tile_size] += tile_w
+            if eng.color_mode == "mono":
+                mask = wgt > 0
+                out[mask] = out[mask] / wgt[mask]
+            else:
+                mask = wgt > 0
+                for c in range(3):
+                    out[..., c][mask] = out[..., c][mask] / wgt[mask]
+            # Create output directory
+            try:
+                Path(out_dir).mkdir(parents=True, exist_ok=True)
+            except Exception:
+                pass
+            # Save raw
+            raw_path = os.path.join(out_dir, f"{basename}_raw.npy")
+            np.save(raw_path, out)
+            # Save stretched image
+            u8 = stretch_to_u8(out)
+            stretch_path = os.path.join(out_dir, f"{basename}_stretch.png")
+            if eng.color_mode == "mono":
+                cv2.imwrite(stretch_path, u8)
+            else:
+                cv2.imwrite(stretch_path, cv2.cvtColor(u8, cv2.COLOR_RGB2BGR))
+            log_info(self.out_log, f"Stacking: saved raw to {raw_path} and stretch to {stretch_path}")
+        except Exception as exc:
+            log_error(self.out_log, "Stacking: save failed", exc)
+
+    # -------------------------
     # Hotpixel calibration
     # -------------------------
     def _hotpix_start_worker_if_needed(
@@ -1620,6 +1702,22 @@ class AppRunner:
             if isinstance(p, dict):
                 self._stacking.set_params(**p)
                 log_info(self.out_log, f"Stacking: SET_PARAMS {list(p.keys())}")
+            return
+
+        # Save stacked mosaic (raw + stretch)
+        if t == ActionType.STACKING_SAVE:
+            # Payload should contain out_dir, basename, fmt; defaults provided
+            if isinstance(p, dict):
+                out_dir = str(p.get("out_dir", "stack_output"))
+                basename = str(p.get("basename", "stack"))
+                fmt = str(p.get("fmt", "png"))
+                self._save_stacking(out_dir, basename, fmt)
+            else:
+                # Fallback to default directory and timestamp
+                out_dir = "stack_output"
+                basename = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                fmt = "png"
+                self._save_stacking(out_dir, basename, fmt)
             return
 
         if t == ActionType.HOTPIX_CALIBRATE:
