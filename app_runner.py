@@ -32,7 +32,6 @@ from platesolve import (
     PlatesolveConfig,
     ObserverConfig,
     platesolve_from_live,
-    platesolve_from_stack,
     save_gaia_auth,
     load_gaia_auth,
 )
@@ -155,7 +154,6 @@ class AppRunner:
         self._platesolve_pending: Optional[Dict[str, Any]] = None
         self._platesolve_last_auto_t = 0.0
         self._platesolve_auto_target: str = ""
-        self._platesolve_auto_source: str = "live"
 
         # Hotpixel calibration (thread dedicado)
         self._hotpix_lock = threading.Lock()
@@ -802,7 +800,7 @@ class AppRunner:
         Toma requests desde self._platesolve_pending (la última gana).
     
         Además, en cada solve guarda un "snapshot" reproducible en disco:
-          - raw (exacto desde la cámara o stack) + meta + config + target/source
+          - raw (exacto desde la cámara) + meta + config + target/source
           - u8_view (si existe) para inspección rápida
           - debug_jpeg + debug_info/result para reproducir el diagnóstico
         """
@@ -893,7 +891,6 @@ class AppRunner:
             dump_base: Optional[str] = None
     
             try:
-                source = str(req.get("source", "live")).lower().strip()
                 target = req.get("target", None)
     
                 if target is None:
@@ -907,127 +904,90 @@ class AppRunner:
                     continue
     
                 # -------------------------
-                # Obtener frame + snapshot
+                # Obtener frame + snapshot (solo live)
                 # -------------------------
-                if source == "stack":
-                    stack = self._stacking.engine.get_latest_stack_frame()
-                    if stack is None:
-                        self._set_state_safe(
-                            platesolve_busy=False,
-                            platesolve_status="ERR_NO_STACK",
-                            platesolve_last_ok=False,
-                            platesolve_debug_jpeg=None,
-                            platesolve_debug_info={"status": "ERR_NO_STACK"},
-                        )
-                        continue
-    
-                    # RAW para reproducir (exacto)
-                    raw_in = np.ascontiguousarray(stack)
-                    dump_base = _dump_snapshot(
-                        source="stack",
-                        target=target,
-                        raw=raw_in,
-                        fmt="STACK",
-                        meta={"note": "latest stack frame"},
-                        u8_view=None,
-                        cfg=self._platesolve_cfg,
-                        observer=self._platesolve_observer,
+                if self._cam_stream is None:
+                    self._set_state_safe(
+                        platesolve_busy=False,
+                        platesolve_status="ERR_NO_CAMERA",
+                        platesolve_last_ok=False,
+                        platesolve_debug_jpeg=None,
+                        platesolve_debug_info={"status": "ERR_NO_CAMERA"},
                     )
-    
-                    # Frame para solver (para stack asumimos ya mono/stackeado)
-                    frame = raw_in
-    
-                    result = platesolve_from_stack(
-                        frame,
-                        target=target,
-                        cfg=self._platesolve_cfg,
-                        observer=self._platesolve_observer,
-                        progress_cb=None,
+                    continue
+
+                fr = self._cam_stream.latest()
+                if fr is None:
+                    self._set_state_safe(
+                        platesolve_busy=False,
+                        platesolve_status="ERR_NO_FRAME",
+                        platesolve_last_ok=False,
+                        platesolve_debug_jpeg=None,
+                        platesolve_debug_info={"status": "ERR_NO_FRAME"},
                     )
-    
-                else:
-                    if self._cam_stream is None:
-                        self._set_state_safe(
-                            platesolve_busy=False,
-                            platesolve_status="ERR_NO_CAMERA",
-                            platesolve_last_ok=False,
-                            platesolve_debug_jpeg=None,
-                            platesolve_debug_info={"status": "ERR_NO_CAMERA"},
-                        )
-                        continue
-    
-                    fr = self._cam_stream.latest()
-                    if fr is None:
-                        self._set_state_safe(
-                            platesolve_busy=False,
-                            platesolve_status="ERR_NO_FRAME",
-                            platesolve_last_ok=False,
-                            platesolve_debug_jpeg=None,
-                            platesolve_debug_info={"status": "ERR_NO_FRAME"},
-                        )
-                        continue
-    
-                    # RAW exacto + meta para reproducir mañana
-                    fmt = str(getattr(fr, "fmt", "") or "RAW16")
-                    meta = dict(getattr(fr, "meta", {}) or {})
-                    raw_in = np.ascontiguousarray(fr.raw)
-                    u8_in = np.ascontiguousarray(fr.u8_view) if hasattr(fr, "u8_view") else None
-    
-                    dump_base = _dump_snapshot(
-                        source="live",
-                        target=target,
-                        raw=raw_in,
-                        fmt=fmt,
-                        meta=meta,
-                        u8_view=u8_in,
-                        cfg=self._platesolve_cfg,
-                        observer=self._platesolve_observer,
-                    )
-    
-                    # Frame para solver: usar verde (half-res) y reescalar a full-res para SEP
-                    bayer = str((meta or {}).get("bayer_pattern", "RGGB"))
-                    raw16 = ensure_raw16_bayer(raw_in)
-                    green_u8 = bayer_green_u8_from_u16(raw16, bayer)
-                    green_full = cv2.resize(green_u8, (raw16.shape[1], raw16.shape[0]), interpolation=cv2.INTER_LINEAR)
-                    frame = green_full.astype(np.uint16) << 8
-    
-                    # Debug de stats de entrada (opcional)
-                    debug_stats = bool(getattr(self._platesolve_cfg, "debug_input_stats", False))
-    
-                    def _stats(a: np.ndarray, name: str) -> None:
-                        if not debug_stats:
-                            return
-                        a = np.asarray(a)
-                        log_info(self.out_log, f"[{name}] shape={a.shape} dtype={a.dtype} C={a.flags['C_CONTIGUOUS']}")
-                        if a.size == 0:
-                            log_info(self.out_log, "  EMPTY")
-                            return
-                        if a.ndim == 1:
-                            log_info(self.out_log, f"  1D buffer: min={a.min()} max={a.max()} mean={a.mean():.3g}")
-                            return
-                        flat = a.reshape(-1)
-                        p = np.percentile(flat, [0, 1, 5, 50, 95, 99, 100])
-                        log_info(self.out_log, f"  min/p1/p5/p50/p95/p99/max = {p}")
-                        log_info(self.out_log, f"  mean={flat.mean():.3g} std={flat.std():.3g}")
-                        if a.dtype == np.uint16:
-                            log_info(self.out_log, f"  sat65535={np.mean(flat == 65535):.4f}")
-                        if a.dtype == np.uint8:
-                            log_info(self.out_log, f"  sat255={np.mean(flat == 255):.4f}")
-    
-                    _stats(raw_in, "fr.raw")
-                    if hasattr(fr, "u16") and fr.u16 is not None:
-                        _stats(fr.u16, "fr.u16")
-                    if hasattr(fr, "u8_view") and fr.u8_view is not None:
-                        _stats(fr.u8_view, "fr.u8_view")
-                    _stats(frame, "frame(mono_u16)")
-    
-                    result = platesolve_from_live(
-                        frame,
-                        target=target,
-                        cfg=self._platesolve_cfg,
-                        observer=self._platesolve_observer,
-                        progress_cb=None,
-                    )
+                    continue
+
+                # RAW exacto + meta para reproducir mañana
+                fmt = str(getattr(fr, "fmt", "") or "RAW16")
+                meta = dict(getattr(fr, "meta", {}) or {})
+                raw_in = np.ascontiguousarray(fr.raw)
+                u8_in = np.ascontiguousarray(fr.u8_view) if hasattr(fr, "u8_view") else None
+
+                dump_base = _dump_snapshot(
+                    source="live",
+                    target=target,
+                    raw=raw_in,
+                    fmt=fmt,
+                    meta=meta,
+                    u8_view=u8_in,
+                    cfg=self._platesolve_cfg,
+                    observer=self._platesolve_observer,
+                )
+
+                # Frame para solver: usar verde (half-res) y reescalar a full-res para SEP
+                bayer = str((meta or {}).get("bayer_pattern", "RGGB"))
+                raw16 = ensure_raw16_bayer(raw_in)
+                green_u8 = bayer_green_u8_from_u16(raw16, bayer)
+                green_full = cv2.resize(green_u8, (raw16.shape[1], raw16.shape[0]), interpolation=cv2.INTER_LINEAR)
+                frame = green_full.astype(np.uint16) << 8
+
+                # Debug de stats de entrada (opcional)
+                debug_stats = bool(getattr(self._platesolve_cfg, "debug_input_stats", False))
+
+                def _stats(a: np.ndarray, name: str) -> None:
+                    if not debug_stats:
+                        return
+                    a = np.asarray(a)
+                    log_info(self.out_log, f"[{name}] shape={a.shape} dtype={a.dtype} C={a.flags['C_CONTIGUOUS']}")
+                    if a.size == 0:
+                        log_info(self.out_log, "  EMPTY")
+                        return
+                    if a.ndim == 1:
+                        log_info(self.out_log, f"  1D buffer: min={a.min()} max={a.max()} mean={a.mean():.3g}")
+                        return
+                    flat = a.reshape(-1)
+                    p = np.percentile(flat, [0, 1, 5, 50, 95, 99, 100])
+                    log_info(self.out_log, f"  min/p1/p5/p50/p95/p99/max = {p}")
+                    log_info(self.out_log, f"  mean={flat.mean():.3g} std={flat.std():.3g}")
+                    if a.dtype == np.uint16:
+                        log_info(self.out_log, f"  sat65535={np.mean(flat == 65535):.4f}")
+                    if a.dtype == np.uint8:
+                        log_info(self.out_log, f"  sat255={np.mean(flat == 255):.4f}")
+
+                _stats(raw_in, "fr.raw")
+                if hasattr(fr, "u16") and fr.u16 is not None:
+                    _stats(fr.u16, "fr.u16")
+                if hasattr(fr, "u8_view") and fr.u8_view is not None:
+                    _stats(fr.u8_view, "fr.u8_view")
+                _stats(frame, "frame(mono_u16)")
+
+                result = platesolve_from_live(
+                    frame,
+                    target=target,
+                    cfg=self._platesolve_cfg,
+                    observer=self._platesolve_observer,
+                    progress_cb=None,
+                )
     
                 # -------------------------
                 # Debug outputs (jpeg + info)
@@ -1082,12 +1042,12 @@ class AppRunner:
                 log_error(self.out_log, "Platesolve: failed", exc)
 
 
-    def _platesolve_request(self, *, source: str, target: Any) -> None:
+    def _platesolve_request(self, *, target: Any) -> None:
         """
         Encola un request para platesolve. Si hay uno pendiente, se reemplaza.
         """
         with self._platesolve_lock:
-            self._platesolve_pending = {"source": str(source), "target": target}
+            self._platesolve_pending = {"target": target}
         self._platesolve_start_worker_if_needed()
 
     def _maybe_autosolve(self) -> None:
@@ -1097,14 +1057,13 @@ class AppRunner:
         target = str(self._platesolve_auto_target or "").strip()
         if not target:
             return
-        source = str(self._platesolve_auto_source or "live")
         st = self.get_state()
         if bool(getattr(st, "platesolve_busy", False)):
             return
         now = _perf()
         if (now - float(self._platesolve_last_auto_t)) < max(2.0, float(getattr(cfg, "solve_every_s", 15.0))):
             return
-        self._platesolve_request(source=source, target=target)
+        self._platesolve_request(target=target)
         self._platesolve_last_auto_t = float(now)
 
     # -------------------------
@@ -1689,8 +1648,6 @@ class AppRunner:
                 payload = dict(p)
                 if "auto_target" in payload:
                     self._platesolve_auto_target = str(payload.pop("auto_target") or "")
-                if "auto_source" in payload:
-                    self._platesolve_auto_source = str(payload.pop("auto_source") or "live")
 
                 # Rebuild dataclass con campos existentes
                 d = dict(self._platesolve_cfg.__dict__)
@@ -1715,10 +1672,8 @@ class AppRunner:
 
         if t == ActionType.PLATESOLVE_RUN:
             # Payload esperado:
-            #  - source: "live" o "stack"
             #  - target: str|tuple|dict (ver platesolve.py)
             #  - (opcional) gaia_username / gaia_password (persistir)
-            source = str(p.get("source", "live"))
             target = p.get("target", None)
 
             # Si vienen credenciales, persistirlas
@@ -1728,8 +1683,8 @@ class AppRunner:
                 save_gaia_auth(user, pw)
                 log_info(self.out_log, "Platesolve: Gaia credentials saved")
 
-            self._platesolve_request(source=source, target=target)
-            log_info(self.out_log, f"Platesolve: RUN source={source}")
+            self._platesolve_request(target=target)
+            log_info(self.out_log, "Platesolve: RUN source=live")
             return
 
         # ---- GoTo ----

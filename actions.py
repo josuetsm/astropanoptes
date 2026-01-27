@@ -212,8 +212,8 @@ def hotpix_calibrate(
 # -------------------------
 # Factories: PlateSolve
 # -------------------------
-def platesolve_run(source: str, target: Any, **kwargs: Any) -> Action:
-    payload = {"source": str(source), "target": target}
+def platesolve_run(target: Any, **kwargs: Any) -> Action:
+    payload = {"target": target}
     payload.update(dict(kwargs))
     return Action(ActionType.PLATESOLVE_RUN, payload, _now())
 
