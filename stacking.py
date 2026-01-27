@@ -13,14 +13,17 @@ from typing import Dict, Tuple, Optional, Any, List, Literal
 import numpy as np
 import cv2
 
-from hotpixels import hotpix_prefilter_base, apply_hotpixel_mask_replace
+from hotpixels import hotpix_prefilter_base
 from config import AppConfig
 from imaging import (
-    downsample_u16,
-    extract_align_mono_u16,
+    ensure_raw16_bayer,
+    apply_hotpixel_mask_replace,
+    bayer_green_u8_from_u16,
     debayer_cv2,
-    stretch_to_u8,
+    half_to_full_shift,
+    warp_rgb16,
 )
+from preview import stretch_to_u8
 from logging_utils import log_error, log_info
 
 # ============================================================
@@ -180,6 +183,14 @@ def _phasecorr_shift_validated(a_u16: np.ndarray, b_u16: np.ndarray) -> Tuple[fl
     return dx, dy, resp
 
 
+def _downsample_u8(u8: np.ndarray, factor: int) -> np.ndarray:
+    if factor <= 1:
+        return u8
+    h, w = u8.shape[:2]
+    nh, nw = h // factor, w // factor
+    return cv2.resize(u8, (nw, nh), interpolation=cv2.INTER_AREA)
+
+
 # ============================================================
 # Affine / tiling helpers
 # ============================================================
@@ -297,43 +308,6 @@ def _corners_bbox_out(
     return float(u.min()), float(v.min()), float(u.max()), float(v.max())
 
 
-def _to_stack_src(
-    raw: np.ndarray,
-    fmt: str,
-    *,
-    color_mode: ColorMode,
-    bayer_pattern: str,
-    pixfrac: float,
-) -> Tuple[np.ndarray, Tuple[int, int], bool]:
-    """
-    Convert input frame into float32 source for warping/accumulation.
-    Returns (src_f32, (h,w), is_color).
-    """
-    fmt_u = str(fmt).upper()
-
-    if color_mode == "mono":
-        mono_u16 = extract_align_mono_u16(raw, fmt_u, bayer_pattern=bayer_pattern)
-        src = mono_u16.astype(np.float32, copy=False)
-        if pixfrac > 0.7:
-            src = cv2.GaussianBlur(src, (0, 0), sigmaX=0.6, sigmaY=0.6)
-        return src, mono_u16.shape, False
-
-    # rgb stacking
-    if fmt_u.startswith("RAW"):
-        rgb = debayer_cv2(raw, pattern=bayer_pattern, edge_aware=False)
-    elif fmt_u.startswith("RGB"):
-        rgb = raw
-        assert rgb.ndim == 3 and rgb.shape[2] == 3, f"Expected RGB frame (H,W,3), got shape={rgb.shape}"
-    else:
-        mono_u16 = extract_align_mono_u16(raw, fmt_u, bayer_pattern=bayer_pattern)
-        rgb = np.repeat(mono_u16[..., None], 3, axis=2)
-
-    src = rgb.astype(np.float32, copy=False)
-    if pixfrac > 0.7:
-        src = cv2.GaussianBlur(src, (0, 0), sigmaX=0.6, sigmaY=0.6)
-    return src, (src.shape[0], src.shape[1]), True
-
-
 # ============================================================
 # Engine
 # ============================================================
@@ -351,8 +325,8 @@ class StackEngine:
     _preview_jpeg: Optional[bytes] = None
     _preview_lock: threading.Lock = field(default_factory=threading.Lock)
 
-    # persistent alignment reference (downsampled mono u16)
-    _ref_align_u16: Optional[np.ndarray] = None
+    # persistent alignment reference (downsampled green u8)
+    _ref_align_u8: Optional[np.ndarray] = None
     _ref_ema: float = 0.08  # conservative reference update
 
     _hotpix_mask: Optional[np.ndarray] = None
@@ -392,7 +366,7 @@ class StackEngine:
             self.canvas.tiles.clear()
             self.canvas.tiles_evicted = 0
 
-        self._ref_align_u16 = None
+        self._ref_align_u8 = None
         self._hotpix_log_once = False
 
         with self._preview_lock:
@@ -542,8 +516,7 @@ class StackEngine:
     def step_batch(self, batch: List[Dict[str, Any]]) -> None:
         """
         batch items: dict with keys:
-          - raw: np.ndarray (H,W) uint8/uint16 (RAW Bayer or mono) OR rgb already
-          - fmt: str ("RAW8","RAW16","MONO8","MONO16","RGB24","RGB48", etc.)
+          - raw16: np.ndarray (H,W) uint16 Bayer
           - t: float timestamp
         """
         if not self.enabled or self.canvas is None or not batch:
@@ -553,30 +526,55 @@ class StackEngine:
         t0 = time.perf_counter()
         self.metrics.frames_in += len(batch)
 
-        # 1) Alignment images (mono u16), downsample.
-        align_u16: List[np.ndarray] = []
+        hotpix_cfg = getattr(self.cfg, "hotpixels", None)
+        mask_enabled = bool(hotpix_cfg and hotpix_cfg.mask_enabled_for_stacking)
+        if mask_enabled and self._hotpix_mask is None:
+            raise ValueError("Hotpixel mask enabled for stacking but no mask is loaded.")
+
+        align_downsample = max(1, int(scfg.align_downsample))
+
+        # 1) Alignment images from RAW16 (green_u8), downsample if requested.
+        align_u8: List[np.ndarray] = []
+        raw16_work_list: List[np.ndarray] = []
         for item in batch:
-            raw = item["raw"]
-            fmt = item.get("fmt", "MONO16")
-            mono_u16 = extract_align_mono_u16(raw, str(fmt).upper(), bayer_pattern=scfg.bayer_pattern)
-            small = downsample_u16(mono_u16, factor=scfg.align_downsample)
-            assert small.ndim == 2, f"align image must be 2D, got shape={small.shape}"
-            align_u16.append(small)
+            raw16 = ensure_raw16_bayer(item["raw16"])
+            raw16_work = raw16
+            if mask_enabled:
+                if raw16.shape != self._hotpix_mask.shape:
+                    raise ValueError(
+                        f"Hotpixel mask shape {self._hotpix_mask.shape} does not match frame shape {raw16.shape}."
+                    )
+                raw16_work = apply_hotpixel_mask_replace(
+                    raw16,
+                    self._hotpix_mask,
+                    ksize=int(hotpix_cfg.mask_ksize),
+                )
+            raw16_work_list.append(raw16_work)
+            green_u8 = bayer_green_u8_from_u16(raw16_work, scfg.bayer_pattern)
+            small = _downsample_u8(green_u8, factor=align_downsample)
+            align_u8.append(small)
 
         # 2) Persistent reference (stabilizes across batches).
-        if self._ref_align_u16 is None:
-            self._ref_align_u16 = align_u16[0].copy()
-        ref_u16 = self._ref_align_u16
+        if self._ref_align_u8 is None:
+            self._ref_align_u8 = align_u8[0].copy()
+        ref_u8 = self._ref_align_u8
 
-        # 3) Shifts relative to reference.
-        dxs = np.zeros(len(batch), dtype=np.float32)
-        dys = np.zeros(len(batch), dtype=np.float32)
+        # 3) Shifts relative to reference (half-res -> full-res).
+        dxs_full = np.zeros(len(batch), dtype=np.float32)
+        dys_full = np.zeros(len(batch), dtype=np.float32)
+        dxs_small = np.zeros(len(batch), dtype=np.float32)
+        dys_small = np.zeros(len(batch), dtype=np.float32)
         resps = np.zeros(len(batch), dtype=np.float32)
 
-        for i, img_u16 in enumerate(align_u16):
-            dx, dy, resp = _phasecorr_shift_validated(ref_u16, img_u16)
-            dxs[i] = dx * scfg.align_downsample
-            dys[i] = dy * scfg.align_downsample
+        for i, img_u8 in enumerate(align_u8):
+            dx_small, dy_small, resp = _phasecorr_shift_validated(ref_u8, img_u8)
+            dxs_small[i] = dx_small
+            dys_small[i] = dy_small
+            dx_half = dx_small * align_downsample
+            dy_half = dy_small * align_downsample
+            dx_full, dy_full = half_to_full_shift(dx_half, dy_half)
+            dxs_full[i] = dx_full
+            dys_full[i] = dy_full
             resps[i] = resp
 
         # 4) Robust gating: response + shift outliers (radial MAD).
@@ -584,9 +582,9 @@ class StackEngine:
         k_mad = float(scfg.outlier_k_mad)
         mad_floor_px = 0.35  # prevents collapse when motion is tiny
 
-        med_dx = float(np.median(dxs))
-        med_dy = float(np.median(dys))
-        dist = np.sqrt((dxs - med_dx) ** 2 + (dys - med_dy) ** 2).astype(np.float32, copy=False)
+        med_dx = float(np.median(dxs_full))
+        med_dy = float(np.median(dys_full))
+        dist = np.sqrt((dxs_full - med_dx) ** 2 + (dys_full - med_dy) ** 2).astype(np.float32, copy=False)
         mad_dist = max(_mad(dist), mad_floor_px)
 
         used: List[int] = []
@@ -605,16 +603,16 @@ class StackEngine:
 
         # 5) Reference update (EMA in reference coordinates) using best-response frame.
         i_best = int(max(used, key=lambda j: float(resps[j])))
-        dx_small = float(dxs[i_best]) / float(scfg.align_downsample)
-        dy_small = float(dys[i_best]) / float(scfg.align_downsample)
+        dx_small = float(dxs_small[i_best])
+        dy_small = float(dys_small[i_best])
 
-        best_small = align_u16[i_best].astype(np.float32, copy=False)
+        best_small = align_u8[i_best].astype(np.float32, copy=False)
         aligned_best = _warp_shift(best_small, dx_small, dy_small)
 
-        ref_f = ref_u16.astype(np.float32, copy=False)
+        ref_f = ref_u8.astype(np.float32, copy=False)
         ema = float(np.clip(self._ref_ema, 0.0, 0.5))
         ref_new = (1.0 - ema) * ref_f + ema * aligned_best
-        self._ref_align_u16 = np.clip(ref_new, 0.0, 65535.0).astype(np.uint16)
+        self._ref_align_u8 = np.clip(ref_new, 0.0, 255.0).astype(np.uint8)
 
         # 6) Accumulate accepted frames into tiles (drizzle grid). Rotation hook kept at zero.
         scale = float(scfg.drizzle_scale)
@@ -627,68 +625,33 @@ class StackEngine:
         dsize = (tile_size, tile_size)
 
         for i in used:
-            raw = batch[i]["raw"]
-            fmt = batch[i].get("fmt", "MONO16")
-            hotpix_cfg = getattr(self.cfg, "hotpixels", None)
-            mask_enabled = bool(hotpix_cfg and hotpix_cfg.mask_enabled_for_stacking)
-            if mask_enabled:
-                if self._hotpix_mask is None:
-                    if not self._hotpix_log_once:
-                        log_info(
-                            None,
-                            "Hotpixel mask not available; stacking raw frames without replacement.",
-                            throttle_key="hotpix-mask-missing-once",
-                        )
-                        self._hotpix_log_once = True
-                elif raw.ndim != 2:
-                    if not self._hotpix_log_once:
-                        log_info(
-                            None,
-                            "Hotpixel mask not applied (expected 2D frame).",
-                            throttle_key="hotpix-mask-invalid-frame-once",
-                        )
-                        self._hotpix_log_once = True
-                elif raw.dtype != np.uint16:
-                    if not self._hotpix_log_once:
-                        log_info(
-                            None,
-                            f"Hotpixel mask not applied (expected uint16, got {raw.dtype}).",
-                            throttle_key="hotpix-mask-invalid-dtype-once",
-                        )
-                        self._hotpix_log_once = True
-                elif raw.shape != self._hotpix_mask.shape:
-                    log_info(
-                        None,
-                        f"Hotpixel mask invalid for frame (mask shape={self._hotpix_mask.shape}, frame shape={raw.shape}).",
-                    )
-                    self._hotpix_mask = None
-                    self._hotpix_meta = None
-                    if not self._hotpix_log_once:
-                        self._hotpix_log_once = True
-                else:
-                    raw = apply_hotpixel_mask_replace(
-                        raw,
-                        self._hotpix_mask,
-                        ksize=int(hotpix_cfg.mask_ksize),
-                    )
-
-            dx = float(dxs[i])
-            dy = float(dys[i])
+            raw16_work = raw16_work_list[i]
+            dx = float(dxs_full[i])
+            dy = float(dys_full[i])
             resp = float(resps[i])
 
             w_frame = float(np.clip((resp - resp_min) / max(1e-6, (1.0 - resp_min)), 0.0, 1.0))
             if w_frame <= 0.0:
                 continue
 
-            src, (h, w), src_is_color = _to_stack_src(
-                raw, str(fmt),
-                color_mode=self.color_mode,
-                bayer_pattern=scfg.bayer_pattern,
-                pixfrac=pixfrac,
-            )
+            rgb16 = debayer_cv2(raw16_work, pattern=scfg.bayer_pattern, edge_aware=False)
+            M_shift = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
+            rgb16_aligned = warp_rgb16(rgb16, M_shift)
+            if self.color_mode == "mono":
+                src = rgb16_aligned.astype(np.float32, copy=False).mean(axis=2)
+                src_is_color = False
+            else:
+                src = rgb16_aligned.astype(np.float32, copy=False)
+                src_is_color = True
+            if pixfrac > 0.7:
+                src = cv2.GaussianBlur(src, (0, 0), sigmaX=0.6, sigmaY=0.6)
+            h, w = src.shape[:2]
+
+            dx_stack = 0.0
+            dy_stack = 0.0
 
             u_min, v_min, u_max, v_max = _corners_bbox_out(
-                w, h, scale=scale, dx=dx, dy=dy, theta_rad=theta_rad
+                w, h, scale=scale, dx=dx_stack, dy=dy_stack, theta_rad=theta_rad
             )
 
             tx0 = int(math.floor(u_min / tile_size))
@@ -708,8 +671,8 @@ class StackEngine:
                         tile_u0=tile_u0,
                         tile_v0=tile_v0,
                         scale=scale,
-                        dx=dx,
-                        dy=dy,
+                        dx=dx_stack,
+                        dy=dy_stack,
                         theta_rad=theta_rad,
                     )
 
@@ -731,8 +694,8 @@ class StackEngine:
         self.metrics.tiles_used = self.canvas.num_tiles()
         self.metrics.tiles_evicted = self.canvas.tiles_evicted
         self.metrics.last_resp = float(np.median(resps[used]))
-        self.metrics.last_dx = float(np.median(dxs[used]))
-        self.metrics.last_dy = float(np.median(dys[used]))
+        self.metrics.last_dx = float(np.median(dxs_full[used]))
+        self.metrics.last_dy = float(np.median(dys_full[used]))
         self.metrics.last_theta_deg = float(theta_deg)
 
         dt = time.perf_counter() - t0
@@ -831,10 +794,10 @@ class StackingWorker:
     def set_params(self, **kwargs: Any) -> None:
         self.engine.set_params(**kwargs)
 
-    def enqueue_frame(self, raw: np.ndarray, fmt: str, t: Optional[float] = None) -> None:
+    def enqueue_frame(self, raw16: np.ndarray, t: Optional[float] = None) -> None:
         if not self.engine.enabled:
             return
-        item = {"raw": raw, "fmt": fmt, "t": float(time.time() if t is None else t)}
+        item = {"raw16": raw16, "t": float(time.time() if t is None else t)}
         try:
             self._q.put_nowait(item)
         except queue.Full:
