@@ -8,7 +8,7 @@ Funciones
   (ra_deg, dec_deg) o dict {'ra','dec'} en grados. Devuelve SkyCoord (ICRS).
 - gaia_cone_with_mag(target, radius, *, gmax=15, ...): cono único, filtro en servidor G<=gmax,
   caché por parámetros. Usa launch_job_async(background=False) para evitar límites de tiempo del sync.
-- gaia_healpix_cone_with_mag(target, radius, *, gmax=15, nside=64, ...): mosaico HEALPix con filtro
+- gaia_healpix_cone_with_mag(target, radius, *, gmax=15, nside=16, ...): mosaico HEALPix con filtro
   en servidor por tesela (polígono), caché por tesela, ensamblaje deduplicado y recorte al círculo.
   Hace login UNA sola vez para todo el mosaico y usa launch_job_async(background=False) por tesela.
 
@@ -416,7 +416,7 @@ def gaia_healpix_cone_with_mag(
     cfg=None,
     progress_cb=None,
     gmax: float = 15.0,
-    nside: int = 64,
+    nside: int = 16,
     order: str = "ring",
     table_name: str = DEFAULT_TABLE,
     columns: Sequence[str] = DEFAULT_COLUMNS,
