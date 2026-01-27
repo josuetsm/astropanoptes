@@ -22,14 +22,20 @@ from actions import Action, ActionType
 from logging_utils import log_info, log_error
 
 from camera_poa import POACameraDevice, CameraStream
-from imaging import ensure_raw16_bayer, bayer_green_u8_from_u16
+from imaging import ensure_raw16_bayer
 from preview import make_preview_jpeg, encode_jpeg, stretch_to_u8
 from mount_arduino import ArduinoMount
 
 from tracking import make_tracking_state, tracking_step, tracking_set_params
 from stacking import StackingWorker
 
-from hotpixels import build_hotpixel_mask, save_hotpixel_mask
+from hotpixels import (
+    apply_hotpixel_correction,
+    build_hotpixel_mask_temporal,
+    load_hotpixel_mask,
+    save_hotpixel_mask,
+)
+from sep_utils import sep_detect_from_raw16
 
 from platesolve import (
     PlatesolveConfig,
@@ -55,6 +61,19 @@ def _safe_slug(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", s)
     return s[:80] if s else "target"
+
+
+def _apply_hotpix_if_available(
+    raw16: np.ndarray,
+    *,
+    hotpix_mask: Optional[np.ndarray],
+    bayer_pattern: str,
+) -> np.ndarray:
+    if hotpix_mask is None:
+        return raw16
+    if hotpix_mask.shape != raw16.shape:
+        raise ValueError(f"Hotpixel mask shape {hotpix_mask.shape} does not match frame shape {raw16.shape}.")
+    return apply_hotpixel_correction(raw16, hotpix_mask, bayer_pattern)
 
 
 class AppRunner:
@@ -116,6 +135,9 @@ class AppRunner:
         self._hotpix_lock = threading.Lock()
         self._hotpix_thr: Optional[threading.Thread] = None
         self._hotpix_cancel = threading.Event()
+        self._hotpix_mask: Optional[np.ndarray] = None
+        self._hotpix_meta: Optional[Dict[str, Any]] = None
+        self._load_hotpix_mask_if_available(self.cfg.hotpixels.mask_path_base)
 
         # Config platesolve (runtime copy, actualizable desde UI por action)
         self._platesolve_observer = ObserverConfig()  # Santiago por default en tu platesolve.py
@@ -129,7 +151,7 @@ class AppRunner:
             ring_radius_m_az=0.24,
             ring_radius_m_alt=0.235,
         )
-        self._goto = GoToController(cfg=GoToConfig(observer=self._platesolve_observer), model=GoToModel(kin=kin))
+        self._goto = GoToController(cfg=GoToConfig(observer=self._platesolve_observer, sep=self.cfg.sep), model=GoToModel(kin=kin))
         self._goto_lock = threading.Lock()
         self._goto_thr: Optional[threading.Thread] = None
         self._goto_cancel = threading.Event()
@@ -155,10 +177,10 @@ class AppRunner:
         # Parámetros de overlay en vivo (SEP)
         self._live_sep_overlay_enabled = False
         self._live_sep_params = {
-            "sep_bw": int(self.cfg.platesolve.sep_bw),
-            "sep_bh": int(self.cfg.platesolve.sep_bh),
-            "sep_thresh_sigma": float(self.cfg.platesolve.sep_thresh_sigma),
-            "sep_minarea": int(self.cfg.platesolve.sep_minarea),
+            "sep_bw": int(self.cfg.sep.bw),
+            "sep_bh": int(self.cfg.sep.bh),
+            "sep_thresh_sigma": float(self.cfg.sep.thresh_sigma),
+            "sep_minarea": int(self.cfg.sep.minarea),
             "max_det": int(self.cfg.platesolve.max_det),
         }
 
@@ -486,18 +508,49 @@ class AppRunner:
 
     def _reset_hotpixels_defaults(self) -> None:
         self.cfg.hotpixels = replace(self.default_cfg.hotpixels)
-        self._stacking.engine.configure_from_cfg()
+        self._load_hotpix_mask_if_available(self.cfg.hotpixels.mask_path_base)
 
     def _reset_platesolve_defaults(self) -> None:
         with self._platesolve_cfg_lock:
             self.cfg.platesolve = replace(self.default_cfg.platesolve)
         self._live_sep_params = {
-            "sep_bw": int(self.cfg.platesolve.sep_bw),
-            "sep_bh": int(self.cfg.platesolve.sep_bh),
-            "sep_thresh_sigma": float(self.cfg.platesolve.sep_thresh_sigma),
-            "sep_minarea": int(self.cfg.platesolve.sep_minarea),
+            "sep_bw": int(self.cfg.sep.bw),
+            "sep_bh": int(self.cfg.sep.bh),
+            "sep_thresh_sigma": float(self.cfg.sep.thresh_sigma),
+            "sep_minarea": int(self.cfg.sep.minarea),
             "max_det": int(self.cfg.platesolve.max_det),
         }
+
+    def _load_hotpix_mask_if_available(self, path_base: str) -> None:
+        try:
+            mask, meta = load_hotpixel_mask(path_base)
+        except FileNotFoundError:
+            self._hotpix_mask = None
+            self._hotpix_meta = None
+            return
+        except Exception as exc:
+            log_error(self.out_log, "Hotpix: failed to load mask", exc, throttle_s=5.0, throttle_key="hotpix_load")
+            self._hotpix_mask = None
+            self._hotpix_meta = None
+            return
+
+        if mask.ndim != 2:
+            log_info(self.out_log, f"Hotpix: invalid mask shape {mask.shape}")
+            self._hotpix_mask = None
+            self._hotpix_meta = None
+            return
+
+        self._hotpix_mask = mask
+        self._hotpix_meta = meta
+
+    def _apply_hotpix(self, raw16: np.ndarray, bayer_pattern: str) -> np.ndarray:
+        try:
+            return _apply_hotpix_if_available(raw16, hotpix_mask=self._hotpix_mask, bayer_pattern=bayer_pattern)
+        except ValueError as exc:
+            log_error(self.out_log, "Hotpix: mask mismatch; disabling hotpixel correction", exc, throttle_s=5.0, throttle_key="hotpix_apply")
+            self._hotpix_mask = None
+            self._hotpix_meta = None
+            return raw16
 
     def _maybe_update_preview(self) -> None:
         if self._cam_stream is None:
@@ -519,60 +572,32 @@ class AppRunner:
             ds = int(self.cfg.preview.ds)
             overlay_enabled = bool(self._live_sep_overlay_enabled)
 
-            if getattr(fr, "raw", None) is not None:
-                raw16 = ensure_raw16_bayer(fr.raw)
-                meta = getattr(fr, "meta", {}) or {}
-                meta_dict = meta if isinstance(meta, dict) else {}
-                bayer = meta_dict.get("bayer_pattern", "RGGB")
-                green_u8 = bayer_green_u8_from_u16(raw16, bayer)
-                if overlay_enabled:
-                    _, u8_preview = make_preview_jpeg(
-                        green_u8,
-                        ds=ds,
-                        plo=float(self.cfg.preview.stretch_plo),
-                        phi=float(self.cfg.preview.stretch_phi),
-                        jpeg_quality=int(self.cfg.preview.jpeg_quality),
-                        sample_stride=4,
-                    )
-                    u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
-                    jpg = encode_jpeg(u8_preview, quality=int(self.cfg.preview.jpeg_quality))
-                else:
-                    jpg, _ = make_preview_jpeg(
-                        green_u8,
-                        ds=ds,
-                        plo=float(self.cfg.preview.stretch_plo),
-                        phi=float(self.cfg.preview.stretch_phi),
-                        jpeg_quality=int(self.cfg.preview.jpeg_quality),
-                        sample_stride=4,
-                    )
+            raw16 = ensure_raw16_bayer(fr.raw)
+            meta = getattr(fr, "meta", {}) or {}
+            meta_dict = meta if isinstance(meta, dict) else {}
+            bayer = meta_dict.get("bayer_pattern", "RGGB")
+            raw16_hp = self._apply_hotpix(raw16, bayer)
+
+            if overlay_enabled:
+                _, u8_preview = make_preview_jpeg(
+                    raw16_hp,
+                    ds=ds,
+                    plo=float(self.cfg.preview.stretch_plo),
+                    phi=float(self.cfg.preview.stretch_phi),
+                    jpeg_quality=int(self.cfg.preview.jpeg_quality),
+                    sample_stride=4,
+                )
+                u8_preview = self._apply_live_sep_overlay(raw16_hp, u8_preview, ds)
+                jpg = encode_jpeg(u8_preview, quality=int(self.cfg.preview.jpeg_quality))
             else:
-                u = fr.u8_view
-                if u.ndim == 3 and u.shape[2] == 3:
-                    u8_preview = u[::ds, ::ds, :] if ds > 1 else u
-                    if overlay_enabled:
-                        u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
-                    jpg = encode_jpeg(u8_preview, quality=int(self.cfg.preview.jpeg_quality))
-                else:
-                    if overlay_enabled:
-                        _, u8_preview = make_preview_jpeg(
-                            u,
-                            ds=ds,
-                            plo=float(self.cfg.preview.stretch_plo),
-                            phi=float(self.cfg.preview.stretch_phi),
-                            jpeg_quality=int(self.cfg.preview.jpeg_quality),
-                            sample_stride=4,
-                        )
-                        u8_preview = self._apply_live_sep_overlay(fr, u8_preview, ds)
-                        jpg = encode_jpeg(u8_preview, quality=int(self.cfg.preview.jpeg_quality))
-                    else:
-                        jpg, _ = make_preview_jpeg(
-                            u,
-                            ds=ds,
-                            plo=float(self.cfg.preview.stretch_plo),
-                            phi=float(self.cfg.preview.stretch_phi),
-                            jpeg_quality=int(self.cfg.preview.jpeg_quality),
-                            sample_stride=4,
-                        )
+                jpg, _ = make_preview_jpeg(
+                    raw16_hp,
+                    ds=ds,
+                    plo=float(self.cfg.preview.stretch_plo),
+                    phi=float(self.cfg.preview.stretch_phi),
+                    jpeg_quality=int(self.cfg.preview.jpeg_quality),
+                    sample_stride=4,
+                )
 
             with self._preview_lock:
                 self._latest_preview_jpeg = jpg
@@ -589,43 +614,16 @@ class AppRunner:
         except Exception as exc:
             log_error(self.out_log, "Preview: failed", exc)
 
-    def _apply_live_sep_overlay(self, fr: Frame, u8_preview: np.ndarray, ds: int) -> np.ndarray:
+    def _apply_live_sep_overlay(self, raw16_hp: np.ndarray, u8_preview: np.ndarray, ds: int) -> np.ndarray:
         try:
-            from platesolve import detect_sep_objects
-        except Exception as exc:
-            log_error(self.out_log, "Live SEP: failed to import detect_sep_objects", exc, throttle_s=5.0, throttle_key="live_sep_import")
-            return u8_preview
-
-        try:
-            raw_gray = None
-            if getattr(fr, "raw", None) is not None:
-                meta = getattr(fr, "meta", {}) or {}
-                meta_dict = meta if isinstance(meta, dict) else {}
-                bayer = meta_dict.get("bayer_pattern", "RGGB")
-                raw16 = ensure_raw16_bayer(fr.raw)
-                raw_gray = bayer_green_u8_from_u16(raw16, bayer)
-            else:
-                raw_gray = fr.u8_view
-
-            if raw_gray is None:
-                return u8_preview
-
-            if getattr(raw_gray, "ndim", 0) == 3:
-                raw_gray = raw_gray[:, :, :3].astype(np.float32).mean(axis=2)
-
-            ds = int(max(1, ds))
-            if ds > 1:
-                raw_gray = raw_gray[::ds, ::ds]
-
             params = dict(self._live_sep_params)
-            _, obj_xy, _ = detect_sep_objects(
-                raw_gray,
+            _, _, _, obj_xy = sep_detect_from_raw16(
+                raw16_hp,
                 sep_bw=int(params.get("sep_bw", 64)),
                 sep_bh=int(params.get("sep_bh", 64)),
-                sep_thresh_sigma=float(params.get("sep_thresh_sigma", 3.5)),
+                sep_thresh_sigma=float(params.get("sep_thresh_sigma", 3.0)),
                 sep_minarea=int(params.get("sep_minarea", 5)),
                 max_sources=int(params.get("max_det", 250)),
-                progress_cb=None,
             )
 
             if obj_xy is None or len(obj_xy) == 0:
@@ -636,10 +634,11 @@ class AppRunner:
             else:
                 img = u8_preview.copy()
 
+            ds = int(max(1, ds))
             h, w = img.shape[:2]
             for x, y in obj_xy:
-                ix = int(round(float(x)))
-                iy = int(round(float(y)))
+                ix = int(round(float(x) / ds))
+                iy = int(round(float(y) / ds))
                 if ix < 0 or iy < 0 or ix >= w or iy >= h:
                     continue
                 cv2.circle(img, (ix, iy), 6, (0, 255, 255), 1, lineType=cv2.LINE_AA)
@@ -807,7 +806,7 @@ class AppRunner:
             "dy_px": float(getattr(result, "dy_px", 0.0)),
             "radius_deg": metrics.get("radius_deg"),
             "scale_arcsec_per_px": float(getattr(result, "scale_arcsec_per_px", metrics.get("scale_arcsec_per_px", 0.0))),
-            "downsample": int(getattr(result, "downsample", metrics.get("downsample", 0) or 0)),
+            "downsample": int(getattr(result, "downsample", metrics.get("downsample", 1) or 1)),
         }
         return info
 
@@ -938,7 +937,7 @@ class AppRunner:
                 fmt = str(getattr(fr, "fmt", "") or "RAW16")
                 meta = dict(getattr(fr, "meta", {}) or {})
                 raw_in = np.ascontiguousarray(fr.raw)
-                u8_in = np.ascontiguousarray(fr.u8_view) if hasattr(fr, "u8_view") else None
+                u8_in = np.ascontiguousarray(fr.u8_view) if getattr(fr, "u8_view", None) is not None else None
 
                 platesolve_cfg = self._get_platesolve_cfg_snapshot()
 
@@ -953,12 +952,10 @@ class AppRunner:
                     observer=self._platesolve_observer,
                 )
 
-                # Frame para solver: usar verde (half-res) y reescalar a full-res para SEP
+                # Frame para solver: RAW16 + hotpixel correction
                 bayer = str((meta or {}).get("bayer_pattern", "RGGB"))
                 raw16 = ensure_raw16_bayer(raw_in)
-                green_u8 = bayer_green_u8_from_u16(raw16, bayer)
-                green_full = cv2.resize(green_u8, (raw16.shape[1], raw16.shape[0]), interpolation=cv2.INTER_LINEAR)
-                frame = green_full.astype(np.uint16) << 8
+                frame = self._apply_hotpix(raw16, bayer)
 
                 # Debug de stats de entrada (opcional)
                 debug_stats = bool(getattr(platesolve_cfg, "debug_input_stats", False))
@@ -984,16 +981,15 @@ class AppRunner:
                         log_info(self.out_log, f"  sat255={np.mean(flat == 255):.4f}")
 
                 _stats(raw_in, "fr.raw")
-                if hasattr(fr, "u16") and fr.u16 is not None:
-                    _stats(fr.u16, "fr.u16")
                 if hasattr(fr, "u8_view") and fr.u8_view is not None:
                     _stats(fr.u8_view, "fr.u8_view")
-                _stats(frame, "frame(mono_u16)")
+                _stats(frame, "frame(raw16_hp)")
 
                 result = platesolve_from_live(
                     frame,
                     target=target,
                     cfg=platesolve_cfg,
+                    sep_cfg=self.cfg.sep,
                     observer=self._platesolve_observer,
                     progress_cb=None,
                 )
@@ -1004,7 +1000,7 @@ class AppRunner:
                 debug_jpeg = self._render_platesolve_debug_jpeg(
                     frame,
                     list(getattr(result, "overlay", []) or []),
-                    int(getattr(result, "downsample", platesolve_cfg.downsample)),
+                    int(getattr(result, "downsample", 1)),
                 )
                 debug_info = self._build_platesolve_debug_info(result)
     
@@ -1164,8 +1160,8 @@ class AppRunner:
         self,
         *,
         n_frames: int,
-        thr_k: float,
-        min_hits_frac: float,
+        abs_percentile: float,
+        var_percentile: float,
         max_component_area: int,
         out_path_base: str,
     ) -> None:
@@ -1180,8 +1176,8 @@ class AppRunner:
                 daemon=True,
                 kwargs={
                     "n_frames": n_frames,
-                    "thr_k": thr_k,
-                    "min_hits_frac": min_hits_frac,
+                    "abs_percentile": abs_percentile,
+                    "var_percentile": var_percentile,
                     "max_component_area": max_component_area,
                     "out_path_base": out_path_base,
                 },
@@ -1192,8 +1188,8 @@ class AppRunner:
         self,
         *,
         n_frames: int,
-        thr_k: float,
-        min_hits_frac: float,
+        abs_percentile: float,
+        var_percentile: float,
         max_component_area: int,
         out_path_base: str,
     ) -> None:
@@ -1227,10 +1223,10 @@ class AppRunner:
             return
 
         try:
-            mask = build_hotpixel_mask(
+            mask = build_hotpixel_mask_temporal(
                 frames,
-                thr_k=float(thr_k),
-                min_hits_frac=float(min_hits_frac),
+                abs_percentile=float(abs_percentile),
+                var_percentile=float(var_percentile),
                 max_component_area=int(max_component_area),
             )
         except Exception as exc:
@@ -1248,18 +1244,19 @@ class AppRunner:
             "fmt": str(getattr(last_frame, "fmt", "")) if last_frame is not None else "",
             "camera_model": frame_meta.get("camera_model"),
             "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "thr_k": float(thr_k),
-            "min_hits_frac": float(min_hits_frac),
+            "abs_percentile": float(abs_percentile),
+            "var_percentile": float(var_percentile),
             "max_component_area": int(max_component_area),
             "n_frames": int(n_frames),
         }
 
         try:
             npy_path, json_path = save_hotpixel_mask(mask, meta, out_path_base)
-            self._stacking.engine.load_hotpix_mask_if_available(out_path_base)
+            self._hotpix_mask = mask
+            self._hotpix_meta = meta
             log_info(
                 self.out_log,
-                f"Hotpix: mask saved ({npy_path.name}, {json_path.name}) and reloaded for stacking",
+                f"Hotpix: mask saved ({npy_path.name}, {json_path.name})",
             )
         except Exception as exc:
             log_error(self.out_log, "Hotpix: failed to save mask", exc)
@@ -1325,7 +1322,10 @@ class AppRunner:
                 fr = self._cam_stream.latest()
                 if fr is None:
                     return None
-                return fr.u8_view
+                meta = dict(getattr(fr, "meta", {}) or {})
+                bayer = str(meta.get("bayer_pattern", "RGGB"))
+                raw16 = ensure_raw16_bayer(fr.raw)
+                return self._apply_hotpix(raw16, bayer)
 
             def move_steps(axis: Axis, direction: int, steps: int, delay_us: int):
                 if self._mount is None:
@@ -1481,23 +1481,30 @@ class AppRunner:
             if tracking_on and (self._cam_stream is not None) and (self._mount is not None):
                 fr = self._cam_stream.latest()
                 if fr is not None:
-                    # Obtener un mono uint16 robusto para tracking (evita usar u8_view cuando el stream es RAW16)
-                    bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
+                    # Tracking en RAW16 (hotpixel-corrected) + SEP
+                    meta = dict(getattr(fr, "meta", {}) or {})
+                    bayer = str(meta.get("bayer_pattern", "RGGB"))
                     raw16 = ensure_raw16_bayer(fr.raw)
-                    green_u8 = bayer_green_u8_from_u16(raw16, bayer)
-                    green_full = cv2.resize(green_u8, (raw16.shape[1], raw16.shape[0]), interpolation=cv2.INTER_LINEAR)
-                    frame_u16 = green_full.astype(np.uint16) << 8
+                    raw16_hp = self._apply_hotpix(raw16, bayer)
+                    img_det, _, _, _ = sep_detect_from_raw16(
+                        raw16_hp,
+                        sep_bw=int(self.cfg.sep.bw),
+                        sep_bh=int(self.cfg.sep.bh),
+                        sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
+                        sep_minarea=int(self.cfg.sep.minarea),
+                        max_sources=None,
+                    )
 
                     try:
                         out = tracking_step(
                             self._tracking_state,
-                            frame_u16,
+                            img_det,
                             now_t=_now_s(),
                             tracking_enabled=True,
                         )
                     except TypeError as exc:
                         log_error(self.out_log, "Tracking: falling back to legacy tracking_step signature", exc, throttle_s=60.0, throttle_key="tracking_step_signature")
-                        out = tracking_step(self._tracking_state, frame_u16)
+                        out = tracking_step(self._tracking_state, img_det)
 
                     try:
                         self._mount.rate(float(out.rate_az), float(out.rate_alt))
@@ -1533,8 +1540,11 @@ class AppRunner:
             if self._stacking_enabled and (self._cam_stream is not None):
                 fr = self._cam_stream.latest()
                 if fr is not None:
+                    meta = dict(getattr(fr, "meta", {}) or {})
+                    bayer = str(meta.get("bayer_pattern", "RGGB"))
                     raw16 = ensure_raw16_bayer(fr.raw)
-                    self._stacking.enqueue_frame(raw16.copy(), t=_now_s())
+                    raw16_hp = self._apply_hotpix(raw16, bayer)
+                    self._stacking.enqueue_frame(raw16_hp.copy(), t=_now_s())
 
             # 2d) publish stacking metrics
             m = self._stacking.engine.metrics
@@ -1774,15 +1784,18 @@ class AppRunner:
             if self._cam_stream is None:
                 log_info(self.out_log, "Hotpix: calibration skipped (camera stream inactive)")
                 return
-            n_frames = int(p.get("n_frames", 30))
-            thr_k = float(p.get("thr_k", 8.0))
-            min_hits_frac = float(p.get("min_hits_frac", 0.7))
-            max_component_area = int(p.get("max_component_area", 4))
-            out_path_base = str(p.get("out_path_base", "./hotpixel_mask"))
+            if self._get_tracking_enabled():
+                self._set_state_safe(tracking_enabled=False, tracking_mode="IDLE")
+                self._mount_rate_safe(0.0, 0.0)
+            n_frames = int(p.get("n_frames", self.cfg.hotpixels.calib_frames))
+            abs_percentile = float(p.get("abs_percentile", self.cfg.hotpixels.calib_abs_percentile))
+            var_percentile = float(p.get("var_percentile", self.cfg.hotpixels.calib_var_percentile))
+            max_component_area = int(p.get("max_component_area", self.cfg.hotpixels.max_component_area))
+            out_path_base = str(p.get("out_path_base", self.cfg.hotpixels.mask_path_base))
             self._hotpix_start_worker_if_needed(
                 n_frames=n_frames,
-                thr_k=thr_k,
-                min_hits_frac=min_hits_frac,
+                abs_percentile=abs_percentile,
+                var_percentile=var_percentile,
                 max_component_area=max_component_area,
                 out_path_base=out_path_base,
             )
@@ -1825,6 +1838,15 @@ class AppRunner:
                 for key in ("sep_bw", "sep_bh", "sep_thresh_sigma", "sep_minarea", "max_det"):
                     if key in p:
                         self._live_sep_params[key] = p.get(key)
+                if "sep_bw" in p:
+                    self.cfg.sep.bw = int(p.get("sep_bw"))
+                if "sep_bh" in p:
+                    self.cfg.sep.bh = int(p.get("sep_bh"))
+                if "sep_thresh_sigma" in p:
+                    self.cfg.sep.thresh_sigma = float(p.get("sep_thresh_sigma"))
+                if "sep_minarea" in p:
+                    self.cfg.sep.minarea = int(p.get("sep_minarea"))
+                self._goto.cfg.sep = self.cfg.sep
                 log_info(self.out_log, "Live SEP: params updated")
             return
 
