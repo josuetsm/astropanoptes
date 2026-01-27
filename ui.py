@@ -455,12 +455,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         description="View Hz",
         layout=W.Layout(width="240px"),
     )
-    w_dd_ds = W.Dropdown(
-        options=[("1x", 1), ("2x", 2), ("3x", 3), ("4x", 4)],
-        value=int(cfg.preview.ds),
-        description="DS",
-        layout=W.Layout(width="200px"),
-    )
     w_bi_jpeg_q = W.BoundedIntText(
         value=int(cfg.preview.jpeg_quality),
         min=10,
@@ -492,7 +486,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             # Always display the fixed RAW16 format; do not allow changing it.
             W.HBox([w_dd_camera_id, w_lbl_img_format]),
             W.HBox([w_bi_exp_ms, w_bi_gain, w_cb_auto_gain]),
-            W.HBox([w_bt_view_hz, w_dd_ds, w_bi_jpeg_q]),
+            W.HBox([w_bt_view_hz, w_bi_jpeg_q]),
             W.HBox([w_bt_plo, w_bt_phi]),
         ]
     )
@@ -1124,9 +1118,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     def _on_view_hz(change):
         _debounce_camera_param("preview_view_hz", float(change["new"]))
 
-    def _on_ds(change):
-        _debounce_camera_param("preview_ds", int(change["new"]))
-
     def _on_jpeg_q(change):
         _debounce_camera_param("preview_jpeg_quality", int(change["new"]))
 
@@ -1142,7 +1133,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # There is no observer for image format; see notes above.
 
     w_bt_view_hz.observe(_on_view_hz, names="value")
-    w_dd_ds.observe(_on_ds, names="value")
     w_bi_jpeg_q.observe(_on_jpeg_q, names="value")
     w_bt_plo.observe(_on_plo, names="value")
     w_bt_phi.observe(_on_phi, names="value")
@@ -1337,7 +1327,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         # image format is fixed to RAW16; provide label instead of dropdown
         "w_lbl_img_format": w_lbl_img_format,
         "w_bt_view_hz": w_bt_view_hz,
-        "w_dd_ds": w_dd_ds,
         "w_bi_jpeg_q": w_bi_jpeg_q,
         "w_bt_plo": w_bt_plo,
         "w_bt_phi": w_bt_phi,
@@ -1500,7 +1489,6 @@ class UILoop:
                     "dy_px",
                     "radius_deg",
                     "scale_arcsec_per_px",
-                    "downsample",
                 ]
 
                 def _fmt_value(val: Any) -> str:

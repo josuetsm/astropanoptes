@@ -37,9 +37,6 @@ class PreviewConfig:
     # refresco visual (NO afecta captura)
     view_hz: float = 10.0
 
-    # downsample barato por stride
-    ds: int = 2
-
     # JPEG encode
     jpeg_quality: int = 75
 
