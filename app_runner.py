@@ -5,6 +5,11 @@ import os
 import queue
 import threading
 import time
+from pathlib import Path
+import json
+import re
+import datetime as _dt
+
 from dataclasses import replace
 from typing import Optional, Any, Dict, List
 
@@ -26,8 +31,6 @@ from stacking import StackingWorker
 
 from hotpixels import build_hotpixel_mask, save_hotpixel_mask
 
-# Platesolve (nuevo)
-# Se asume que platesolve.py está al mismo nivel que app_runner.py
 from platesolve import (
     PlatesolveConfig,
     ObserverConfig,
@@ -36,8 +39,6 @@ from platesolve import (
     load_gaia_auth,
 )
 
-
-# GoTo (nuevo)
 from goto import GoToController, GoToConfig, GoToModel, MountKinematics
 
 
@@ -49,64 +50,11 @@ def _now_s() -> float:
     return time.time()
 
 
-from pathlib import Path
-import json
-import re
-import datetime as _dt
 
 def _safe_slug(self, s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", s)
     return s[:80] if s else "target"
-
-def _platesolve_dump_dir(self) -> Path:
-    # carpeta fija, fácil de encontrar
-    d = Path("platesolve_dumps")
-    d.mkdir(parents=True, exist_ok=True)
-    return d
-
-def _dump_platesolve_snapshot(
-    self,
-    *,
-    source: str,
-    target: Any,
-    frame_raw: np.ndarray,
-    fmt: str,
-    meta: dict,
-    u8_view: Optional[np.ndarray] = None,
-) -> Optional[str]:
-    """
-    Guarda un snapshot reproducible. Devuelve la ruta base (sin extensión) o None si falla.
-    """
-    try:
-        ts = _dt.datetime.now().strftime("%Y%m%d_%H%M%S_%f")
-        slug = self._safe_slug(str(target))
-        base = self._platesolve_dump_dir() / f"{ts}_{source}_{slug}"
-
-        # Guardar RAW como .npy (exacto, rápido, sin pérdidas)
-        np.save(str(base) + "_raw.npy", np.ascontiguousarray(frame_raw))
-
-        # Guardar u8_view opcional (útil para inspección rápida)
-        if u8_view is not None:
-            np.save(str(base) + "_u8.npy", np.ascontiguousarray(u8_view))
-
-        # Metadatos en JSON
-        info = {
-            "ts": ts,
-            "source": str(source),
-            "target": target,
-            "fmt": str(fmt),
-            "shape": list(frame_raw.shape),
-            "dtype": str(frame_raw.dtype),
-            "meta": meta or {},
-        }
-        with open(str(base) + "_meta.json", "w", encoding="utf-8") as f:
-            json.dump(info, f, ensure_ascii=False, indent=2)
-
-        return str(base)
-    except Exception as exc:
-        log_error(self.out_log, "Platesolve: failed to dump snapshot", exc)
-        return None
 
 
 class AppRunner:
