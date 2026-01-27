@@ -1335,14 +1335,28 @@ class AppRunner:
             try:
                 if kind == "goto":
                     # Expect target dict from UI/actions
-                    # params may include: delay_us, tol_arcsec, max_iters, max_step_deg, gain
+                    # params may include: delay_us, tol_arcsec, max_iters, max_step_deg, max_step_per_iter, gain
                     delay_us = int(params.get("delay_us", 1800))
                     tol_arcsec = float(params.get("tol_arcsec", 10.0))
                     max_iters = int(params.get("max_iters", 8))
                     gain = float(params.get("gain", 0.9))
-                    max_step_deg = float(params.get("max_step_deg", 5.0))
+                    max_step_per_iter = self._goto.cfg.max_step_per_iter
+                    if "max_step_per_iter" in params:
+                        max_step_per_iter = int(params.get("max_step_per_iter"))
+                    else:
+                        max_step_deg = float(params.get("max_step_deg", 5.0))
+                        j_matrix = self._goto.model.J_deg_per_step
+                        max_abs_deg_per_step = float(np.max(np.abs(j_matrix))) if j_matrix is not None and j_matrix.size else 0.0
+                        if max_abs_deg_per_step > 0.0:
+                            max_step_per_iter = int(max(1, round(max_step_deg / max_abs_deg_per_step)))
 
-                    self._goto.cfg = replace(self._goto.cfg, tol_arcsec=tol_arcsec, max_iters=max_iters, gain=gain, max_step_deg=max_step_deg)
+                    self._goto.cfg = replace(
+                        self._goto.cfg,
+                        tol_arcsec=tol_arcsec,
+                        max_iters=max_iters,
+                        gain=gain,
+                        max_step_per_iter=max_step_per_iter,
+                    )
 
                     ok, last_err = self._goto.goto_blocking(
                         target,
