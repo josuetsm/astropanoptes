@@ -12,13 +12,13 @@ import cv2
 import sep
 
 import astropy.units as u
-from astropy.coordinates import SkyCoord, EarthLocation, AltAz
+from astropy.coordinates import SkyCoord, EarthLocation, AltAz, ICRS
 from astropy.time import Time
 
 from sklearn.neighbors import KDTree
 from itertools import combinations, permutations
 
-from logging_utils import log_error
+from logging_utils import log_error, log_info
 from hotpixels import hotpix_prefilter_base
 from config import PlatesolveConfig
 
@@ -201,6 +201,15 @@ def parse_target_to_icrs(
         raise TargetParseError(f"Could not parse target string: {s}")
 
     raise TargetParseError(f"Unsupported target type: {type(target).__name__}")
+
+
+_ICRS_FRAME = ICRS()
+
+
+def _ensure_icrs(coord: SkyCoord, *, label: str) -> SkyCoord:
+    if not coord.frame.is_equivalent_frame(_ICRS_FRAME):
+        log_info(None, f"Platesolve: normalizing {label} from frame {coord.frame} to ICRS")
+    return coord.icrs
 
 
 # ============================================================
@@ -627,6 +636,7 @@ def platesolve_sweep(
             guides=[],
             metrics={"source": 1.0},
         )
+    center_icrs = _ensure_icrs(center_icrs, label="center")
 
     # 2) Prepare frame (gray + downsample)
     gray = _to_gray(frame)
@@ -1027,7 +1037,7 @@ def platesolve_sweep(
         )
 
     # 12) Final overlays (inliers + Gaia points in view)
-    best_center: SkyCoord = best["center"]
+    best_center: SkyCoord = _ensure_icrs(best["center"], label="best_center")
     best_fit: Dict[str, Any] = best["fit"]
     best_inliers: List[Tuple[int, int, float]] = best["inliers"]
 
