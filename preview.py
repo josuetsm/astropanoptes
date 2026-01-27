@@ -7,17 +7,6 @@ import numpy as np
 import cv2
 
 
-def downsample_u16(u16: np.ndarray, factor: int) -> np.ndarray:
-    """
-    Downsample estable para uint16 usando INTER_AREA.
-    """
-    if factor <= 1:
-        return u16
-    h, w = u16.shape[:2]
-    nh, nw = h // factor, w // factor
-    return cv2.resize(u16, (nw, nh), interpolation=cv2.INTER_AREA)
-
-
 def stretch_to_u8(img: np.ndarray, plo: float = 1.0, phi: float = 99.0, gamma: float = 1.0) -> np.ndarray:
     """
     Stretch robusto para preview. Soporta (H,W) o (H,W,3) float32.
@@ -127,7 +116,6 @@ def encode_jpeg(u8: np.ndarray, quality: int = 75) -> bytes:
 
 def make_preview_jpeg(
     img: np.ndarray,
-    ds: int = 2,
     plo: float = 5.0,
     phi: float = 99.5,
     jpeg_quality: int = 75,
@@ -135,15 +123,12 @@ def make_preview_jpeg(
 ) -> Tuple[bytes, np.ndarray]:
     """
     Pipeline compacto para preview:
-      img(u16/u8) -> u8 -> downsample por stride -> stretch -> jpeg
+      img(u16/u8) -> u8 -> stretch -> jpeg
 
     Retorna:
       (jpeg_bytes, u8_preview_used)
     """
     u8 = to_u8_preview(img)
-
-    if ds > 1:
-        u8 = u8[::ds, ::ds]
 
     u8s = stretch_fast_u8(u8, plo=plo, phi=phi, sample_stride=sample_stride)
     jpg = encode_jpeg(u8s, quality=jpeg_quality)
@@ -151,7 +136,6 @@ def make_preview_jpeg(
 
 
 __all__ = [
-    "downsample_u16",
     "stretch_to_u8",
     "to_u8_preview",
     "stretch_fast_u8",

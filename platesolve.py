@@ -41,7 +41,6 @@ __all__ = [
     "TargetParseError",
     "platesolve_sweep",
     "platesolve_from_live",
-    "platesolve_from_stack",
     "pixel_to_radec",
     "load_gaia_auth",
     "save_gaia_auth",
@@ -124,8 +123,6 @@ class PlatesolveResult:
 
     center_ra_deg: float
     center_dec_deg: float
-
-    downsample: int
 
     overlay: List[OverlayItem]
     guides: List[GuideStar]
@@ -463,7 +460,6 @@ def build_guides_from_solution(
     s_arcsec_per_px: float,
     R: np.ndarray,
     t_arcsec: np.ndarray,
-    downsample: int,
     cfg: PlatesolveConfig,
     progress_cb: Optional[ProgressCB],
 ) -> List[GuideStar]:
@@ -490,7 +486,7 @@ def build_guides_from_solution(
         dec = float(df_gaia.at[i, "dec"])
         gmag = float(df_gaia.at[i, "phot_g_mean_mag"]) if "phot_g_mean_mag" in df_gaia.columns else float("nan")
 
-        # arcsec -> px (in downsampled pixel grid)
+        # arcsec -> px (in the fitted pixel grid)
         px = inverse_similarity(cat_all[i:i + 1], float(s_arcsec_per_px), R, t_arcsec)[0]
         x_ds, y_ds = float(px[0]), float(px[1])
 
@@ -522,7 +518,7 @@ def pixel_to_radec(
     t_arcsec: np.ndarray,
 ) -> SkyCoord:
     """
-    Given a pixel position (in the same pixel coordinate system used to fit, i.e. downsampled),
+    Given a pixel position (in the same pixel coordinate system used to fit),
     return ICRS SkyCoord using the inverse similarity:
       px -> arcsec offsets -> SkyCoord offset frame -> ICRS
     """
@@ -608,7 +604,6 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=0.0,
             center_dec_deg=0.0,
-            downsample=1,
             overlay=[],
             guides=[],
             metrics={"source": 1.0},
@@ -649,7 +644,6 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"n_det": float(img_xy_all.shape[0])},
@@ -665,13 +659,11 @@ def platesolve_sweep(
         # last resort: require explicit
         arcsec_per_px = float(getattr(cfg, "arcsec_per_px", 1.0))
 
-    arcsec_per_px_ds = float(arcsec_per_px)
-
     # 5) Gaia radius: prefer cfg.search_radius_deg else estimate from FOV
     def _estimate_radius_deg() -> float:
         diag_px = float(np.hypot(w, h))
         factor = float(getattr(cfg, "search_radius_factor", 1.15))
-        radius_as = factor * (diag_px / 2.0) * float(arcsec_per_px_ds)
+        radius_as = factor * (diag_px / 2.0) * float(arcsec_per_px)
         return float(max(0.4, radius_as / 3600.0))
 
     radius_deg = float(getattr(cfg, "search_radius_deg", None) or _estimate_radius_deg())
@@ -691,7 +683,7 @@ def platesolve_sweep(
             dx_px=0.0,
             dy_px=0.0,
             response=0.0,
-            scale_arcsec_per_px=float(arcsec_per_px_ds),
+            scale_arcsec_per_px=float(arcsec_per_px),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
@@ -699,7 +691,6 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"missing_tiles": float(getattr(e, "missing_tiles", 0))},
@@ -714,7 +705,7 @@ def platesolve_sweep(
             dx_px=0.0,
             dy_px=0.0,
             response=0.0,
-            scale_arcsec_per_px=float(arcsec_per_px_ds),
+            scale_arcsec_per_px=float(arcsec_per_px),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
@@ -722,7 +713,6 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"missing": float(len(missing_paths))},
@@ -737,7 +727,7 @@ def platesolve_sweep(
             dx_px=0.0,
             dy_px=0.0,
             response=0.0,
-            scale_arcsec_per_px=float(arcsec_per_px_ds),
+            scale_arcsec_per_px=float(arcsec_per_px),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
@@ -745,7 +735,6 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"err": 1.0},
@@ -759,7 +748,7 @@ def platesolve_sweep(
             dx_px=0.0,
             dy_px=0.0,
             response=0.0,
-            scale_arcsec_per_px=float(arcsec_per_px_ds),
+            scale_arcsec_per_px=float(arcsec_per_px),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
@@ -767,7 +756,6 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"gaia_rows": float(len(gaia_df))},
@@ -800,7 +788,7 @@ def platesolve_sweep(
             dx_px=0.0,
             dy_px=0.0,
             response=0.0,
-            scale_arcsec_per_px=float(arcsec_per_px_ds),
+            scale_arcsec_per_px=float(arcsec_per_px),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
@@ -808,7 +796,6 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"n_seed": float(img_xy_seed.shape[0])},
@@ -817,7 +804,7 @@ def platesolve_sweep(
     # 9) Triplets in image seeds
     img_triplets: List[Tuple[int, int, int, np.ndarray]] = []
     for (a, b, c) in combinations(range(img_xy_seed.shape[0]), 3):
-        sides = sorted_sides_arcsec_from_pixels(img_xy_seed[[a, b, c]], arcsec_per_pixel=arcsec_per_px_ds)
+        sides = sorted_sides_arcsec_from_pixels(img_xy_seed[[a, b, c]], arcsec_per_pixel=arcsec_per_px)
         img_triplets.append((a, b, c, sides))
 
     # 10) Candidate generation via annuli on 3D KDTree
@@ -910,7 +897,7 @@ def platesolve_sweep(
             dx_px=0.0,
             dy_px=0.0,
             response=0.0,
-            scale_arcsec_per_px=float(arcsec_per_px_ds),
+            scale_arcsec_per_px=float(arcsec_per_px),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
@@ -918,7 +905,6 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"n_candidates": 0.0},
@@ -998,7 +984,7 @@ def platesolve_sweep(
             dx_px=0.0,
             dy_px=0.0,
             response=0.0,
-            scale_arcsec_per_px=float(arcsec_per_px_ds),
+            scale_arcsec_per_px=float(arcsec_per_px),
             R_2x2=((1.0, 0.0), (0.0, 1.0)),
             t_arcsec=(0.0, 0.0),
             n_inliers=0,
@@ -1006,7 +992,6 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"n_eval": float(len(to_eval))},
@@ -1025,7 +1010,7 @@ def platesolve_sweep(
     R = np.asarray(best_fit["R"], dtype=np.float64)
     t_arcsec = np.asarray(best_fit["t"], dtype=np.float64)
 
-    # convert Gaia arcsec -> pixels (DS) for overlay
+    # convert Gaia arcsec -> pixels for overlay
     gaia_xy_px = inverse_similarity(gaia_xy_arcsec, s, R, t_arcsec)
 
     # mark matches in overlay
@@ -1048,7 +1033,6 @@ def platesolve_sweep(
             s_arcsec_per_px=s,
             R=R,
             t_arcsec=t_arcsec,
-            downsample=1,
             cfg=cfg,
             progress_cb=progress_cb,
         )
@@ -1072,14 +1056,13 @@ def platesolve_sweep(
         "n_seed": float(img_xy_seed.shape[0]),
         "gaia_rows": float(len(gaia_df)),
         "radius_deg": float(radius_deg),
-        "arcsec_per_px_ds": float(arcsec_per_px_ds),
+        "arcsec_per_px": float(arcsec_per_px),
         "triplet_score": float(best["candidate"]["score"]),
         "triplet_err_max": float(best["candidate"]["err_max"]),
         "max_trials": float(len(to_eval)),
         "n_inliers": float(best["num_inliers"]),
         "rms_inliers_arcsec": float(best["rms_inliers"]),
         "scale_arcsec_per_px": float(s),
-        "downsample": 1.0,
     }
 
     return PlatesolveResult(
@@ -1097,7 +1080,6 @@ def platesolve_sweep(
         rms_px=rms_px,
         center_ra_deg=float(best_center.ra.deg),
         center_dec_deg=float(best_center.dec.deg),
-        downsample=1,
         overlay=overlay,
         guides=guides,
         metrics=metrics,
@@ -1130,25 +1112,3 @@ def platesolve_from_live(
         progress_cb=progress_cb,
     )
 
-
-def platesolve_from_stack(
-    stack_frame: np.ndarray,
-    *,
-    target: TargetType,
-    cfg: PlatesolveConfig,
-    sep_cfg: Optional[SepConfig] = None,
-    observer: ObserverConfig = ObserverConfig(),
-    obstime: Optional[Time] = None,
-    progress_cb: Optional[ProgressCB] = None,
-) -> PlatesolveResult:
-    return platesolve_sweep(
-        stack_frame,
-        target=target,
-        cfg=cfg,
-        sep_cfg=sep_cfg,
-        observer=observer,
-        obstime=obstime,
-        source="stack",
-        gaia_auth=None,
-        progress_cb=progress_cb,
-    )

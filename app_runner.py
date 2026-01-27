@@ -445,8 +445,6 @@ class AppRunner:
             self.cfg.camera.binning = int(value)
         elif n in ("preview_view_hz",):
             self.cfg.preview.view_hz = float(value)
-        elif n in ("preview_ds",):
-            self.cfg.preview.ds = int(value)
         elif n in ("preview_jpeg_quality",):
             self.cfg.preview.jpeg_quality = int(value)
         elif n in ("preview_stretch_plo",):
@@ -569,7 +567,6 @@ class AppRunner:
             return
 
         try:
-            ds = int(self.cfg.preview.ds)
             overlay_enabled = bool(self._live_sep_overlay_enabled)
 
             raw16 = ensure_raw16_bayer(fr.raw)
@@ -581,18 +578,16 @@ class AppRunner:
             if overlay_enabled:
                 _, u8_preview = make_preview_jpeg(
                     raw16_hp,
-                    ds=ds,
                     plo=float(self.cfg.preview.stretch_plo),
                     phi=float(self.cfg.preview.stretch_phi),
                     jpeg_quality=int(self.cfg.preview.jpeg_quality),
                     sample_stride=4,
                 )
-                u8_preview = self._apply_live_sep_overlay(raw16_hp, u8_preview, ds)
+                u8_preview = self._apply_live_sep_overlay(raw16_hp, u8_preview)
                 jpg = encode_jpeg(u8_preview, quality=int(self.cfg.preview.jpeg_quality))
             else:
                 jpg, _ = make_preview_jpeg(
                     raw16_hp,
-                    ds=ds,
                     plo=float(self.cfg.preview.stretch_plo),
                     phi=float(self.cfg.preview.stretch_phi),
                     jpeg_quality=int(self.cfg.preview.jpeg_quality),
@@ -614,7 +609,7 @@ class AppRunner:
         except Exception as exc:
             log_error(self.out_log, "Preview: failed", exc)
 
-    def _apply_live_sep_overlay(self, raw16_hp: np.ndarray, u8_preview: np.ndarray, ds: int) -> np.ndarray:
+    def _apply_live_sep_overlay(self, raw16_hp: np.ndarray, u8_preview: np.ndarray) -> np.ndarray:
         try:
             params = dict(self._live_sep_params)
             _, _, _, obj_xy = sep_detect_from_raw16(
@@ -634,11 +629,10 @@ class AppRunner:
             else:
                 img = u8_preview.copy()
 
-            ds = int(max(1, ds))
             h, w = img.shape[:2]
             for x, y in obj_xy:
-                ix = int(round(float(x) / ds))
-                iy = int(round(float(y) / ds))
+                ix = int(round(float(x)))
+                iy = int(round(float(y)))
                 if ix < 0 or iy < 0 or ix >= w or iy >= h:
                     continue
                 cv2.circle(img, (ix, iy), 6, (0, 255, 255), 1, lineType=cv2.LINE_AA)
@@ -731,7 +725,6 @@ class AppRunner:
         self,
         frame: Optional[np.ndarray],
         overlay: Optional[List[Any]],
-        downsample: int,
     ) -> Optional[bytes]:
         if frame is None:
             return None
@@ -744,11 +737,6 @@ class AppRunner:
         gray = np.asarray(gray, dtype=np.float32)
         if gray.ndim != 2:
             return None
-
-        ds = int(max(1, downsample))
-        if ds > 1:
-            h, w = gray.shape[:2]
-            gray = cv2.resize(gray, (max(1, w // ds), max(1, h // ds)), interpolation=cv2.INTER_AREA)
 
         p1, p99 = np.percentile(gray, [1.0, 99.0])
         if p99 <= p1:
@@ -806,7 +794,6 @@ class AppRunner:
             "dy_px": float(getattr(result, "dy_px", 0.0)),
             "radius_deg": metrics.get("radius_deg"),
             "scale_arcsec_per_px": float(getattr(result, "scale_arcsec_per_px", metrics.get("scale_arcsec_per_px", 0.0))),
-            "downsample": int(getattr(result, "downsample", metrics.get("downsample", 1) or 1)),
         }
         return info
 
@@ -1000,7 +987,6 @@ class AppRunner:
                 debug_jpeg = self._render_platesolve_debug_jpeg(
                     frame,
                     list(getattr(result, "overlay", []) or []),
-                    int(getattr(result, "downsample", 1)),
                 )
                 debug_info = self._build_platesolve_debug_info(result)
     

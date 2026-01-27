@@ -578,7 +578,6 @@ class GoToController:
                 R_2x2=((1.0, 0.0), (0.0, 1.0)),
                 t_arcsec=(0.0, 0.0),
                 rms_arcsec=float("inf"),
-                downsample=1,
                 overlay=[],
                 guides=[],
                 metrics={"err": 1.0},
