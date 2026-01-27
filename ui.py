@@ -16,8 +16,8 @@ from actions import (
     mount_connect,
     mount_disconnect,
     mount_stop,
-    mount_set_microsteps,   # NEW
-    mount_move_steps,       # NEW
+    mount_set_microsteps,
+    mount_move_steps,
     mount_sync,
     mount_goto,
     goto_calibrate,
@@ -28,6 +28,7 @@ from actions import (
     stacking_start,
     stacking_stop,
     stacking_reset,
+    stacking_save,
     platesolve_run,
     platesolve_set_params,
     live_sep_set_params,
@@ -98,6 +99,9 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_btn_stacking_toggle = W.ToggleButton(description="Stacking", value=False, disabled=False)
     w_btn_save_quick = W.Button(description="Save Stack", disabled=True)
+    # The Save Stack button will trigger saving the current stacked mosaic in both
+    # raw (floating point) and stretched (uint8) formats.  See the handler
+    # below for implementation.  It remains disabled until stacking is running.
 
     top_left = W.VBox([w_status_camera, w_status_mount, w_status_tracking, w_status_stacking])
     top_mid = W.VBox([w_lbl_fps, w_lbl_frame_ms])
@@ -180,12 +184,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             )
         )
 
-    w_tb_live_sep.observe(_send_live_sep_params, names="value")
-    w_bi_live_sep_bw.observe(_send_live_sep_params, names="value")
-    w_bi_live_sep_bh.observe(_send_live_sep_params, names="value")
-    w_tf_live_sep_sigma.observe(_send_live_sep_params, names="value")
-    w_bi_live_sep_minarea.observe(_send_live_sep_params, names="value")
-    w_bi_live_sep_max_det.observe(_send_live_sep_params, names="value")
+    # Observers for SEP overlay are attached via the debounce handler defined below.
+    # See _debounce_live_sep for details.
 
     w_live_overlay_controls = W.VBox(
         [
@@ -216,6 +216,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         layout=W.Layout(width="170px"),
     )
     w_btn_apply_ms = W.Button(description="Apply MS", layout=W.Layout(width="110px"))
+    # Hide the Apply MS button; microstep divisions will be applied automatically via debounce
+    w_btn_apply_ms.layout.display = "none"
 
     w_steps_az = W.BoundedIntText(
         value=_clamp_int(getattr(cfg.mount, "slew_steps_az", 600), 1, 500000),
@@ -295,6 +297,112 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         layout=W.Layout(border="1px solid #eee", padding="8px", gap="6px"),
     )
 
+    # -------------------------------------------------------------------------
+    # Debounce logic for microstep changes.
+    #
+    # We wait briefly (0.3s) after a change to either MS AZ or MS ALT before
+    # sending a mount_set_microsteps action to the runner. Each subsequent change
+    # within the debounce interval resets the timer, ensuring we only send the
+    # final selected values.
+    _ms_timer: Optional[threading.Timer] = None  # type: ignore
+
+    def _debounce_set_ms(change: Any = None) -> None:
+        nonlocal _ms_timer
+        # cancel any existing timer
+        if _ms_timer is not None:
+            try:
+                _ms_timer.cancel()
+            except Exception:
+                pass
+        # capture current values
+        az_val = int(w_dd_ms_az.value)
+        alt_val = int(w_dd_ms_alt.value)
+
+        def _send_ms() -> None:
+            runner.enqueue(mount_set_microsteps(az_div=az_val, alt_div=alt_val))
+
+        # create and start new timer
+        _ms_timer = threading.Timer(0.3, _send_ms)
+        _ms_timer.start()
+
+    w_dd_ms_az.observe(_debounce_set_ms, names="value")
+    w_dd_ms_alt.observe(_debounce_set_ms, names="value")
+
+    # -------------------------------------------------------------------------
+    # Debounce logic for Live SEP overlay parameters.
+    #
+    # Changing any of the SEP overlay controls rapidly can enqueue a large number
+    # of live_sep_set_params actions.  To prevent flooding the runner, wait
+    # briefly (0.3s) after the last change before sending the action.  Each
+    # subsequent change within the debounce window resets the timer.
+    _live_sep_timer: Optional[threading.Timer] = None  # type: ignore
+
+    def _debounce_live_sep(change: Any = None) -> None:
+        nonlocal _live_sep_timer
+        # Cancel any existing timer
+        if _live_sep_timer is not None:
+            try:
+                _live_sep_timer.cancel()
+            except Exception:
+                pass
+        # Capture current values
+        enabled = bool(w_tb_live_sep.value)
+        sep_bw = int(w_bi_live_sep_bw.value)
+        sep_bh = int(w_bi_live_sep_bh.value)
+        sep_thresh_sigma = float(w_tf_live_sep_sigma.value)
+        sep_minarea = int(w_bi_live_sep_minarea.value)
+        max_det = int(w_bi_live_sep_max_det.value)
+
+        def _send_sep() -> None:
+            runner.enqueue(
+                live_sep_set_params(
+                    enabled=enabled,
+                    sep_bw=sep_bw,
+                    sep_bh=sep_bh,
+                    sep_thresh_sigma=sep_thresh_sigma,
+                    sep_minarea=sep_minarea,
+                    max_det=max_det,
+                )
+            )
+
+        _live_sep_timer = threading.Timer(0.3, _send_sep)
+        _live_sep_timer.start()
+
+    # Observe changes on SEP overlay controls using the debounce handler
+    w_tb_live_sep.observe(_debounce_live_sep, names="value")
+    w_bi_live_sep_bw.observe(_debounce_live_sep, names="value")
+    w_bi_live_sep_bh.observe(_debounce_live_sep, names="value")
+    w_tf_live_sep_sigma.observe(_debounce_live_sep, names="value")
+    w_bi_live_sep_minarea.observe(_debounce_live_sep, names="value")
+    w_bi_live_sep_max_det.observe(_debounce_live_sep, names="value")
+
+    # -------------------------------------------------------------------------
+    # Debounce logic for PlateSolve parameters.
+    #
+    # The platesolve config is large; changing any field enqueues an action.  To
+    # avoid spamming the runner, collect changes and apply them after 0.3s of
+    # inactivity.  The existing _ps_send_params function is used to build the
+    # payload; the timer simply invokes that function.
+    _ps_timer: Optional[threading.Timer] = None  # type: ignore
+
+    def _debounce_ps_params(change: Any = None) -> None:
+        nonlocal _ps_timer
+        if _ps_timer is not None:
+            try:
+                _ps_timer.cancel()
+            except Exception:
+                pass
+
+        def _send_ps() -> None:
+            # Call the existing helper to enqueue the parameters.  We ignore the
+            # change argument because _ps_send_params reads the current widget
+            # values.
+            _ps_send_params()
+
+        _ps_timer = threading.Timer(0.3, _send_ps)
+        _ps_timer.start()
+
+
     # -------------------------
     # Camera Tab
     # -------------------------
@@ -325,11 +433,12 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_cb_auto_gain = W.Checkbox(value=bool(cfg.camera.auto_gain), description="Auto Gain")
 
-    w_dd_img_format = W.Dropdown(
-        options=[("RAW16", "RAW16"), ("RAW8", "RAW8"), ("RGB24", "RGB24"), ("MONO8", "MONO8")],
-        value=str(cfg.camera.img_format),
-        description="Format",
-        layout=W.Layout(width="240px"),
+    # The camera stream always uses RAW16 format internally.  Instead of allowing
+    # the user to change the image format (which could break the pipeline),
+    # present a fixed label.  See imaging.ensure_raw16_bayer() for details.
+    w_lbl_img_format = W.HTML(
+        value="<b>Format</b>: RAW16 (fixed)",
+        layout=W.Layout(width="240px")
     )
 
     # Preview controls (mantengo aquí)
@@ -375,7 +484,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     cam_grid = W.VBox(
         [
-            W.HBox([w_dd_camera_id, w_dd_img_format]),
+            # Always display the fixed RAW16 format; do not allow changing it.
+            W.HBox([w_dd_camera_id, w_lbl_img_format]),
             W.HBox([w_bi_exp_ms, w_bi_gain, w_cb_auto_gain]),
             W.HBox([w_bt_view_hz, w_dd_ds, w_bi_jpeg_q]),
             W.HBox([w_bt_plo, w_bt_phi]),
@@ -492,7 +602,35 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     w_img_stack = W.Image(format="jpeg", layout=W.Layout(width="100%", max_width="980px"))
     w_btn_stack_reset = W.Button(description="Reset Stack", button_style="warning", layout=W.Layout(width="140px"))
-    w_tab_stacking = W.VBox([W.HTML("<b>Stacking</b>"), W.HBox([w_btn_stack_reset]), w_img_stack])
+    # Stacking control buttons: replicate Start and Stop inside the tab for symmetry
+    # with the tracking tab.  These simply toggle the global stacking toggle on
+    # the top bar; they do not send actions directly.  Reset remains available
+    # separately.
+    w_btn_stack_start = W.Button(description="Start", button_style="success", layout=W.Layout(width="110px"))
+    w_btn_stack_stop = W.Button(description="Stop", button_style="warning", layout=W.Layout(width="110px"))
+    # Bindings for stacking buttons in the tab
+    def _on_stack_start(_btn):
+        try:
+            if not bool(w_btn_stacking_toggle.value):
+                w_btn_stacking_toggle.value = True
+        except Exception as exc:
+            log_error(w_out_log, "UI: failed to update stacking toggle (start)", exc, throttle_s=5.0, throttle_key="ui_stack_toggle_start")
+
+    def _on_stack_stop(_btn):
+        try:
+            if bool(w_btn_stacking_toggle.value):
+                w_btn_stacking_toggle.value = False
+        except Exception as exc:
+            log_error(w_out_log, "UI: failed to update stacking toggle (stop)", exc, throttle_s=5.0, throttle_key="ui_stack_toggle_stop")
+
+    w_btn_stack_start.on_click(_on_stack_start)
+    w_btn_stack_stop.on_click(_on_stack_stop)
+
+    w_tab_stacking = W.VBox([
+        W.HTML("<b>Stacking</b>"),
+        W.HBox([w_btn_stack_start, w_btn_stack_stop, w_btn_stack_reset]),
+        w_img_stack
+    ])
 
     # ============================================================
     # TAB PLATESOLVE (integrado)
@@ -722,6 +860,10 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_btn_ps_solve.on_click(_on_ps_solve)
 
     # Observers -> update runner cfg live
+    # Use the debounce handler for all platesolve parameter changes.  This
+    # prevents flooding the runner when multiple parameters are edited in
+    # sequence.  When the user finishes editing, the parameters are applied
+    # together after a brief delay.
     for _w in [
         w_tf_ps_focal_mm,
         w_tf_ps_pixel_um,
@@ -743,10 +885,10 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         w_bi_ps_guide_n,
         w_tf_ps_simbad_radius_arcsec,
     ]:
-        _w.observe(_ps_send_params, names="value")
-    w_tb_ps_auto.observe(_ps_send_params, names="value")
-    w_tf_ps_every_s.observe(_ps_send_params, names="value")
-    w_txt_ps_target.observe(_ps_send_params, names="value")
+        _w.observe(_debounce_ps_params, names="value")
+    w_tb_ps_auto.observe(_debounce_ps_params, names="value")
+    w_tf_ps_every_s.observe(_debounce_ps_params, names="value")
+    w_txt_ps_target.observe(_debounce_ps_params, names="value")
 
     w_tab_platesolve = W.VBox(
         [
@@ -795,10 +937,13 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         description="Planeta:",
         layout=W.Layout(width="260px"),
     )
-    w_tf_goto_ra = W.FloatText(value=0.0, description="RA°:", layout=W.Layout(width="200px"))
-    w_tf_goto_dec = W.FloatText(value=0.0, description="Dec°:", layout=W.Layout(width="200px"))
-    w_tf_goto_az = W.FloatText(value=0.0, description="Az°:", layout=W.Layout(width="200px"))
-    w_tf_goto_alt = W.FloatText(value=45.0, description="Alt°:", layout=W.Layout(width="200px"))
+    # Use bounded inputs for RA/Dec/Az/Alt to prevent out-of-range values.  RA and
+    # Azimuth wrap around 0–360°, declination is limited to ±90°, and altitude
+    # between 0° (horizon) and 90° (zenith).
+    w_tf_goto_ra = W.BoundedFloatText(value=0.0, min=0.0, max=360.0, step=0.1, description="RA°:", layout=W.Layout(width="200px"))
+    w_tf_goto_dec = W.BoundedFloatText(value=0.0, min=-90.0, max=90.0, step=0.1, description="Dec°:", layout=W.Layout(width="200px"))
+    w_tf_goto_az = W.BoundedFloatText(value=0.0, min=0.0, max=360.0, step=0.1, description="Az°:", layout=W.Layout(width="200px"))
+    w_tf_goto_alt = W.BoundedFloatText(value=45.0, min=0.0, max=90.0, step=0.1, description="Alt°:", layout=W.Layout(width="200px"))
 
     w_bt_goto_tol = W.BoundedFloatText(value=10.0, min=0.5, max=3600.0, step=0.5, description="Tol (arcsec):", layout=W.Layout(width="220px"))
     w_bi_goto_max_iters = W.BoundedIntText(value=6, min=1, max=50, step=1, description="Iters:", layout=W.Layout(width="160px"))
@@ -926,37 +1071,65 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     # Bindings: Camera params
     # -------------------------
+    # -------------------------------------------------------------------------
+    # Camera parameter debounce.  Changing camera exposure, gain or preview
+    # settings forces the runner to reconnect the camera.  To avoid multiple
+    # reconnections while editing values (e.g. when typing), each parameter
+    # update is debounced: only the last change within 0.3s triggers a
+    # camera_set_param action.
+    _cam_param_timers: Dict[str, threading.Timer] = {}
+
+    def _debounce_camera_param(name: str, value: Any) -> None:
+        """Send camera_set_param(name, value) after 0.3s of inactivity."""
+        # cancel existing timer for this parameter
+        t = _cam_param_timers.get(name)
+        if t is not None:
+            try:
+                t.cancel()
+            except Exception:
+                pass
+
+        def _send() -> None:
+            try:
+                runner.enqueue(camera_set_param(name, value))
+            except Exception as exc:
+                log_error(w_out_log, f"UI: failed to enqueue camera param {name}", exc, throttle_s=5.0, throttle_key=f"ui_cam_{name}")
+
+        timer = threading.Timer(0.3, _send)
+        _cam_param_timers[name] = timer
+        timer.start()
+
     def _on_exp(change):
-        runner.enqueue(camera_set_param("exp_ms", int(change["new"])))
+        _debounce_camera_param("exp_ms", int(change["new"]))
 
     def _on_gain(change):
-        runner.enqueue(camera_set_param("gain", int(change["new"])))
+        _debounce_camera_param("gain", int(change["new"]))
 
     def _on_auto_gain(change):
-        runner.enqueue(camera_set_param("auto_gain", bool(change["new"])))
+        _debounce_camera_param("auto_gain", bool(change["new"]))
 
-    def _on_img_format(change):
-        runner.enqueue(camera_set_param("img_format", str(change["new"])))
+    # No handler for image format: the format is fixed to RAW16.  The corresponding dropdown
+    # has been removed.
 
     def _on_view_hz(change):
-        runner.enqueue(camera_set_param("preview_view_hz", float(change["new"])))
+        _debounce_camera_param("preview_view_hz", float(change["new"]))
 
     def _on_ds(change):
-        runner.enqueue(camera_set_param("preview_ds", int(change["new"])))
+        _debounce_camera_param("preview_ds", int(change["new"]))
 
     def _on_jpeg_q(change):
-        runner.enqueue(camera_set_param("preview_jpeg_quality", int(change["new"])))
+        _debounce_camera_param("preview_jpeg_quality", int(change["new"]))
 
     def _on_plo(change):
-        runner.enqueue(camera_set_param("preview_stretch_plo", float(change["new"])))
+        _debounce_camera_param("preview_stretch_plo", float(change["new"]))
 
     def _on_phi(change):
-        runner.enqueue(camera_set_param("preview_stretch_phi", float(change["new"])))
+        _debounce_camera_param("preview_stretch_phi", float(change["new"]))
 
     w_bi_exp_ms.observe(_on_exp, names="value")
     w_bi_gain.observe(_on_gain, names="value")
     w_cb_auto_gain.observe(_on_auto_gain, names="value")
-    w_dd_img_format.observe(_on_img_format, names="value")
+    # There is no observer for image format; see notes above.
 
     w_bt_view_hz.observe(_on_view_hz, names="value")
     w_dd_ds.observe(_on_ds, names="value")
@@ -987,21 +1160,15 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_btn_mount_disconnect_tab.on_click(_on_disconnect_mount)
 
     # -------------------------
-    # Bindings: Manual mount (MOVE steps/delay + MS)
+    # Bindings: Manual mount (MOVE steps/delay)
     # -------------------------
-    def _enqueue_apply_ms():
-        az_div = int(w_dd_ms_az.value)
-        alt_div = int(w_dd_ms_alt.value)
-        runner.enqueue(mount_set_microsteps(az_div=az_div, alt_div=alt_div))
-
+    # Note: microstep divisions (MS AZ / MS ALT) are applied automatically via the debounce
+    # handler defined above. This section binds only movement and stop actions.
     def _enqueue_move(axis: Axis, direction: int, steps: int, delay_us: int):
         if steps <= 0 or delay_us <= 0:
             log_info(w_out_log, f"Manual MOVE: invalid params steps={steps} delay_us={delay_us}")
             return
         runner.enqueue(mount_move_steps(axis=axis, direction=direction, steps=steps, delay_us=delay_us))
-
-    def _on_apply_ms(_btn):
-        _enqueue_apply_ms()
 
     def _on_az_left(_btn):
         _enqueue_move(Axis.AZ, -1, int(w_steps_az.value), int(w_delay_az.value))
@@ -1021,7 +1188,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     def _on_stop_top(_btn):
         runner.enqueue(mount_stop())
 
-    w_btn_apply_ms.on_click(_on_apply_ms)
     w_btn_az_left.on_click(_on_az_left)
     w_btn_az_right.on_click(_on_az_right)
     w_btn_alt_up.on_click(_on_alt_up)
@@ -1066,6 +1232,23 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_btn_stack_reset.on_click(_on_stacking_reset)
 
+    # -------------------------
+    # Binding: Save Stack
+    # -------------------------
+    def _on_save_stack(_btn):
+        """Save the current stacked mosaic to disk.
+
+        The output directory is fixed to 'stack_output' relative to the current
+        working directory.  A timestamp is used as the basename to avoid
+        collisions.  The backend will produce both a raw .npy file and a
+        stretched PNG.
+        """
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        out_dir = "stack_output"
+        runner.enqueue(stacking_save(out_dir=out_dir, basename=ts, fmt="png"))
+
+    w_btn_save_quick.on_click(_on_save_stack)
+
     widgets = {
         # top bar
         "w_status_camera": w_status_camera,
@@ -1093,6 +1276,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         # stacking tab
         "w_img_stack": w_img_stack,
         "w_btn_stack_reset": w_btn_stack_reset,
+        "w_btn_stack_start": w_btn_stack_start,
+        "w_btn_stack_stop": w_btn_stack_stop,
         # platesolve tab
         "w_txt_ps_target": w_txt_ps_target,
         "w_btn_ps_solve": w_btn_ps_solve,
@@ -1125,7 +1310,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         # manual mount control
         "w_dd_ms_az": w_dd_ms_az,
         "w_dd_ms_alt": w_dd_ms_alt,
-        "w_btn_apply_ms": w_btn_apply_ms,
         "w_steps_az": w_steps_az,
         "w_delay_az": w_delay_az,
         "w_steps_alt": w_steps_alt,
@@ -1140,7 +1324,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_bi_exp_ms": w_bi_exp_ms,
         "w_bi_gain": w_bi_gain,
         "w_cb_auto_gain": w_cb_auto_gain,
-        "w_dd_img_format": w_dd_img_format,
+        # image format is fixed to RAW16; provide label instead of dropdown
+        "w_lbl_img_format": w_lbl_img_format,
         "w_bt_view_hz": w_bt_view_hz,
         "w_dd_ds": w_dd_ds,
         "w_bi_jpeg_q": w_bi_jpeg_q,
@@ -1206,6 +1391,12 @@ class UILoop:
 
     def tick(self) -> None:
         st = self.runner.get_state()
+
+        # Determine connectivity and running states for gating controls
+        cam_connected = bool(getattr(st, "camera_connected", False))
+        mount_connected = bool(getattr(st, "mount_connected", False))
+        stacking_running = bool(getattr(st, "stacking_enabled", False))
+        tracking_running = bool(getattr(st, "tracking_enabled", False))
 
         # status labels
         self.widgets["w_status_camera"].value = f"Camera: <b>{st.camera_status}</b>"
@@ -1350,6 +1541,71 @@ class UILoop:
         ps_jpg = getattr(st, "platesolve_debug_jpeg", None)
         if ps_jpg and "w_img_platesolve" in self.widgets:
             self.widgets["w_img_platesolve"].value = ps_jpg
+
+        # -------------------------------------------------------------------
+        # Enable/disable UI controls based on current state
+        # Camera connect/disconnect
+        if "w_btn_connect_camera" in self.widgets:
+            self.widgets["w_btn_connect_camera"].disabled = cam_connected
+        if "w_btn_disconnect_camera" in self.widgets:
+            self.widgets["w_btn_disconnect_camera"].disabled = not cam_connected
+        # Mount connect/disconnect (both top bar and tab)
+        if "w_btn_connect_mount" in self.widgets:
+            self.widgets["w_btn_connect_mount"].disabled = mount_connected
+        if "w_btn_disconnect_mount" in self.widgets:
+            self.widgets["w_btn_disconnect_mount"].disabled = not mount_connected
+        if "w_btn_mount_connect_tab" in self.widgets:
+            self.widgets["w_btn_mount_connect_tab"].disabled = mount_connected
+        if "w_btn_mount_disconnect_tab" in self.widgets:
+            self.widgets["w_btn_mount_disconnect_tab"].disabled = not mount_connected
+
+        # Manual mount controls: disable if mount is not connected
+        manual_keys = [
+            "w_dd_ms_az",
+            "w_dd_ms_alt",
+            "w_steps_az",
+            "w_delay_az",
+            "w_steps_alt",
+            "w_delay_alt",
+            "w_btn_az_left",
+            "w_btn_az_right",
+            "w_btn_alt_up",
+            "w_btn_alt_down",
+            "w_btn_stop",
+        ]
+        for k in manual_keys:
+            if k in self.widgets:
+                # Always allow STOP (for safety) regardless of mount connection
+                if k in ("w_btn_stop",):
+                    self.widgets[k].disabled = False
+                else:
+                    self.widgets[k].disabled = not mount_connected
+
+        # Tracking controls: disable toggle if camera or mount not connected
+        if "w_btn_tracking_toggle" in self.widgets:
+            self.widgets["w_btn_tracking_toggle"].disabled = not (cam_connected and mount_connected)
+        # Tracking tab buttons
+        if "w_btn_track_start" in self.widgets:
+            self.widgets["w_btn_track_start"].disabled = not (cam_connected and mount_connected)
+        if "w_btn_track_stop" in self.widgets:
+            self.widgets["w_btn_track_stop"].disabled = not tracking_running
+
+        # Stacking controls: disable toggle and tab buttons when camera not connected
+        if "w_btn_stacking_toggle" in self.widgets:
+            self.widgets["w_btn_stacking_toggle"].disabled = not cam_connected
+        if "w_btn_stack_start" in self.widgets:
+            self.widgets["w_btn_stack_start"].disabled = not cam_connected
+        if "w_btn_stack_stop" in self.widgets:
+            # Enable stop only if stacking is currently running
+            self.widgets["w_btn_stack_stop"].disabled = not stacking_running
+        if "w_btn_stack_reset" in self.widgets:
+            # Allow resetting only if stacking is running (has state)
+            self.widgets["w_btn_stack_reset"].disabled = not stacking_running
+
+        # Save Stack button: enable only when stacking is running.  When disabled,
+        # clicking has no effect.  The button is visible in the top bar.
+        if "w_btn_save_quick" in self.widgets:
+            self.widgets["w_btn_save_quick"].disabled = not stacking_running
 
 
 def show_ui(cfg: AppConfig, runner: AppRunner, *, start_loops: bool = True, ui_hz: float = 10.0):
