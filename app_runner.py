@@ -51,7 +51,7 @@ def _now_s() -> float:
 
 
 
-def _safe_slug(self, s: str) -> str:
+def _safe_slug(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", s)
     return s[:80] if s else "target"
@@ -115,8 +115,8 @@ class AppRunner:
         # GoTo subsystem (no bloquea loop)
         kin = MountKinematics(
             motor_full_steps_per_rev=200,
-            microsteps_az=int(getattr(cfg.mount, 'ms_az', 64)),
-            microsteps_alt=int(getattr(cfg.mount, 'ms_alt', 64)),
+            microsteps_az=int(cfg.mount.ms_az),
+            microsteps_alt=int(cfg.mount.ms_alt),
             motor_pulley_teeth=20,
             ring_radius_m_az=0.24,
             ring_radius_m_alt=0.235,
@@ -149,11 +149,11 @@ class AppRunner:
         self._pending_preview_cfg: PreviewConfig = cfg.preview
         self._live_sep_overlay_enabled = False
         self._live_sep_params = {
-            "sep_bw": int(getattr(cfg.platesolve, "sep_bw", 64)),
-            "sep_bh": int(getattr(cfg.platesolve, "sep_bh", 64)),
-            "sep_thresh_sigma": float(getattr(cfg.platesolve, "sep_thresh_sigma", 3.5)),
-            "sep_minarea": int(getattr(cfg.platesolve, "sep_minarea", 5)),
-            "max_det": int(getattr(cfg.platesolve, "max_det", 250)),
+            "sep_bw": int(cfg.platesolve.sep_bw),
+            "sep_bh": int(cfg.platesolve.sep_bh),
+            "sep_thresh_sigma": float(cfg.platesolve.sep_thresh_sigma),
+            "sep_minarea": int(cfg.platesolve.sep_minarea),
+            "max_det": int(cfg.platesolve.max_det),
         }
 
         # Estado inicial
@@ -756,16 +756,6 @@ class AppRunner:
           - u8_view (si existe) para inspección rápida
           - debug_jpeg + debug_info/result para reproducir el diagnóstico
         """
-        from pathlib import Path
-        import json
-        import re
-        import datetime as _dt
-    
-        def _safe_slug(s: str) -> str:
-            s = (s or "").strip()
-            s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", s)
-            return s[:80] if s else "target"
-    
         def _dump_dir() -> Path:
             d = Path("platesolve_dumps")
             d.mkdir(parents=True, exist_ok=True)
@@ -818,7 +808,7 @@ class AppRunner:
                     json.dump(info, f, ensure_ascii=False, indent=2)
     
                 return str(base)
-            except Exception as exc:
+            except (OSError, ValueError, TypeError) as exc:
                 log_error(self.out_log, "Platesolve: failed to dump snapshot", exc)
                 return None
     
@@ -1004,7 +994,7 @@ class AppRunner:
 
     def _maybe_autosolve(self) -> None:
         cfg = self._platesolve_cfg
-        if not bool(getattr(cfg, "auto_solve", False)):
+        if not bool(cfg.auto_solve):
             return
         target = str(self._platesolve_auto_target or "").strip()
         if not target:
@@ -1013,7 +1003,7 @@ class AppRunner:
         if bool(getattr(st, "platesolve_busy", False)):
             return
         now = _perf()
-        if (now - float(self._platesolve_last_auto_t)) < max(2.0, float(getattr(cfg, "solve_every_s", 15.0))):
+        if (now - float(self._platesolve_last_auto_t)) < max(2.0, float(cfg.solve_every_s)):
             return
         self._platesolve_request(target=target)
         self._platesolve_last_auto_t = float(now)
