@@ -652,12 +652,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
 
     # Controls
-    w_dd_ps_source = W.Dropdown(
-        description="source",
-        options=[("Live", "live"), ("Stack", "stack")],
-        value="live",
-        layout=W.Layout(width="220px"),
-    )
     w_txt_ps_target = W.Text(
         description="target",
         value="",
@@ -712,7 +706,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             "auto_solve": bool(w_tb_ps_auto.value),
             "solve_every_s": float(w_tf_ps_every_s.value),
             "auto_target": str(w_txt_ps_target.value),
-            "auto_source": str(w_dd_ps_source.value),
         }
         runner.enqueue(platesolve_set_params(**params))
 
@@ -721,7 +714,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         if not target:
             log_info(w_out_log, "PlateSolve: missing target")
             return
-        runner.enqueue(platesolve_run(source=str(w_dd_ps_source.value), target=target))
+        runner.enqueue(platesolve_run(target=target))
 
     def _on_ps_solve(_btn):
         _ps_request_once()
@@ -753,13 +746,12 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         _w.observe(_ps_send_params, names="value")
     w_tb_ps_auto.observe(_ps_send_params, names="value")
     w_tf_ps_every_s.observe(_ps_send_params, names="value")
-    w_dd_ps_source.observe(_ps_send_params, names="value")
     w_txt_ps_target.observe(_ps_send_params, names="value")
 
     w_tab_platesolve = W.VBox(
         [
             W.HTML("<b>PlateSolve</b>"),
-            W.HBox([w_dd_ps_source, w_btn_ps_solve, w_tb_ps_auto, w_tf_ps_every_s]),
+            W.HBox([w_btn_ps_solve, w_tb_ps_auto, w_tf_ps_every_s]),
             w_txt_ps_target,
             W.HTML("<b>Instrument</b>"),
             W.HBox([w_tf_ps_focal_mm, w_tf_ps_pixel_um, w_bi_ps_binning]),
@@ -1103,7 +1095,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_btn_stack_reset": w_btn_stack_reset,
         # platesolve tab
         "w_txt_ps_target": w_txt_ps_target,
-        "w_dd_ps_source": w_dd_ps_source,
         "w_btn_ps_solve": w_btn_ps_solve,
         "w_tb_ps_auto": w_tb_ps_auto,
         "w_tf_ps_every_s": w_tf_ps_every_s,
