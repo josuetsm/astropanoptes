@@ -50,6 +50,23 @@ except Exception as exc:
     log_error(None, "Gaia cache: failed to import pyarrow; parquet disabled", exc)
     _HAS_PARQUET = False
 
+class GaiaCacheMissError(RuntimeError):
+    """Raised when required Gaia cache tiles are missing and downloads are disabled."""
+
+    def __init__(self, missing_paths: Sequence[Path], missing_tiles: Optional[Sequence[int]] = None) -> None:
+        self.missing_paths = list(missing_paths)
+        self.missing_tiles = list(missing_tiles) if missing_tiles is not None else []
+        super().__init__(f"Missing Gaia cache tiles: {len(self.missing_paths)}")
+
+
+class NeedGaiaAuthError(RuntimeError):
+    """Raised when Gaia authentication is required to proceed."""
+
+    def __init__(self, missing_tiles: Optional[Sequence[int]] = None) -> None:
+        self.missing_tiles = list(missing_tiles) if missing_tiles is not None else []
+        super().__init__("Gaia authentication required to download missing tiles.")
+
+
 # -------------------------
 # Config caché y defaults
 # -------------------------
@@ -177,6 +194,9 @@ def normalize_input(target) -> SkyCoord:
       - {'ra': 6.5, 'dec': -39.6} → grados
     Devuelve SkyCoord(ICRS).
     """
+    if isinstance(target, SkyCoord):
+        return target.icrs
+
     if isinstance(target, str):
         if any(ch.isalpha() for ch in target):
             return SkyCoord.from_name(target)
@@ -388,9 +408,13 @@ def _query_healpix_tile_async(
 # Mosaico HEALPix (async, login único)
 # -------------------------
 def gaia_healpix_cone_with_mag(
-    target,
-    radius: Union[float, u.Quantity],
+    target=None,
+    radius: Optional[Union[float, u.Quantity]] = None,
     *,
+    center_icrs: Optional[SkyCoord] = None,
+    radius_deg: Optional[float] = None,
+    cfg=None,
+    progress_cb=None,
     gmax: float = 15.0,
     nside: int = 64,
     order: str = "ring",
@@ -412,8 +436,36 @@ def gaia_healpix_cone_with_mag(
     """
     _ensure_healpix_available()
 
-    center = normalize_input(target)
-    radius_deg = (radius.to_value(u.deg) if isinstance(radius, u.Quantity) else float(radius))
+    if cfg is not None:
+        cache_dir = getattr(cfg, "cache_dir", None)
+        if cache_dir:
+            set_cache_dir(cache_dir)
+        table_name = getattr(cfg, "table_name", table_name)
+        columns = getattr(cfg, "columns", columns)
+        gmax = float(getattr(cfg, "gmax", gmax))
+        nside = int(getattr(cfg, "nside", nside))
+        order = getattr(cfg, "order", order)
+        prefer_parquet = bool(getattr(cfg, "prefer_parquet", prefer_parquet))
+        row_limit = int(getattr(cfg, "row_limit", row_limit))
+        retries = int(getattr(cfg, "retries", retries))
+        backoff_s = float(getattr(cfg, "backoff_s", backoff_s))
+        download_missing_tiles = bool(getattr(cfg, "download_missing_tiles", True))
+    else:
+        download_missing_tiles = True
+
+    if center_icrs is not None:
+        center = normalize_input(center_icrs)
+    elif target is not None:
+        center = normalize_input(target)
+    else:
+        raise ValueError("gaia_healpix_cone_with_mag: missing target/center_icrs")
+
+    if radius_deg is None:
+        if radius is None:
+            raise ValueError("gaia_healpix_cone_with_mag: missing radius/radius_deg")
+        radius_deg = (radius.to_value(u.deg) if isinstance(radius, u.Quantity) else float(radius))
+    else:
+        radius_deg = float(radius_deg)
 
     hp = HEALPix(nside=nside, order=order, frame=center.frame)
     pix_indices = hp.cone_search_skycoord(center, Angle(radius_deg, u.deg))
@@ -434,8 +486,14 @@ def gaia_healpix_cone_with_mag(
 
     need_download = (len(missing) > 0)
 
+    if need_download and not download_missing_tiles:
+        missing_paths = [cache_paths[pix] for pix in missing]
+        raise GaiaCacheMissError(missing_paths, missing_tiles=missing)
+
     if verbose and need_download:
         print(f"[gaia_healpix] nside={nside}, tiles={len(pix_indices)}")
+        if progress_cb:
+            progress_cb("gaia:healpix:start", {"tiles": float(len(pix_indices)), "missing": float(len(missing))})
 
     did_login = False
     try:
@@ -445,6 +503,9 @@ def gaia_healpix_cone_with_mag(
                 print(f"[gaia_healpix] Login único al Gaia Archive… (missing tiles={len(missing)})")
             Gaia.login(user=auth[0], password=auth[1])
             did_login = True
+        elif need_download and auth is None and getattr(Gaia, "login", None) is not None:
+            # allow anonymous downloads; only error out if caller explicitly wants auth
+            pass
 
         parts: List[Table] = []
         for i, pix in enumerate(pix_indices, 1):
@@ -460,6 +521,8 @@ def gaia_healpix_cone_with_mag(
                 if verbose:
                     # Ojo: este bloque solo corre si need_download=True (por definición)
                     print(f"[gaia_healpix] Query tile {i}/{len(pix_indices)} (pix={pix_i})")
+                if progress_cb:
+                    progress_cb("gaia:healpix:tile", {"tile": float(i), "tiles": float(len(pix_indices)), "pix": float(pix_i)})
                 poly = hp.boundaries_skycoord(pix, step=1)
                 tab = _query_healpix_tile_async(
                     table_name=table_name,
