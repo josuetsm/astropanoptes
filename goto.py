@@ -57,7 +57,7 @@ from platesolve import (
     ObserverConfig,
     PlatesolveConfig,
     PlatesolveResult,
-    platesolve_from_live,
+    platesolve_from_frame,
     parse_target_to_icrs,
 )
 from logging_utils import log_error, log_info
@@ -605,7 +605,7 @@ class GoToController:
                     )
                     cfg2 = platesolve_cfg
 
-            res = platesolve_from_live(
+            res = platesolve_from_frame(
                 frame,
                 target=target_for_solver,
                 cfg=cfg2,
