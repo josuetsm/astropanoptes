@@ -8,8 +8,6 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 import pandas as pd
-import cv2
-import sep
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz, ICRS
@@ -19,8 +17,9 @@ from sklearn.neighbors import KDTree
 from itertools import combinations, permutations
 
 from logging_utils import log_error, log_info
-from hotpixels import hotpix_prefilter_base
-from config import PlatesolveConfig
+from imaging import ensure_raw16_bayer
+from sep_utils import sep_detect_from_raw16
+from config import PlatesolveConfig, SepConfig
 
 # IMPORTANT: all Gaia/cache/auth logic must live in gaia_cache.py
 import gaia_cache as gc
@@ -216,20 +215,6 @@ def _ensure_icrs(coord: SkyCoord, *, label: str) -> SkyCoord:
 # Image: SEP detection (closer to your notebook logic)
 # ============================================================
 
-def _to_gray(img: np.ndarray) -> np.ndarray:
-    arr = np.asarray(img)
-    if arr.ndim == 3:
-        arr = cv2.cvtColor(arr, cv2.COLOR_BGR2GRAY)
-    return arr
-
-
-def _downsample(img: np.ndarray, factor: int) -> np.ndarray:
-    f = int(max(1, factor))
-    if f == 1:
-        return img
-    return np.ascontiguousarray(img[::f, ::f])
-
-
 def stretch01(img: np.ndarray) -> np.ndarray:
     lo, hi = np.percentile(img, [1, 99])
     if hi <= lo:
@@ -239,7 +224,7 @@ def stretch01(img: np.ndarray) -> np.ndarray:
 
 
 def detect_sep_objects(
-    raw_gray: np.ndarray,
+    raw16_hp: np.ndarray,
     *,
     sep_bw: int,
     sep_bh: int,
@@ -257,38 +242,29 @@ def detect_sep_objects(
     if progress_cb:
         progress_cb("detect:start", {})
 
-    raw = np.asarray(raw_gray)
+    raw = ensure_raw16_bayer(raw16_hp)
     disp = stretch01(raw)
 
-    img_med = hotpix_prefilter_base(raw, ksize=3)
-    bkg = sep.Background(img_med, bw=int(sep_bw), bh=int(sep_bh))
-    img_sub = img_med - bkg.back()
-    img_det = np.maximum(img_sub, 0.0)
-
-    thresh = float(sep_thresh_sigma) * float(bkg.globalrms)
-    objects = sep.extract(img_det, thresh, minarea=int(sep_minarea))
+    img_det, bkg, objects, obj_xy = sep_detect_from_raw16(
+        raw,
+        sep_bw=sep_bw,
+        sep_bh=sep_bh,
+        sep_thresh_sigma=sep_thresh_sigma,
+        sep_minarea=sep_minarea,
+        max_sources=max_sources,
+    )
 
     if objects is None or len(objects) == 0:
         if progress_cb:
-            progress_cb("detect:empty", {"thresh": float(thresh), "globalrms": float(bkg.globalrms)})
+            progress_cb("detect:empty", {"thresh": float(sep_thresh_sigma), "globalrms": float(bkg.globalrms)})
         return disp.astype(np.float32), np.zeros((0, 2), np.float64), np.zeros((0,), np.float64)
 
-    # sort by flux desc
-    order = np.argsort(-objects["flux"].astype(np.float64))
-    objects = objects[order]
-
-    # cap sources
-    n_use = min(int(max_sources), len(objects))
-    objects = objects[:n_use]
-
-    x = objects["x"].astype(np.float64)
-    y = objects["y"].astype(np.float64)
     flux = objects["flux"].astype(np.float64)
 
     if progress_cb:
-        progress_cb("detect:done", {"n": int(n_use), "thresh": float(thresh), "globalrms": float(bkg.globalrms)})
+        progress_cb("detect:done", {"n": int(len(obj_xy)), "thresh": float(sep_thresh_sigma), "globalrms": float(bkg.globalrms)})
 
-    return disp.astype(np.float32), np.column_stack([x, y]), flux
+    return disp.astype(np.float32), obj_xy, flux
 
 
 # ============================================================
@@ -602,6 +578,7 @@ def platesolve_sweep(
     *,
     target: TargetType,
     cfg: PlatesolveConfig,
+    sep_cfg: Optional[SepConfig] = None,
     observer: ObserverConfig = ObserverConfig(),
     obstime: Optional[Time] = None,
     source: str = "live",
@@ -631,26 +608,25 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=0.0,
             center_dec_deg=0.0,
-            downsample=int(getattr(cfg, "downsample", 1)),
+            downsample=1,
             overlay=[],
             guides=[],
             metrics={"source": 1.0},
         )
     center_icrs = _ensure_icrs(center_icrs, label="center")
 
-    # 2) Prepare frame (gray + downsample)
-    gray = _to_gray(frame)
-    ds = int(max(1, getattr(cfg, "downsample", 1)))
-    gray_ds = _downsample(gray, ds)
-    h, w = gray_ds.shape[:2]
+    # 2) Prepare frame (RAW16)
+    raw16 = ensure_raw16_bayer(frame)
+    h, w = raw16.shape[:2]
+    sep_cfg = sep_cfg or SepConfig()
 
     # 3) Detect stars (SEP)
     disp, img_xy_all, img_flux_all = detect_sep_objects(
-        gray_ds,
-        sep_bw=int(getattr(cfg, "sep_bw", 64)),
-        sep_bh=int(getattr(cfg, "sep_bh", 64)),
-        sep_thresh_sigma=float(getattr(cfg, "sep_thresh_sigma", getattr(cfg, "det_thresh_sigma", 3.0))),
-        sep_minarea=int(getattr(cfg, "sep_minarea", getattr(cfg, "det_minarea", 5))),
+        raw16,
+        sep_bw=int(sep_cfg.bw),
+        sep_bh=int(sep_cfg.bh),
+        sep_thresh_sigma=float(sep_cfg.thresh_sigma),
+        sep_minarea=int(sep_cfg.minarea),
         max_sources=int(getattr(cfg, "max_det", 200)),
         progress_cb=progress_cb,
     )
@@ -673,13 +649,13 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=int(ds),
+            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"n_det": float(img_xy_all.shape[0])},
         )
 
-    # 4) Plate scale (arcsec/px) at full-res, then adjust for downsample
+    # 4) Plate scale (arcsec/px) at full-res
     # pixel_size_m expected in cfg; if not, allow pixel_um + focal_mm fallback
     if hasattr(cfg, "pixel_size_m") and hasattr(cfg, "focal_m"):
         arcsec_per_px = 206265.0 * (float(cfg.pixel_size_m)) / float(cfg.focal_m)
@@ -689,7 +665,7 @@ def platesolve_sweep(
         # last resort: require explicit
         arcsec_per_px = float(getattr(cfg, "arcsec_per_px", 1.0))
 
-    arcsec_per_px_ds = float(arcsec_per_px) * float(ds)
+    arcsec_per_px_ds = float(arcsec_per_px)
 
     # 5) Gaia radius: prefer cfg.search_radius_deg else estimate from FOV
     def _estimate_radius_deg() -> float:
@@ -723,7 +699,7 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=int(ds),
+            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"missing_tiles": float(getattr(e, "missing_tiles", 0))},
@@ -746,7 +722,7 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=int(ds),
+            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"missing": float(len(missing_paths))},
@@ -769,7 +745,7 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=int(ds),
+            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"err": 1.0},
@@ -791,7 +767,7 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=int(ds),
+            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"gaia_rows": float(len(gaia_df))},
@@ -832,7 +808,7 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=int(ds),
+            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"n_seed": float(img_xy_seed.shape[0])},
@@ -942,7 +918,7 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=int(ds),
+            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"n_candidates": 0.0},
@@ -1030,7 +1006,7 @@ def platesolve_sweep(
             rms_px=float("inf"),
             center_ra_deg=float(center_icrs.ra.deg),
             center_dec_deg=float(center_icrs.dec.deg),
-            downsample=int(ds),
+            downsample=1,
             overlay=overlay,
             guides=[],
             metrics={"n_eval": float(len(to_eval))},
@@ -1072,7 +1048,7 @@ def platesolve_sweep(
             s_arcsec_per_px=s,
             R=R,
             t_arcsec=t_arcsec,
-            downsample=ds,
+            downsample=1,
             cfg=cfg,
             progress_cb=progress_cb,
         )
@@ -1103,7 +1079,7 @@ def platesolve_sweep(
         "n_inliers": float(best["num_inliers"]),
         "rms_inliers_arcsec": float(best["rms_inliers"]),
         "scale_arcsec_per_px": float(s),
-        "downsample": float(ds),
+        "downsample": 1.0,
     }
 
     return PlatesolveResult(
@@ -1121,7 +1097,7 @@ def platesolve_sweep(
         rms_px=rms_px,
         center_ra_deg=float(best_center.ra.deg),
         center_dec_deg=float(best_center.dec.deg),
-        downsample=int(ds),
+        downsample=1,
         overlay=overlay,
         guides=guides,
         metrics=metrics,
@@ -1137,6 +1113,7 @@ def platesolve_from_live(
     *,
     target: TargetType,
     cfg: PlatesolveConfig,
+    sep_cfg: Optional[SepConfig] = None,
     observer: ObserverConfig = ObserverConfig(),
     obstime: Optional[Time] = None,
     progress_cb: Optional[ProgressCB] = None,
@@ -1145,6 +1122,7 @@ def platesolve_from_live(
         frame,
         target=target,
         cfg=cfg,
+        sep_cfg=sep_cfg,
         observer=observer,
         obstime=obstime,
         source="live",
@@ -1158,6 +1136,7 @@ def platesolve_from_stack(
     *,
     target: TargetType,
     cfg: PlatesolveConfig,
+    sep_cfg: Optional[SepConfig] = None,
     observer: ObserverConfig = ObserverConfig(),
     obstime: Optional[Time] = None,
     progress_cb: Optional[ProgressCB] = None,
@@ -1166,6 +1145,7 @@ def platesolve_from_stack(
         stack_frame,
         target=target,
         cfg=cfg,
+        sep_cfg=sep_cfg,
         observer=observer,
         obstime=obstime,
         source="stack",

@@ -72,9 +72,7 @@ class MountConfig:
 
 @dataclass
 class TrackingConfig:
-    track_source: str = "green"  # luma|green|full
     track_method: str = "PyramidPhaseCorr"
-    track_downsample: int = 2
     sigma_hp: float = 10.0
     resp_min: float = 0.06
 
@@ -88,7 +86,6 @@ class StackingConfig:
     max_queue: int = 80  # >= batch_size*4 recomendado
 
     # alignment
-    align_downsample: int = 4
     resp_min: float = 0.08
     outlier_k_mad: float = 3.0
 
@@ -120,6 +117,16 @@ class HotPixelsConfig:
     min_hits_frac: float = 0.7
     max_component_area: int = 4
     calib_frames: int = 30
+    calib_abs_percentile: float = 99.9
+    calib_var_percentile: float = 10.0
+
+
+@dataclass
+class SepConfig:
+    minarea: int = 5
+    bw: int = 64
+    bh: int = 64
+    thresh_sigma: float = 3.0
 
 
 @dataclass
@@ -136,15 +143,10 @@ class PlatesolveConfig:
     debug_input_stats: bool = False
 
     # Image processing
-    downsample: int = 2
     max_det: int = 250
     det_thresh_sigma: float = 3.5
     det_minarea: int = 5
     point_sigma: float = 1.2  # sigma for gaussian blur of point-maps
-    sep_bw: int = 64
-    sep_bh: int = 64
-    sep_thresh_sigma: float = 3.5
-    sep_minarea: int = 5
 
     # Gaia cache + query
     cache_dir: str = "~/.cache/gaia_cones"
@@ -168,7 +170,7 @@ class PlatesolveConfig:
     max_i_scan: int = 2000
 
     # Matching
-    match_max_px: float = 3.5  # in downsampled pixels
+    match_max_px: float = 3.5  # in full-res pixels
     match_tol_arcsec: float = 5.0
     pred_margin_arcsec: float = 25.0
     min_inliers: int = 3
@@ -202,6 +204,7 @@ class AppConfig:
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     stacking: StackingConfig = field(default_factory=StackingConfig)
     hotpixels: HotPixelsConfig = field(default_factory=HotPixelsConfig)
+    sep: SepConfig = field(default_factory=SepConfig)
     platesolve: PlatesolveConfig = field(default_factory=PlatesolveConfig)
 #    goto: GoToConfig = field(default_factory=GoToConfig)
     
