@@ -5,7 +5,7 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple
+from typing import Any, Dict, Iterable, Tuple, Optional, List
 
 import cv2
 import numpy as np
@@ -92,6 +92,56 @@ def build_hotpixel_mask(
 
     hits_frac = hits.astype(np.float32) / float(len(frames))
     mask = hits_frac >= float(min_hits_frac)
+
+    if max_component_area is not None and max_component_area > 0:
+        mask_u8 = mask.astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, 8)
+        if num_labels > 1:
+            for label in range(1, num_labels):
+                area = stats[label, cv2.CC_STAT_AREA]
+                if area > max_component_area:
+                    mask[labels == label] = False
+
+    return mask
+
+
+def build_hotpixel_mask_temporal(
+    frames_u16: Iterable[np.ndarray],
+    *,
+    abs_percentile: float = 99.9,
+    var_percentile: float = 10.0,
+    max_component_area: int = 4,
+) -> np.ndarray:
+    """Build a hot-pixel mask from a short temporal sequence.
+
+    A hot pixel is defined as persistently bright (high temporal median)
+    and stable (low temporal MAD).
+
+    Args:
+        frames_u16: Iterable of 2D uint16 frames.
+        abs_percentile: Percentile over per-pixel median to set the absolute threshold.
+        var_percentile: Percentile over per-pixel MAD to set the stability threshold.
+        max_component_area: Maximum connected component area to keep.
+
+    Returns:
+        Boolean mask of hot pixels (True for hot pixels).
+    """
+    frames = [np.asarray(frame) for frame in frames_u16]
+    if not frames:
+        raise ValueError("frames_u16 must contain at least one frame.")
+
+    frames = [_ensure_2d(frame) for frame in frames]
+    if any(frame.dtype != np.uint16 for frame in frames):
+        raise TypeError("All frames must be uint16.")
+
+    stack = np.stack(frames, axis=0)
+    median = np.median(stack, axis=0)
+    mad = np.median(np.abs(stack - median), axis=0)
+
+    thr_abs = float(np.percentile(median, float(abs_percentile)))
+    thr_var = float(np.percentile(mad, float(var_percentile)))
+
+    mask = (median >= thr_abs) & (mad <= thr_var)
 
     if max_component_area is not None and max_component_area > 0:
         mask_u8 = mask.astype(np.uint8)
@@ -195,3 +245,75 @@ def hotpixel_weight_mask(mask: np.ndarray) -> np.ndarray:
     weights = np.ones_like(mask_arr, dtype=np.float32)
     weights[mask_arr] = 0.0
     return weights
+
+
+def _bayer_parity_offsets(window: int = 5) -> List[Tuple[int, int]]:
+    if window % 2 == 0 or window < 1:
+        raise ValueError("window must be a positive odd integer.")
+    radius = window // 2
+    offsets: List[Tuple[int, int]] = []
+    for dy in range(-radius, radius + 1):
+        for dx in range(-radius, radius + 1):
+            if dx == 0 and dy == 0:
+                continue
+            if (dx % 2 == 0) and (dy % 2 == 0):
+                offsets.append((dy, dx))
+    return offsets
+
+
+def apply_hotpixel_correction(
+    raw16: np.ndarray,
+    mask: Optional[np.ndarray],
+    bayer_pattern: str,
+    *,
+    window: int = 5,
+) -> np.ndarray:
+    """Correct hot pixels using same-color Bayer neighbors.
+
+    Args:
+        raw16: 2D uint16 Bayer image.
+        mask: 2D boolean mask of hot pixels (True for hot pixels).
+        bayer_pattern: Bayer pattern string (RGGB/BGGR/GRBG/GBRG).
+        window: Neighborhood window size (odd integer).
+
+    Returns:
+        Corrected uint16 image.
+    """
+    img = _ensure_2d(np.asarray(raw16))
+    if img.dtype != np.uint16:
+        raise TypeError("raw16 must be uint16.")
+
+    if mask is None:
+        return img.copy()
+
+    mask_arr = _ensure_2d(np.asarray(mask)).astype(bool)
+    if mask_arr.shape != img.shape:
+        raise ValueError("mask shape must match raw16 shape.")
+
+    hot_idx = np.argwhere(mask_arr)
+    if hot_idx.size == 0:
+        return img.copy()
+
+    out = img.copy()
+    offsets = _bayer_parity_offsets(window=window)
+
+    h, w = img.shape
+    for y, x in hot_idx:
+        vals = []
+        y0 = int(y)
+        x0 = int(x)
+        parity_y = y0 % 2
+        parity_x = x0 % 2
+        for dy, dx in offsets:
+            yy = y0 + dy
+            xx = x0 + dx
+            if yy < 0 or yy >= h or xx < 0 or xx >= w:
+                continue
+            if (yy % 2) != parity_y or (xx % 2) != parity_x:
+                continue
+            if mask_arr[yy, xx]:
+                continue
+            vals.append(int(img[yy, xx]))
+        if vals:
+            out[y0, x0] = np.uint16(int(np.median(vals)))
+    return out

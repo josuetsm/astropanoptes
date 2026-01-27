@@ -4,7 +4,7 @@
 
 This module is intentionally *self-contained*: it does not import AppRunner.
 AppRunner (or any orchestrator) should provide callbacks for:
-  - get_live_frame(): -> np.ndarray (uint8 gray or color; platesolve will convert)
+  - get_live_frame(): -> np.ndarray (uint16 RAW16 Bayer; platesolve will use SEP)
   - move_steps(axis: Axis, direction: int, steps: int, delay_us: int) -> None/str
   - stop() -> None/str
   - (optional) set_tracking_enabled(bool) + tracking_keyframe_reset()
@@ -50,6 +50,7 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from ap_types import Axis
+from config import SepConfig
 
 # We reuse target parsing & observer from your plate-solver module.
 from platesolve import (
@@ -364,6 +365,7 @@ class GoToModel:
 @dataclass
 class GoToConfig:
     observer: ObserverConfig = field(default_factory=ObserverConfig)
+    sep: SepConfig = field(default_factory=SepConfig)
 
     # Safe operating window
     alt_min_deg: float = 10.0
@@ -576,7 +578,7 @@ class GoToController:
                 R_2x2=((1.0, 0.0), (0.0, 1.0)),
                 t_arcsec=(0.0, 0.0),
                 rms_arcsec=float("inf"),
-                downsample=int(getattr(platesolve_cfg, "downsample", 1)),
+                downsample=1,
                 overlay=[],
                 guides=[],
                 metrics={"err": 1.0},
@@ -608,6 +610,7 @@ class GoToController:
                 frame,
                 target=target_for_solver,
                 cfg=cfg2,
+                sep_cfg=self.cfg.sep,
                 observer=self.cfg.observer,
                 obstime=obstime,
                 progress_cb=None,

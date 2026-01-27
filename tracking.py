@@ -7,7 +7,6 @@ from typing import Optional, Tuple, Dict, Any
 
 import numpy as np
 import cv2
-from hotpixels import hotpix_prefilter_base
 from logging_utils import log_error
 
 
@@ -230,10 +229,10 @@ def compute_A_pinv_dls(A: np.ndarray, lam: float) -> np.ndarray:
 # Image preproc + phase correlation
 # ============================================================
 
-def preprocess_for_phasecorr(frame_u16: np.ndarray, state: TrackingState, *, update_bg: bool = True) -> np.ndarray:
+def preprocess_for_phasecorr(img_det: np.ndarray, state: TrackingState, *, update_bg: bool = True) -> np.ndarray:
     cfg = state.cfg
     pre = cfg.preproc
-    x = hotpix_prefilter_base(frame_u16, ksize=cfg.hotpixels.base_ksize)
+    x = np.asarray(img_det, dtype=np.float32)
 
     if pre.subtract_bg_ema:
         if state.bg_ema is None:
@@ -626,7 +625,7 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
 
 def tracking_step(
     state: TrackingState,
-    frame_u16_for_tracking: np.ndarray,
+    img_det: np.ndarray,
     *,
     now_t: Optional[float] = None,
     tracking_enabled: bool = True,
@@ -643,7 +642,7 @@ def tracking_step(
     # resp_min configurable desde UI
     resp_min = float(getattr(state.cfg, "_resp_min", 0.06))
 
-    reg = preprocess_for_phasecorr(frame_u16_for_tracking, state, update_bg=True)
+    reg = preprocess_for_phasecorr(img_det, state, update_bg=True)
 
     # keyframe init/pending
     if state.key_reg is None:

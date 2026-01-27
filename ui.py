@@ -29,6 +29,7 @@ from actions import (
     stacking_stop,
     stacking_reset,
     stacking_save,
+    hotpix_calibrate,
     platesolve_run,
     platesolve_set_params,
     live_sep_set_params,
@@ -76,6 +77,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_out_log = W.Output(layout=W.Layout(border="1px solid #ddd", height="180px", overflow="auto"))
     runner.out_log = w_out_log  # conectar runner a este output
     platesolve_cfg = cfg.platesolve
+    sep_cfg = cfg.sep
     mount_cfg = cfg.mount
     tracking_cfg = cfg.tracking
 
@@ -136,7 +138,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_live_sep_bw = W.BoundedIntText(
         description="sep_bw",
-        value=int(platesolve_cfg.sep_bw),
+        value=int(sep_cfg.bw),
         min=4,
         max=512,
         step=1,
@@ -144,7 +146,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_live_sep_bh = W.BoundedIntText(
         description="sep_bh",
-        value=int(platesolve_cfg.sep_bh),
+        value=int(sep_cfg.bh),
         min=4,
         max=512,
         step=1,
@@ -152,7 +154,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_live_sep_sigma = W.BoundedFloatText(
         description="sep_sigma",
-        value=float(platesolve_cfg.sep_thresh_sigma),
+        value=float(sep_cfg.thresh_sigma),
         min=0.1,
         max=20.0,
         step=0.1,
@@ -160,7 +162,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_live_sep_minarea = W.BoundedIntText(
         description="sep_minarea",
-        value=int(platesolve_cfg.sep_minarea),
+        value=int(sep_cfg.minarea),
         min=1,
         max=500,
         step=1,
@@ -611,6 +613,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # separately.
     w_btn_stack_start = W.Button(description="Start", button_style="success", layout=W.Layout(width="110px"))
     w_btn_stack_stop = W.Button(description="Stop", button_style="warning", layout=W.Layout(width="110px"))
+    w_btn_hotpix_calib = W.Button(description="Calibrar Hot Pixels", button_style="info", layout=W.Layout(width="200px"))
     # Bindings for stacking buttons in the tab
     def _on_stack_start(_btn):
         try:
@@ -629,9 +632,23 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_btn_stack_start.on_click(_on_stack_start)
     w_btn_stack_stop.on_click(_on_stack_stop)
 
+    def _on_hotpix_calib(_btn):
+        hp_cfg = cfg.hotpixels
+        runner.enqueue(
+            hotpix_calibrate(
+                n_frames=int(hp_cfg.calib_frames),
+                abs_percentile=float(hp_cfg.calib_abs_percentile),
+                var_percentile=float(hp_cfg.calib_var_percentile),
+                max_component_area=int(hp_cfg.max_component_area),
+                out_path_base=str(hp_cfg.mask_path_base),
+            )
+        )
+
+    w_btn_hotpix_calib.on_click(_on_hotpix_calib)
+
     w_tab_stacking = W.VBox([
         W.HTML("<b>Stacking</b>"),
-        W.HBox([w_btn_stack_start, w_btn_stack_stop, w_btn_stack_reset]),
+        W.HBox([w_btn_stack_start, w_btn_stack_stop, w_btn_stack_reset, w_btn_hotpix_calib]),
         w_img_stack
     ])
 
@@ -667,14 +684,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_bi_ps_binning.disabled = True  # CameraStream fuerza binning=1; evitamos inconsistencia
 
     # Solver params (subconjunto razonable)
-    w_bi_ps_downsample = W.BoundedIntText(
-        description="downsample",
-        value=int(platesolve_cfg.downsample),
-        min=1,
-        max=8,
-        step=1,
-        layout=W.Layout(width="220px"),
-    )
     w_bi_ps_max_det = W.BoundedIntText(
         description="max_det",
         value=int(platesolve_cfg.max_det),
@@ -829,7 +838,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         params = {
             "pixel_size_m": float(pixel_size_m),
             "focal_m": float(focal_m),
-            "downsample": int(w_bi_ps_downsample.value),
             "max_det": int(w_bi_ps_max_det.value),
             "det_thresh_sigma": float(w_tf_ps_det_sigma.value),
             "det_minarea": int(w_bi_ps_minarea.value),
@@ -871,7 +879,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         w_tf_ps_focal_mm,
         w_tf_ps_pixel_um,
         w_bi_ps_binning,
-        w_bi_ps_downsample,
         w_bi_ps_max_det,
         w_tf_ps_det_sigma,
         w_bi_ps_minarea,
@@ -901,7 +908,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             W.HTML("<b>Instrument</b>"),
             W.HBox([w_tf_ps_focal_mm, w_tf_ps_pixel_um, w_bi_ps_binning]),
             W.HTML("<b>Solver</b>"),
-            W.HBox([w_bi_ps_downsample, w_bi_ps_max_det, w_tf_ps_det_sigma, w_bi_ps_minarea, w_tf_ps_point_sigma]),
+            W.HBox([w_bi_ps_max_det, w_tf_ps_det_sigma, w_bi_ps_minarea, w_tf_ps_point_sigma]),
             W.HBox([w_tf_ps_gmax, w_cb_ps_use_radius, w_tf_ps_search_radius_deg, w_tf_ps_search_radius_factor]),
             W.HBox([w_tf_ps_theta_step, w_tf_ps_theta_refine_span, w_tf_ps_theta_refine_step]),
             W.HBox([w_tf_ps_match_max, w_bi_ps_min_inliers, w_bi_ps_guide_n, w_tf_ps_simbad_radius_arcsec]),
@@ -1281,6 +1288,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_btn_stack_reset": w_btn_stack_reset,
         "w_btn_stack_start": w_btn_stack_start,
         "w_btn_stack_stop": w_btn_stack_stop,
+        "w_btn_hotpix_calib": w_btn_hotpix_calib,
         # platesolve tab
         "w_txt_ps_target": w_txt_ps_target,
         "w_btn_ps_solve": w_btn_ps_solve,
@@ -1292,7 +1300,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_tf_ps_focal_mm": w_tf_ps_focal_mm,
         "w_tf_ps_pixel_um": w_tf_ps_pixel_um,
         "w_bi_ps_binning": w_bi_ps_binning,
-        "w_bi_ps_downsample": w_bi_ps_downsample,
         "w_bi_ps_max_det": w_bi_ps_max_det,
         "w_tf_ps_det_sigma": w_tf_ps_det_sigma,
         "w_bi_ps_minarea": w_bi_ps_minarea,
@@ -1604,6 +1611,8 @@ class UILoop:
         if "w_btn_stack_reset" in self.widgets:
             # Allow resetting only if stacking is running (has state)
             self.widgets["w_btn_stack_reset"].disabled = not stacking_running
+        if "w_btn_hotpix_calib" in self.widgets:
+            self.widgets["w_btn_hotpix_calib"].disabled = not cam_connected
 
         # Save Stack button: enable only when stacking is running.  When disabled,
         # clicking has no effect.  The button is visible in the top bar.
