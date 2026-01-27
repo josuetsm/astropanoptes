@@ -14,6 +14,8 @@ class ActionType(str, Enum):
     CAMERA_CONNECT = "CAMERA_CONNECT"
     CAMERA_DISCONNECT = "CAMERA_DISCONNECT"
     CAMERA_SET_PARAM = "CAMERA_SET_PARAM"
+    RESET_CAMERA_DEFAULTS = "RESET_CAMERA_DEFAULTS"
+    RESET_PREVIEW_DEFAULTS = "RESET_PREVIEW_DEFAULTS"
 
     # mount
     MOUNT_CONNECT = "MOUNT_CONNECT"
@@ -21,12 +23,14 @@ class ActionType(str, Enum):
     MOUNT_SET_MICROSTEPS = "MOUNT_SET_MICROSTEPS"
     MOUNT_MOVE_STEPS = "MOUNT_MOVE_STEPS"
     MOUNT_STOP = "MOUNT_STOP"
+    RESET_MOUNT_DEFAULTS = "RESET_MOUNT_DEFAULTS"
 
     # tracking
     TRACKING_START = "TRACKING_START"
     TRACKING_STOP = "TRACKING_STOP"
     TRACKING_SET_PARAMS = "TRACKING_SET_PARAMS"
     TRACKING_KEYFRAME_RESET = "TRACKING_KEYFRAME_RESET"
+    RESET_TRACKING_DEFAULTS = "RESET_TRACKING_DEFAULTS"
 
     TRACKING_CALIB_AZ = "TRACKING_CALIB_AZ"
     TRACKING_CALIB_ALT = "TRACKING_CALIB_ALT"
@@ -42,10 +46,13 @@ class ActionType(str, Enum):
     STACKING_SAVE = "STACKING_SAVE"
     STACKING_SET_PARAMS = "STACKING_SET_PARAMS"
     HOTPIX_CALIBRATE = "HOTPIX_CALIBRATE"
+    RESET_STACKING_DEFAULTS = "RESET_STACKING_DEFAULTS"
+    RESET_HOTPIXELS_DEFAULTS = "RESET_HOTPIXELS_DEFAULTS"
 
     # platesolve (OBLIGATORIO)
     PLATESOLVE_RUN = "PLATESOLVE_RUN"
     PLATESOLVE_SET_PARAMS = "PLATESOLVE_SET_PARAMS"
+    RESET_PLATESOLVE_DEFAULTS = "RESET_PLATESOLVE_DEFAULTS"
     MOUNT_SYNC = "MOUNT_SYNC"
     MOUNT_GOTO = "MOUNT_GOTO"
 
@@ -81,6 +88,14 @@ def camera_disconnect() -> Action:
 
 def camera_set_param(name: str, value: Any) -> Action:
     return Action(ActionType.CAMERA_SET_PARAM, {"name": str(name), "value": value}, _now())
+
+
+def camera_reset_defaults() -> Action:
+    return Action(ActionType.RESET_CAMERA_DEFAULTS, {}, _now())
+
+
+def preview_reset_defaults() -> Action:
+    return Action(ActionType.RESET_PREVIEW_DEFAULTS, {}, _now())
 
 
 # -------------------------
@@ -121,6 +136,10 @@ def mount_stop() -> Action:
     return Action(ActionType.MOUNT_STOP, {}, _now())
 
 
+def mount_reset_defaults() -> Action:
+    return Action(ActionType.RESET_MOUNT_DEFAULTS, {}, _now())
+
+
 # -------------------------
 # Factories: Tracking
 # -------------------------
@@ -138,6 +157,10 @@ def tracking_set_params(**kwargs: Any) -> Action:
 
 def tracking_keyframe_reset() -> Action:
     return Action(ActionType.TRACKING_KEYFRAME_RESET, {}, _now())
+
+
+def tracking_reset_defaults() -> Action:
+    return Action(ActionType.RESET_TRACKING_DEFAULTS, {}, _now())
 
 
 def tracking_calib_az() -> Action:
@@ -179,6 +202,10 @@ def stacking_set_params(**kwargs: Any) -> Action:
     return Action(ActionType.STACKING_SET_PARAMS, dict(kwargs), _now())
 
 
+def stacking_reset_defaults() -> Action:
+    return Action(ActionType.RESET_STACKING_DEFAULTS, {}, _now())
+
+
 def stacking_save(out_dir: str, basename: str, fmt: str) -> Action:
     return Action(
         ActionType.STACKING_SAVE,
@@ -209,6 +236,10 @@ def hotpix_calibrate(
         _now(),
     )
 
+
+def hotpixels_reset_defaults() -> Action:
+    return Action(ActionType.RESET_HOTPIXELS_DEFAULTS, {}, _now())
+
 # -------------------------
 # Factories: PlateSolve
 # -------------------------
@@ -219,6 +250,10 @@ def platesolve_run(target: Any, **kwargs: Any) -> Action:
 
 def platesolve_set_params(**kwargs: Any) -> Action:
     return Action(ActionType.PLATESOLVE_SET_PARAMS, dict(kwargs), _now())
+
+
+def platesolve_reset_defaults() -> Action:
+    return Action(ActionType.RESET_PLATESOLVE_DEFAULTS, {}, _now())
 
 
 # -------------------------
