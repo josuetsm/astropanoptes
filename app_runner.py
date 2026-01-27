@@ -97,6 +97,7 @@ class AppRunner:
 
         # Platesolve subsystem (thread dedicado)
         self._platesolve_lock = threading.Lock()
+        self._platesolve_cfg_lock = threading.Lock()
         self._platesolve_thr: Optional[threading.Thread] = None
         self._platesolve_cancel = threading.Event()
         self._platesolve_pending: Optional[Dict[str, Any]] = None
@@ -108,8 +109,9 @@ class AppRunner:
         self._hotpix_thr: Optional[threading.Thread] = None
         self._hotpix_cancel = threading.Event()
 
-        # Config platesolve (se puede setear desde UI por action)
-        self._platesolve_cfg = self._build_default_platesolve_config(cfg)
+        # Config platesolve (defaults + runtime copy, actualizable desde UI por action)
+        self._platesolve_defaults = cfg.platesolve
+        self._platesolve_cfg = self._copy_platesolve_config(cfg.platesolve)
         self._platesolve_observer = ObserverConfig()  # Santiago por default en tu platesolve.py
 
         # GoTo subsystem (no bloquea loop)
@@ -218,13 +220,17 @@ class AppRunner:
         )
 
     # -------------------------
-    # Platesolve config default
+    # Platesolve config copy
     # -------------------------
-    def _build_default_platesolve_config(self, cfg: AppConfig) -> PlatesolveConfig:
+    def _copy_platesolve_config(self, cfg: PlatesolveConfig) -> PlatesolveConfig:
         """
-        Reusa el PlatesolveConfig único definido en AppConfig.
+        Devuelve una copia de PlatesolveConfig para evitar aliasing con defaults.
         """
-        return cfg.platesolve
+        return replace(cfg)
+
+    def _get_platesolve_cfg_snapshot(self) -> PlatesolveConfig:
+        with self._platesolve_cfg_lock:
+            return self._copy_platesolve_config(self._platesolve_cfg)
 
     # -------------------------
     # Lifecycle
@@ -875,6 +881,8 @@ class AppRunner:
                 raw_in = np.ascontiguousarray(fr.raw)
                 u8_in = np.ascontiguousarray(fr.u8_view) if hasattr(fr, "u8_view") else None
 
+                platesolve_cfg = self._get_platesolve_cfg_snapshot()
+
                 dump_base = _dump_snapshot(
                     source="live",
                     target=target,
@@ -882,7 +890,7 @@ class AppRunner:
                     fmt=fmt,
                     meta=meta,
                     u8_view=u8_in,
-                    cfg=self._platesolve_cfg,
+                    cfg=platesolve_cfg,
                     observer=self._platesolve_observer,
                 )
 
@@ -894,7 +902,7 @@ class AppRunner:
                 frame = green_full.astype(np.uint16) << 8
 
                 # Debug de stats de entrada (opcional)
-                debug_stats = bool(getattr(self._platesolve_cfg, "debug_input_stats", False))
+                debug_stats = bool(getattr(platesolve_cfg, "debug_input_stats", False))
 
                 def _stats(a: np.ndarray, name: str) -> None:
                     if not debug_stats:
@@ -926,7 +934,7 @@ class AppRunner:
                 result = platesolve_from_live(
                     frame,
                     target=target,
-                    cfg=self._platesolve_cfg,
+                    cfg=platesolve_cfg,
                     observer=self._platesolve_observer,
                     progress_cb=None,
                 )
@@ -937,7 +945,7 @@ class AppRunner:
                 debug_jpeg = self._render_platesolve_debug_jpeg(
                     frame,
                     list(getattr(result, "overlay", []) or []),
-                    int(getattr(result, "downsample", self._platesolve_cfg.downsample)),
+                    int(getattr(result, "downsample", platesolve_cfg.downsample)),
                 )
                 debug_info = self._build_platesolve_debug_info(result)
     
@@ -993,7 +1001,7 @@ class AppRunner:
         self._platesolve_start_worker_if_needed()
 
     def _maybe_autosolve(self) -> None:
-        cfg = self._platesolve_cfg
+        cfg = self._get_platesolve_cfg_snapshot()
         if not bool(cfg.auto_solve):
             return
         target = str(self._platesolve_auto_target or "").strip()
@@ -1270,6 +1278,8 @@ class AppRunner:
                     return self._mount.stop()
                 return None
 
+            platesolve_cfg = self._get_platesolve_cfg_snapshot()
+
             try:
                 if kind == "goto":
                     # Expect target dict from UI/actions
@@ -1301,7 +1311,7 @@ class AppRunner:
                         get_live_frame=get_live_frame,
                         move_steps=move_steps,
                         stop=stop,
-                        platesolve_cfg=self._platesolve_cfg,
+                        platesolve_cfg=platesolve_cfg,
                         delay_us=delay_us,
                         should_cancel=should_cancel,
                         status_cb=lambda s: self._set_state_safe(goto_status=str(s)),
@@ -1343,7 +1353,7 @@ class AppRunner:
                         get_live_frame=get_live_frame,
                         move_steps=move_steps,
                         stop=stop,
-                        platesolve_cfg=self._platesolve_cfg,
+                        platesolve_cfg=platesolve_cfg,
                         step_magnitudes_deg=step_magnitudes_deg,
                         step_magnitudes_steps=step_magnitudes_steps,
                         samples_per_mag=n_samples,
@@ -1704,11 +1714,12 @@ class AppRunner:
                     self._platesolve_auto_target = str(payload.pop("auto_target") or "")
 
                 # Rebuild dataclass con campos existentes
-                d = dict(self._platesolve_cfg.__dict__)
-                for k, v in payload.items():
-                    if k in d:
-                        d[k] = v
-                self._platesolve_cfg = PlatesolveConfig(**d)
+                with self._platesolve_cfg_lock:
+                    d = dict(self._platesolve_cfg.__dict__)
+                    for k, v in payload.items():
+                        if k in d:
+                            d[k] = v
+                    self._platesolve_cfg = PlatesolveConfig(**d)
                 log_info(self.out_log, f"Platesolve: SET_PARAMS {list(payload.keys())}")
             return
 
