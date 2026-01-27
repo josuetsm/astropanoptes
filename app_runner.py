@@ -508,7 +508,9 @@ class AppRunner:
 
             if getattr(fr, "raw", None) is not None:
                 raw16 = ensure_raw16_bayer(fr.raw)
-                bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
+                meta = getattr(fr, "meta", {}) or {}
+                meta_dict = meta if isinstance(meta, dict) else {}
+                bayer = meta_dict.get("bayer_pattern", "RGGB")
                 green_u8 = bayer_green_u8_from_u16(raw16, bayer)
                 if overlay_enabled:
                     _, u8_preview = make_preview_jpeg(
@@ -584,7 +586,9 @@ class AppRunner:
         try:
             raw_gray = None
             if getattr(fr, "raw", None) is not None:
-                bayer = str(getattr(fr, "meta", {}) or {}).get("bayer_pattern", "RGGB")
+                meta = getattr(fr, "meta", {}) or {}
+                meta_dict = meta if isinstance(meta, dict) else {}
+                bayer = meta_dict.get("bayer_pattern", "RGGB")
                 raw16 = ensure_raw16_bayer(fr.raw)
                 raw_gray = bayer_green_u8_from_u16(raw16, bayer)
             else:
