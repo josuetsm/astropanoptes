@@ -24,7 +24,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 - `pyPOACamera.py`: wrapper ctypes del SDK Player One (loader multiplataforma + constantes/structs).
 - `libPlayerOneCamera.3.9.0.dylib`: binario del SDK (macOS). En Linux/Windows se esperan `.so`/`.dll`.
 - `PlayerOneCamera.h`: header del SDK (referencia de API).
-- `imaging.py`: utilidades de imagen (downsample, stretch rápido, preview JPEG, canal verde de Bayer).
+- `imaging.py`: utilidades de imagen (stretch rápido, preview JPEG, canal verde de Bayer).
 - `tracking.py`: pipeline de tracking (preprocesado, correlación de fase, control PI, auto-calibración, rate limiter).
 - `mount_arduino.py`: driver de montura vía serial (protocolo Arduino, comandos RATE/MOVE/MS/STOP).
 - `mount_firmware.ino`: firmware Arduino para la montura (lado microcontrolador).
@@ -66,7 +66,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
   - Define enums, structs y funciones del driver.
 
 - **`imaging.py`**
-  - Utilidades rápidas para preview: downsample por stride, stretch por percentiles, JPEG encode.
+  - Utilidades rápidas para preview: stretch por percentiles y JPEG encode.
   - Extracción rápida del canal verde desde Bayer RAW16.
 
 ### 3.1) Calibración de hotpixels
