@@ -75,6 +75,9 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     w_out_log = W.Output(layout=W.Layout(border="1px solid #ddd", height="180px", overflow="auto"))
     runner.out_log = w_out_log  # conectar runner a este output
+    platesolve_cfg = cfg.platesolve
+    mount_cfg = cfg.mount
+    tracking_cfg = cfg.tracking
 
     # -------------------------
     # Top Bar (siempre visible)
@@ -133,7 +136,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_live_sep_bw = W.BoundedIntText(
         description="sep_bw",
-        value=int(getattr(getattr(cfg, "platesolve", object()), "sep_bw", 64)),
+        value=int(platesolve_cfg.sep_bw),
         min=4,
         max=512,
         step=1,
@@ -141,7 +144,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_live_sep_bh = W.BoundedIntText(
         description="sep_bh",
-        value=int(getattr(getattr(cfg, "platesolve", object()), "sep_bh", 64)),
+        value=int(platesolve_cfg.sep_bh),
         min=4,
         max=512,
         step=1,
@@ -149,7 +152,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_live_sep_sigma = W.BoundedFloatText(
         description="sep_sigma",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "sep_thresh_sigma", 3.5)),
+        value=float(platesolve_cfg.sep_thresh_sigma),
         min=0.1,
         max=20.0,
         step=0.1,
@@ -157,7 +160,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_live_sep_minarea = W.BoundedIntText(
         description="sep_minarea",
-        value=int(getattr(getattr(cfg, "platesolve", object()), "sep_minarea", 5)),
+        value=int(platesolve_cfg.sep_minarea),
         min=1,
         max=500,
         step=1,
@@ -165,7 +168,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_live_sep_max_det = W.BoundedIntText(
         description="max_det",
-        value=int(getattr(getattr(cfg, "platesolve", object()), "max_det", 250)),
+        value=int(platesolve_cfg.max_det),
         min=1,
         max=5000,
         step=5,
@@ -205,13 +208,13 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_dd_ms_az = W.Dropdown(
         options=ms_opts,
-        value=int(getattr(cfg.mount, "ms_az", 64)),
+        value=int(mount_cfg.ms_az),
         description="MS AZ",
         layout=W.Layout(width="170px"),
     )
     w_dd_ms_alt = W.Dropdown(
         options=ms_opts,
-        value=int(getattr(cfg.mount, "ms_alt", 64)),
+        value=int(mount_cfg.ms_alt),
         description="MS ALT",
         layout=W.Layout(width="170px"),
     )
@@ -220,7 +223,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_btn_apply_ms.layout.display = "none"
 
     w_steps_az = W.BoundedIntText(
-        value=_clamp_int(getattr(cfg.mount, "slew_steps_az", 600), 1, 500000),
+        value=_clamp_int(mount_cfg.slew_steps_az, 1, 500000),
         min=1,
         max=500000,
         step=10,
@@ -228,7 +231,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         layout=W.Layout(width="180px"),
     )
     w_delay_az = W.BoundedIntText(
-        value=_clamp_int(getattr(cfg.mount, "slew_delay_us_az", 1800), 50, 200000),
+        value=_clamp_int(mount_cfg.slew_delay_us_az, 50, 200000),
         min=50,
         max=200000,
         step=50,
@@ -237,7 +240,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
 
     w_steps_alt = W.BoundedIntText(
-        value=_clamp_int(getattr(cfg.mount, "slew_steps_alt", 600), 1, 500000),
+        value=_clamp_int(mount_cfg.slew_steps_alt, 1, 500000),
         min=1,
         max=500000,
         step=10,
@@ -245,7 +248,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         layout=W.Layout(width="190px"),
     )
     w_delay_alt = W.BoundedIntText(
-        value=_clamp_int(getattr(cfg.mount, "slew_delay_us_alt", 1800), 50, 200000),
+        value=_clamp_int(mount_cfg.slew_delay_us_alt, 50, 200000),
         min=50,
         max=200000,
         step=50,
@@ -496,8 +499,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     # Mount Tab (real)
     # -------------------------
-    default_port = str(getattr(cfg.mount, "port", "/dev/cu.usbserial-1130"))
-    default_baud = int(getattr(cfg.mount, "baud", 115200))
+    default_port = str(mount_cfg.port)
+    default_baud = int(mount_cfg.baudrate)
 
     w_txt_serial_port = W.Text(value=default_port, description="Port", layout=W.Layout(width="520px"))
     w_bi_baudrate = W.BoundedIntText(
@@ -534,7 +537,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # parámetros mínimos (ajusta rangos si quieres)
     w_tf_sigma_hp = W.BoundedFloatText(
         description="sigma_hp",
-        value=float(getattr(getattr(cfg, "tracking", object()), "sigma_hp", 10.0)),
+        value=float(tracking_cfg.sigma_hp),
         min=0.5,
         max=300.0,
         step=0.5,
@@ -542,7 +545,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_resp_min = W.BoundedFloatText(
         description="resp_min",
-        value=float(getattr(getattr(cfg, "tracking", object()), "resp_min", 0.06)),
+        value=float(tracking_cfg.resp_min),
         min=0.0,
         max=1.0,
         step=0.01,
@@ -638,7 +641,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # Instrument params -> se convierten a SI para PlatesolveConfig
     w_tf_ps_focal_mm = W.BoundedFloatText(
         description="focal (mm)",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "focal_m", 0.9)) * 1000.0,
+        value=float(platesolve_cfg.focal_m) * 1000.0,
         min=10.0,
         max=50000.0,
         step=1.0,
@@ -646,7 +649,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_pixel_um = W.BoundedFloatText(
         description="pixel (µm)",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "pixel_size_m", 2.9e-6)) * 1e6,
+        value=float(platesolve_cfg.pixel_size_m) * 1e6,
         min=0.5,
         max=30.0,
         step=0.1,
@@ -666,7 +669,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # Solver params (subconjunto razonable)
     w_bi_ps_downsample = W.BoundedIntText(
         description="downsample",
-        value=int(getattr(getattr(cfg, "platesolve", object()), "downsample", 2)),
+        value=int(platesolve_cfg.downsample),
         min=1,
         max=8,
         step=1,
@@ -674,7 +677,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_max_det = W.BoundedIntText(
         description="max_det",
-        value=int(getattr(getattr(cfg, "platesolve", object()), "max_det", 250)),
+        value=int(platesolve_cfg.max_det),
         min=20,
         max=2000,
         step=10,
@@ -682,7 +685,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_det_sigma = W.BoundedFloatText(
         description="det_sigma",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "det_thresh_sigma", 6.0)),
+        value=float(platesolve_cfg.det_thresh_sigma),
         min=0.5,
         max=50.0,
         step=0.5,
@@ -690,7 +693,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_minarea = W.BoundedIntText(
         description="minarea",
-        value=int(getattr(getattr(cfg, "platesolve", object()), "det_minarea", 5)),
+        value=int(platesolve_cfg.det_minarea),
         min=1,
         max=200,
         step=1,
@@ -698,7 +701,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_point_sigma = W.BoundedFloatText(
         description="point_sigma",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "point_sigma", 1.2)),
+        value=float(platesolve_cfg.point_sigma),
         min=0.2,
         max=10.0,
         step=0.1,
@@ -706,7 +709,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_gmax = W.BoundedFloatText(
         description="gmax",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "gmax", 14.5)),
+        value=float(platesolve_cfg.gmax),
         min=6.0,
         max=20.0,
         step=0.1,
@@ -714,11 +717,11 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_cb_ps_use_radius = W.Checkbox(
         description="use search_radius_deg",
-        value=getattr(getattr(cfg, "platesolve", object()), "search_radius_deg", None) is not None,
+        value=platesolve_cfg.search_radius_deg is not None,
     )
     w_tf_ps_search_radius_deg = W.BoundedFloatText(
         description="search_radius_deg",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "search_radius_deg", 2.0) or 2.0),
+        value=float(platesolve_cfg.search_radius_deg or 2.0),
         min=0.1,
         max=30.0,
         step=0.1,
@@ -726,7 +729,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_search_radius_factor = W.BoundedFloatText(
         description="search_radius_factor",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "search_radius_factor", 1.4)),
+        value=float(platesolve_cfg.search_radius_factor),
         min=0.5,
         max=10.0,
         step=0.1,
@@ -734,7 +737,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_theta_step = W.BoundedFloatText(
         description="theta_step (deg)",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "theta_step_deg", 15.0)),
+        value=float(platesolve_cfg.theta_step_deg),
         min=0.5,
         max=60.0,
         step=0.5,
@@ -742,7 +745,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_theta_refine_span = W.BoundedFloatText(
         description="theta_refine_span",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "theta_refine_span_deg", 12.0)),
+        value=float(platesolve_cfg.theta_refine_span_deg),
         min=0.5,
         max=60.0,
         step=0.5,
@@ -750,7 +753,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_theta_refine_step = W.BoundedFloatText(
         description="theta_refine_step",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "theta_refine_step_deg", 3.0)),
+        value=float(platesolve_cfg.theta_refine_step_deg),
         min=0.1,
         max=10.0,
         step=0.1,
@@ -758,7 +761,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_match_max = W.BoundedFloatText(
         description="match_max_px",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "match_max_px", 3.5)),
+        value=float(platesolve_cfg.match_max_px),
         min=0.5,
         max=25.0,
         step=0.1,
@@ -766,7 +769,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_min_inliers = W.BoundedIntText(
         description="min_inliers",
-        value=int(getattr(getattr(cfg, "platesolve", object()), "min_inliers", 10)),
+        value=int(platesolve_cfg.min_inliers),
         min=1,
         max=200,
         step=1,
@@ -774,7 +777,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_guide_n = W.BoundedIntText(
         description="guide_n",
-        value=int(getattr(getattr(cfg, "platesolve", object()), "guide_n", 3)),
+        value=int(platesolve_cfg.guide_n),
         min=0,
         max=20,
         step=1,
@@ -782,7 +785,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_simbad_radius_arcsec = W.BoundedFloatText(
         description="simbad_radius\"",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "simbad_radius_arcsec", 2.0)),
+        value=float(platesolve_cfg.simbad_radius_arcsec),
         min=0.1,
         max=30.0,
         step=0.1,
@@ -800,13 +803,13 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_tb_ps_auto = W.ToggleButton(
         description="Auto",
-        value=bool(getattr(getattr(cfg, "platesolve", object()), "auto_solve", False)),
+        value=bool(platesolve_cfg.auto_solve),
         disabled=False,
         layout=W.Layout(width="110px"),
     )
     w_tf_ps_every_s = W.BoundedFloatText(
         description="every (s)",
-        value=float(getattr(getattr(cfg, "platesolve", object()), "solve_every_s", 15.0)),
+        value=float(platesolve_cfg.solve_every_s),
         min=2.0,
         max=600.0,
         step=1.0,

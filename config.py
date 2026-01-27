@@ -53,14 +53,21 @@ class PreviewConfig:
 
 @dataclass
 class MountConfig:
+    port: str = "/dev/cu.usbserial-1130"
+    baudrate: int = 115200
+
     rate_max: float = 600.0
     default_rate: float = 80.0
     default_nudge_ms: int = 250
 
     invert_az: bool = False
     invert_alt: bool = False
-
-    baudrate: int = 115200
+    ms_az: int = 64
+    ms_alt: int = 64
+    slew_steps_az: int = 600
+    slew_steps_alt: int = 600
+    slew_delay_us_az: int = 1800
+    slew_delay_us_alt: int = 1800
 
 
 @dataclass
@@ -68,6 +75,8 @@ class TrackingConfig:
     track_source: str = "green"  # luma|green|full
     track_method: str = "PyramidPhaseCorr"
     track_downsample: int = 2
+    sigma_hp: float = 10.0
+    resp_min: float = 0.06
 
 
 @dataclass
