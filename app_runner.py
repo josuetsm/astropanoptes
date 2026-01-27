@@ -40,7 +40,7 @@ from sep_utils import sep_detect_from_raw16
 from platesolve import (
     PlatesolveConfig,
     ObserverConfig,
-    platesolve_from_frame,
+    platesolve_sweep,
     save_gaia_auth,
     load_gaia_auth,
 )
@@ -972,7 +972,7 @@ class AppRunner:
                     _stats(fr.u8_view, "fr.u8_view")
                 _stats(frame, "frame(raw16_hp)")
 
-                result = platesolve_from_frame(
+                result = platesolve_sweep(
                     frame,
                     target=target,
                     cfg=platesolve_cfg,
