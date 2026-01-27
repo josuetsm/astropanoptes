@@ -40,7 +40,6 @@ __all__ = [
     "PlatesolveResult",
     "TargetParseError",
     "platesolve_sweep",
-    "platesolve_from_frame",
     "pixel_to_radec",
     "load_gaia_auth",
     "save_gaia_auth",
@@ -1085,29 +1084,3 @@ def platesolve_sweep(
         metrics=metrics,
     )
 
-
-# ============================================================
-# Convenience wrappers for app_runner.py
-# ============================================================
-
-def platesolve_from_frame(
-    frame: np.ndarray,
-    *,
-    target: TargetType,
-    cfg: PlatesolveConfig,
-    sep_cfg: Optional[SepConfig] = None,
-    observer: ObserverConfig = ObserverConfig(),
-    obstime: Optional[Time] = None,
-    progress_cb: Optional[ProgressCB] = None,
-) -> PlatesolveResult:
-    return platesolve_sweep(
-        frame,
-        target=target,
-        cfg=cfg,
-        sep_cfg=sep_cfg,
-        observer=observer,
-        obstime=obstime,
-        source="live",
-        gaia_auth=None,
-        progress_cb=progress_cb,
-    )
