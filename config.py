@@ -149,8 +149,8 @@ class PlatesolveConfig:
     cache_dir: str = "~/.cache/gaia_cones"
     table_name: str = "gaiadr3.gaia_source"
     columns: tuple[str, ...] = ("source_id", "ra", "dec", "phot_g_mean_mag")
-    gmax: float = 17.0
-    nside: int = 64
+    gmax: float = 15.0
+    nside: int = 16
     order: str = "ring"
     prefer_parquet: bool = True
     row_limit: int = -1
@@ -170,7 +170,7 @@ class PlatesolveConfig:
     match_max_px: float = 3.5  # in full-res pixels
     match_tol_arcsec: float = 5.0
     pred_margin_arcsec: float = 25.0
-    min_inliers: int = 3
+    min_inliers: int = 4
     N_det: int = 30
     N_seed: int = 3
 
