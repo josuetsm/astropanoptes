@@ -385,7 +385,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # Debounce logic for PlateSolve parameters.
     #
     # The platesolve config is large; changing any field enqueues an action.  To
-    # avoid spamming the runner, collect changes and apply them after 0.3s of
+    # avoid spamming the runner, collect changes and apply them after 0.8s of
     # inactivity.  The existing _ps_send_params function is used to build the
     # payload; the timer simply invokes that function.
     _ps_timer: Optional[threading.Timer] = None  # type: ignore
@@ -393,10 +393,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     def _debounce_ps_params(change: Any = None) -> None:
         nonlocal _ps_timer
         if _ps_timer is not None:
-            try:
-                _ps_timer.cancel()
-            except Exception:
-                pass
+            _ps_timer.cancel()
 
         def _send_ps() -> None:
             # Call the existing helper to enqueue the parameters.  We ignore the
@@ -404,7 +401,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             # values.
             _ps_send_params()
 
-        _ps_timer = threading.Timer(0.3, _send_ps)
+        _ps_timer = threading.Timer(0.8, _send_ps)
         _ps_timer.start()
 
 

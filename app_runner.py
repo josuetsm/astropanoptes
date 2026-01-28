@@ -1773,7 +1773,8 @@ class AppRunner:
                         if k in d:
                             d[k] = v
                     self.cfg.platesolve = PlatesolveConfig(**d)
-                log_info(self.out_log, f"Platesolve: SET_PARAMS {list(payload.keys())}")
+                if payload:
+                    log_info(self.out_log, "Platesolve: params updated")
             return
 
         if t == ActionType.RESET_PLATESOLVE_DEFAULTS:
