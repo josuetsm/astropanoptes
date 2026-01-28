@@ -30,7 +30,6 @@ from tracking import make_tracking_state, tracking_step, tracking_set_params
 from stacking import StackingWorker
 
 from hotpixels import (
-    apply_hotpixel_correction,
     build_hotpixel_mask_temporal,
     load_hotpixel_mask,
     save_hotpixel_mask,
@@ -61,19 +60,6 @@ def _safe_slug(s: str) -> str:
     s = (s or "").strip()
     s = re.sub(r"[^a-zA-Z0-9_\-\.]+", "_", s)
     return s[:80] if s else "target"
-
-
-def _apply_hotpix_if_available(
-    raw16: np.ndarray,
-    *,
-    hotpix_mask: Optional[np.ndarray],
-    bayer_pattern: str,
-) -> np.ndarray:
-    if hotpix_mask is None:
-        return raw16
-    if hotpix_mask.shape != raw16.shape:
-        raise ValueError(f"Hotpixel mask shape {hotpix_mask.shape} does not match frame shape {raw16.shape}.")
-    return apply_hotpixel_correction(raw16, hotpix_mask, bayer_pattern)
 
 
 class AppRunner:
@@ -349,7 +335,7 @@ class AppRunner:
 
     def _tracking_keyframe_reset(self) -> None:
         try:
-            self._tracking_state.key_reg = "PENDING"
+            self._tracking_state.key_obj_xy = "PENDING"
         except Exception as exc:
             log_error(self.out_log, "Tracking: failed to reset keyframe", exc)
 
@@ -541,15 +527,6 @@ class AppRunner:
         self._hotpix_mask = mask
         self._hotpix_meta = meta
 
-    def _apply_hotpix(self, raw16: np.ndarray, bayer_pattern: str) -> np.ndarray:
-        try:
-            return _apply_hotpix_if_available(raw16, hotpix_mask=self._hotpix_mask, bayer_pattern=bayer_pattern)
-        except ValueError as exc:
-            log_error(self.out_log, "Hotpix: mask mismatch; disabling hotpixel correction", exc, throttle_s=5.0, throttle_key="hotpix_apply")
-            self._hotpix_mask = None
-            self._hotpix_meta = None
-            return raw16
-
     def _maybe_update_preview(self) -> None:
         if self._cam_stream is None:
             return
@@ -570,24 +547,21 @@ class AppRunner:
             overlay_enabled = bool(self._live_sep_overlay_enabled)
 
             raw16 = ensure_raw16_bayer(fr.raw)
-            meta = getattr(fr, "meta", {}) or {}
-            meta_dict = meta if isinstance(meta, dict) else {}
-            bayer = meta_dict.get("bayer_pattern", "RGGB")
-            raw16_hp = self._apply_hotpix(raw16, bayer)
+            raw16_work = raw16
 
             if overlay_enabled:
                 _, u8_preview = make_preview_jpeg(
-                    raw16_hp,
+                    raw16_work,
                     plo=float(self.cfg.preview.stretch_plo),
                     phi=float(self.cfg.preview.stretch_phi),
                     jpeg_quality=int(self.cfg.preview.jpeg_quality),
                     sample_stride=4,
                 )
-                u8_preview = self._apply_live_sep_overlay(raw16_hp, u8_preview)
+                u8_preview = self._apply_live_sep_overlay(raw16_work, u8_preview)
                 jpg = encode_jpeg(u8_preview, quality=int(self.cfg.preview.jpeg_quality))
             else:
                 jpg, _ = make_preview_jpeg(
-                    raw16_hp,
+                    raw16_work,
                     plo=float(self.cfg.preview.stretch_plo),
                     phi=float(self.cfg.preview.stretch_phi),
                     jpeg_quality=int(self.cfg.preview.jpeg_quality),
@@ -609,11 +583,11 @@ class AppRunner:
         except Exception as exc:
             log_error(self.out_log, "Preview: failed", exc)
 
-    def _apply_live_sep_overlay(self, raw16_hp: np.ndarray, u8_preview: np.ndarray) -> np.ndarray:
+    def _apply_live_sep_overlay(self, raw16: np.ndarray, u8_preview: np.ndarray) -> np.ndarray:
         try:
             params = dict(self._live_sep_params)
             _, _, _, obj_xy = sep_detect_from_raw16(
-                raw16_hp,
+                raw16,
                 sep_bw=int(params.get("sep_bw", 64)),
                 sep_bh=int(params.get("sep_bh", 64)),
                 sep_thresh_sigma=float(params.get("sep_thresh_sigma", 3.0)),
@@ -939,10 +913,8 @@ class AppRunner:
                     observer=self._platesolve_observer,
                 )
 
-                # Frame para solver: RAW16 + hotpixel correction
-                bayer = str((meta or {}).get("bayer_pattern", "RGGB"))
-                raw16 = ensure_raw16_bayer(raw_in)
-                frame = self._apply_hotpix(raw16, bayer)
+                # Frame para solver: RAW16
+                frame = ensure_raw16_bayer(raw_in)
 
                 # Debug de stats de entrada (opcional)
                 debug_stats = bool(getattr(platesolve_cfg, "debug_input_stats", False))
@@ -970,7 +942,7 @@ class AppRunner:
                 _stats(raw_in, "fr.raw")
                 if hasattr(fr, "u8_view") and fr.u8_view is not None:
                     _stats(fr.u8_view, "fr.u8_view")
-                _stats(frame, "frame(raw16_hp)")
+                _stats(frame, "frame(raw16)")
 
                 result = platesolve_sweep(
                     frame,
@@ -1308,10 +1280,8 @@ class AppRunner:
                 fr = self._cam_stream.latest()
                 if fr is None:
                     return None
-                meta = dict(getattr(fr, "meta", {}) or {})
-                bayer = str(meta.get("bayer_pattern", "RGGB"))
                 raw16 = ensure_raw16_bayer(fr.raw)
-                return self._apply_hotpix(raw16, bayer)
+                return raw16
 
             def move_steps(axis: Axis, direction: int, steps: int, delay_us: int):
                 if self._mount is None:
@@ -1467,13 +1437,11 @@ class AppRunner:
             if tracking_on and (self._cam_stream is not None) and (self._mount is not None):
                 fr = self._cam_stream.latest()
                 if fr is not None:
-                    # Tracking en RAW16 (hotpixel-corrected) + SEP
+                    # Tracking en RAW16 + SEP
                     meta = dict(getattr(fr, "meta", {}) or {})
-                    bayer = str(meta.get("bayer_pattern", "RGGB"))
                     raw16 = ensure_raw16_bayer(fr.raw)
-                    raw16_hp = self._apply_hotpix(raw16, bayer)
-                    img_det, _, _, _ = sep_detect_from_raw16(
-                        raw16_hp,
+                    _, _, _, obj_xy = sep_detect_from_raw16(
+                        raw16,
                         sep_bw=int(self.cfg.sep.bw),
                         sep_bh=int(self.cfg.sep.bh),
                         sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
@@ -1484,7 +1452,7 @@ class AppRunner:
                     try:
                         out = tracking_step(
                             self._tracking_state,
-                            img_det,
+                            obj_xy,
                             now_t=_now_s(),
                             tracking_enabled=True,
                         )
@@ -1526,11 +1494,8 @@ class AppRunner:
             if self._stacking_enabled and (self._cam_stream is not None):
                 fr = self._cam_stream.latest()
                 if fr is not None:
-                    meta = dict(getattr(fr, "meta", {}) or {})
-                    bayer = str(meta.get("bayer_pattern", "RGGB"))
                     raw16 = ensure_raw16_bayer(fr.raw)
-                    raw16_hp = self._apply_hotpix(raw16, bayer)
-                    self._stacking.enqueue_frame(raw16_hp.copy(), t=_now_s())
+                    self._stacking.enqueue_frame(raw16.copy(), t=_now_s())
 
             # 2d) publish stacking metrics
             m = self._stacking.engine.metrics
