@@ -411,6 +411,8 @@ class GoToConfig:
     max_iters: int = 8
     gain: float = 0.85
     max_step_per_iter: int = 150000  # hard clamp (microsteps)
+    stages: int = 1
+    platesolve_feedback: bool = True
 
     # MOVE speed (blocking). delay_us ~ 1e6 / microsteps_per_s.
     slew_delay_us_az: int = 1200
@@ -668,6 +670,8 @@ class GoToController:
         stop: Optional[StopFn] = None,
         tracking_pause: Optional[Callable[[bool], Any]] = None,
         tracking_keyframe_reset: Optional[Callable[[], Any]] = None,
+        stages: int = 1,
+        platesolve_feedback: bool = True,
         obstime: Optional[Time] = None,
     ) -> GoToStatus:
         """Closed-loop GoTo (blocking).
@@ -689,6 +693,9 @@ class GoToController:
             except Exception as exc:
                 log_error(None, "GoTo: failed to pause tracking", exc)
 
+        stages = max(1, int(stages))
+        use_platesolve_feedback = bool(platesolve_feedback)
+
         try:
             # Resolve target once to ICRS; we will recompute AltAz each iter.
             if obstime is None:
@@ -703,7 +710,7 @@ class GoToController:
                 return st
 
             # Iterate corrections
-            for it in range(int(self.cfg.max_iters)):
+            for it in range(stages):
                 st.iters = it + 1
                 obstime = _now_time()
 
@@ -711,7 +718,10 @@ class GoToController:
                 altaz_tgt = icrs_to_altaz_deg(target_icrs, observer=self.cfg.observer, obstime=obstime)
 
                 # current mount altaz best estimate
-                altaz_cur = self.model.current_az_alt_deg()
+                if use_platesolve_feedback:
+                    altaz_cur = self.model.current_az_alt_deg()
+                else:
+                    altaz_cur = self.model.predict_az_alt_deg()
                 if altaz_cur is None:
                     st.status = "ERR_NO_CURRENT"
                     return st
@@ -741,6 +751,10 @@ class GoToController:
                     return st
 
                 dsteps = invJ @ d_altaz_vec
+
+                remaining = max(1, stages - it)
+                stage_scale = 1.0 / float(remaining)
+                dsteps *= stage_scale
 
                 # Apply gain and clamp.
                 dsteps *= float(self.cfg.gain)
@@ -799,27 +813,28 @@ class GoToController:
                 else:
                     target_for_solver = target
 
-                sol = self._platesolve_live(
-                    get_live_frame=get_live_frame,
-                    target_for_solver=target_for_solver,
-                    platesolve_cfg=platesolve_cfg,
-                    obstime=obstime,
-                )
-                st.last_solution = sol
-
-                if bool(getattr(sol, "success", False)):
-                    az_alt_new = platesolve_center_to_altaz_deg(
-                        float(sol.center_ra_deg),
-                        float(sol.center_dec_deg),
-                        observer=self.cfg.observer,
+                if use_platesolve_feedback:
+                    sol = self._platesolve_live(
+                        get_live_frame=get_live_frame,
+                        target_for_solver=target_for_solver,
+                        platesolve_cfg=platesolve_cfg,
                         obstime=obstime,
                     )
-                    self.model.apply_plate_solve(az_alt_new)
-                else:
-                    # If solve fails, fall back to model prediction but keep iterating.
-                    # You can also choose to abort here.
-                    self.model.last_solve_az_alt_deg = self.model.predict_az_alt_deg()
-                    self.model.last_solve_time = time.time()
+                    st.last_solution = sol
+
+                    if bool(getattr(sol, "success", False)):
+                        az_alt_new = platesolve_center_to_altaz_deg(
+                            float(sol.center_ra_deg),
+                            float(sol.center_dec_deg),
+                            observer=self.cfg.observer,
+                            obstime=obstime,
+                        )
+                        self.model.apply_plate_solve(az_alt_new)
+                    else:
+                        # If solve fails, fall back to model prediction but keep iterating.
+                        # You can also choose to abort here.
+                        self.model.last_solve_az_alt_deg = self.model.predict_az_alt_deg()
+                        self.model.last_solve_time = time.time()
 
             st.status = "ERR_MAX_ITERS"
             return st
