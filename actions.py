@@ -58,6 +58,7 @@ class ActionType(str, Enum):
 
     # goto
     GOTO_CALIBRATE = "GOTO_CALIBRATE"
+    GOTO_AUTOCALIBRATE = "GOTO_AUTOCALIBRATE"
     GOTO_CANCEL = "GOTO_CANCEL"
 
     # live overlay
@@ -181,6 +182,10 @@ def tracking_auto_reset() -> Action:
 
 def tracking_bootstrap() -> Action:
     return Action(ActionType.TRACKING_BOOTSTRAP, {}, _now())
+
+
+def goto_autocalibrate(params: Dict[str, Any] | None = None) -> Action:
+    return Action(ActionType.GOTO_AUTOCALIBRATE, {"params": params or {}}, _now())
 
 
 # -------------------------

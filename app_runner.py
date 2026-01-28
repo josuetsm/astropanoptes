@@ -10,12 +10,16 @@ import json
 import re
 import datetime as _dt
 
-from dataclasses import replace
-from typing import Optional, Any, Dict, List
+from dataclasses import dataclass, replace
+from typing import Optional, Any, Dict, List, Tuple
 
 import cv2
 import numpy as np
 import serial
+
+import astropy.units as u
+from astropy.coordinates import AltAz, SkyCoord
+from astropy.time import Time
 
 from ap_types import SystemState, Axis, Frame
 from config import AppConfig
@@ -35,7 +39,7 @@ from hotpixels import (
     load_hotpixel_mask,
     save_hotpixel_mask,
 )
-from sep_utils import sep_detect_from_raw16
+from sep_utils import sep_detect_from_raw16, estimate_shift_from_objects
 
 from platesolve import (
     PlatesolveConfig,
@@ -70,6 +74,15 @@ def _format_params(params: Dict[str, Any]) -> str:
     for key, value in params.items():
         parts.append(f"{key}={value}")
     return ", ".join(parts)
+
+
+@dataclass(frozen=True)
+class _AutocalFrame:
+    raw16: np.ndarray
+    t_capture: float
+    obj_xy: np.ndarray
+    star_count: int
+    saturation_frac: float
 
 
 class AppRunner:
@@ -1299,6 +1312,587 @@ class AppRunner:
             self._goto_pending = {"kind": str(kind), "target": target, "params": dict(params)}
         self._goto_start_worker_if_needed()
 
+    def _autocal_detect(self, raw16: np.ndarray) -> Tuple[np.ndarray, int, float]:
+        img_det, _bkg, objects, obj_xy = sep_detect_from_raw16(
+            raw16,
+            sep_bw=int(self.cfg.sep.bw),
+            sep_bh=int(self.cfg.sep.bh),
+            sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
+            sep_minarea=int(self.cfg.sep.minarea),
+            max_sources=int(self.cfg.platesolve.max_det),
+        )
+        _ = img_det
+        star_count = int(obj_xy.shape[0])
+        max_val = np.iinfo(raw16.dtype).max
+        saturation_frac = float(np.mean(raw16 >= max_val))
+        return obj_xy, star_count, saturation_frac
+
+    def _autocal_capture_frames(self, *, n_frames: int, timeout_s: float) -> List[_AutocalFrame]:
+        frames: List[_AutocalFrame] = []
+        if self._cam_stream is None:
+            return frames
+        deadline = _perf() + float(timeout_s)
+        last_seq: Optional[int] = None
+        while len(frames) < int(n_frames) and _perf() < deadline:
+            if self._goto_cancel.is_set():
+                break
+            fr = self._cam_stream.latest()
+            if fr is None:
+                time.sleep(0.01)
+                continue
+            if last_seq is not None and int(fr.seq) == last_seq:
+                time.sleep(0.005)
+                continue
+            last_seq = int(fr.seq)
+            raw16 = ensure_raw16_bayer(fr.raw).copy()
+            obj_xy, star_count, saturation_frac = self._autocal_detect(raw16)
+            t_capture = float(getattr(fr, "t_capture", _now_s()))
+            frames.append(
+                _AutocalFrame(
+                    raw16=raw16,
+                    t_capture=t_capture,
+                    obj_xy=obj_xy,
+                    star_count=star_count,
+                    saturation_frac=saturation_frac,
+                )
+            )
+        return frames
+
+    def _autocal_adjust_exposure(
+        self,
+        *,
+        star_count: int,
+        saturation_frac: float,
+        target_min: int,
+        target_max: int,
+        sat_max: float,
+        exp_min_ms: float,
+        exp_max_ms: float,
+        exp_step: float,
+        gain_min: int,
+        gain_max: int,
+        gain_step: int,
+        settle_s: float,
+    ) -> bool:
+        exp_ms = float(getattr(self.cfg.camera, "exp_ms", 0.0))
+        gain = int(getattr(self.cfg.camera, "gain", 0))
+
+        need_more = int(star_count) < int(target_min)
+        need_less = int(star_count) > int(target_max) or float(saturation_frac) > float(sat_max)
+
+        if not need_more and not need_less:
+            return False
+
+        if need_more:
+            if exp_ms < float(exp_max_ms):
+                new_exp = min(float(exp_max_ms), exp_ms * float(exp_step))
+                if new_exp != exp_ms:
+                    self._apply_camera_param("exp_ms", new_exp)
+                    time.sleep(float(settle_s))
+                    return True
+            if gain < int(gain_max):
+                new_gain = min(int(gain_max), gain + int(gain_step))
+                if new_gain != gain:
+                    self._apply_camera_param("gain", new_gain)
+                    time.sleep(float(settle_s))
+                    return True
+        else:
+            if gain > int(gain_min):
+                new_gain = max(int(gain_min), gain - int(gain_step))
+                if new_gain != gain:
+                    self._apply_camera_param("gain", new_gain)
+                    time.sleep(float(settle_s))
+                    return True
+            if exp_ms > float(exp_min_ms):
+                new_exp = max(float(exp_min_ms), exp_ms / float(exp_step))
+                if new_exp != exp_ms:
+                    self._apply_camera_param("exp_ms", new_exp)
+                    time.sleep(float(settle_s))
+                    return True
+        return False
+
+    def _autocal_estimate_drift(
+        self,
+        frames: List[_AutocalFrame],
+        *,
+        dt_min_s: float,
+        dt_max_s: float,
+        max_pairs: int,
+        max_shift_px: float,
+        min_resp: float,
+    ) -> Optional[np.ndarray]:
+        pairs: List[Tuple[int, int, float]] = []
+        for i in range(len(frames)):
+            for j in range(i + 1, len(frames)):
+                dt = float(frames[j].t_capture - frames[i].t_capture)
+                if float(dt_min_s) <= dt <= float(dt_max_s):
+                    pairs.append((i, j, dt))
+        if not pairs:
+            return None
+
+        if len(pairs) > int(max_pairs):
+            idx = np.linspace(0, len(pairs) - 1, int(max_pairs)).round().astype(int)
+            pairs = [pairs[i] for i in idx]
+
+        v_list: List[np.ndarray] = []
+        for i, j, dt in pairs:
+            dx, dy, resp, _n = estimate_shift_from_objects(
+                frames[i].obj_xy,
+                frames[j].obj_xy,
+                max_shift_px=float(max_shift_px),
+            )
+            if float(resp) < float(min_resp):
+                continue
+            v = np.array([-dx / dt, -dy / dt], dtype=np.float64)
+            v_list.append(v)
+
+        if len(v_list) < 2:
+            return None
+        drift = np.median(np.stack(v_list, axis=0), axis=0)
+        return drift
+
+    def _autocal_measure_axis_j(
+        self,
+        *,
+        axis: Axis,
+        steps: int,
+        repeats: int,
+        block_frames: int,
+        drift_pix: np.ndarray,
+        max_shift_px: float,
+        min_resp: float,
+        delay_us: int,
+        settle_s: float,
+    ) -> Optional[np.ndarray]:
+        if self._mount is None:
+            return None
+
+        step_count = int(abs(int(steps)))
+        if step_count <= 0:
+            return None
+
+        cols: List[np.ndarray] = []
+        for _ in range(int(repeats)):
+            if self._goto_cancel.is_set():
+                return None
+
+            base_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
+            if not base_frames:
+                continue
+            base = base_frames[0]
+
+            self._goto._exec_steps(self._mount.move_steps, axis, float(step_count), delay_us=int(delay_us))
+            time.sleep(float(settle_s))
+            plus_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
+            if not plus_frames:
+                continue
+            plus = plus_frames[0]
+
+            self._goto._exec_steps(self._mount.move_steps, axis, float(-2 * step_count), delay_us=int(delay_us))
+            time.sleep(float(settle_s))
+            minus_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
+            if not minus_frames:
+                continue
+            minus = minus_frames[0]
+
+            self._goto._exec_steps(self._mount.move_steps, axis, float(step_count), delay_us=int(delay_us))
+            time.sleep(float(settle_s))
+
+            dx_p, dy_p, resp_p, _n_p = estimate_shift_from_objects(
+                base.obj_xy,
+                plus.obj_xy,
+                max_shift_px=float(max_shift_px),
+            )
+            dx_m, dy_m, resp_m, _n_m = estimate_shift_from_objects(
+                base.obj_xy,
+                minus.obj_xy,
+                max_shift_px=float(max_shift_px),
+            )
+            if float(resp_p) < float(min_resp) or float(resp_m) < float(min_resp):
+                continue
+
+            dt_plus = float(plus.t_capture - base.t_capture)
+            dt_minus = float(minus.t_capture - base.t_capture)
+            dp_plus = np.array([-dx_p, -dy_p], dtype=np.float64) - drift_pix * dt_plus
+            dp_minus = np.array([-dx_m, -dy_m], dtype=np.float64) - drift_pix * dt_minus
+            dp_axis = (dp_plus - dp_minus) * 0.5
+            cols.append(dp_axis / float(step_count))
+
+        if not cols:
+            return None
+        return np.median(np.stack(cols, axis=0), axis=0)
+
+    def _goto_autocalibrate_blocking(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "ok": False,
+            "status": "RUNNING",
+            "drift_pix": None,
+            "J_pix_per_step": None,
+            "pointing_estimate": None,
+            "platesolve_result": None,
+        }
+
+        if self._cam_stream is None:
+            out["status"] = "ERR_NO_CAMERA"
+            return out
+        if self._mount is None:
+            out["status"] = "ERR_NO_MOUNT"
+            return out
+
+        target_star_min = int(params.get("target_star_min", 30))
+        target_star_max = int(params.get("target_star_max", 200))
+        target_sat_max = float(params.get("target_sat_max", 0.01))
+        exp_min_ms = float(params.get("exp_min_ms", 20.0))
+        exp_max_ms = float(params.get("exp_max_ms", 1200.0))
+        exp_step = float(params.get("exp_step", 1.5))
+        gain_min = int(params.get("gain_min", 0))
+        gain_max = int(params.get("gain_max", 600))
+        gain_step = int(params.get("gain_step", 50))
+        settle_s = float(params.get("settle_s", self.cfg.goto.settle_s))
+        tune_attempts = int(params.get("tune_attempts", 5))
+        tune_settle_s = float(params.get("tune_settle_s", 0.4))
+
+        drift_frames = int(params.get("drift_frames", 8))
+        drift_dt_min = float(params.get("drift_dt_min_s", 0.8))
+        drift_dt_max = float(params.get("drift_dt_max_s", 2.5))
+        drift_pairs = int(params.get("drift_pairs", 12))
+        drift_max_shift_px = float(params.get("drift_max_shift_px", 25.0))
+        drift_min_resp = float(params.get("drift_min_resp", 0.2))
+
+        jcal_steps_az = int(params.get("jcal_steps_az", self.cfg.mount.slew_steps_az))
+        jcal_steps_alt = int(params.get("jcal_steps_alt", self.cfg.mount.slew_steps_alt))
+        jcal_repeats = int(params.get("jcal_repeats", 2))
+        jcal_block_frames = int(params.get("jcal_block_frames", 3))
+        jcal_max_shift_px = float(params.get("jcal_max_shift_px", 30.0))
+        jcal_min_resp = float(params.get("jcal_min_resp", 0.2))
+
+        solve_attempts = int(params.get("solve_attempts", 5))
+        jitter_deg = float(params.get("solve_jitter_deg", 0.2))
+
+        platesolve_cfg = self._get_platesolve_cfg_snapshot()
+        plate_scale_rad = float(platesolve_cfg.pixel_size_m) / float(platesolve_cfg.focal_m)
+        if not np.isfinite(plate_scale_rad) or plate_scale_rad <= 0.0:
+            out["status"] = "ERR_BAD_PLATE_SCALE"
+            return out
+
+        self._set_state_safe(goto_autocal_status="EXPOSURE_TUNE")
+        tuned = False
+        for _ in range(int(tune_attempts)):
+            if self._goto_cancel.is_set():
+                out["status"] = "CANCELLED"
+                return out
+            frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
+            if not frames:
+                continue
+            fr = frames[0]
+            changed = self._autocal_adjust_exposure(
+                star_count=fr.star_count,
+                saturation_frac=fr.saturation_frac,
+                target_min=target_star_min,
+                target_max=target_star_max,
+                sat_max=target_sat_max,
+                exp_min_ms=exp_min_ms,
+                exp_max_ms=exp_max_ms,
+                exp_step=exp_step,
+                gain_min=gain_min,
+                gain_max=gain_max,
+                gain_step=gain_step,
+                settle_s=tune_settle_s,
+            )
+            if not changed:
+                tuned = True
+                break
+        if not tuned:
+            out["status"] = "ERR_EXPOSURE_TUNE"
+            return out
+
+        self._set_state_safe(goto_autocal_status="DRIFT")
+        drift_frames_list = self._autocal_capture_frames(n_frames=drift_frames, timeout_s=4.0)
+        if len(drift_frames_list) < 2:
+            out["status"] = "ERR_DRIFT_FRAMES"
+            return out
+        drift_pix = self._autocal_estimate_drift(
+            drift_frames_list,
+            dt_min_s=drift_dt_min,
+            dt_max_s=drift_dt_max,
+            max_pairs=drift_pairs,
+            max_shift_px=drift_max_shift_px,
+            min_resp=drift_min_resp,
+        )
+        if drift_pix is None:
+            out["status"] = "ERR_DRIFT"
+            return out
+        out["drift_pix"] = drift_pix
+        self._set_state_safe(
+            goto_autocal_drift_px_s_x=float(drift_pix[0]),
+            goto_autocal_drift_px_s_y=float(drift_pix[1]),
+        )
+
+        self._set_state_safe(goto_autocal_status="JCAL")
+        col_az = self._autocal_measure_axis_j(
+            axis=Axis.AZ,
+            steps=jcal_steps_az,
+            repeats=jcal_repeats,
+            block_frames=jcal_block_frames,
+            drift_pix=drift_pix,
+            max_shift_px=jcal_max_shift_px,
+            min_resp=jcal_min_resp,
+            delay_us=int(self.cfg.goto.slew_delay_us),
+            settle_s=settle_s,
+        )
+        if col_az is None:
+            out["status"] = "ERR_JCAL_AZ"
+            return out
+
+        col_alt = self._autocal_measure_axis_j(
+            axis=Axis.ALT,
+            steps=jcal_steps_alt,
+            repeats=jcal_repeats,
+            block_frames=jcal_block_frames,
+            drift_pix=drift_pix,
+            max_shift_px=jcal_max_shift_px,
+            min_resp=jcal_min_resp,
+            delay_us=int(self.cfg.goto.slew_delay_us),
+            settle_s=settle_s,
+        )
+        if col_alt is None:
+            out["status"] = "ERR_JCAL_ALT"
+            return out
+
+        J_pix = np.column_stack([col_az, col_alt])
+        out["J_pix_per_step"] = J_pix
+        self._set_state_safe(
+            goto_autocal_J_pix_per_step_00=float(J_pix[0, 0]),
+            goto_autocal_J_pix_per_step_01=float(J_pix[0, 1]),
+            goto_autocal_J_pix_per_step_10=float(J_pix[1, 0]),
+            goto_autocal_J_pix_per_step_11=float(J_pix[1, 1]),
+        )
+
+        self._set_state_safe(goto_autocal_status="POINTING_SOLVE")
+        e_az = J_pix[:, 0]
+        e_alt = J_pix[:, 1]
+        n_az = float(np.linalg.norm(e_az))
+        n_alt = float(np.linalg.norm(e_alt))
+        if n_az <= 0.0 or n_alt <= 0.0:
+            out["status"] = "ERR_JCAL_NORM"
+            return out
+
+        e_az_hat = e_az / n_az
+        e_alt_hat = e_alt / n_alt
+
+        v_az_pix = float(np.dot(drift_pix, e_az_hat))
+        v_alt_pix = float(np.dot(drift_pix, e_alt_hat))
+        v_obs = np.array([v_az_pix * plate_scale_rad, v_alt_pix * plate_scale_rad], dtype=np.float64)
+
+        def _wrap_deg_180(x: float) -> float:
+            y = (float(x) + 180.0) % 360.0 - 180.0
+            if y <= -180.0:
+                y += 360.0
+            return float(y)
+
+        def _wrap_deg_360(x: float) -> float:
+            y = float(x) % 360.0
+            if y < 0.0:
+                y += 360.0
+            return float(y)
+
+        def _predict_rate(az_deg: float, alt_deg: float, t0: Time, dt_s: float = 1.0) -> np.ndarray:
+            loc = self._platesolve_observer.location()
+            altaz0 = AltAz(az=float(az_deg) * u.deg, alt=float(alt_deg) * u.deg, obstime=t0, location=loc)
+            coord = SkyCoord(altaz0)
+            altaz1 = coord.transform_to(AltAz(obstime=t0 + float(dt_s) * u.s, location=loc))
+            daz = _wrap_deg_180(float(altaz1.az.deg) - float(az_deg))
+            dalt = float(altaz1.alt.deg) - float(alt_deg)
+            return np.array(
+                [
+                    np.deg2rad(daz) / float(dt_s),
+                    np.deg2rad(dalt) / float(dt_s),
+                ],
+                dtype=np.float64,
+            )
+
+        t_ref = Time.now()
+        seeds = params.get(
+            "pointing_seeds",
+            [
+                (90.0, 45.0),
+                (270.0, 45.0),
+                (60.0, 35.0),
+                (300.0, 35.0),
+            ],
+        )
+        best = None
+        best_res = float("inf")
+        for seed in seeds:
+            if self._goto_cancel.is_set():
+                out["status"] = "CANCELLED"
+                return out
+            az = float(seed[0])
+            alt = float(seed[1])
+            for _ in range(8):
+                pred = _predict_rate(az, alt, t_ref)
+                resid = pred - v_obs
+                if float(np.linalg.norm(resid)) < 1e-7:
+                    break
+                delta = 0.1
+                pred_az = _predict_rate(az + delta, alt, t_ref)
+                pred_alt = _predict_rate(az, alt + delta, t_ref)
+                J = np.column_stack([(pred_az - pred) / delta, (pred_alt - pred) / delta])
+                if np.linalg.matrix_rank(J) < 2:
+                    break
+                step = np.linalg.solve(J, -resid)
+                step = np.clip(step, -5.0, 5.0)
+                az = _wrap_deg_360(az + float(step[0]))
+                alt = float(alt + float(step[1]))
+                alt = float(np.clip(alt, self.cfg.goto.alt_min_deg, self.cfg.goto.alt_max_deg))
+            resid_norm = float(np.linalg.norm(_predict_rate(az, alt, t_ref) - v_obs))
+            if resid_norm < best_res:
+                best_res = resid_norm
+                best = (az, alt)
+
+        if best is None:
+            out["status"] = "ERR_POINTING_SOLVE"
+            return out
+
+        az_hat, alt_hat = best
+        dist_to_0 = min(az_hat, 360.0 - az_hat)
+        dist_to_180 = abs(az_hat - 180.0)
+        if dist_to_0 < 15.0 or dist_to_180 < 15.0:
+            out["status"] = "ERR_DEGENERATE_AZ"
+            return out
+
+        out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
+        self._set_state_safe(
+            goto_autocal_az_deg=float(az_hat),
+            goto_autocal_alt_deg=float(alt_hat),
+            goto_autocal_radius_deg=1.0,
+        )
+
+        self._set_state_safe(goto_autocal_status="PLATESOLVE_LOOP")
+        v_deg_s = np.rad2deg(v_obs)
+        jitter_seq = [
+            (0.0, 0.0),
+            (jitter_deg, 0.0),
+            (-jitter_deg, 0.0),
+            (0.0, jitter_deg),
+            (0.0, -jitter_deg),
+        ]
+        platesolve_result = None
+        attempts = 0
+        while attempts < int(solve_attempts):
+            if self._goto_cancel.is_set():
+                out["status"] = "CANCELLED"
+                return out
+            frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
+            if not frames:
+                attempts += 1
+                continue
+            fr = frames[0]
+            changed = self._autocal_adjust_exposure(
+                star_count=fr.star_count,
+                saturation_frac=fr.saturation_frac,
+                target_min=target_star_min,
+                target_max=target_star_max,
+                sat_max=target_sat_max,
+                exp_min_ms=exp_min_ms,
+                exp_max_ms=exp_max_ms,
+                exp_step=exp_step,
+                gain_min=gain_min,
+                gain_max=gain_max,
+                gain_step=gain_step,
+                settle_s=tune_settle_s,
+            )
+            if changed:
+                continue
+
+            t_now = Time.now()
+            dt_s = float((t_now - t_ref).to_value(u.s))
+            az_c = _wrap_deg_360(az_hat + float(v_deg_s[0]) * dt_s)
+            alt_c = float(alt_hat + float(v_deg_s[1]) * dt_s)
+            alt_c = float(np.clip(alt_c, self.cfg.goto.alt_min_deg, self.cfg.goto.alt_max_deg))
+
+            jitter = jitter_seq[attempts % len(jitter_seq)]
+            target = {"az_deg": float(az_c + jitter[0]), "alt_deg": float(alt_c + jitter[1])}
+
+            ps_cfg = replace(platesolve_cfg, search_radius_deg=1.0)
+            platesolve_result = platesolve_sweep(
+                fr.raw16,
+                target=target,
+                cfg=ps_cfg,
+                sep_cfg=self.cfg.sep,
+                observer=self._platesolve_observer,
+                obstime=t_now,
+                progress_cb=None,
+            )
+            attempts += 1
+
+            debug_jpeg = self._render_platesolve_debug_jpeg(
+                fr.raw16,
+                list(getattr(platesolve_result, "overlay", []) or []),
+            )
+            debug_info = self._build_platesolve_debug_info(platesolve_result)
+
+            self._set_state_safe(
+                platesolve_busy=False,
+                platesolve_status=getattr(platesolve_result, "status", "UNKNOWN"),
+                platesolve_last_ok=bool(getattr(platesolve_result, "success", False)),
+                platesolve_theta_deg=float(getattr(platesolve_result, "theta_deg", 0.0)),
+                platesolve_dx_px=float(getattr(platesolve_result, "dx_px", 0.0)),
+                platesolve_dy_px=float(getattr(platesolve_result, "dy_px", 0.0)),
+                platesolve_resp=float(getattr(platesolve_result, "response", 0.0)),
+                platesolve_n_inliers=int(getattr(platesolve_result, "n_inliers", 0)),
+                platesolve_rms_px=float(getattr(platesolve_result, "rms_px", 0.0)),
+                platesolve_overlay=list(getattr(platesolve_result, "overlay", []) or []),
+                platesolve_guides=list(getattr(platesolve_result, "guides", []) or []),
+                platesolve_debug_jpeg=debug_jpeg,
+                platesolve_debug_info=debug_info,
+                platesolve_center_ra_deg=float(getattr(platesolve_result, "center_ra_deg", 0.0)),
+                platesolve_center_dec_deg=float(getattr(platesolve_result, "center_dec_deg", 0.0)),
+            )
+
+            if bool(getattr(platesolve_result, "success", False)):
+                self._last_platesolve_result = platesolve_result
+                break
+
+        if platesolve_result is None or not bool(getattr(platesolve_result, "success", False)):
+            out["status"] = "ERR_PLATESOLVE"
+            out["platesolve_result"] = platesolve_result
+            return out
+
+        out["platesolve_result"] = platesolve_result
+        self._set_state_safe(goto_autocal_status="SYNC")
+        ok_sync = bool(self._goto.sync_from_platesolve(platesolve_result))
+        self._set_state_safe(goto_synced=ok_sync, goto_status="SYNC_OK" if ok_sync else "SYNC_ERR")
+        if not ok_sync:
+            out["status"] = "ERR_SYNC"
+            return out
+
+        self._set_state_safe(goto_autocal_status="CALIBRATE_J")
+        def _get_live_frame_for_calib() -> Optional[np.ndarray]:
+            if self._cam_stream is None:
+                return None
+            fr = self._cam_stream.latest()
+            if fr is None:
+                return None
+            return ensure_raw16_bayer(fr.raw)
+
+        calib_out = self._goto.calibrate_blocking(
+            get_live_frame=_get_live_frame_for_calib,
+            move_steps=self._mount.move_steps,
+            stop=self._mount.stop,
+            platesolve_cfg=platesolve_cfg,
+            n_samples=int(params.get("calib_samples", self.cfg.goto.calib_samples)),
+            max_radius_deg=float(params.get("calib_max_radius_deg", self.cfg.goto.calib_max_radius_deg)),
+        )
+        if not bool(calib_out.get("ok", False)):
+            out["status"] = "ERR_CALIBRATE_J"
+            return out
+
+        out["ok"] = True
+        out["status"] = "OK"
+        self._set_state_safe(goto_autocal_last_ok=True, goto_autocal_status="READY")
+        return out
+
     def _goto_worker(self) -> None:
         """Ejecuta GoTo/Calibración en background para no bloquear el control loop."""
         while not self._stop.is_set():
@@ -1439,6 +2033,21 @@ class AppRunner:
                     log_info(
                         self.out_log,
                         f"GoTo: CALIBRATE status={calib_status} ok={calib_ok} samples={calib_samples}",
+                    )
+
+                elif kind == "autocal":
+                    self._set_state_safe(goto_autocal_status="RUNNING")
+                    autocal_out = self._goto_autocalibrate_blocking(params)
+                    autocal_ok = bool(autocal_out.get("ok", False))
+                    autocal_status = "READY" if autocal_ok else str(autocal_out.get("status", "UNKNOWN"))
+                    self._set_state_safe(
+                        goto_status="AUTOCAL_DONE" if autocal_ok else "AUTOCAL_ERR",
+                        goto_autocal_last_ok=autocal_ok,
+                        goto_autocal_status=autocal_status,
+                    )
+                    log_info(
+                        self.out_log,
+                        f"GoTo: AUTOCAL status={autocal_out.get('status')} ok={autocal_ok}",
                     )
 
                 else:
@@ -1642,6 +2251,7 @@ class AppRunner:
                     ActionType.STACKING_SET_PARAMS,
                     ActionType.PLATESOLVE_RUN,
                     ActionType.PLATESOLVE_SET_PARAMS,
+                    ActionType.GOTO_AUTOCALIBRATE,
                 ):
                     if act.type in (
                         ActionType.MOUNT_CONNECT,
@@ -1911,6 +2521,11 @@ class AppRunner:
         if t == ActionType.GOTO_CALIBRATE:
             params = p.get('params', {})
             self._goto_request(kind='calibrate', target=None, params=params)
+            return
+
+        if t == ActionType.GOTO_AUTOCALIBRATE:
+            params = p.get('params', {})
+            self._goto_request(kind='autocal', target=None, params=params)
             return
 
         if t == ActionType.GOTO_CANCEL:
