@@ -469,9 +469,6 @@ def resolve_target_icrs(
         target,
         observer=observer,
         obstime=obstime,
-        progress_cb=None,
-        simbad_retries=2,
-        simbad_backoff_s=0.4,
     ).icrs
 
 
@@ -556,6 +553,7 @@ class GoToController:
         get_live_frame: GetFrameFn,
         target_for_solver: TargetType,
         platesolve_cfg: PlatesolveConfig,
+        radius_deg_seq: Optional[Tuple[Optional[float], ...]] = None,
         obstime: Optional[Time] = None,
     ) -> PlatesolveResult:
         if obstime is None:
@@ -584,7 +582,8 @@ class GoToController:
             )
 
         last: Optional[PlatesolveResult] = None
-        for rad in self.cfg.platesolve_radius_deg_seq:
+        radius_seq = radius_deg_seq if radius_deg_seq is not None else self.cfg.platesolve_radius_deg_seq
+        for rad in radius_seq:
             cfg2 = platesolve_cfg
             if rad is not None:
                 try:
@@ -864,6 +863,13 @@ class GoToController:
             out["status"] = "ERR_NOT_SYNCED"
             return out
 
+        calib_platesolve_cfg = replace(
+            platesolve_cfg,
+            search_radius_deg=1.0,
+            gmax=15.0,
+            nside=16,
+        )
+
         # Disable tracking while calibrating
         was_tracking = False
         if tracking_pause is not None:
@@ -890,7 +896,8 @@ class GoToController:
                 sol0 = self._platesolve_live(
                     get_live_frame=get_live_frame,
                     target_for_solver={"az_deg": float(altaz_pred[0]), "alt_deg": float(altaz_pred[1])},
-                    platesolve_cfg=platesolve_cfg,
+                    platesolve_cfg=calib_platesolve_cfg,
+                    radius_deg_seq=(1.0,),
                     obstime=obstime,
                 )
                 if not bool(getattr(sol0, "success", False)):
@@ -974,7 +981,8 @@ class GoToController:
                 sol = self._platesolve_live(
                     get_live_frame=get_live_frame,
                     target_for_solver={"az_deg": float(altaz_pred[0]), "alt_deg": float(altaz_pred[1])},
-                    platesolve_cfg=platesolve_cfg,
+                    platesolve_cfg=calib_platesolve_cfg,
+                    radius_deg_seq=(1.0,),
                     obstime=_now_time(),
                 )
                 if not bool(getattr(sol, "success", False)):
