@@ -8,6 +8,7 @@ from typing import Optional, Tuple, Dict, Any
 import numpy as np
 import cv2
 from logging_utils import log_error
+from sep_utils import estimate_shift_from_objects
 
 
 # ============================================================
@@ -137,7 +138,7 @@ class TrackingState:
     bg_ema: Optional[np.ndarray] = None
 
     # incremental tracking
-    prev_reg: Optional[np.ndarray] = None
+    prev_obj_xy: Optional[np.ndarray] = None
     prev_t: Optional[float] = None
     fail: int = 0
 
@@ -149,7 +150,7 @@ class TrackingState:
     resp_inc: float = 0.0
 
     # keyframe & absolute correction
-    key_reg: Optional[np.ndarray] = None
+    key_obj_xy: Optional[np.ndarray] = None
     key_t: Optional[float] = None
     x_hat: float = 0.0
     y_hat: float = 0.0
@@ -521,7 +522,7 @@ def make_tracking_state(cfg: Optional[TrackingConfig] = None) -> TrackingState:
 
 
 def reset_tracker(state: TrackingState, mode: str = "STABILIZE") -> None:
-    state.prev_reg = None
+    state.prev_obj_xy = None
     state.prev_t = None
     state.fail = 0
     state.vpx = 0.0
@@ -535,7 +536,7 @@ def reset_tracker(state: TrackingState, mode: str = "STABILIZE") -> None:
     state.current_mode = str(mode)
     state.t_mode = time.time()
 
-    state.key_reg = None
+    state.key_obj_xy = None
     state.key_t = None
     state.x_hat = 0.0
     state.y_hat = 0.0
@@ -545,8 +546,8 @@ def reset_tracker(state: TrackingState, mode: str = "STABILIZE") -> None:
     state.abs_resp_last = 0.0
 
 
-def reset_keyframe(state: TrackingState, reg_now: Optional[np.ndarray]) -> None:
-    state.key_reg = reg_now
+def reset_keyframe(state: TrackingState, obj_xy: Optional[np.ndarray]) -> None:
+    state.key_obj_xy = obj_xy
     state.key_t = time.time()
     state.x_hat = 0.0
     state.y_hat = 0.0
@@ -625,14 +626,14 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
 
 def tracking_step(
     state: TrackingState,
-    img_det: np.ndarray,
+    obj_xy: np.ndarray,
     *,
     now_t: Optional[float] = None,
     tracking_enabled: bool = True,
 ) -> TrackingOutput:
     """
     Un paso de tracking puro (sin tocar hardware):
-    - Preproc + phasecorr incremental (v) + keyframe abs correction (x_hat/y_hat).
+    - Alineación por objetos (SEP) incremental (v) + keyframe abs correction (x_hat/y_hat).
     - Si tracking_enabled y hay A_pinv (manual o auto), computa RATE targets (pero NO envía).
       AppRunner es quien envía RATE al Arduino.
     """
@@ -642,17 +643,19 @@ def tracking_step(
     # resp_min configurable desde UI
     resp_min = float(getattr(state.cfg, "_resp_min", 0.06))
 
-    reg = preprocess_for_phasecorr(img_det, state, update_bg=True)
+    obj_xy = np.asarray(obj_xy, dtype=np.float64)
+    if obj_xy.ndim != 2 or obj_xy.shape[1] != 2:
+        raise ValueError(f"obj_xy must have shape (N,2), got {obj_xy.shape}")
 
     # keyframe init/pending
-    if state.key_reg is None:
-        reset_keyframe(state, reg)
-    elif isinstance(state.key_reg, str) and state.key_reg == "PENDING":
-        reset_keyframe(state, reg)
+    if state.key_obj_xy is None:
+        reset_keyframe(state, obj_xy)
+    elif isinstance(state.key_obj_xy, str) and state.key_obj_xy == "PENDING":
+        reset_keyframe(state, obj_xy)
 
     # first frame
-    if state.prev_reg is None or state.prev_t is None:
-        state.prev_reg = reg
+    if state.prev_obj_xy is None or state.prev_t is None:
+        state.prev_obj_xy = obj_xy
         state.prev_t = now_t
         return TrackingOutput(
             ok=True,
@@ -675,7 +678,11 @@ def tracking_step(
     if dt <= 1e-6:
         dt = 1e-6
 
-    dx_inc, dy_inc, resp_inc = phasecorr_delta(state.prev_reg, reg)
+    dx_inc, dy_inc, resp_inc, _ = estimate_shift_from_objects(
+        state.prev_obj_xy,
+        obj_xy,
+        max_shift_px=float(state.cfg.rate.max_shift_per_frame_px),
+    )
     mag_inc = float(np.hypot(dx_inc, dy_inc))
 
     good_inc = (
@@ -703,7 +710,7 @@ def tracking_step(
     else:
         state.fail += 1
 
-    state.prev_reg = reg
+    state.prev_obj_xy = obj_xy
     state.prev_t = now_t
 
     # fail reset
@@ -729,9 +736,13 @@ def tracking_step(
         )
 
     # ABS correction against keyframe
-    if isinstance(state.key_reg, np.ndarray):
+    if isinstance(state.key_obj_xy, np.ndarray):
         if (state.abs_last_t is None) or ((now_t - float(state.abs_last_t)) >= float(state.cfg.keyframe.abs_corr_every_s)):
-            dx_abs, dy_abs, resp_abs = pyramid_phasecorr_delta(state.key_reg, reg, levels=3)
+            dx_abs, dy_abs, resp_abs, _ = estimate_shift_from_objects(
+                state.key_obj_xy,
+                obj_xy,
+                max_shift_px=float(state.cfg.keyframe.abs_max_px),
+            )
             state.abs_last_t = now_t
             state.abs_resp_last = float(resp_abs)
             mag_abs = float(np.hypot(dx_abs, dy_abs))
@@ -781,7 +792,7 @@ def tracking_step(
         # keyframe refresh when stable
         e_mag = float(np.hypot(ex, ey))
         if (e_mag <= float(state.cfg.keyframe.keyframe_refresh_px)) and (float(state.abs_resp_last) >= float(state.cfg.keyframe.abs_resp_min)):
-            reset_keyframe(state, reg)
+            reset_keyframe(state, obj_xy)
 
     else:
         # no calib -> hold rates at 0

@@ -18,7 +18,7 @@ from imaging import (
 )
 from preview import stretch_to_u8
 from logging_utils import log_error
-from sep_utils import sep_detect_from_raw16
+from sep_utils import sep_detect_from_raw16, estimate_shift_from_objects
 
 # ============================================================
 # Types
@@ -109,70 +109,6 @@ class TileCanvas:
 def _mad(x: np.ndarray) -> float:
     med = np.median(x)
     return float(np.median(np.abs(x - med))) + _EPS
-
-
-def _robust_norm_f32(x_in: np.ndarray) -> np.ndarray:
-    """
-    Robust normalization for phase correlation:
-      z = clip((x - median)/MAD, [-6, +6])
-    Improves stability under gradients/noise and varying exposure.
-    """
-    x = x_in.astype(np.float32, copy=False)
-    med = float(np.median(x))
-    mad = float(np.median(np.abs(x - med))) + _EPS
-    z = (x - med) / mad
-    return np.clip(z, -6.0, 6.0, out=z)
-
-
-def _phasecorr(a_f32: np.ndarray, b_f32: np.ndarray) -> Tuple[float, float, float]:
-    """
-    OpenCV phase correlation: returns shift (dx,dy) and response.
-    """
-    win = cv2.createHanningWindow((a_f32.shape[1], a_f32.shape[0]), cv2.CV_32F)
-    (dx, dy), resp = cv2.phaseCorrelate(a_f32, b_f32, win)
-    return float(dx), float(dy), float(resp)
-
-
-def _warp_shift(b: np.ndarray, dx: float, dy: float) -> np.ndarray:
-    """
-    Warp b by a pure translation so output is b shifted by (dx,dy).
-    """
-    M = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
-    h, w = b.shape[:2]
-    return cv2.warpAffine(b, M, (w, h), flags=cv2.INTER_LINEAR, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
-
-def _corr_score(a: np.ndarray, b: np.ndarray) -> float:
-    """
-    Similarity score for sign disambiguation: normalized dot product over overlap.
-    """
-    a_f = a.astype(np.float32, copy=False)
-    b_f = b.astype(np.float32, copy=False)
-    m = (a_f != 0).astype(np.float32) * (b_f != 0).astype(np.float32)
-    denom = float(np.sqrt(np.sum((a_f * m) ** 2) * np.sum((b_f * m) ** 2)) + _EPS)
-    if denom <= 0.0:
-        return -1e9
-    return float(np.sum(a_f * b_f * m) / denom)
-
-
-def _phasecorr_shift_validated(a_img: np.ndarray, b_img: np.ndarray) -> Tuple[float, float, float]:
-    """
-    Estimate shift to align b onto a, and disambiguate sign by scoring correlation
-    after applying +/- shift (on the small alignment images).
-
-    Returns (dx, dy, resp) where shifting b by (dx,dy) best aligns to a.
-    """
-    a_n = _robust_norm_f32(a_img)
-    b_n = _robust_norm_f32(b_img)
-
-    dx, dy, resp = _phasecorr(a_n, b_n)
-
-    b_plus = _warp_shift(b_n, dx, dy)
-    b_minus = _warp_shift(b_n, -dx, -dy)
-
-    if _corr_score(a_n, b_minus) > _corr_score(a_n, b_plus):
-        return -dx, -dy, resp
-    return dx, dy, resp
 
 
 # ============================================================
@@ -309,9 +245,8 @@ class StackEngine:
     _preview_jpeg: Optional[bytes] = None
     _preview_lock: threading.Lock = field(default_factory=threading.Lock)
 
-    # persistent alignment reference (SEP detection image, full-res)
-    _ref_align_img: Optional[np.ndarray] = None
-    _ref_ema: float = 0.08  # conservative reference update
+    # persistent alignment reference (SEP objects, full-res)
+    _ref_align_xy: Optional[np.ndarray] = None
 
     def configure_from_cfg(self) -> None:
         scfg = self.cfg.stacking
@@ -341,7 +276,7 @@ class StackEngine:
             self.canvas.tiles.clear()
             self.canvas.tiles_evicted = 0
 
-        self._ref_align_img = None
+        self._ref_align_xy = None
 
         with self._preview_lock:
             self._preview_jpeg = None
@@ -422,13 +357,13 @@ class StackEngine:
         t0 = time.perf_counter()
         self.metrics.frames_in += len(batch)
 
-        # 1) Alignment images from RAW16 via SEP (full-res).
-        align_img: List[np.ndarray] = []
+        # 1) Alignment objects from RAW16 via SEP (full-res).
+        align_xy: List[np.ndarray] = []
         raw16_work_list: List[np.ndarray] = []
         for item in batch:
             raw16_work = ensure_raw16_bayer(item["raw16"])
             raw16_work_list.append(raw16_work)
-            img_det, _, _, _ = sep_detect_from_raw16(
+            _, _, _, obj_xy = sep_detect_from_raw16(
                 raw16_work,
                 sep_bw=int(self.cfg.sep.bw),
                 sep_bh=int(self.cfg.sep.bh),
@@ -436,23 +371,25 @@ class StackEngine:
                 sep_minarea=int(self.cfg.sep.minarea),
                 max_sources=None,
             )
-            align_img.append(img_det)
+            align_xy.append(obj_xy)
 
         # 2) Persistent reference (stabilizes across batches).
-        if self._ref_align_img is None:
-            self._ref_align_img = align_img[0].copy()
-        ref_img = self._ref_align_img
+        if self._ref_align_xy is None:
+            self._ref_align_xy = align_xy[0].copy()
+        ref_xy = self._ref_align_xy
 
         # 3) Shifts relative to reference (full-res).
         dxs_full = np.zeros(len(batch), dtype=np.float32)
         dys_full = np.zeros(len(batch), dtype=np.float32)
         resps = np.zeros(len(batch), dtype=np.float32)
 
-        for i, img in enumerate(align_img):
-            dx, dy, resp = _phasecorr_shift_validated(ref_img, img)
-            dxs_full[i] = dx
-            dys_full[i] = dy
-            resps[i] = resp
+        ref_shape = raw16_work_list[0].shape if raw16_work_list else (0, 0)
+        max_shift = float(max(ref_shape) / 2.0) if ref_shape[0] > 0 else 0.0
+        for i, obj_xy in enumerate(align_xy):
+            dx, dy, resp, _ = estimate_shift_from_objects(ref_xy, obj_xy, max_shift_px=max_shift)
+            dxs_full[i] = float(dx)
+            dys_full[i] = float(dy)
+            resps[i] = float(resp)
 
         # 4) Robust gating: response + shift outliers (radial MAD).
         resp_min = float(scfg.resp_min)
@@ -483,13 +420,10 @@ class StackEngine:
         dx_best = float(dxs_full[i_best])
         dy_best = float(dys_full[i_best])
 
-        best_img = align_img[i_best].astype(np.float32, copy=False)
-        aligned_best = _warp_shift(best_img, dx_best, dy_best)
-
-        ref_f = ref_img.astype(np.float32, copy=False)
-        ema = float(np.clip(self._ref_ema, 0.0, 0.5))
-        ref_new = (1.0 - ema) * ref_f + ema * aligned_best
-        self._ref_align_img = np.maximum(ref_new, 0.0)
+        best_xy = align_xy[i_best]
+        if best_xy.size > 0:
+            shifted_best = best_xy + np.array([[dx_best, dy_best]], dtype=np.float64)
+            self._ref_align_xy = shifted_best.astype(np.float64, copy=False)
 
         # 6) Accumulate accepted frames into tiles (drizzle grid). Rotation hook kept at zero.
         scale = float(scfg.drizzle_scale)

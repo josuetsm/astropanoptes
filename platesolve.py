@@ -220,7 +220,7 @@ def stretch01(img: np.ndarray) -> np.ndarray:
 
 
 def detect_sep_objects(
-    raw16_hp: np.ndarray,
+    raw16: np.ndarray,
     *,
     sep_bw: int,
     sep_bh: int,
@@ -238,7 +238,7 @@ def detect_sep_objects(
     if progress_cb:
         progress_cb("detect:start", {})
 
-    raw = ensure_raw16_bayer(raw16_hp)
+    raw = ensure_raw16_bayer(raw16)
     disp = stretch01(raw)
 
     img_det, bkg, objects, obj_xy = sep_detect_from_raw16(
@@ -1083,4 +1083,3 @@ def platesolve_sweep(
         guides=guides,
         metrics=metrics,
     )
-
