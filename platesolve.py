@@ -998,11 +998,13 @@ def platesolve_sweep(
 
     # 12) Final overlays (inliers + Gaia points in view)
     best_center: SkyCoord = _ensure_icrs(best["center"], label="best_center")
+    best_center_icrs = SkyCoord(ra=best_center.icrs.ra, dec=best_center.icrs.dec, frame="icrs")
+    center_icrs_ref = SkyCoord(ra=center_icrs.icrs.ra, dec=center_icrs.icrs.dec, frame="icrs")
     best_fit: Dict[str, Any] = best["fit"]
     best_inliers: List[Tuple[int, int, float]] = best["inliers"]
 
     # Gaia all into best TAN arcsec
-    d_lon_all, d_lat_all = best_center.spherical_offsets_to(coords)
+    d_lon_all, d_lat_all = best_center_icrs.spherical_offsets_to(coords)
     gaia_xy_arcsec = np.column_stack([d_lon_all.to_value(u.arcsec), d_lat_all.to_value(u.arcsec)])
 
     s = float(best_fit["s"])
@@ -1028,7 +1030,7 @@ def platesolve_sweep(
         guides = build_guides_from_solution(
             gaia_df,
             gi,
-            center_icrs=best_center,
+            center_icrs=best_center_icrs,
             s_arcsec_per_px=s,
             R=R,
             t_arcsec=t_arcsec,
@@ -1042,7 +1044,7 @@ def platesolve_sweep(
     min_inliers = int(getattr(cfg, "min_inliers", 3))
     success = bool(best["num_inliers"] >= min_inliers)
 
-    offset_lon, offset_lat = best_center.spherical_offsets_to(center_icrs)
+    offset_lon, offset_lat = best_center_icrs.spherical_offsets_to(center_icrs_ref)
     offset_arcsec = np.array([offset_lon.to_value(u.arcsec), offset_lat.to_value(u.arcsec)], dtype=np.float64)
     offset_px = (offset_arcsec / max(1e-9, float(s))) @ R
     theta_deg = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
