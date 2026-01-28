@@ -15,6 +15,7 @@ from typing import Optional, Any, Dict, List
 
 import cv2
 import numpy as np
+import serial
 
 from ap_types import SystemState, Axis, Frame
 from config import AppConfig
@@ -166,6 +167,8 @@ class AppRunner:
         self._goto_cancel = threading.Event()
         self._goto_pending: Optional[Dict[str, Any]] = None
         self._last_platesolve_result: Optional[Any] = None
+        self._mount_move_lock = threading.Lock()
+        self._mount_move_thr: Optional[threading.Thread] = None
 
         # State + outputs (thread-safe)
         self._state = SystemState()
@@ -690,18 +693,37 @@ class AppRunner:
     def _mount_move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
         if self._mount is None or not self._mount.is_connected():
             return
-        try:
-            self._mount.stop()
-            self._mount.move_steps(
-                axis=axis,
-                direction=int(direction),
-                steps=int(steps),
-                delay_us=int(delay_us),
+        with self._mount_move_lock:
+            if self._mount_move_thr is not None and self._mount_move_thr.is_alive():
+                log_info(self.out_log, "Mount: MOVE ignored; previous move still running")
+                return
+            mount = self._mount
+
+            def _job() -> None:
+                try:
+                    mount.stop()
+                    mount.move_steps(
+                        axis=axis,
+                        direction=int(direction),
+                        steps=int(steps),
+                        delay_us=int(delay_us),
+                    )
+                    self._goto.model.note_manual_move(axis, int(direction), int(steps))
+                except (RuntimeError, ValueError, OSError, serial.SerialException) as exc:
+                    self._set_state_safe(
+                        mount_status="ERR",
+                        mount_connected=False,
+                        tracking_enabled=False,
+                        tracking_mode="IDLE",
+                    )
+                    log_error(self.out_log, "Mount: MOVE steps failed", exc)
+
+            self._mount_move_thr = threading.Thread(
+                target=_job,
+                name="MountMoveWorker",
+                daemon=True,
             )
-            self._goto.model.note_manual_move(axis, int(direction), int(steps))
-        except Exception as exc:
-            self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
-            log_error(self.out_log, "Mount: MOVE steps failed", exc)
+            self._mount_move_thr.start()
 
     # -------------------------
     # Platesolve (thread worker)
