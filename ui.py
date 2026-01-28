@@ -554,11 +554,9 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     def _send_track_params(_=None):
         runner.enqueue(
             tracking_set_params(
-                {
-                    "mode": str(w_dd_track_mode.value),
-                    "sigma_hp": float(w_tf_sigma_hp.value),
-                    "resp_min": float(w_tf_resp_min.value),
-                }
+                mode=str(w_dd_track_mode.value),
+                sigma_hp=float(w_tf_sigma_hp.value),
+                resp_min=float(w_tf_resp_min.value),
             )
         )
 
