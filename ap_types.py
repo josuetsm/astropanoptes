@@ -130,3 +130,16 @@ class SystemState:
     goto_J01: float = 0.0
     goto_J10: float = 0.0
     goto_J11: float = 0.0
+
+    # goto autocal metrics (optional)
+    goto_autocal_status: str = "IDLE"
+    goto_autocal_last_ok: bool = False
+    goto_autocal_drift_px_s_x: float = 0.0
+    goto_autocal_drift_px_s_y: float = 0.0
+    goto_autocal_J_pix_per_step_00: float = 0.0
+    goto_autocal_J_pix_per_step_01: float = 0.0
+    goto_autocal_J_pix_per_step_10: float = 0.0
+    goto_autocal_J_pix_per_step_11: float = 0.0
+    goto_autocal_az_deg: float = 0.0
+    goto_autocal_alt_deg: float = 0.0
+    goto_autocal_radius_deg: float = 0.0
