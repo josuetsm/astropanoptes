@@ -29,7 +29,6 @@ from actions import (
     stacking_stop,
     stacking_reset,
     stacking_save,
-    hotpix_calibrate,
     platesolve_run,
     platesolve_set_params,
     live_sep_set_params,
@@ -602,7 +601,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # separately.
     w_btn_stack_start = W.Button(description="Start", button_style="success", layout=W.Layout(width="110px"))
     w_btn_stack_stop = W.Button(description="Stop", button_style="warning", layout=W.Layout(width="110px"))
-    w_btn_hotpix_calib = W.Button(description="Calibrar Hot Pixels", button_style="info", layout=W.Layout(width="200px"))
     # Bindings for stacking buttons in the tab
     def _on_stack_start(_btn):
         try:
@@ -621,23 +619,9 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_btn_stack_start.on_click(_on_stack_start)
     w_btn_stack_stop.on_click(_on_stack_stop)
 
-    def _on_hotpix_calib(_btn):
-        hp_cfg = cfg.hotpixels
-        runner.enqueue(
-            hotpix_calibrate(
-                n_frames=int(hp_cfg.calib_frames),
-                abs_percentile=float(hp_cfg.calib_abs_percentile),
-                var_percentile=float(hp_cfg.calib_var_percentile),
-                max_component_area=int(hp_cfg.max_component_area),
-                out_path_base=str(hp_cfg.mask_path_base),
-            )
-        )
-
-    w_btn_hotpix_calib.on_click(_on_hotpix_calib)
-
     w_tab_stacking = W.VBox([
         W.HTML("<b>Stacking</b>"),
-        W.HBox([w_btn_stack_start, w_btn_stack_stop, w_btn_stack_reset, w_btn_hotpix_calib]),
+        W.HBox([w_btn_stack_start, w_btn_stack_stop, w_btn_stack_reset]),
         w_img_stack
     ])
 
@@ -944,19 +928,24 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_tf_goto_az = W.BoundedFloatText(value=0.0, min=0.0, max=360.0, step=0.1, description="Az°:", layout=W.Layout(width="200px"))
     w_tf_goto_alt = W.BoundedFloatText(value=45.0, min=0.0, max=90.0, step=0.1, description="Alt°:", layout=W.Layout(width="200px"))
 
-    w_bt_goto_tol = W.BoundedFloatText(value=10.0, min=0.5, max=3600.0, step=0.5, description="Tol (arcsec):", layout=W.Layout(width="220px"))
-    w_bi_goto_max_iters = W.BoundedIntText(value=6, min=1, max=50, step=1, description="Iters:", layout=W.Layout(width="160px"))
-    w_bt_goto_gain = W.BoundedFloatText(value=0.85, min=0.1, max=2.0, step=0.05, description="Gain:", layout=W.Layout(width="160px"))
-    w_bt_goto_settle_s = W.BoundedFloatText(value=0.25, min=0.0, max=10.0, step=0.05, description="Settle(s):", layout=W.Layout(width="170px"))
+    w_bt_goto_tol = W.BoundedFloatText(value=float(cfg.goto.tol_arcsec), min=0.5, max=3600.0, step=0.5, description="Tol (arcsec):", layout=W.Layout(width="220px"))
+    w_bi_goto_max_iters = W.BoundedIntText(value=int(cfg.goto.max_iters), min=1, max=50, step=1, description="Iters:", layout=W.Layout(width="160px"))
+    w_bt_goto_gain = W.BoundedFloatText(value=float(cfg.goto.gain), min=0.1, max=2.0, step=0.05, description="Gain:", layout=W.Layout(width="160px"))
+    w_bt_goto_settle_s = W.BoundedFloatText(value=float(cfg.goto.settle_s), min=0.0, max=10.0, step=0.05, description="Settle(s):", layout=W.Layout(width="170px"))
 
     # Calibración
-    w_bi_calib_samples = W.BoundedIntText(value=8, min=2, max=80, step=1, description="Muestras:", layout=W.Layout(width="180px"))
-    w_dd_calib_units = W.Dropdown(options=[("Grados", "deg"), ("Pasos", "steps")], value="deg", description="Unidad:", layout=W.Layout(width="190px"))
-    w_bt_calib_small = W.BoundedFloatText(value=1.0, min=0.1, max=30.0, step=0.1, description="Paso 1:", layout=W.Layout(width="160px"))
-    w_bt_calib_big = W.BoundedFloatText(value=5.0, min=0.1, max=60.0, step=0.1, description="Paso 2:", layout=W.Layout(width="160px"))
+    w_bi_calib_samples = W.BoundedIntText(value=int(cfg.goto.calib_samples), min=1, max=80, step=1, description="Muestras:", layout=W.Layout(width="180px"))
+    w_bt_calib_radius = W.BoundedFloatText(
+        value=float(cfg.goto.calib_max_radius_deg),
+        min=0.1,
+        max=60.0,
+        step=0.1,
+        description="Rango°:",
+        layout=W.Layout(width="180px"),
+    )
 
     # Reusa delays de la pestaña mount/manual
-    w_bi_goto_delay_us = W.BoundedIntText(value=1800, min=50, max=50000, step=50, description="delay_us:", layout=W.Layout(width="200px"))
+    w_bi_goto_delay_us = W.BoundedIntText(value=int(cfg.goto.slew_delay_us), min=50, max=50000, step=50, description="delay_us:", layout=W.Layout(width="200px"))
 
     w_btn_goto_sync = W.Button(description="Sync", button_style="info", layout=W.Layout(width="100px"))
     w_btn_goto_run = W.Button(description="GoTo", button_style="success", layout=W.Layout(width="100px"))
@@ -1012,8 +1001,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     def _enqueue_goto_calib():
         params = {
             "n_samples": int(w_bi_calib_samples.value),
-            "step_unit": str(w_dd_calib_units.value),
-            "step_magnitudes": [float(w_bt_calib_small.value), float(w_bt_calib_big.value)],
+            "max_radius_deg": float(w_bt_calib_radius.value),
             "delay_us": int(w_bi_goto_delay_us.value),
         }
         runner.enqueue(goto_calibrate(params))
@@ -1028,7 +1016,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_box_goto_buttons = W.HBox([w_btn_goto_sync, w_btn_goto_run, w_btn_goto_calib, w_btn_goto_cancel])
     w_box_goto_params = W.HBox([w_bt_goto_tol, w_bi_goto_max_iters, w_bt_goto_gain, w_bt_goto_settle_s])
-    w_box_goto_calib = W.HBox([w_bi_calib_samples, w_dd_calib_units, w_bt_calib_small, w_bt_calib_big])
+    w_box_goto_calib = W.HBox([w_bi_calib_samples, w_bt_calib_radius])
     w_box_goto_delay = W.HBox([w_bi_goto_delay_us])
 
     w_tab_goto = W.VBox([
@@ -1273,7 +1261,6 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_btn_stack_reset": w_btn_stack_reset,
         "w_btn_stack_start": w_btn_stack_start,
         "w_btn_stack_stop": w_btn_stack_stop,
-        "w_btn_hotpix_calib": w_btn_hotpix_calib,
         # platesolve tab
         "w_txt_ps_target": w_txt_ps_target,
         "w_btn_ps_solve": w_btn_ps_solve,
@@ -1594,9 +1581,6 @@ class UILoop:
         if "w_btn_stack_reset" in self.widgets:
             # Allow resetting only if stacking is running (has state)
             self.widgets["w_btn_stack_reset"].disabled = not stacking_running
-        if "w_btn_hotpix_calib" in self.widgets:
-            self.widgets["w_btn_hotpix_calib"].disabled = not cam_connected
-
         # Save Stack button: enable only when stacking is running.  When disabled,
         # clicking has no effect.  The button is visible in the top bar.
         if "w_btn_save_quick" in self.widgets:

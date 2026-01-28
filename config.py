@@ -187,10 +187,23 @@ class PlatesolveConfig:
     simbad_retries: int = 3
     simbad_backoff_s: float = 0.6
 
-#@dataclass
-#class GoToConfig:
-    # complete
-    
+@dataclass
+class GoToConfig:
+    # GoTo defaults
+    tol_arcsec: float = 10.0
+    max_iters: int = 6
+    gain: float = 0.85
+    settle_s: float = 0.25
+    max_step_per_iter: int = 150000
+    slew_delay_us: int = 1800
+
+    # Safe operating window
+    alt_min_deg: float = 10.0
+    alt_max_deg: float = 90.0
+
+    # Calibration defaults (random samples within radius)
+    calib_samples: int = 3
+    calib_max_radius_deg: float = 1.0
 
 
 @dataclass
@@ -203,7 +216,7 @@ class AppConfig:
     hotpixels: HotPixelsConfig = field(default_factory=HotPixelsConfig)
     sep: SepConfig = field(default_factory=SepConfig)
     platesolve: PlatesolveConfig = field(default_factory=PlatesolveConfig)
-#    goto: GoToConfig = field(default_factory=GoToConfig)
+    goto: GoToConfig = field(default_factory=GoToConfig)
     
     control_hz: float = 120.0
 
