@@ -196,6 +196,8 @@ class GoToConfig:
     settle_s: float = 0.25
     max_step_per_iter: int = 150000
     slew_delay_us: int = 1800
+    stages: int = 6
+    platesolve_feedback: bool = True
 
     # Safe operating window
     alt_min_deg: float = 10.0

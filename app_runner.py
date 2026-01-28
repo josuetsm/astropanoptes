@@ -173,6 +173,8 @@ class AppRunner:
             slew_delay_us_az=int(self.cfg.goto.slew_delay_us),
             slew_delay_us_alt=int(self.cfg.goto.slew_delay_us),
             settle_s=float(self.cfg.goto.settle_s),
+            stages=int(self.cfg.goto.stages),
+            platesolve_feedback=bool(self.cfg.goto.platesolve_feedback),
         )
         self._goto = GoToController(cfg=goto_cfg, model=GoToModel(kin=kin))
         self._goto_lock = threading.Lock()
@@ -1953,10 +1955,11 @@ class AppRunner:
             try:
                 if kind == "goto":
                     # Expect target dict from UI/actions
-                    # params may include: delay_us, tol_arcsec, max_iters, max_step_deg, max_step_per_iter, gain
+                    # params may include: delay_us, tol_arcsec, stages, max_step_deg, max_step_per_iter, gain, platesolve_feedback
                     delay_us = int(params.get("delay_us", self.cfg.goto.slew_delay_us))
                     tol_arcsec = float(params.get("tol_arcsec", self.cfg.goto.tol_arcsec))
-                    max_iters = int(params.get("max_iters", self.cfg.goto.max_iters))
+                    stages = int(params.get("stages", self.cfg.goto.stages))
+                    platesolve_feedback = bool(params.get("platesolve_feedback", self.cfg.goto.platesolve_feedback))
                     gain = float(params.get("gain", self.cfg.goto.gain))
                     max_step_per_iter = int(self.cfg.goto.max_step_per_iter)
                     if "max_step_per_iter" in params:
@@ -1971,11 +1974,13 @@ class AppRunner:
                     self._goto.cfg = replace(
                         self._goto.cfg,
                         tol_arcsec=tol_arcsec,
-                        max_iters=max_iters,
+                        max_iters=stages,
                         gain=gain,
                         max_step_per_iter=max_step_per_iter,
                         slew_delay_us_az=delay_us,
                         slew_delay_us_alt=delay_us,
+                        stages=stages,
+                        platesolve_feedback=platesolve_feedback,
                     )
 
                     status = self._goto.goto_blocking(
@@ -1984,6 +1989,8 @@ class AppRunner:
                         move_steps=move_steps,
                         stop=stop,
                         platesolve_cfg=platesolve_cfg,
+                        stages=stages,
+                        platesolve_feedback=platesolve_feedback,
                     )
                     err_norm = float(status.err_norm_arcsec())
                     self._set_state_safe(
