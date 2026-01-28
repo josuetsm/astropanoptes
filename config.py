@@ -114,8 +114,9 @@ class HotPixelsConfig:
     min_hits_frac: float = 0.7
     max_component_area: int = 4
     calib_frames: int = 30
-    calib_abs_percentile: float = 99.9
-    calib_var_percentile: float = 10.0
+    calib_t_abs: float = 200.0
+    calib_z_thr: float = 8.0
+    calib_vote_frac: float = 0.6
 
 
 @dataclass

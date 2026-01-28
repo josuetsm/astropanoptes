@@ -631,8 +631,9 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         runner.enqueue(
             hotpix_calibrate(
                 n_frames=int(hp_cfg.calib_frames),
-                abs_percentile=float(hp_cfg.calib_abs_percentile),
-                var_percentile=float(hp_cfg.calib_var_percentile),
+                t_abs=float(hp_cfg.calib_t_abs),
+                z_thr=float(hp_cfg.calib_z_thr),
+                vote_frac=float(hp_cfg.calib_vote_frac),
                 max_component_area=int(hp_cfg.max_component_area),
                 out_path_base=str(hp_cfg.mask_path_base),
             )

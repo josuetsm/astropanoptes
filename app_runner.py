@@ -30,8 +30,8 @@ from tracking import make_tracking_state, tracking_step, tracking_set_params
 from stacking import StackingWorker
 
 from hotpixels import (
-    apply_hotpixel_correction,
-    build_hotpixel_mask_temporal,
+    apply_hotpixel_mask_median_same_channel,
+    build_hotpixel_mask_spatial_vote,
     load_hotpixel_mask,
     save_hotpixel_mask,
 )
@@ -67,13 +67,12 @@ def _apply_hotpix_if_available(
     raw16: np.ndarray,
     *,
     hotpix_mask: Optional[np.ndarray],
-    bayer_pattern: str,
 ) -> np.ndarray:
     if hotpix_mask is None:
         return raw16
     if hotpix_mask.shape != raw16.shape:
         raise ValueError(f"Hotpixel mask shape {hotpix_mask.shape} does not match frame shape {raw16.shape}.")
-    return apply_hotpixel_correction(raw16, hotpix_mask, bayer_pattern)
+    return apply_hotpixel_mask_median_same_channel(raw16, hotpix_mask)
 
 
 class AppRunner:
@@ -541,9 +540,9 @@ class AppRunner:
         self._hotpix_mask = mask
         self._hotpix_meta = meta
 
-    def _apply_hotpix(self, raw16: np.ndarray, bayer_pattern: str) -> np.ndarray:
+    def _apply_hotpix(self, raw16: np.ndarray) -> np.ndarray:
         try:
-            return _apply_hotpix_if_available(raw16, hotpix_mask=self._hotpix_mask, bayer_pattern=bayer_pattern)
+            return _apply_hotpix_if_available(raw16, hotpix_mask=self._hotpix_mask)
         except ValueError as exc:
             log_error(self.out_log, "Hotpix: mask mismatch; disabling hotpixel correction", exc, throttle_s=5.0, throttle_key="hotpix_apply")
             self._hotpix_mask = None
@@ -570,10 +569,7 @@ class AppRunner:
             overlay_enabled = bool(self._live_sep_overlay_enabled)
 
             raw16 = ensure_raw16_bayer(fr.raw)
-            meta = getattr(fr, "meta", {}) or {}
-            meta_dict = meta if isinstance(meta, dict) else {}
-            bayer = meta_dict.get("bayer_pattern", "RGGB")
-            raw16_hp = self._apply_hotpix(raw16, bayer)
+            raw16_hp = self._apply_hotpix(raw16)
 
             if overlay_enabled:
                 _, u8_preview = make_preview_jpeg(
@@ -940,9 +936,8 @@ class AppRunner:
                 )
 
                 # Frame para solver: RAW16 + hotpixel correction
-                bayer = str((meta or {}).get("bayer_pattern", "RGGB"))
                 raw16 = ensure_raw16_bayer(raw_in)
-                frame = self._apply_hotpix(raw16, bayer)
+                frame = self._apply_hotpix(raw16)
 
                 # Debug de stats de entrada (opcional)
                 debug_stats = bool(getattr(platesolve_cfg, "debug_input_stats", False))
@@ -1146,8 +1141,9 @@ class AppRunner:
         self,
         *,
         n_frames: int,
-        abs_percentile: float,
-        var_percentile: float,
+        t_abs: float,
+        z_thr: float,
+        vote_frac: float,
         max_component_area: int,
         out_path_base: str,
     ) -> None:
@@ -1162,8 +1158,9 @@ class AppRunner:
                 daemon=True,
                 kwargs={
                     "n_frames": n_frames,
-                    "abs_percentile": abs_percentile,
-                    "var_percentile": var_percentile,
+                    "t_abs": t_abs,
+                    "z_thr": z_thr,
+                    "vote_frac": vote_frac,
                     "max_component_area": max_component_area,
                     "out_path_base": out_path_base,
                 },
@@ -1174,8 +1171,9 @@ class AppRunner:
         self,
         *,
         n_frames: int,
-        abs_percentile: float,
-        var_percentile: float,
+        t_abs: float,
+        z_thr: float,
+        vote_frac: float,
         max_component_area: int,
         out_path_base: str,
     ) -> None:
@@ -1209,10 +1207,12 @@ class AppRunner:
             return
 
         try:
-            mask = build_hotpixel_mask_temporal(
+            mask, _ = build_hotpixel_mask_spatial_vote(
                 frames,
-                abs_percentile=float(abs_percentile),
-                var_percentile=float(var_percentile),
+                n_frames=int(n_frames),
+                t_abs=float(t_abs),
+                z_thr=float(z_thr),
+                vote_frac=float(vote_frac),
                 max_component_area=int(max_component_area),
             )
         except Exception as exc:
@@ -1230,8 +1230,9 @@ class AppRunner:
             "fmt": str(getattr(last_frame, "fmt", "")) if last_frame is not None else "",
             "camera_model": frame_meta.get("camera_model"),
             "timestamp": _dt.datetime.now(_dt.timezone.utc).isoformat(),
-            "abs_percentile": float(abs_percentile),
-            "var_percentile": float(var_percentile),
+            "t_abs": float(t_abs),
+            "z_thr": float(z_thr),
+            "vote_frac": float(vote_frac),
             "max_component_area": int(max_component_area),
             "n_frames": int(n_frames),
         }
@@ -1308,10 +1309,8 @@ class AppRunner:
                 fr = self._cam_stream.latest()
                 if fr is None:
                     return None
-                meta = dict(getattr(fr, "meta", {}) or {})
-                bayer = str(meta.get("bayer_pattern", "RGGB"))
                 raw16 = ensure_raw16_bayer(fr.raw)
-                return self._apply_hotpix(raw16, bayer)
+                return self._apply_hotpix(raw16)
 
             def move_steps(axis: Axis, direction: int, steps: int, delay_us: int):
                 if self._mount is None:
@@ -1468,10 +1467,8 @@ class AppRunner:
                 fr = self._cam_stream.latest()
                 if fr is not None:
                     # Tracking en RAW16 (hotpixel-corrected) + SEP
-                    meta = dict(getattr(fr, "meta", {}) or {})
-                    bayer = str(meta.get("bayer_pattern", "RGGB"))
                     raw16 = ensure_raw16_bayer(fr.raw)
-                    raw16_hp = self._apply_hotpix(raw16, bayer)
+                    raw16_hp = self._apply_hotpix(raw16)
                     img_det, _, _, _ = sep_detect_from_raw16(
                         raw16_hp,
                         sep_bw=int(self.cfg.sep.bw),
@@ -1526,10 +1523,8 @@ class AppRunner:
             if self._stacking_enabled and (self._cam_stream is not None):
                 fr = self._cam_stream.latest()
                 if fr is not None:
-                    meta = dict(getattr(fr, "meta", {}) or {})
-                    bayer = str(meta.get("bayer_pattern", "RGGB"))
                     raw16 = ensure_raw16_bayer(fr.raw)
-                    raw16_hp = self._apply_hotpix(raw16, bayer)
+                    raw16_hp = self._apply_hotpix(raw16)
                     self._stacking.enqueue_frame(raw16_hp.copy(), t=_now_s())
 
             # 2d) publish stacking metrics
@@ -1774,14 +1769,16 @@ class AppRunner:
                 self._set_state_safe(tracking_enabled=False, tracking_mode="IDLE")
                 self._mount_rate_safe(0.0, 0.0)
             n_frames = int(p.get("n_frames", self.cfg.hotpixels.calib_frames))
-            abs_percentile = float(p.get("abs_percentile", self.cfg.hotpixels.calib_abs_percentile))
-            var_percentile = float(p.get("var_percentile", self.cfg.hotpixels.calib_var_percentile))
+            t_abs = float(p.get("t_abs", self.cfg.hotpixels.calib_t_abs))
+            z_thr = float(p.get("z_thr", self.cfg.hotpixels.calib_z_thr))
+            vote_frac = float(p.get("vote_frac", self.cfg.hotpixels.calib_vote_frac))
             max_component_area = int(p.get("max_component_area", self.cfg.hotpixels.max_component_area))
             out_path_base = str(p.get("out_path_base", self.cfg.hotpixels.mask_path_base))
             self._hotpix_start_worker_if_needed(
                 n_frames=n_frames,
-                abs_percentile=abs_percentile,
-                var_percentile=var_percentile,
+                t_abs=t_abs,
+                z_thr=z_thr,
+                vote_frac=vote_frac,
                 max_component_area=max_component_area,
                 out_path_base=out_path_base,
             )

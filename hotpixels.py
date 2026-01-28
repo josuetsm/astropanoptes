@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import json
+import math
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Dict, Iterable, Tuple, Optional, List
@@ -12,6 +13,17 @@ import numpy as np
 
 
 _UINT16_MAX = np.iinfo(np.uint16).max
+_EPS = 1e-6
+_OFFSETS_SAME_CHANNEL: Tuple[Tuple[int, int], ...] = (
+    (-2, 0),
+    (2, 0),
+    (0, -2),
+    (0, 2),
+    (-2, -2),
+    (-2, 2),
+    (2, -2),
+    (2, 2),
+)
 
 
 def _ensure_2d(img: np.ndarray) -> np.ndarray:
@@ -51,6 +63,43 @@ def _mad(data: np.ndarray) -> float:
     median = np.median(data)
     mad = np.median(np.abs(data - median))
     return float(mad)
+
+
+def _spatial_hot_mask_one_frame(
+    raw_u16: np.ndarray,
+    *,
+    t_abs: float,
+    z_thr: float,
+    pad: int = 2,
+) -> np.ndarray:
+    if raw_u16.dtype != np.uint16 or raw_u16.ndim != 2:
+        raise ValueError(f"raw_u16 must be 2D uint16; got {raw_u16.dtype}, shape={raw_u16.shape}")
+
+    h, w = raw_u16.shape
+    pad = max(int(pad), 2)
+    if h <= 2 * pad or w <= 2 * pad:
+        return np.zeros((h, w), dtype=bool)
+
+    ys = slice(pad, h - pad)
+    xs = slice(pad, w - pad)
+
+    center = raw_u16[ys, xs].astype(np.float32)
+    neigh = []
+    for dy, dx in _OFFSETS_SAME_CHANNEL:
+        neigh.append(raw_u16[pad + dy : h - pad + dy, pad + dx : w - pad + dx].astype(np.float32))
+    neigh = np.stack(neigh, axis=0)
+
+    median = np.median(neigh, axis=0)
+    mad = np.median(np.abs(neigh - median), axis=0)
+    sigma = 1.4826 * mad + _EPS
+
+    resid = center - median
+    z = resid / sigma
+    inner_hot = (resid > float(t_abs)) & (z > float(z_thr))
+
+    out = np.zeros((h, w), dtype=bool)
+    out[ys, xs] = inner_hot
+    return out
 
 
 def build_hotpixel_mask(
@@ -103,6 +152,60 @@ def build_hotpixel_mask(
                     mask[labels == label] = False
 
     return mask
+
+
+def build_hotpixel_mask_spatial_vote(
+    frames_u16: Iterable[np.ndarray],
+    *,
+    n_frames: int,
+    t_abs: float,
+    z_thr: float,
+    vote_frac: float,
+    max_component_area: Optional[int] = None,
+) -> Tuple[np.ndarray, np.ndarray]:
+    frames_iter = iter(frames_u16)
+    first = next(frames_iter, None)
+    if first is None:
+        raise ValueError("frames_u16 must contain at least one frame.")
+
+    first = _ensure_2d(np.asarray(first))
+    if first.dtype != np.uint16:
+        raise TypeError("All frames must be uint16.")
+
+    h, w = first.shape
+    counts = np.zeros((h, w), dtype=np.uint16)
+
+    def _all_frames() -> Iterable[np.ndarray]:
+        yield first
+        yield from frames_iter
+
+    used = 0
+    for raw in _all_frames():
+        if used >= int(n_frames):
+            break
+        raw = _ensure_2d(np.asarray(raw))
+        if raw.dtype != np.uint16 or raw.shape != (h, w):
+            raise ValueError(f"Inconsistent frame at idx={used}: dtype/shape mismatch")
+        mask = _spatial_hot_mask_one_frame(raw, t_abs=float(t_abs), z_thr=float(z_thr), pad=2)
+        counts += mask.astype(np.uint16)
+        used += 1
+
+    if used == 0:
+        raise ValueError("No frames processed")
+
+    thr = int(math.ceil(float(vote_frac) * used))
+    mask_persistent = counts >= thr
+
+    if max_component_area is not None and max_component_area > 0:
+        mask_u8 = mask_persistent.astype(np.uint8)
+        num_labels, labels, stats, _ = cv2.connectedComponentsWithStats(mask_u8, 8)
+        if num_labels > 1:
+            for label in range(1, num_labels):
+                area = stats[label, cv2.CC_STAT_AREA]
+                if area > max_component_area:
+                    mask_persistent[labels == label] = False
+
+    return mask_persistent, counts
 
 
 def build_hotpixel_mask_temporal(
@@ -316,4 +419,47 @@ def apply_hotpixel_correction(
             vals.append(int(img[yy, xx]))
         if vals:
             out[y0, x0] = np.uint16(int(np.median(vals)))
+    return out
+
+
+def apply_hotpixel_mask_median_same_channel(
+    raw_u16: np.ndarray,
+    hot_mask: np.ndarray,
+) -> np.ndarray:
+    img = _ensure_2d(np.asarray(raw_u16))
+    if img.dtype != np.uint16:
+        raise TypeError("raw_u16 must be uint16.")
+
+    mask_arr = _ensure_2d(np.asarray(hot_mask)).astype(bool)
+    if mask_arr.shape != img.shape:
+        raise ValueError("hot_mask must match raw_u16 shape.")
+
+    h, w = img.shape
+    out = img.copy()
+    pad = 2
+    if h <= 2 * pad or w <= 2 * pad:
+        return out
+
+    ys = slice(pad, h - pad)
+    xs = slice(pad, w - pad)
+
+    hot_inner = mask_arr[ys, xs]
+    if not np.any(hot_inner):
+        return out
+
+    center = out[ys, xs].astype(np.float32)
+    neigh = []
+    for dy, dx in _OFFSETS_SAME_CHANNEL:
+        neighbor = out[pad + dy : h - pad + dy, pad + dx : w - pad + dx].astype(np.float32)
+        neighbor_hot = mask_arr[pad + dy : h - pad + dy, pad + dx : w - pad + dx]
+        neighbor[neighbor_hot] = np.nan
+        neigh.append(neighbor)
+
+    neigh = np.stack(neigh, axis=0)
+    repl = np.nanmedian(neigh, axis=0)
+    repl = np.where(np.isfinite(repl), repl, center)
+
+    corrected = center
+    corrected[hot_inner] = repl[hot_inner]
+    out[ys, xs] = np.clip(corrected, 0, _UINT16_MAX).astype(np.uint16)
     return out

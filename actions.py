@@ -219,8 +219,9 @@ def stacking_save(out_dir: str, basename: str, fmt: str) -> Action:
 # -------------------------
 def hotpix_calibrate(
     n_frames: int,
-    abs_percentile: float,
-    var_percentile: float,
+    t_abs: float,
+    z_thr: float,
+    vote_frac: float,
     max_component_area: int,
     out_path_base: str,
 ) -> Action:
@@ -228,8 +229,9 @@ def hotpix_calibrate(
         ActionType.HOTPIX_CALIBRATE,
         {
             "n_frames": int(n_frames),
-            "abs_percentile": float(abs_percentile),
-            "var_percentile": float(var_percentile),
+            "t_abs": float(t_abs),
+            "z_thr": float(z_thr),
+            "vote_frac": float(vote_frac),
             "max_component_area": int(max_component_area),
             "out_path_base": str(out_path_base),
         },
