@@ -44,7 +44,7 @@ from platesolve import (
     load_gaia_auth,
 )
 
-from goto import GoToController, GoToConfig, GoToModel, MountKinematics
+from goto import GoToController, GoToConfig as GoToRuntimeConfig, GoToModel, MountKinematics
 
 
 def _perf() -> float:
@@ -88,6 +88,7 @@ class AppRunner:
         self.cfg.mount = replace(cfg.mount)
         self.cfg.tracking = replace(cfg.tracking)
         self.cfg.stacking = replace(cfg.stacking)
+        self.cfg.goto = replace(cfg.goto)
         self.cfg.hotpixels = replace(cfg.hotpixels)
         self.cfg.platesolve = replace(cfg.platesolve)
         self.out_log = out_log
@@ -137,7 +138,20 @@ class AppRunner:
             ring_radius_m_az=0.24,
             ring_radius_m_alt=0.235,
         )
-        self._goto = GoToController(cfg=GoToConfig(observer=self._platesolve_observer, sep=self.cfg.sep), model=GoToModel(kin=kin))
+        goto_cfg = GoToRuntimeConfig(
+            observer=self._platesolve_observer,
+            sep=self.cfg.sep,
+            alt_min_deg=float(self.cfg.goto.alt_min_deg),
+            alt_max_deg=float(self.cfg.goto.alt_max_deg),
+            tol_arcsec=float(self.cfg.goto.tol_arcsec),
+            max_iters=int(self.cfg.goto.max_iters),
+            gain=float(self.cfg.goto.gain),
+            max_step_per_iter=int(self.cfg.goto.max_step_per_iter),
+            slew_delay_us_az=int(self.cfg.goto.slew_delay_us),
+            slew_delay_us_alt=int(self.cfg.goto.slew_delay_us),
+            settle_s=float(self.cfg.goto.settle_s),
+        )
+        self._goto = GoToController(cfg=goto_cfg, model=GoToModel(kin=kin))
         self._goto_lock = threading.Lock()
         self._goto_thr: Optional[threading.Thread] = None
         self._goto_cancel = threading.Event()
@@ -1299,11 +1313,11 @@ class AppRunner:
                 if kind == "goto":
                     # Expect target dict from UI/actions
                     # params may include: delay_us, tol_arcsec, max_iters, max_step_deg, max_step_per_iter, gain
-                    delay_us = int(params.get("delay_us", 1800))
-                    tol_arcsec = float(params.get("tol_arcsec", 10.0))
-                    max_iters = int(params.get("max_iters", 8))
-                    gain = float(params.get("gain", 0.9))
-                    max_step_per_iter = self._goto.cfg.max_step_per_iter
+                    delay_us = int(params.get("delay_us", self.cfg.goto.slew_delay_us))
+                    tol_arcsec = float(params.get("tol_arcsec", self.cfg.goto.tol_arcsec))
+                    max_iters = int(params.get("max_iters", self.cfg.goto.max_iters))
+                    gain = float(params.get("gain", self.cfg.goto.gain))
+                    max_step_per_iter = int(self.cfg.goto.max_step_per_iter)
                     if "max_step_per_iter" in params:
                         max_step_per_iter = int(params.get("max_step_per_iter"))
                     else:
@@ -1338,40 +1352,26 @@ class AppRunner:
                     # Calibrate requires a prior sync/platesolve; we use the current live frame + small dithers
                     if "n_samples" not in params and "samples" in params:
                         params["n_samples"] = params.get("samples")
-                    if "step_unit" not in params and "units" in params:
-                        params["step_unit"] = params.get("units")
-                    if "step_magnitudes" not in params:
-                        step_small = params.get("step_small", None)
-                        step_big = params.get("step_big", None)
-                        if step_small is not None or step_big is not None:
-                            mags_legacy = []
-                            if step_small is not None:
-                                mags_legacy.append(float(step_small))
-                            if step_big is not None:
-                                mags_legacy.append(float(step_big))
-                            params["step_magnitudes"] = mags_legacy
+                    if "max_radius_deg" not in params and "radius_deg" in params:
+                        params["max_radius_deg"] = params.get("radius_deg")
 
-                    delay_us = int(params.get("delay_us", 1800))
-                    n_samples = int(params.get("n_samples", 12))
-                    unit = str(params.get("step_unit", "deg"))
-                    mags = params.get("step_magnitudes") or [1.0, 5.0]
+                    delay_us = int(params.get("delay_us", self.cfg.goto.slew_delay_us))
+                    n_samples = int(params.get("n_samples", self.cfg.goto.calib_samples))
+                    max_radius_deg = float(params.get("max_radius_deg", self.cfg.goto.calib_max_radius_deg))
 
                     self._goto.cfg = replace(
                         self._goto.cfg,
                         slew_delay_us_az=delay_us,
                         slew_delay_us_alt=delay_us,
                     )
-                    step_magnitudes_steps = mags if unit == "steps" else None
-                    step_magnitudes_deg = mags if unit != "steps" else (1.0, 5.0)
 
                     self._goto.calibrate_blocking(
                         get_live_frame=get_live_frame,
                         move_steps=move_steps,
                         stop=stop,
                         platesolve_cfg=platesolve_cfg,
-                        step_magnitudes_deg=step_magnitudes_deg,
-                        step_magnitudes_steps=step_magnitudes_steps,
-                        samples_per_mag=n_samples,
+                        n_samples=n_samples,
+                        max_radius_deg=max_radius_deg,
                     )
                     self._set_state_safe(goto_status="CAL_OK")
 
