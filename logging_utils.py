@@ -14,9 +14,16 @@ else:
     W = None  # type: ignore
 
 
+_START_TIME = time.monotonic()
+
+
 def _ts() -> str:
-    # timestamp monotónico y consistente para logs
-    return f"{time.monotonic():.3f}s"
+    # timestamp monotónico y consistente para logs (HH:MM:SS.mmm)
+    elapsed = time.monotonic() - _START_TIME
+    hours = int(elapsed // 3600)
+    minutes = int((elapsed % 3600) // 60)
+    seconds = float(elapsed % 60.0)
+    return f"{hours:02d}:{minutes:02d}:{seconds:06.3f}"
 
 
 _THROTTLE_LOCK = threading.Lock()

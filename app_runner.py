@@ -62,6 +62,15 @@ def _safe_slug(s: str) -> str:
     return s[:80] if s else "target"
 
 
+def _format_params(params: Dict[str, Any]) -> str:
+    if not params:
+        return "(none)"
+    parts = []
+    for key, value in params.items():
+        parts.append(f"{key}={value}")
+    return ", ".join(parts)
+
+
 class AppRunner:
     """
     Orquestador principal (runtime).
@@ -882,6 +891,7 @@ class AppRunner:
                         platesolve_debug_jpeg=None,
                         platesolve_debug_info={"status": "ERR_NO_TARGET"},
                     )
+                    log_info(self.out_log, "Platesolve: ERR_NO_TARGET")
                     continue
     
                 # -------------------------
@@ -895,6 +905,7 @@ class AppRunner:
                         platesolve_debug_jpeg=None,
                         platesolve_debug_info={"status": "ERR_NO_CAMERA"},
                     )
+                    log_info(self.out_log, "Platesolve: ERR_NO_CAMERA")
                     continue
 
                 fr = self._cam_stream.latest()
@@ -906,6 +917,7 @@ class AppRunner:
                         platesolve_debug_jpeg=None,
                         platesolve_debug_info={"status": "ERR_NO_FRAME"},
                     )
+                    log_info(self.out_log, "Platesolve: ERR_NO_FRAME")
                     continue
 
                 # RAW exacto + meta para reproducir mañana
@@ -1005,6 +1017,22 @@ class AppRunner:
                     platesolve_center_ra_deg=float(getattr(result, "center_ra_deg", 0.0)),
                     platesolve_center_dec_deg=float(getattr(result, "center_dec_deg", 0.0)),
                 )
+
+                status = str(getattr(result, "status", "UNKNOWN"))
+                success = bool(getattr(result, "success", False))
+                resp = float(getattr(result, "response", 0.0))
+                n_inliers = int(getattr(result, "n_inliers", 0))
+                rms_px = float(getattr(result, "rms_px", 0.0))
+                if success:
+                    log_info(
+                        self.out_log,
+                        f"Platesolve: OK status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+                    )
+                else:
+                    log_info(
+                        self.out_log,
+                        f"Platesolve: ERR status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+                    )
     
                 # Cache para GoTo sync/calibrate (solo si OK)
                 if bool(getattr(result, "success", False)):
@@ -1285,9 +1313,6 @@ class AppRunner:
             self._set_state_safe(goto_busy=True, goto_status=kind.upper())
             self._goto_cancel.clear()
 
-            def should_cancel() -> bool:
-                return self._goto_cancel.is_set() or self._stop.is_set()
-
             def get_live_frame():
                 if self._cam_stream is None:
                     return None
@@ -1333,20 +1358,32 @@ class AppRunner:
                         max_iters=max_iters,
                         gain=gain,
                         max_step_per_iter=max_step_per_iter,
+                        slew_delay_us_az=delay_us,
+                        slew_delay_us_alt=delay_us,
                     )
 
-                    ok, last_err = self._goto.goto_blocking(
+                    status = self._goto.goto_blocking(
                         target,
                         get_live_frame=get_live_frame,
                         move_steps=move_steps,
                         stop=stop,
                         platesolve_cfg=platesolve_cfg,
-                        delay_us=delay_us,
-                        should_cancel=should_cancel,
-                        status_cb=lambda s: self._set_state_safe(goto_status=str(s)),
-                        error_cb=lambda e: self._set_state_safe(goto_last_error_arcsec=float(e)),
                     )
-                    self._set_state_safe(goto_last_error_arcsec=float(last_err), goto_status="GOTO_OK" if ok else "GOTO_ERR")
+                    err_norm = float(status.err_norm_arcsec())
+                    self._set_state_safe(
+                        goto_last_error_arcsec=err_norm,
+                        goto_status="GOTO_OK" if status.ok else "GOTO_ERR",
+                    )
+                    if status.ok:
+                        log_info(
+                            self.out_log,
+                            f"GoTo: OK status={status.status} iters={status.iters} err_arcsec={err_norm:.2f}",
+                        )
+                    else:
+                        log_info(
+                            self.out_log,
+                            f"GoTo: ERR status={status.status} iters={status.iters} err_arcsec={err_norm:.2f}",
+                        )
 
                 elif kind == "calibrate":
                     # Calibrate requires a prior sync/platesolve; we use the current live frame + small dithers
@@ -1365,7 +1402,7 @@ class AppRunner:
                         slew_delay_us_alt=delay_us,
                     )
 
-                    self._goto.calibrate_blocking(
+                    calib_out = self._goto.calibrate_blocking(
                         get_live_frame=get_live_frame,
                         move_steps=move_steps,
                         stop=stop,
@@ -1373,7 +1410,14 @@ class AppRunner:
                         n_samples=n_samples,
                         max_radius_deg=max_radius_deg,
                     )
-                    self._set_state_safe(goto_status="CAL_OK")
+                    calib_ok = bool(calib_out.get("ok", False))
+                    calib_status = str(calib_out.get("status", "UNKNOWN"))
+                    calib_samples = int(calib_out.get("n_samples", 0))
+                    self._set_state_safe(goto_status="CAL_OK" if calib_ok else "CAL_ERR")
+                    log_info(
+                        self.out_log,
+                        f"GoTo: CALIBRATE status={calib_status} ok={calib_ok} samples={calib_samples}",
+                    )
 
                 else:
                     self._set_state_safe(goto_status=f"ERR_KIND_{kind}")
@@ -1676,7 +1720,7 @@ class AppRunner:
         if t == ActionType.TRACKING_SET_PARAMS:
             if isinstance(p, dict):
                 tracking_set_params(self._tracking_state, **p)
-                log_info(self.out_log, f"Tracking: SET_PARAMS {list(p.keys())}")
+                log_info(self.out_log, f"Tracking: SET_PARAMS {_format_params(p)}")
             return
 
         if t == ActionType.RESET_TRACKING_DEFAULTS:
@@ -1834,6 +1878,7 @@ class AppRunner:
             except Exception as exc:
                 log_error(self.out_log, 'GoTo: sync exception', exc)
             self._set_state_safe(goto_synced=bool(ok), goto_status='SYNC_OK' if ok else 'SYNC_ERR')
+            log_info(self.out_log, f"GoTo: sync {'OK' if ok else 'ERR'}")
             return
 
         if t == ActionType.MOUNT_GOTO:
