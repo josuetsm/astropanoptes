@@ -21,6 +21,7 @@ from actions import (
     mount_sync,
     mount_goto,
     goto_calibrate,
+    goto_autocalibrate,
     goto_cancel,
     tracking_start,
     tracking_stop,
@@ -929,9 +930,10 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_tf_goto_alt = W.BoundedFloatText(value=45.0, min=0.0, max=90.0, step=0.1, description="Alt°:", layout=W.Layout(width="200px"))
 
     w_bt_goto_tol = W.BoundedFloatText(value=float(cfg.goto.tol_arcsec), min=0.5, max=3600.0, step=0.5, description="Tol (arcsec):", layout=W.Layout(width="220px"))
-    w_bi_goto_max_iters = W.BoundedIntText(value=int(cfg.goto.max_iters), min=1, max=50, step=1, description="Iters:", layout=W.Layout(width="160px"))
+    w_bi_goto_stages = W.BoundedIntText(value=int(cfg.goto.stages), min=1, max=50, step=1, description="Etapas:", layout=W.Layout(width="160px"))
     w_bt_goto_gain = W.BoundedFloatText(value=float(cfg.goto.gain), min=0.1, max=2.0, step=0.05, description="Gain:", layout=W.Layout(width="160px"))
     w_bt_goto_settle_s = W.BoundedFloatText(value=float(cfg.goto.settle_s), min=0.0, max=10.0, step=0.05, description="Settle(s):", layout=W.Layout(width="170px"))
+    w_cb_goto_feedback = W.Checkbox(value=bool(cfg.goto.platesolve_feedback), description="Feedback platesolve", indent=False)
 
     # Calibración
     w_bi_calib_samples = W.BoundedIntText(value=int(cfg.goto.calib_samples), min=1, max=80, step=1, description="Muestras:", layout=W.Layout(width="180px"))
@@ -950,6 +952,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_btn_goto_sync = W.Button(description="Sync", button_style="info", layout=W.Layout(width="100px"))
     w_btn_goto_run = W.Button(description="GoTo", button_style="success", layout=W.Layout(width="100px"))
     w_btn_goto_calib = W.Button(description="Calibrate", button_style="warning", layout=W.Layout(width="120px"))
+    w_btn_goto_autocal = W.Button(description="AutoCalibrate", button_style="warning", layout=W.Layout(width="140px"))
     w_btn_goto_cancel = W.Button(description="Cancel", button_style="danger", layout=W.Layout(width="110px"))
 
     w_box_goto_name = W.HBox([w_txt_goto_name])
@@ -991,10 +994,11 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             mount_goto(
                 target,
                 tol_arcsec=float(w_bt_goto_tol.value),
-                max_iters=int(w_bi_goto_max_iters.value),
+                stages=int(w_bi_goto_stages.value),
                 gain=float(w_bt_goto_gain.value),
                 settle_s=float(w_bt_goto_settle_s.value),
                 delay_us=int(w_bi_goto_delay_us.value),
+                platesolve_feedback=bool(w_cb_goto_feedback.value),
             )
         )
 
@@ -1006,16 +1010,20 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         }
         runner.enqueue(goto_calibrate(params))
 
+    def _enqueue_goto_autocal():
+        runner.enqueue(goto_autocalibrate())
+
     def _enqueue_goto_cancel():
         runner.enqueue(goto_cancel())
 
     w_btn_goto_sync.on_click(lambda _: _enqueue_goto_sync())
     w_btn_goto_run.on_click(lambda _: _enqueue_goto_run())
     w_btn_goto_calib.on_click(lambda _: _enqueue_goto_calib())
+    w_btn_goto_autocal.on_click(lambda _: _enqueue_goto_autocal())
     w_btn_goto_cancel.on_click(lambda _: _enqueue_goto_cancel())
 
-    w_box_goto_buttons = W.HBox([w_btn_goto_sync, w_btn_goto_run, w_btn_goto_calib, w_btn_goto_cancel])
-    w_box_goto_params = W.HBox([w_bt_goto_tol, w_bi_goto_max_iters, w_bt_goto_gain, w_bt_goto_settle_s])
+    w_box_goto_buttons = W.HBox([w_btn_goto_sync, w_btn_goto_run, w_btn_goto_calib, w_btn_goto_autocal, w_btn_goto_cancel])
+    w_box_goto_params = W.HBox([w_bt_goto_tol, w_bi_goto_stages, w_bt_goto_gain, w_bt_goto_settle_s, w_cb_goto_feedback])
     w_box_goto_calib = W.HBox([w_bi_calib_samples, w_bt_calib_radius])
     w_box_goto_delay = W.HBox([w_bi_goto_delay_us])
 
