@@ -322,6 +322,39 @@ class GoToModel:
             return None
         return self.predict_az_alt_deg()
 
+    def apply_plate_solve(self, az_alt_deg: np.ndarray) -> bool:
+        """Update last solve and reconcile steps_est with the solved AltAz.
+
+        Returns True if steps_est was updated from the solve.
+        """
+        az_alt_deg = _as_array2(az_alt_deg)
+        self.last_solve_az_alt_deg = az_alt_deg.copy()
+        self.last_solve_time = time.time()
+
+        if not self.synced:
+            return False
+
+        daltaz = np.array(
+            [
+                _wrap_deg_180(float(az_alt_deg[0]) - float(self.ref_az_alt_deg[0])),
+                float(az_alt_deg[1]) - float(self.ref_az_alt_deg[1]),
+            ],
+            dtype=np.float64,
+        )
+
+        try:
+            dsteps, *_ = np.linalg.lstsq(self.J_deg_per_step, daltaz, rcond=None)
+        except np.linalg.LinAlgError as exc:
+            log_error(None, "GoTo: failed to reconcile steps from plate-solve", exc, throttle_s=5.0, throttle_key="goto_steps_reconcile")
+            return False
+
+        if not np.all(np.isfinite(dsteps)):
+            log_error(None, "GoTo: non-finite steps from plate-solve reconciliation", None, throttle_s=5.0, throttle_key="goto_steps_reconcile_nan")
+            return False
+
+        self.steps_est = self.ref_steps + dsteps
+        return True
+
     def add_calibration_sample(self, dsteps: np.ndarray, daltaz_deg: np.ndarray) -> None:
         self._calib_steps.append(_as_array2(dsteps))
         self._calib_daltaz.append(_as_array2(daltaz_deg))
@@ -781,8 +814,7 @@ class GoToController:
                         observer=self.cfg.observer,
                         obstime=obstime,
                     )
-                    self.model.last_solve_az_alt_deg = az_alt_new
-                    self.model.last_solve_time = time.time()
+                    self.model.apply_plate_solve(az_alt_new)
                 else:
                     # If solve fails, fall back to model prediction but keep iterating.
                     # You can also choose to abort here.
@@ -909,7 +941,7 @@ class GoToController:
                     observer=self.cfg.observer,
                     obstime=obstime,
                 )
-                self.model.last_solve_az_alt_deg = altaz0
+                self.model.apply_plate_solve(altaz0)
 
             # Run samples
             max_radius = float(max_radius_deg)
@@ -1009,8 +1041,7 @@ class GoToController:
                 dsteps_meas = np.array([float(dsteps[0]), float(dsteps[1])], dtype=np.float64)
 
                 self.model.add_calibration_sample(dsteps_meas, daltaz_meas)
-                self.model.last_solve_az_alt_deg = altaz_new
-                self.model.last_solve_time = time.time()
+                self.model.apply_plate_solve(altaz_new)
 
             # Fit
             ok = self.model.fit_J_from_samples(min_samples=3)
