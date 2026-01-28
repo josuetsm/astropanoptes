@@ -832,9 +832,8 @@ class GoToController:
         stop: Optional[StopFn] = None,
         tracking_pause: Optional[Callable[[bool], Any]] = None,
         tracking_keyframe_reset: Optional[Callable[[], Any]] = None,
-        step_magnitudes_deg: Sequence[float] = (1.0, 5.0, 10.0),
-        step_magnitudes_steps: Optional[Sequence[int]] = None,
-        samples_per_mag: int = 1,
+        n_samples: int = 3,
+        max_radius_deg: float = 1.0,
         obstime: Optional[Time] = None,
     ) -> Dict[str, Any]:
         """Refine the model J (including cross-coupling) via randomized dithers.
@@ -843,9 +842,9 @@ class GoToController:
           - You should have synced once with a successful plate-solve.
 
         Procedure:
-          - For each magnitude in step_magnitudes_deg:
-              * choose a random direction in (AZ,ALT)
-              * convert to steps using current diagonal scale
+          - For each sample:
+              * choose a random direction and radius within max_radius_deg
+              * convert to steps using current J
               * move
               * plate-solve near predicted center
               * measure delta AltAz
@@ -906,112 +905,104 @@ class GoToController:
                 self.model.last_solve_az_alt_deg = altaz0
 
             # Run samples
-            use_steps = (step_magnitudes_steps is not None) and (len(step_magnitudes_steps) > 0)
-            mags: Sequence[Union[float, int]] = step_magnitudes_steps if use_steps else step_magnitudes_deg
+            max_radius = float(max_radius_deg)
+            if max_radius <= 0.0:
+                out["status"] = "ERR_BAD_RADIUS"
+                return out
+            total_samples = int(max(1, n_samples))
 
-            for mag in mags:
-                for _ in range(int(samples_per_mag)):
-                    # Random direction
-                    ang = random.uniform(0.0, 2.0 * math.pi)
+            for _ in range(total_samples):
+                # Random direction + radius (uniform over area)
+                ang = random.uniform(0.0, 2.0 * math.pi)
+                radius = math.sqrt(random.random()) * max_radius
 
+                daz_deg = radius * math.cos(ang)
+                dalt_deg = radius * math.sin(ang)
+
+                J = self.model.J_deg_per_step
+                try:
+                    invJ = np.linalg.inv(J)
+                except np.linalg.LinAlgError as exc:
+                    log_error(None, "GoTo: singular J matrix during calibration; resetting mechanics", exc, throttle_s=5.0, throttle_key="goto_calib_invJ")
+                    # fall back to diagonal mechanics
+                    self.model.init_from_mechanics()
                     J = self.model.J_deg_per_step
+                    invJ = np.linalg.inv(J)
 
-                    if use_steps:
-                        # magnitude directly in step-space (what you asked for)
-                        mag_steps = float(mag)
-                        dsteps = np.array(
-                            [mag_steps * math.cos(ang), mag_steps * math.sin(ang)],
-                            dtype=np.float64,
-                        )
-                    else:
-                        # magnitude in degrees (converted to steps using the current model)
-                        mag_deg = float(mag)
-                        daz_deg = mag_deg * math.cos(ang)
-                        dalt_deg = mag_deg * math.sin(ang)
+                dsteps = invJ @ np.array([daz_deg, dalt_deg], dtype=np.float64)
 
-                        try:
-                            invJ = np.linalg.inv(J)
-                        except np.linalg.LinAlgError as exc:
-                            log_error(None, "GoTo: singular J matrix during calibration; resetting mechanics", exc, throttle_s=5.0, throttle_key="goto_calib_invJ")
-                            # fall back to diagonal mechanics
-                            self.model.init_from_mechanics()
-                            J = self.model.J_deg_per_step
-                            invJ = np.linalg.inv(J)
+                # Commanded steps are integers; use the same for prediction + sampling
+                dsteps = np.array([float(int(round(dsteps[0]))), float(int(round(dsteps[1])))], dtype=np.float64)
+                if int(dsteps[0]) == 0 and int(dsteps[1]) == 0:
+                    continue
 
-                        dsteps = invJ @ np.array([daz_deg, dalt_deg], dtype=np.float64)
+                # Predict and enforce ALT safe range by flipping ALT sign if needed
+                altaz_cur = self.model.current_az_alt_deg()
+                if altaz_cur is None:
+                    out["status"] = "ERR_NO_CURRENT"
+                    return out
 
-                    # Commanded steps are integers; use the same for prediction + sampling
-                    dsteps = np.array([float(int(round(dsteps[0]))), float(int(round(dsteps[1])))], dtype=np.float64)
-                    if int(dsteps[0]) == 0 and int(dsteps[1]) == 0:
-                        continue
+                pred_after = altaz_cur.copy()
+                pred_after[0] = _wrap_deg_360(float(pred_after[0]) + float((J @ dsteps)[0]))
+                pred_after[1] = float(pred_after[1]) + float((J @ dsteps)[1])
+                if pred_after[1] < float(self.cfg.alt_min_deg) or pred_after[1] > float(self.cfg.alt_max_deg):
+                    # flip the ALT component
+                    dsteps[1] *= -1.0
+                    pred_after[1] = float(altaz_cur[1]) + float((J @ dsteps)[1])
+                    pred_after[1] = _clamp(pred_after[1], self.cfg.alt_min_deg, self.cfg.alt_max_deg)
 
-                    # Predict and enforce ALT safe range by flipping ALT sign if needed
-                    altaz_cur = self.model.current_az_alt_deg()
-                    if altaz_cur is None:
-                        out["status"] = "ERR_NO_CURRENT"
-                        return out
+                if stop is not None:
+                    try:
+                        stop()
+                    except Exception as exc:
+                        log_error(None, "GoTo: stop failed before calibration move", exc)
 
-                    pred_after = altaz_cur.copy()
-                    pred_after[0] = _wrap_deg_360(float(pred_after[0]) + float((J @ dsteps)[0]))
-                    pred_after[1] = float(pred_after[1]) + float((J @ dsteps)[1])
-                    if pred_after[1] < float(self.cfg.alt_min_deg) or pred_after[1] > float(self.cfg.alt_max_deg):
-                        # flip the ALT component
-                        dsteps[1] *= -1.0
-                        pred_after[1] = float(altaz_cur[1]) + float((J @ dsteps)[1])
-                        pred_after[1] = _clamp(pred_after[1], self.cfg.alt_min_deg, self.cfg.alt_max_deg)
+                # Move
+                self._exec_steps(move_steps, Axis.AZ, float(dsteps[0]), delay_us=int(self.cfg.slew_delay_us_az))
+                self._exec_steps(move_steps, Axis.ALT, float(dsteps[1]), delay_us=int(self.cfg.slew_delay_us_alt))
 
-                    if stop is not None:
-                        try:
-                            stop()
-                        except Exception as exc:
-                            log_error(None, "GoTo: stop failed before calibration move", exc)
+                if stop is not None:
+                    try:
+                        stop()
+                    except Exception as exc:
+                        log_error(None, "GoTo: stop failed after calibration move", exc)
 
-                    # Move
-                    self._exec_steps(move_steps, Axis.AZ, float(dsteps[0]), delay_us=int(self.cfg.slew_delay_us_az))
-                    self._exec_steps(move_steps, Axis.ALT, float(dsteps[1]), delay_us=int(self.cfg.slew_delay_us_alt))
+                time.sleep(max(0.0, float(self.cfg.settle_s)))
 
-                    if stop is not None:
-                        try:
-                            stop()
-                        except Exception as exc:
-                            log_error(None, "GoTo: stop failed after calibration move", exc)
+                # Plate-solve near predicted center (recommended)
+                altaz_pred = self.model.predict_az_alt_deg()
+                sol = self._platesolve_live(
+                    get_live_frame=get_live_frame,
+                    target_for_solver={"az_deg": float(altaz_pred[0]), "alt_deg": float(altaz_pred[1])},
+                    platesolve_cfg=platesolve_cfg,
+                    obstime=_now_time(),
+                )
+                if not bool(getattr(sol, "success", False)):
+                    # skip sample
+                    continue
 
-                    time.sleep(max(0.0, float(self.cfg.settle_s)))
+                altaz_new = platesolve_center_to_altaz_deg(
+                    float(sol.center_ra_deg),
+                    float(sol.center_dec_deg),
+                    observer=self.cfg.observer,
+                    obstime=_now_time(),
+                )
 
-                    # Plate-solve near predicted center (recommended)
-                    altaz_pred = self.model.predict_az_alt_deg()
-                    sol = self._platesolve_live(
-                        get_live_frame=get_live_frame,
-                        target_for_solver={"az_deg": float(altaz_pred[0]), "alt_deg": float(altaz_pred[1])},
-                        platesolve_cfg=platesolve_cfg,
-                        obstime=_now_time(),
-                    )
-                    if not bool(getattr(sol, "success", False)):
-                        # skip sample
-                        continue
+                # Measured delta (wrap az)
+                daltaz_meas = np.array(
+                    [
+                        _wrap_deg_180(float(altaz_new[0]) - float(altaz_cur[0])),
+                        float(altaz_new[1]) - float(altaz_cur[1]),
+                    ],
+                    dtype=np.float64,
+                )
 
-                    altaz_new = platesolve_center_to_altaz_deg(
-                        float(sol.center_ra_deg),
-                        float(sol.center_dec_deg),
-                        observer=self.cfg.observer,
-                        obstime=_now_time(),
-                    )
+                # Measured step delta (what we commanded this sample)
+                dsteps_meas = np.array([float(dsteps[0]), float(dsteps[1])], dtype=np.float64)
 
-                    # Measured delta (wrap az)
-                    daltaz_meas = np.array(
-                        [
-                            _wrap_deg_180(float(altaz_new[0]) - float(altaz_cur[0])),
-                            float(altaz_new[1]) - float(altaz_cur[1]),
-                        ],
-                        dtype=np.float64,
-                    )
-
-                    # Measured step delta (what we commanded this sample)
-                    dsteps_meas = np.array([float(dsteps[0]), float(dsteps[1])], dtype=np.float64)
-
-                    self.model.add_calibration_sample(dsteps_meas, daltaz_meas)
-                    self.model.last_solve_az_alt_deg = altaz_new
-                    self.model.last_solve_time = time.time()
+                self.model.add_calibration_sample(dsteps_meas, daltaz_meas)
+                self.model.last_solve_az_alt_deg = altaz_new
+                self.model.last_solve_time = time.time()
 
             # Fit
             ok = self.model.fit_J_from_samples(min_samples=3)
