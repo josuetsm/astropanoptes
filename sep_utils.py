@@ -4,9 +4,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import sep
-import cv2
-
-from imaging import ensure_raw16_bayer
+from imaging import ensure_raw16_bayer, median_prefilter_raw16
 
 
 def sep_detect_from_raw16(
@@ -17,6 +15,7 @@ def sep_detect_from_raw16(
     sep_thresh_sigma: float,
     sep_minarea: int,
     max_sources: Optional[int] = None,
+    prefilter_ksize: int = 3,
 ) -> Tuple[np.ndarray, sep.Background, np.ndarray, np.ndarray]:
     """
     Detect sources from a RAW16 Bayer frame using SEP.
@@ -28,6 +27,7 @@ def sep_detect_from_raw16(
         sep_thresh_sigma: Threshold multiplier for global RMS.
         sep_minarea: Minimum source area.
         max_sources: Optional cap on number of detections (sorted by flux desc).
+        prefilter_ksize: Median prefilter kernel size.
 
     Returns:
         img_det: float32 detection image (background-subtracted, >=0).
@@ -36,7 +36,7 @@ def sep_detect_from_raw16(
         obj_xy: (N,2) float64 array of x,y positions.
     """
     raw = ensure_raw16_bayer(raw16)
-    img_med = cv2.medianBlur(raw, 3).astype(np.float32, copy=False)
+    img_med = median_prefilter_raw16(raw, ksize=int(prefilter_ksize))
 
     bkg = sep.Background(img_med, bw=int(sep_bw), bh=int(sep_bh))
     img_sub = img_med - bkg.back()

@@ -41,6 +41,7 @@ from tracking import (
     tracking_step,
     tracking_set_params,
 )
+from tracking_preprocess import build_tracking_observations
 from stacking import StackingWorker
 
 from sep_utils import sep_detect_from_raw16, estimate_shift_from_objects
@@ -388,15 +389,14 @@ class AppRunner:
                 continue
 
             raw16 = ensure_raw16_bayer(fr.raw)
-            _, _, _, obj_xy = sep_detect_from_raw16(
+            obs = build_tracking_observations(
                 raw16,
-                sep_bw=int(self.cfg.sep.bw),
-                sep_bh=int(self.cfg.sep.bh),
-                sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
-                sep_minarea=int(self.cfg.sep.minarea),
+                sep_cfg=self.cfg.sep,
+                prefilter_ksize=3,
                 max_sources=None,
+                compute_saturation=False,
             )
-            return fr, obj_xy
+            return fr, obs["obj_xy"]
 
         return None
 
@@ -1064,19 +1064,14 @@ class AppRunner:
         self._goto_start_worker_if_needed()
 
     def _autocal_detect(self, raw16: np.ndarray) -> Tuple[np.ndarray, int, float]:
-        img_det, _bkg, objects, obj_xy = sep_detect_from_raw16(
+        obs = build_tracking_observations(
             raw16,
-            sep_bw=int(self.cfg.sep.bw),
-            sep_bh=int(self.cfg.sep.bh),
-            sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
-            sep_minarea=int(self.cfg.sep.minarea),
+            sep_cfg=self.cfg.sep,
+            prefilter_ksize=3,
             max_sources=int(self.cfg.platesolve.max_det),
+            compute_saturation=True,
         )
-        _ = img_det
-        star_count = int(obj_xy.shape[0])
-        max_val = np.iinfo(raw16.dtype).max
-        saturation_frac = float(np.mean(raw16 >= max_val))
-        return obj_xy, star_count, saturation_frac
+        return obs["obj_xy"], obs["star_count"], obs["saturation_frac"]
 
     def _autocal_capture_frames(
         self,
@@ -2266,16 +2261,16 @@ class AppRunner:
                 fr = self._cam_stream.latest()
                 if fr is not None:
                     # Tracking en RAW16 + SEP
-                    meta = dict(getattr(fr, "meta", {}) or {})
                     raw16 = ensure_raw16_bayer(fr.raw)
-                    _, _, _, obj_xy = sep_detect_from_raw16(
+                    obs = build_tracking_observations(
                         raw16,
-                        sep_bw=int(self.cfg.sep.bw),
-                        sep_bh=int(self.cfg.sep.bh),
-                        sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
-                        sep_minarea=int(self.cfg.sep.minarea),
+                        sep_cfg=self.cfg.sep,
+                        prefilter_ksize=3,
                         max_sources=None,
+                        compute_saturation=False,
                     )
+                    obj_xy = obs["obj_xy"]
+                    img_det = obs["img_det"]
 
                     calib_ready = bool(self._tracking_state.cal_A_pinv is not None) or bool(
                         self._tracking_state.auto.ok and self._tracking_state.auto.A_pinv is not None
