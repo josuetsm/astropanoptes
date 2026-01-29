@@ -1711,6 +1711,23 @@ class AppRunner:
                     return True
         return False
 
+    def _autocal_exposure_in_range(
+        self,
+        *,
+        star_count: int,
+        saturation_frac: float,
+        target_min: int,
+        target_max: int,
+        sat_max: float,
+    ) -> bool:
+        if int(star_count) < int(target_min):
+            return False
+        if int(star_count) > int(target_max):
+            return False
+        if float(saturation_frac) > float(sat_max):
+            return False
+        return True
+
     def _autocal_estimate_drift(
         self,
         frames: List[_AutocalFrame],
@@ -1839,7 +1856,7 @@ class AppRunner:
             out["status"] = "ERR_NO_MOUNT"
             return out
 
-        target_star_min = int(params.get("target_star_min", 30))
+        target_star_min = int(params.get("target_star_min", 3))
         target_star_max = int(params.get("target_star_max", 200))
         target_sat_max = float(params.get("target_sat_max", 0.01))
         exp_min_ms = float(params.get("exp_min_ms", 20.0))
@@ -1902,6 +1919,17 @@ class AppRunner:
             if not changed:
                 tuned = True
                 break
+        if not tuned:
+            frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
+            if frames:
+                fr = frames[0]
+                tuned = self._autocal_exposure_in_range(
+                    star_count=fr.star_count,
+                    saturation_frac=fr.saturation_frac,
+                    target_min=target_star_min,
+                    target_max=target_star_max,
+                    sat_max=target_sat_max,
+                )
         if not tuned:
             out["status"] = "ERR_EXPOSURE_TUNE"
             return out
