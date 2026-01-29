@@ -93,6 +93,17 @@ class _AutocalFrame:
     saturation_frac: float
 
 
+@dataclass(frozen=True)
+class _AutocalJResult:
+    col: Optional[np.ndarray]
+    ok_count: int
+    missing_base: int
+    missing_plus: int
+    missing_minus: int
+    resp_low: int
+    expanded_used: int
+
+
 class AppRunner:
     """
     Orquestador principal (runtime).
@@ -1881,13 +1892,38 @@ class AppRunner:
         settle_s: float,
         skip_frames: int,
         capture_timeout_s: float,
-    ) -> Optional[np.ndarray]:
+    ) -> _AutocalJResult:
+        def _format_obj_xy(obj_xy: np.ndarray, max_items: int = 8) -> str:
+            count = int(obj_xy.shape[0])
+            if count == 0:
+                return "count=0"
+            sample = obj_xy[:max_items]
+            sample_str = ", ".join(f"({float(x):.1f},{float(y):.1f})" for x, y in sample)
+            suffix = "..." if count > max_items else ""
+            return f"count={count} sample=[{sample_str}{suffix}]"
+
         if self._mount is None:
-            return None
+            return _AutocalJResult(
+                col=None,
+                ok_count=0,
+                missing_base=0,
+                missing_plus=0,
+                missing_minus=0,
+                resp_low=0,
+                expanded_used=0,
+            )
 
         step_count = int(abs(int(steps)))
         if step_count <= 0:
-            return None
+            return _AutocalJResult(
+                col=None,
+                ok_count=0,
+                missing_base=0,
+                missing_plus=0,
+                missing_minus=0,
+                resp_low=0,
+                expanded_used=0,
+            )
 
         cols: List[np.ndarray] = []
         missing_base = 0
@@ -1897,7 +1933,15 @@ class AppRunner:
         expanded_used = 0
         for _ in range(int(repeats)):
             if self._goto_cancel.is_set():
-                return None
+                return _AutocalJResult(
+                    col=None,
+                    ok_count=0,
+                    missing_base=missing_base,
+                    missing_plus=missing_plus,
+                    missing_minus=missing_minus,
+                    resp_low=resp_low,
+                    expanded_used=expanded_used,
+                )
 
             base_frames = self._autocal_capture_frames(
                 n_frames=int(block_frames),
@@ -1908,6 +1952,11 @@ class AppRunner:
             if base is None:
                 missing_base += 1
                 continue
+            log_info(
+                self.out_log,
+                "GoTo: AutoCal J base objects "
+                f"axis={axis.name} steps={step_count} {_format_obj_xy(base.obj_xy)}",
+            )
 
             self._goto._exec_steps(self._mount.move_steps, axis, float(step_count), delay_us=int(delay_us))
             time.sleep(float(settle_s))
@@ -1920,6 +1969,11 @@ class AppRunner:
             if plus is None:
                 missing_plus += 1
                 continue
+            log_info(
+                self.out_log,
+                "GoTo: AutoCal J plus objects "
+                f"axis={axis.name} steps={step_count} {_format_obj_xy(plus.obj_xy)}",
+            )
 
             self._goto._exec_steps(self._mount.move_steps, axis, float(-2 * step_count), delay_us=int(delay_us))
             time.sleep(float(settle_s))
@@ -1932,6 +1986,11 @@ class AppRunner:
             if minus is None:
                 missing_minus += 1
                 continue
+            log_info(
+                self.out_log,
+                "GoTo: AutoCal J minus objects "
+                f"axis={axis.name} steps={step_count} {_format_obj_xy(minus.obj_xy)}",
+            )
 
             self._goto._exec_steps(self._mount.move_steps, axis, float(step_count), delay_us=int(delay_us))
             time.sleep(float(settle_s))
@@ -1970,8 +2029,24 @@ class AppRunner:
             f"expanded_shift={expanded_used}",
         )
         if not cols:
-            return None
-        return np.median(np.stack(cols, axis=0), axis=0)
+            return _AutocalJResult(
+                col=None,
+                ok_count=0,
+                missing_base=missing_base,
+                missing_plus=missing_plus,
+                missing_minus=missing_minus,
+                resp_low=resp_low,
+                expanded_used=expanded_used,
+            )
+        return _AutocalJResult(
+            col=np.median(np.stack(cols, axis=0), axis=0),
+            ok_count=len(cols),
+            missing_base=missing_base,
+            missing_plus=missing_plus,
+            missing_minus=missing_minus,
+            resp_low=resp_low,
+            expanded_used=expanded_used,
+        )
 
     def _autocal_measure_axis_j_with_fallback(
         self,
@@ -1998,25 +2073,48 @@ class AppRunner:
         step_scale = float(step_scale)
         max_attempts = max(1, int(max_attempts))
 
+        def _candidate_scale_down(start: int) -> List[int]:
+            candidates_down: List[int] = []
+            step_val = int(start)
+            while step_val >= min_steps and len(candidates_down) < max_attempts:
+                next_step = int(round(step_val * step_scale))
+                if next_step >= step_val:
+                    next_step = step_val - 1
+                step_val = next_step
+                if step_val >= min_steps and step_val not in candidates_down:
+                    candidates_down.append(step_val)
+            return candidates_down
+
+        if self._goto_cancel.is_set():
+            return None
+        initial = self._autocal_measure_axis_j(
+            axis=axis,
+            steps=int(step_count),
+            repeats=repeats,
+            block_frames=block_frames,
+            drift_pix=drift_pix,
+            max_shift_px=max_shift_px,
+            min_resp=min_resp,
+            delay_us=delay_us,
+            settle_s=settle_s,
+            skip_frames=skip_frames,
+            capture_timeout_s=capture_timeout_s,
+        )
+        if initial.col is not None:
+            return initial.col
+
         candidates: List[int] = []
-        while step_count >= min_steps and len(candidates) < max_attempts:
-            if step_count not in candidates:
-                candidates.append(step_count)
-            next_step = int(round(step_count * step_scale))
-            if next_step >= step_count:
-                next_step = step_count - 1
-            step_count = next_step
+        candidates.extend(_candidate_scale_down(step_count))
 
         for idx, candidate in enumerate(candidates):
             if self._goto_cancel.is_set():
                 return None
-            if idx > 0:
-                log_info(
-                    self.out_log,
-                    "GoTo: AutoCal J axis retry "
-                    f"axis={axis.name} steps={int(candidate)}",
-                )
-            col = self._autocal_measure_axis_j(
+            log_info(
+                self.out_log,
+                "GoTo: AutoCal J axis retry "
+                f"axis={axis.name} steps={int(candidate)}",
+            )
+            attempt = self._autocal_measure_axis_j(
                 axis=axis,
                 steps=int(candidate),
                 repeats=repeats,
@@ -2029,8 +2127,8 @@ class AppRunner:
                 skip_frames=skip_frames,
                 capture_timeout_s=capture_timeout_s,
             )
-            if col is not None:
-                return col
+            if attempt.col is not None:
+                return attempt.col
         return None
 
     def _goto_autocalibrate_blocking(self, params: Dict[str, Any]) -> Dict[str, Any]:
@@ -2063,22 +2161,23 @@ class AppRunner:
         tune_attempts = int(params.get("tune_attempts", 5))
         tune_settle_s = float(params.get("tune_settle_s", 0.4))
 
-        drift_frames = int(params.get("drift_frames", 8))
-        drift_dt_min = float(params.get("drift_dt_min_s", 0.8))
-        drift_dt_max = float(params.get("drift_dt_max_s", 2.5))
-        drift_pairs = int(params.get("drift_pairs", 12))
+        drift_frames = int(params.get("drift_frames", 10))
+        drift_dt_min = float(params.get("drift_dt_min_s", 1.0))
+        drift_dt_max = float(params.get("drift_dt_max_s", 10.0))
+        drift_pairs = int(params.get("drift_pairs", 20))
         drift_max_shift_px = float(params.get("drift_max_shift_px", 25.0))
         drift_min_resp = float(params.get("drift_min_resp", 0.2))
+        drift_capture_timeout_s = float(params.get("drift_capture_timeout_s", 12.0))
 
-        jcal_steps_az = int(params.get("jcal_steps_az", self.cfg.mount.slew_steps_az))
-        jcal_steps_alt = int(params.get("jcal_steps_alt", self.cfg.mount.slew_steps_alt))
-        jcal_steps_scale = float(params.get("jcal_steps_scale", 1.0))
+        jcal_steps_az_base = int(params.get("jcal_steps_az", self.cfg.mount.slew_steps_az))
+        jcal_steps_alt_base = int(params.get("jcal_steps_alt", self.cfg.mount.slew_steps_alt))
+        jcal_steps_scale = float(params.get("jcal_steps_scale", 0.1))
         jcal_repeats = int(params.get("jcal_repeats", 2))
-        jcal_block_frames = int(params.get("jcal_block_frames", 3))
+        jcal_block_frames = int(params.get("jcal_block_frames", 5))
         jcal_max_shift_px = float(params.get("jcal_max_shift_px", 30.0))
         jcal_min_resp = float(params.get("jcal_min_resp", 0.2))
-        jcal_settle_s = float(params.get("jcal_settle_s", settle_s))
-        jcal_capture_timeout_s = float(params.get("jcal_capture_timeout_s", 2.0))
+        jcal_settle_s = float(params.get("jcal_settle_s", max(settle_s, 0.6)))
+        jcal_capture_timeout_s = float(params.get("jcal_capture_timeout_s", 4.0))
         jcal_skip_frames = int(params.get("jcal_skip_frames", 0))
         jcal_delay_us = int(params.get("jcal_delay_us", self.cfg.goto.slew_delay_us))
         jcal_min_steps = int(params.get("jcal_min_steps", 50))
@@ -2109,12 +2208,15 @@ class AppRunner:
         if jcal_skip_frames < 0:
             out["status"] = "ERR_JCAL_PARAMS"
             return out
+        if drift_capture_timeout_s <= 0.0:
+            out["status"] = "ERR_DRIFT_PARAMS"
+            return out
         if jcal_delay_us <= 0:
             out["status"] = "ERR_JCAL_PARAMS"
             return out
 
-        jcal_steps_az = max(1, int(round(jcal_steps_az * jcal_steps_scale)))
-        jcal_steps_alt = max(1, int(round(jcal_steps_alt * jcal_steps_scale)))
+        jcal_steps_az = max(1, int(round(jcal_steps_az_base * jcal_steps_scale)))
+        jcal_steps_alt = max(1, int(round(jcal_steps_alt_base * jcal_steps_scale)))
 
         log_info(
             self.out_log,
@@ -2123,6 +2225,7 @@ class AppRunner:
             f"exp_ms=[{exp_min_ms:.1f},{exp_max_ms:.1f}] gain=[{gain_min},{gain_max}] "
             f"drift_frames={drift_frames} drift_dt=[{drift_dt_min:.2f},{drift_dt_max:.2f}] "
             f"drift_pairs={drift_pairs} drift_min_resp={drift_min_resp:.2f} "
+            f"drift_capture_timeout_s={drift_capture_timeout_s:.2f} "
             f"jcal_steps=[{jcal_steps_az},{jcal_steps_alt}] jcal_repeats={jcal_repeats} "
             f"jcal_min_resp={jcal_min_resp:.2f} "
             f"jcal_settle_s={jcal_settle_s:.2f} "
@@ -2192,7 +2295,7 @@ class AppRunner:
         self._set_state_safe(goto_autocal_status="DRIFT")
         drift_frames_list = self._autocal_capture_frames(
             n_frames=drift_frames,
-            timeout_s=4.0,
+            timeout_s=drift_capture_timeout_s,
             min_dt_s=drift_dt_min,
         )
         if len(drift_frames_list) < 2:
