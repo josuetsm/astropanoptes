@@ -20,6 +20,8 @@ class ActionType(str, Enum):
     # mount
     MOUNT_CONNECT = "MOUNT_CONNECT"
     MOUNT_DISCONNECT = "MOUNT_DISCONNECT"
+    MOUNT_NUDGE = "MOUNT_NUDGE"
+    MOUNT_START_CONTINUOUS = "MOUNT_START_CONTINUOUS"
     MOUNT_SET_MICROSTEPS = "MOUNT_SET_MICROSTEPS"
     MOUNT_MOVE_STEPS = "MOUNT_MOVE_STEPS"
     MOUNT_STOP = "MOUNT_STOP"
@@ -108,6 +110,35 @@ def mount_connect(port: str, baudrate: int) -> Action:
 
 def mount_disconnect() -> Action:
     return Action(ActionType.MOUNT_DISCONNECT, {}, _now())
+
+
+def mount_nudge(axis: Axis, direction: int, rate: float, duration_ms: int) -> Action:
+    if direction not in (-1, +1):
+        raise ValueError("direction must be -1 or +1")
+    return Action(
+        ActionType.MOUNT_NUDGE,
+        {
+            "axis": axis.value,
+            "direction": int(direction),
+            "rate": float(rate),
+            "duration_ms": int(duration_ms),
+        },
+        _now(),
+    )
+
+
+def mount_start_continuous(axis: Axis, direction: int, rate: float) -> Action:
+    if direction not in (-1, +1):
+        raise ValueError("direction must be -1 or +1")
+    return Action(
+        ActionType.MOUNT_START_CONTINUOUS,
+        {
+            "axis": axis.value,
+            "direction": int(direction),
+            "rate": float(rate),
+        },
+        _now(),
+    )
 
 
 def mount_set_microsteps(az_div: int, alt_div: int) -> Action:
