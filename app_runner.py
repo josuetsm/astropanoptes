@@ -1627,12 +1627,20 @@ class AppRunner:
         saturation_frac = float(np.mean(raw16 >= max_val))
         return obj_xy, star_count, saturation_frac
 
-    def _autocal_capture_frames(self, *, n_frames: int, timeout_s: float) -> List[_AutocalFrame]:
+    def _autocal_capture_frames(
+        self,
+        *,
+        n_frames: int,
+        timeout_s: float,
+        min_dt_s: float = 0.0,
+    ) -> List[_AutocalFrame]:
         frames: List[_AutocalFrame] = []
         if self._cam_stream is None:
             return frames
         deadline = _perf() + float(timeout_s)
         last_seq: Optional[int] = None
+        last_capture_t: Optional[float] = None
+        min_dt_s = max(0.0, float(min_dt_s))
         while len(frames) < int(n_frames) and _perf() < deadline:
             if self._goto_cancel.is_set():
                 break
@@ -1647,6 +1655,9 @@ class AppRunner:
             raw16 = ensure_raw16_bayer(fr.raw).copy()
             obj_xy, star_count, saturation_frac = self._autocal_detect(raw16)
             t_capture = float(getattr(fr, "t_capture", _now_s()))
+            if last_capture_t is not None and (t_capture - last_capture_t) < min_dt_s:
+                time.sleep(0.005)
+                continue
             frames.append(
                 _AutocalFrame(
                     raw16=raw16,
@@ -1656,6 +1667,7 @@ class AppRunner:
                     saturation_frac=saturation_frac,
                 )
             )
+            last_capture_t = t_capture
         return frames
 
     def _autocal_adjust_exposure(
@@ -1806,6 +1818,33 @@ class AppRunner:
         )
         return drift
 
+    def _autocal_shift_with_retry(
+        self,
+        ref_xy: np.ndarray,
+        cur_xy: np.ndarray,
+        *,
+        max_shift_px: float,
+        min_resp: float,
+    ) -> Tuple[float, float, float, int, bool]:
+        dx, dy, resp, matches = estimate_shift_from_objects(
+            ref_xy,
+            cur_xy,
+            max_shift_px=float(max_shift_px),
+        )
+        if float(resp) >= float(min_resp):
+            return dx, dy, resp, matches, False
+        expanded = float(max_shift_px) * 2.0
+        if expanded <= float(max_shift_px):
+            return dx, dy, resp, matches, False
+        dx2, dy2, resp2, matches2 = estimate_shift_from_objects(
+            ref_xy,
+            cur_xy,
+            max_shift_px=expanded,
+        )
+        if float(resp2) <= float(resp):
+            return dx, dy, resp, matches, False
+        return dx2, dy2, resp2, matches2, True
+
     def _autocal_measure_axis_j(
         self,
         *,
@@ -1831,6 +1870,7 @@ class AppRunner:
         missing_plus = 0
         missing_minus = 0
         resp_low = 0
+        expanded_used = 0
         for _ in range(int(repeats)):
             if self._goto_cancel.is_set():
                 return None
@@ -1860,16 +1900,20 @@ class AppRunner:
             self._goto._exec_steps(self._mount.move_steps, axis, float(step_count), delay_us=int(delay_us))
             time.sleep(float(settle_s))
 
-            dx_p, dy_p, resp_p, _n_p = estimate_shift_from_objects(
+            dx_p, dy_p, resp_p, _n_p, expanded_p = self._autocal_shift_with_retry(
                 base.obj_xy,
                 plus.obj_xy,
                 max_shift_px=float(max_shift_px),
+                min_resp=float(min_resp),
             )
-            dx_m, dy_m, resp_m, _n_m = estimate_shift_from_objects(
+            dx_m, dy_m, resp_m, _n_m, expanded_m = self._autocal_shift_with_retry(
                 base.obj_xy,
                 minus.obj_xy,
                 max_shift_px=float(max_shift_px),
+                min_resp=float(min_resp),
             )
+            if expanded_p or expanded_m:
+                expanded_used += 1
             if float(resp_p) < float(min_resp) or float(resp_m) < float(min_resp):
                 resp_low += 1
                 continue
@@ -1886,7 +1930,8 @@ class AppRunner:
             "GoTo: AutoCal J axis "
             f"axis={axis.name} repeats={int(repeats)} ok={len(cols)} "
             f"missing_base={missing_base} missing_plus={missing_plus} "
-            f"missing_minus={missing_minus} resp_low={resp_low}",
+            f"missing_minus={missing_minus} resp_low={resp_low} "
+            f"expanded_shift={expanded_used}",
         )
         if not cols:
             return None
@@ -2006,7 +2051,11 @@ class AppRunner:
         )
 
         self._set_state_safe(goto_autocal_status="DRIFT")
-        drift_frames_list = self._autocal_capture_frames(n_frames=drift_frames, timeout_s=4.0)
+        drift_frames_list = self._autocal_capture_frames(
+            n_frames=drift_frames,
+            timeout_s=4.0,
+            min_dt_s=drift_dt_min,
+        )
         if len(drift_frames_list) < 2:
             out["status"] = "ERR_DRIFT_FRAMES"
             log_info(
