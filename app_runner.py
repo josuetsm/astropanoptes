@@ -11,7 +11,7 @@ import re
 import datetime as _dt
 
 from dataclasses import dataclass, replace
-from typing import Optional, Any, Dict, List, Tuple
+from typing import Optional, Any, Dict, List, Tuple, Sequence
 
 import cv2
 import numpy as np
@@ -1639,6 +1639,7 @@ class AppRunner:
         n_frames: int,
         timeout_s: float,
         min_dt_s: float = 0.0,
+        skip_frames: int = 0,
     ) -> List[_AutocalFrame]:
         frames: List[_AutocalFrame] = []
         if self._cam_stream is None:
@@ -1647,6 +1648,7 @@ class AppRunner:
         last_seq: Optional[int] = None
         last_capture_t: Optional[float] = None
         min_dt_s = max(0.0, float(min_dt_s))
+        skip_remaining = max(0, int(skip_frames))
         while len(frames) < int(n_frames) and _perf() < deadline:
             if self._goto_cancel.is_set():
                 break
@@ -1658,6 +1660,9 @@ class AppRunner:
                 time.sleep(0.005)
                 continue
             last_seq = int(fr.seq)
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                continue
             raw16 = ensure_raw16_bayer(fr.raw).copy()
             obj_xy, star_count, saturation_frac = self._autocal_detect(raw16)
             t_capture = float(getattr(fr, "t_capture", _now_s()))
@@ -1851,6 +1856,17 @@ class AppRunner:
             return dx, dy, resp, matches, False
         return dx2, dy2, resp2, matches2, True
 
+    def _autocal_pick_best_frame(
+        self,
+        frames: Sequence[_AutocalFrame],
+    ) -> Optional[_AutocalFrame]:
+        if not frames:
+            return None
+        return max(
+            frames,
+            key=lambda fr: (int(fr.star_count), -float(fr.saturation_frac)),
+        )
+
     def _autocal_measure_axis_j(
         self,
         *,
@@ -1863,6 +1879,8 @@ class AppRunner:
         min_resp: float,
         delay_us: int,
         settle_s: float,
+        skip_frames: int,
+        capture_timeout_s: float,
     ) -> Optional[np.ndarray]:
         if self._mount is None:
             return None
@@ -1881,27 +1899,39 @@ class AppRunner:
             if self._goto_cancel.is_set():
                 return None
 
-            base_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
-            if not base_frames:
+            base_frames = self._autocal_capture_frames(
+                n_frames=int(block_frames),
+                timeout_s=float(capture_timeout_s),
+                skip_frames=int(skip_frames),
+            )
+            base = self._autocal_pick_best_frame(base_frames)
+            if base is None:
                 missing_base += 1
                 continue
-            base = base_frames[0]
 
             self._goto._exec_steps(self._mount.move_steps, axis, float(step_count), delay_us=int(delay_us))
             time.sleep(float(settle_s))
-            plus_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
-            if not plus_frames:
+            plus_frames = self._autocal_capture_frames(
+                n_frames=int(block_frames),
+                timeout_s=float(capture_timeout_s),
+                skip_frames=int(skip_frames),
+            )
+            plus = self._autocal_pick_best_frame(plus_frames)
+            if plus is None:
                 missing_plus += 1
                 continue
-            plus = plus_frames[0]
 
             self._goto._exec_steps(self._mount.move_steps, axis, float(-2 * step_count), delay_us=int(delay_us))
             time.sleep(float(settle_s))
-            minus_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
-            if not minus_frames:
+            minus_frames = self._autocal_capture_frames(
+                n_frames=int(block_frames),
+                timeout_s=float(capture_timeout_s),
+                skip_frames=int(skip_frames),
+            )
+            minus = self._autocal_pick_best_frame(minus_frames)
+            if minus is None:
                 missing_minus += 1
                 continue
-            minus = minus_frames[0]
 
             self._goto._exec_steps(self._mount.move_steps, axis, float(step_count), delay_us=int(delay_us))
             time.sleep(float(settle_s))
@@ -1943,6 +1973,66 @@ class AppRunner:
             return None
         return np.median(np.stack(cols, axis=0), axis=0)
 
+    def _autocal_measure_axis_j_with_fallback(
+        self,
+        *,
+        axis: Axis,
+        steps: int,
+        repeats: int,
+        block_frames: int,
+        drift_pix: np.ndarray,
+        max_shift_px: float,
+        min_resp: float,
+        delay_us: int,
+        settle_s: float,
+        skip_frames: int,
+        capture_timeout_s: float,
+        min_steps: int,
+        step_scale: float,
+        max_attempts: int,
+    ) -> Optional[np.ndarray]:
+        step_count = int(abs(int(steps)))
+        if step_count <= 0:
+            return None
+        min_steps = max(1, int(min_steps))
+        step_scale = float(step_scale)
+        max_attempts = max(1, int(max_attempts))
+
+        candidates: List[int] = []
+        while step_count >= min_steps and len(candidates) < max_attempts:
+            if step_count not in candidates:
+                candidates.append(step_count)
+            next_step = int(round(step_count * step_scale))
+            if next_step >= step_count:
+                next_step = step_count - 1
+            step_count = next_step
+
+        for idx, candidate in enumerate(candidates):
+            if self._goto_cancel.is_set():
+                return None
+            if idx > 0:
+                log_info(
+                    self.out_log,
+                    "GoTo: AutoCal J axis retry "
+                    f"axis={axis.name} steps={int(candidate)}",
+                )
+            col = self._autocal_measure_axis_j(
+                axis=axis,
+                steps=int(candidate),
+                repeats=repeats,
+                block_frames=block_frames,
+                drift_pix=drift_pix,
+                max_shift_px=max_shift_px,
+                min_resp=min_resp,
+                delay_us=delay_us,
+                settle_s=settle_s,
+                skip_frames=skip_frames,
+                capture_timeout_s=capture_timeout_s,
+            )
+            if col is not None:
+                return col
+        return None
+
     def _goto_autocalibrate_blocking(self, params: Dict[str, Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "ok": False,
@@ -1982,13 +2072,49 @@ class AppRunner:
 
         jcal_steps_az = int(params.get("jcal_steps_az", self.cfg.mount.slew_steps_az))
         jcal_steps_alt = int(params.get("jcal_steps_alt", self.cfg.mount.slew_steps_alt))
+        jcal_steps_scale = float(params.get("jcal_steps_scale", 1.0))
         jcal_repeats = int(params.get("jcal_repeats", 2))
         jcal_block_frames = int(params.get("jcal_block_frames", 3))
         jcal_max_shift_px = float(params.get("jcal_max_shift_px", 30.0))
         jcal_min_resp = float(params.get("jcal_min_resp", 0.2))
+        jcal_settle_s = float(params.get("jcal_settle_s", settle_s))
+        jcal_capture_timeout_s = float(params.get("jcal_capture_timeout_s", 2.0))
+        jcal_skip_frames = int(params.get("jcal_skip_frames", 0))
+        jcal_delay_us = int(params.get("jcal_delay_us", self.cfg.goto.slew_delay_us))
+        jcal_min_steps = int(params.get("jcal_min_steps", 50))
+        jcal_step_scale = float(params.get("jcal_step_scale", 0.5))
+        jcal_step_attempts = int(params.get("jcal_step_attempts", 3))
 
         solve_attempts = int(params.get("solve_attempts", 5))
         jitter_deg = float(params.get("solve_jitter_deg", 0.2))
+
+        if jcal_min_steps <= 0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_step_scale <= 0.0 or jcal_step_scale >= 1.0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_step_attempts <= 0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_steps_scale <= 0.0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_settle_s < 0.0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_capture_timeout_s <= 0.0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_skip_frames < 0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_delay_us <= 0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+
+        jcal_steps_az = max(1, int(round(jcal_steps_az * jcal_steps_scale)))
+        jcal_steps_alt = max(1, int(round(jcal_steps_alt * jcal_steps_scale)))
 
         log_info(
             self.out_log,
@@ -1998,7 +2124,14 @@ class AppRunner:
             f"drift_frames={drift_frames} drift_dt=[{drift_dt_min:.2f},{drift_dt_max:.2f}] "
             f"drift_pairs={drift_pairs} drift_min_resp={drift_min_resp:.2f} "
             f"jcal_steps=[{jcal_steps_az},{jcal_steps_alt}] jcal_repeats={jcal_repeats} "
-            f"jcal_min_resp={jcal_min_resp:.2f}",
+            f"jcal_min_resp={jcal_min_resp:.2f} "
+            f"jcal_settle_s={jcal_settle_s:.2f} "
+            f"jcal_capture_timeout_s={jcal_capture_timeout_s:.2f} "
+            f"jcal_skip_frames={jcal_skip_frames} "
+            f"jcal_delay_us={jcal_delay_us} "
+            f"jcal_steps_scale={jcal_steps_scale:.2f} "
+            f"jcal_min_steps={jcal_min_steps} step_scale={jcal_step_scale:.2f} "
+            f"step_attempts={jcal_step_attempts}",
         )
 
         platesolve_cfg = self._get_platesolve_cfg_snapshot()
@@ -2097,7 +2230,7 @@ class AppRunner:
         )
 
         self._set_state_safe(goto_autocal_status="JCAL")
-        col_az = self._autocal_measure_axis_j(
+        col_az = self._autocal_measure_axis_j_with_fallback(
             axis=Axis.AZ,
             steps=jcal_steps_az,
             repeats=jcal_repeats,
@@ -2105,14 +2238,19 @@ class AppRunner:
             drift_pix=drift_pix,
             max_shift_px=jcal_max_shift_px,
             min_resp=jcal_min_resp,
-            delay_us=int(self.cfg.goto.slew_delay_us),
-            settle_s=settle_s,
+            delay_us=jcal_delay_us,
+            settle_s=jcal_settle_s,
+            skip_frames=jcal_skip_frames,
+            capture_timeout_s=jcal_capture_timeout_s,
+            min_steps=jcal_min_steps,
+            step_scale=jcal_step_scale,
+            max_attempts=jcal_step_attempts,
         )
         if col_az is None:
             out["status"] = "ERR_JCAL_AZ"
             return out
 
-        col_alt = self._autocal_measure_axis_j(
+        col_alt = self._autocal_measure_axis_j_with_fallback(
             axis=Axis.ALT,
             steps=jcal_steps_alt,
             repeats=jcal_repeats,
@@ -2120,8 +2258,13 @@ class AppRunner:
             drift_pix=drift_pix,
             max_shift_px=jcal_max_shift_px,
             min_resp=jcal_min_resp,
-            delay_us=int(self.cfg.goto.slew_delay_us),
-            settle_s=settle_s,
+            delay_us=jcal_delay_us,
+            settle_s=jcal_settle_s,
+            skip_frames=jcal_skip_frames,
+            capture_timeout_s=jcal_capture_timeout_s,
+            min_steps=jcal_min_steps,
+            step_scale=jcal_step_scale,
+            max_attempts=jcal_step_attempts,
         )
         if col_alt is None:
             out["status"] = "ERR_JCAL_ALT"
