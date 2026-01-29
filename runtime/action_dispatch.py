@@ -345,10 +345,10 @@ class ActionDispatcher:
             if isinstance(p, dict):
                 payload = dict(p)
                 if "auto_target" in payload:
-                    self._runner._platesolve_auto_target = str(payload.pop("auto_target") or "")
+                    self._runner._platesolve.set_auto_target(str(payload.pop("auto_target") or ""))
 
                 # Rebuild dataclass con campos existentes
-                with self._runner._platesolve_cfg_lock:
+                with self._runner._platesolve.cfg_lock:
                     d = dict(self._runner.cfg.platesolve.__dict__)
                     for k, v in payload.items():
                         if k in d:
@@ -396,14 +396,14 @@ class ActionDispatcher:
                 save_gaia_auth(user, pw)
                 log_info(self._logger, "Platesolve: Gaia credentials saved")
 
-            self._runner._platesolve_request(target=target)
+            self._runner._platesolve.request(target=target)
             log_info(self._logger, "Platesolve: RUN source=live")
             return
 
         # ---- GoTo ----
         if t == ActionType.MOUNT_SYNC:
             # Sync usando el último platesolve OK
-            sol = getattr(self._runner, "_last_platesolve_result", None)
+            sol = self._runner._platesolve.get_last_result()
             if sol is None or not bool(getattr(sol, "success", False)):
                 log_info(self._logger, "GoTo: sync failed (no successful platesolve cached)")
                 self._runner._set_state_safe(goto_synced=False, goto_status="SYNC_ERR")
