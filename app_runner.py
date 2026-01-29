@@ -399,8 +399,14 @@ class AppRunner:
         except Exception as exc:
             log_error(self.out_log, "Tracking: failed to reset keyframe", exc)
 
+    def _is_manual_move_active(self) -> bool:
+        thr = self._mount_move_thr
+        return bool(thr is not None and thr.is_alive())
+
     def _mount_rate_safe(self, az: float, alt: float) -> None:
         if self._mount is None:
+            return
+        if self._is_manual_move_active():
             return
         try:
             self._mount.rate(float(az), float(alt))
@@ -2613,7 +2619,7 @@ class AppRunner:
                     if boot_active:
                         self._tracking_bootstrap_collect(float(out.vx), float(out.vy), resp_ok=bool(out.ok))
                         self._tracking_bootstrap_step(_now_s())
-                    else:
+                    elif not self._is_manual_move_active():
                         try:
                             self._mount.rate(float(out.rate_az), float(out.rate_alt))
                         except Exception as exc:
