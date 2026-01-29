@@ -678,16 +678,21 @@ def tracking_step(
     if dt <= 1e-6:
         dt = 1e-6
 
+    max_shift_inc = float(state.cfg.rate.max_shift_per_frame_px) * clamp(
+        dt / float(state.cfg.rate.update_s),
+        1.0,
+        4.0,
+    )
     dx_inc, dy_inc, resp_inc, _ = estimate_shift_from_objects(
         state.prev_obj_xy,
         obj_xy,
-        max_shift_px=float(state.cfg.rate.max_shift_per_frame_px),
+        max_shift_px=max_shift_inc,
     )
     mag_inc = float(np.hypot(dx_inc, dy_inc))
 
     good_inc = (
         float(resp_inc) >= resp_min
-        and mag_inc <= float(state.cfg.rate.max_shift_per_frame_px)
+        and mag_inc <= max_shift_inc
         and np.isfinite(mag_inc)
     )
 
@@ -710,8 +715,9 @@ def tracking_step(
     else:
         state.fail += 1
 
-    state.prev_obj_xy = obj_xy
-    state.prev_t = now_t
+    if good_inc:
+        state.prev_obj_xy = obj_xy
+        state.prev_t = now_t
 
     # fail reset
     if state.fail >= int(state.cfg.rate.fail_reset_n):
