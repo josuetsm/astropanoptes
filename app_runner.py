@@ -1738,6 +1738,12 @@ class AppRunner:
         max_shift_px: float,
         min_resp: float,
     ) -> Optional[np.ndarray]:
+        if len(frames) < 2:
+            log_info(
+                self.out_log,
+                f"GoTo: AutoCal drift needs >=2 frames, got {len(frames)}",
+            )
+            return None
         pairs: List[Tuple[int, int, float]] = []
         for i in range(len(frames)):
             for j in range(i + 1, len(frames)):
@@ -1745,13 +1751,28 @@ class AppRunner:
                 if float(dt_min_s) <= dt <= float(dt_max_s):
                     pairs.append((i, j, dt))
         if not pairs:
+            log_info(
+                self.out_log,
+                "GoTo: AutoCal drift has no frame pairs in dt range "
+                f"[{float(dt_min_s):.3f}, {float(dt_max_s):.3f}]s",
+            )
             return None
 
-        if len(pairs) > int(max_pairs):
+        pair_count = len(pairs)
+        if pair_count > int(max_pairs):
             idx = np.linspace(0, len(pairs) - 1, int(max_pairs)).round().astype(int)
             pairs = [pairs[i] for i in idx]
+        log_info(
+            self.out_log,
+            "GoTo: AutoCal drift pairing "
+            f"frames={len(frames)} pairs={pair_count}->{len(pairs)} "
+            f"dt_range=[{float(dt_min_s):.3f}, {float(dt_max_s):.3f}]s "
+            f"max_shift_px={float(max_shift_px):.1f} min_resp={float(min_resp):.3f}",
+        )
 
         v_list: List[np.ndarray] = []
+        resp_list: List[float] = []
+        resp_low = 0
         for i, j, dt in pairs:
             dx, dy, resp, _n = estimate_shift_from_objects(
                 frames[i].obj_xy,
@@ -1759,13 +1780,30 @@ class AppRunner:
                 max_shift_px=float(max_shift_px),
             )
             if float(resp) < float(min_resp):
+                resp_low += 1
                 continue
             v = np.array([-dx / dt, -dy / dt], dtype=np.float64)
             v_list.append(v)
+            resp_list.append(float(resp))
 
         if len(v_list) < 2:
+            resp_min = min(resp_list) if resp_list else 0.0
+            resp_med = float(np.median(resp_list)) if resp_list else 0.0
+            resp_max = max(resp_list) if resp_list else 0.0
+            log_info(
+                self.out_log,
+                "GoTo: AutoCal drift insufficient valid pairs "
+                f"valid={len(v_list)} total={len(pairs)} resp_low={resp_low} "
+                f"resp_stats=[{resp_min:.3f},{resp_med:.3f},{resp_max:.3f}]",
+            )
             return None
         drift = np.median(np.stack(v_list, axis=0), axis=0)
+        log_info(
+            self.out_log,
+            "GoTo: AutoCal drift estimate "
+            f"vx={float(drift[0]):.3f}px/s vy={float(drift[1]):.3f}px/s "
+            f"valid_pairs={len(v_list)}",
+        )
         return drift
 
     def _autocal_measure_axis_j(
@@ -1789,12 +1827,17 @@ class AppRunner:
             return None
 
         cols: List[np.ndarray] = []
+        missing_base = 0
+        missing_plus = 0
+        missing_minus = 0
+        resp_low = 0
         for _ in range(int(repeats)):
             if self._goto_cancel.is_set():
                 return None
 
             base_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
             if not base_frames:
+                missing_base += 1
                 continue
             base = base_frames[0]
 
@@ -1802,6 +1845,7 @@ class AppRunner:
             time.sleep(float(settle_s))
             plus_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
             if not plus_frames:
+                missing_plus += 1
                 continue
             plus = plus_frames[0]
 
@@ -1809,6 +1853,7 @@ class AppRunner:
             time.sleep(float(settle_s))
             minus_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
             if not minus_frames:
+                missing_minus += 1
                 continue
             minus = minus_frames[0]
 
@@ -1826,6 +1871,7 @@ class AppRunner:
                 max_shift_px=float(max_shift_px),
             )
             if float(resp_p) < float(min_resp) or float(resp_m) < float(min_resp):
+                resp_low += 1
                 continue
 
             dt_plus = float(plus.t_capture - base.t_capture)
@@ -1835,6 +1881,13 @@ class AppRunner:
             dp_axis = (dp_plus - dp_minus) * 0.5
             cols.append(dp_axis / float(step_count))
 
+        log_info(
+            self.out_log,
+            "GoTo: AutoCal J axis "
+            f"axis={axis.name} repeats={int(repeats)} ok={len(cols)} "
+            f"missing_base={missing_base} missing_plus={missing_plus} "
+            f"missing_minus={missing_minus} resp_low={resp_low}",
+        )
         if not cols:
             return None
         return np.median(np.stack(cols, axis=0), axis=0)
@@ -1886,6 +1939,17 @@ class AppRunner:
         solve_attempts = int(params.get("solve_attempts", 5))
         jitter_deg = float(params.get("solve_jitter_deg", 0.2))
 
+        log_info(
+            self.out_log,
+            "GoTo: AutoCal config "
+            f"stars=[{target_star_min},{target_star_max}] sat_max={target_sat_max:.3f} "
+            f"exp_ms=[{exp_min_ms:.1f},{exp_max_ms:.1f}] gain=[{gain_min},{gain_max}] "
+            f"drift_frames={drift_frames} drift_dt=[{drift_dt_min:.2f},{drift_dt_max:.2f}] "
+            f"drift_pairs={drift_pairs} drift_min_resp={drift_min_resp:.2f} "
+            f"jcal_steps=[{jcal_steps_az},{jcal_steps_alt}] jcal_repeats={jcal_repeats} "
+            f"jcal_min_resp={jcal_min_resp:.2f}",
+        )
+
         platesolve_cfg = self._get_platesolve_cfg_snapshot()
         plate_scale_rad = float(platesolve_cfg.pixel_size_m) / float(platesolve_cfg.focal_m)
         if not np.isfinite(plate_scale_rad) or plate_scale_rad <= 0.0:
@@ -1932,13 +1996,33 @@ class AppRunner:
                 )
         if not tuned:
             out["status"] = "ERR_EXPOSURE_TUNE"
+            log_info(self.out_log, "GoTo: AutoCal exposure tune failed")
             return out
+        log_info(
+            self.out_log,
+            "GoTo: AutoCal exposure tuned "
+            f"exp_ms={float(getattr(self.cfg.camera, 'exp_ms', 0.0)):.2f} "
+            f"gain={int(getattr(self.cfg.camera, 'gain', 0))}",
+        )
 
         self._set_state_safe(goto_autocal_status="DRIFT")
         drift_frames_list = self._autocal_capture_frames(n_frames=drift_frames, timeout_s=4.0)
         if len(drift_frames_list) < 2:
             out["status"] = "ERR_DRIFT_FRAMES"
+            log_info(
+                self.out_log,
+                f"GoTo: AutoCal drift capture insufficient frames ({len(drift_frames_list)})",
+            )
             return out
+        star_counts = [fr.star_count for fr in drift_frames_list]
+        sat_fracs = [fr.saturation_frac for fr in drift_frames_list]
+        log_info(
+            self.out_log,
+            "GoTo: AutoCal drift frames "
+            f"count={len(drift_frames_list)} "
+            f"stars=[{min(star_counts)},{int(np.median(star_counts))},{max(star_counts)}] "
+            f"sat=[{min(sat_fracs):.3f},{float(np.median(sat_fracs)):.3f},{max(sat_fracs):.3f}]",
+        )
         drift_pix = self._autocal_estimate_drift(
             drift_frames_list,
             dt_min_s=drift_dt_min,
@@ -1949,6 +2033,7 @@ class AppRunner:
         )
         if drift_pix is None:
             out["status"] = "ERR_DRIFT"
+            log_info(self.out_log, "GoTo: AutoCal drift estimate failed")
             return out
         out["drift_pix"] = drift_pix
         self._set_state_safe(
