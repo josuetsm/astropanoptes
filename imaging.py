@@ -6,8 +6,6 @@ from typing import Tuple
 import numpy as np
 import cv2
 
-from hotpixels import apply_hotpixel_mask_replace
-
 
 _BAYER_CV2 = {
     "RGGB": cv2.COLOR_BayerRG2RGB,
@@ -21,6 +19,13 @@ _BAYER_CV2_EA = {
     "GRBG": cv2.COLOR_BayerGR2RGB_EA,
     "GBRG": cv2.COLOR_BayerGB2RGB_EA,
 }
+
+def median_prefilter_raw16(img: np.ndarray, ksize: int = 3) -> np.ndarray:
+    """
+    Median prefilter for alignment / tracking on RAW16 frames.
+    """
+    out = cv2.medianBlur(img, ksize)
+    return out.astype(np.float32)
 
 
 def ensure_raw16_bayer(frame: np.ndarray) -> np.ndarray:
@@ -119,7 +124,7 @@ def warp_rgb16(rgb16: np.ndarray, M: np.ndarray, dsize: Tuple[int, int] | None =
 
 __all__ = [
     "ensure_raw16_bayer",
-    "apply_hotpixel_mask_replace",
+    "median_prefilter_raw16",
     "bayer_green_u8_from_u16",
     "debayer_cv2",
     "warp_rgb16",

@@ -313,29 +313,11 @@ class ActionDispatcher:
 
         # ---- Hotpixels ----
         if t == ActionType.HOTPIX_CALIBRATE:
-            if self._runner._cam_stream is None:
-                log_info(self._logger, "Hotpix: calibration skipped (camera stream inactive)")
-                return
-            if self._runner._get_tracking_enabled():
-                self._runner._set_state_safe(tracking_enabled=False, tracking_mode="IDLE")
-                self._runner._mount_rate_safe(0.0, 0.0)
-            n_frames = int(p.get("n_frames", self._runner.cfg.hotpixels.calib_frames))
-            abs_percentile = float(p.get("abs_percentile", self._runner.cfg.hotpixels.calib_abs_percentile))
-            var_percentile = float(p.get("var_percentile", self._runner.cfg.hotpixels.calib_var_percentile))
-            max_component_area = int(p.get("max_component_area", self._runner.cfg.hotpixels.max_component_area))
-            out_path_base = str(p.get("out_path_base", self._runner.cfg.hotpixels.mask_path_base))
-            self._runner._hotpix_start_worker_if_needed(
-                n_frames=n_frames,
-                abs_percentile=abs_percentile,
-                var_percentile=var_percentile,
-                max_component_area=max_component_area,
-                out_path_base=out_path_base,
-            )
+            log_info(self._logger, "Hotpix: calibration disabled (median prefilter only)")
             return
 
         if t == ActionType.RESET_HOTPIXELS_DEFAULTS:
-            self._runner._reset_hotpixels_defaults()
-            log_info(self._logger, "Hotpix: RESET_DEFAULTS")
+            log_info(self._logger, "Hotpix: reset defaults disabled (median prefilter only)")
             return
 
         # ---- Platesolve ----
