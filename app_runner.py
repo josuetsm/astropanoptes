@@ -2063,22 +2063,23 @@ class AppRunner:
         tune_attempts = int(params.get("tune_attempts", 5))
         tune_settle_s = float(params.get("tune_settle_s", 0.4))
 
-        drift_frames = int(params.get("drift_frames", 8))
-        drift_dt_min = float(params.get("drift_dt_min_s", 0.8))
-        drift_dt_max = float(params.get("drift_dt_max_s", 2.5))
-        drift_pairs = int(params.get("drift_pairs", 12))
+        drift_frames = int(params.get("drift_frames", 10))
+        drift_dt_min = float(params.get("drift_dt_min_s", 1.0))
+        drift_dt_max = float(params.get("drift_dt_max_s", 10.0))
+        drift_pairs = int(params.get("drift_pairs", 20))
         drift_max_shift_px = float(params.get("drift_max_shift_px", 25.0))
         drift_min_resp = float(params.get("drift_min_resp", 0.2))
+        drift_capture_timeout_s = float(params.get("drift_capture_timeout_s", 12.0))
 
         jcal_steps_az = int(params.get("jcal_steps_az", self.cfg.mount.slew_steps_az))
         jcal_steps_alt = int(params.get("jcal_steps_alt", self.cfg.mount.slew_steps_alt))
-        jcal_steps_scale = float(params.get("jcal_steps_scale", 1.0))
+        jcal_steps_scale = float(params.get("jcal_steps_scale", 0.1))
         jcal_repeats = int(params.get("jcal_repeats", 2))
-        jcal_block_frames = int(params.get("jcal_block_frames", 3))
+        jcal_block_frames = int(params.get("jcal_block_frames", 5))
         jcal_max_shift_px = float(params.get("jcal_max_shift_px", 30.0))
         jcal_min_resp = float(params.get("jcal_min_resp", 0.2))
-        jcal_settle_s = float(params.get("jcal_settle_s", settle_s))
-        jcal_capture_timeout_s = float(params.get("jcal_capture_timeout_s", 2.0))
+        jcal_settle_s = float(params.get("jcal_settle_s", max(settle_s, 0.6)))
+        jcal_capture_timeout_s = float(params.get("jcal_capture_timeout_s", 4.0))
         jcal_skip_frames = int(params.get("jcal_skip_frames", 0))
         jcal_delay_us = int(params.get("jcal_delay_us", self.cfg.goto.slew_delay_us))
         jcal_min_steps = int(params.get("jcal_min_steps", 50))
@@ -2109,6 +2110,9 @@ class AppRunner:
         if jcal_skip_frames < 0:
             out["status"] = "ERR_JCAL_PARAMS"
             return out
+        if drift_capture_timeout_s <= 0.0:
+            out["status"] = "ERR_DRIFT_PARAMS"
+            return out
         if jcal_delay_us <= 0:
             out["status"] = "ERR_JCAL_PARAMS"
             return out
@@ -2123,6 +2127,7 @@ class AppRunner:
             f"exp_ms=[{exp_min_ms:.1f},{exp_max_ms:.1f}] gain=[{gain_min},{gain_max}] "
             f"drift_frames={drift_frames} drift_dt=[{drift_dt_min:.2f},{drift_dt_max:.2f}] "
             f"drift_pairs={drift_pairs} drift_min_resp={drift_min_resp:.2f} "
+            f"drift_capture_timeout_s={drift_capture_timeout_s:.2f} "
             f"jcal_steps=[{jcal_steps_az},{jcal_steps_alt}] jcal_repeats={jcal_repeats} "
             f"jcal_min_resp={jcal_min_resp:.2f} "
             f"jcal_settle_s={jcal_settle_s:.2f} "
@@ -2192,7 +2197,7 @@ class AppRunner:
         self._set_state_safe(goto_autocal_status="DRIFT")
         drift_frames_list = self._autocal_capture_frames(
             n_frames=drift_frames,
-            timeout_s=4.0,
+            timeout_s=drift_capture_timeout_s,
             min_dt_s=drift_dt_min,
         )
         if len(drift_frames_list) < 2:
