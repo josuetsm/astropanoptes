@@ -399,11 +399,27 @@ class AppRunner:
         except Exception as exc:
             log_error(self.out_log, "Tracking: failed to reset keyframe", exc)
 
+    def _apply_mount_rate_inversion(self, az: float, alt: float) -> Tuple[float, float]:
+        inv_az = bool(self.cfg.mount.invert_az)
+        inv_alt = bool(self.cfg.mount.invert_alt)
+        az_out = -float(az) if inv_az else float(az)
+        alt_out = -float(alt) if inv_alt else float(alt)
+        return az_out, alt_out
+
+    def _apply_mount_direction_inversion(self, axis: Axis, direction: int) -> int:
+        direction_i = int(direction)
+        if axis == Axis.AZ and bool(self.cfg.mount.invert_az):
+            return -direction_i
+        if axis == Axis.ALT and bool(self.cfg.mount.invert_alt):
+            return -direction_i
+        return direction_i
+
     def _mount_rate_safe(self, az: float, alt: float) -> None:
         if self._mount is None:
             return
         try:
-            self._mount.rate(float(az), float(alt))
+            az_out, alt_out = self._apply_mount_rate_inversion(az, alt)
+            self._mount.rate(float(az_out), float(alt_out))
         except Exception as exc:
             self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
             log_error(
@@ -493,7 +509,8 @@ class AppRunner:
                     return None
                 try:
                     self._mount.stop()
-                    self._mount.move_steps(axis, direction=1, steps=steps, delay_us=delay_us)
+                    hw_dir = self._apply_mount_direction_inversion(axis, 1)
+                    self._mount.move_steps(axis, direction=hw_dir, steps=steps, delay_us=delay_us)
                 except (RuntimeError, ValueError, OSError, serial.SerialException) as exc:
                     log_error(self.out_log, "Tracking: calibration move failed", exc)
                     return None
@@ -502,7 +519,8 @@ class AppRunner:
 
             with self._mount_move_lock:
                 try:
-                    self._mount.move_steps(axis, direction=-1, steps=steps, delay_us=delay_us)
+                    hw_dir = self._apply_mount_direction_inversion(axis, -1)
+                    self._mount.move_steps(axis, direction=hw_dir, steps=steps, delay_us=delay_us)
                 except (RuntimeError, ValueError, OSError, serial.SerialException) as exc:
                     log_error(self.out_log, "Tracking: calibration move-back failed", exc)
 
@@ -1015,9 +1033,10 @@ class AppRunner:
             def _job() -> None:
                 try:
                     mount.stop()
+                    hw_direction = self._apply_mount_direction_inversion(axis, int(direction))
                     mount.move_steps(
                         axis=axis,
-                        direction=int(direction),
+                        direction=int(hw_direction),
                         steps=int(steps),
                         delay_us=int(delay_us),
                     )
@@ -1037,6 +1056,12 @@ class AppRunner:
                 daemon=True,
             )
             self._mount_move_thr.start()
+
+    def _goto_move_steps_with_inversion(self, axis: Axis, direction: int, steps: int, delay_us: int) -> str:
+        if self._mount is None:
+            raise RuntimeError("mount not connected")
+        hw_direction = self._apply_mount_direction_inversion(axis, int(direction))
+        return self._mount.move_steps(axis, hw_direction, int(steps), int(delay_us))
 
     # -------------------------
     # Platesolve (thread worker)
@@ -1841,7 +1866,7 @@ class AppRunner:
                 continue
             base = base_frames[0]
 
-            self._goto._exec_steps(self._mount.move_steps, axis, float(step_count), delay_us=int(delay_us))
+            self._goto._exec_steps(self._goto_move_steps_with_inversion, axis, float(step_count), delay_us=int(delay_us))
             time.sleep(float(settle_s))
             plus_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
             if not plus_frames:
@@ -1849,7 +1874,7 @@ class AppRunner:
                 continue
             plus = plus_frames[0]
 
-            self._goto._exec_steps(self._mount.move_steps, axis, float(-2 * step_count), delay_us=int(delay_us))
+            self._goto._exec_steps(self._goto_move_steps_with_inversion, axis, float(-2 * step_count), delay_us=int(delay_us))
             time.sleep(float(settle_s))
             minus_frames = self._autocal_capture_frames(n_frames=int(block_frames), timeout_s=2.0)
             if not minus_frames:
@@ -1857,7 +1882,7 @@ class AppRunner:
                 continue
             minus = minus_frames[0]
 
-            self._goto._exec_steps(self._mount.move_steps, axis, float(step_count), delay_us=int(delay_us))
+            self._goto._exec_steps(self._goto_move_steps_with_inversion, axis, float(step_count), delay_us=int(delay_us))
             time.sleep(float(settle_s))
 
             dx_p, dy_p, resp_p, _n_p = estimate_shift_from_objects(
@@ -2291,7 +2316,7 @@ class AppRunner:
 
         calib_out = self._goto.calibrate_blocking(
             get_live_frame=_get_live_frame_for_calib,
-            move_steps=self._mount.move_steps,
+            move_steps=self._goto_move_steps_with_inversion,
             stop=self._mount.stop,
             platesolve_cfg=platesolve_cfg,
             n_samples=int(params.get("calib_samples", self.cfg.goto.calib_samples)),
@@ -2354,7 +2379,7 @@ class AppRunner:
             def move_steps(axis: Axis, direction: int, steps: int, delay_us: int):
                 if self._mount is None:
                     raise RuntimeError("mount not connected")
-                return self._mount.move_steps(axis, direction, steps, delay_us)
+                return self._goto_move_steps_with_inversion(axis, direction, steps, delay_us)
 
             def stop():
                 if self._mount is not None:
@@ -2566,7 +2591,7 @@ class AppRunner:
                         self._tracking_bootstrap_step(_now_s())
                     else:
                         try:
-                            self._mount.rate(float(out.rate_az), float(out.rate_alt))
+                            self._mount_rate_safe(float(out.rate_az), float(out.rate_alt))
                         except Exception as exc:
                             self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
                             log_error(self.out_log, "Tracking: mount.rate failed", exc, throttle_s=2.0, throttle_key="tracking_mount_rate")
