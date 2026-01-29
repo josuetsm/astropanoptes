@@ -31,7 +31,15 @@ from imaging import ensure_raw16_bayer
 from preview import make_preview_jpeg, encode_jpeg, stretch_to_u8
 from mount_arduino import ArduinoMount
 
-from tracking import make_tracking_state, tracking_step, tracking_set_params
+from tracking import (
+    auto_reset,
+    auto_set_from_A,
+    calib_reset,
+    calib_set_A_micro,
+    make_tracking_state,
+    tracking_step,
+    tracking_set_params,
+)
 from stacking import StackingWorker
 
 from hotpixels import (
@@ -184,6 +192,17 @@ class AppRunner:
         self._last_platesolve_result: Optional[Any] = None
         self._mount_move_lock = threading.Lock()
         self._mount_move_thr: Optional[threading.Thread] = None
+        self._tracking_calib_cols: Dict[str, np.ndarray] = {}
+        self._tracking_bootstrap = {
+            "active": False,
+            "phase": "IDLE",
+            "t_phase": 0.0,
+            "t_set": 0.0,
+            "samples": [],
+            "v_base": None,
+            "v_az": None,
+            "v_alt": None,
+        }
 
         # State + outputs (thread-safe)
         self._state = SystemState()
@@ -394,6 +413,285 @@ class AppRunner:
                 throttle_s=2.0,
                 throttle_key="mount_rate",
             )
+
+    def _tracking_capture_objects(
+        self,
+        *,
+        wait_for_seq: Optional[int] = None,
+        timeout_s: float = 1.5,
+    ) -> Optional[Tuple[Frame, np.ndarray]]:
+        if self._cam_stream is None:
+            return None
+
+        t0 = _perf()
+        while (_perf() - t0) < float(timeout_s):
+            fr = self._cam_stream.latest()
+            if fr is None:
+                time.sleep(0.01)
+                continue
+            if wait_for_seq is not None and int(fr.seq) == int(wait_for_seq):
+                time.sleep(0.005)
+                continue
+
+            raw16 = ensure_raw16_bayer(fr.raw)
+            _, _, _, obj_xy = sep_detect_from_raw16(
+                raw16,
+                sep_bw=int(self.cfg.sep.bw),
+                sep_bh=int(self.cfg.sep.bh),
+                sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
+                sep_minarea=int(self.cfg.sep.minarea),
+                max_sources=None,
+            )
+            return fr, obj_xy
+
+        return None
+
+    def _tracking_pause_for_calib(self) -> bool:
+        was_tracking = self._get_tracking_enabled()
+        if was_tracking:
+            self._set_state_safe(tracking_enabled=False)
+            self._mount_rate_safe(0.0, 0.0)
+            self._tracking_keyframe_reset()
+        return was_tracking
+
+    def _tracking_resume_after_calib(self, was_tracking: bool) -> None:
+        if was_tracking:
+            self._set_state_safe(tracking_enabled=True)
+            self._tracking_keyframe_reset()
+
+    def _tracking_calibrate_axis(self, axis: Axis) -> Optional[np.ndarray]:
+        if self._cam_stream is None or self._mount is None:
+            log_info(self.out_log, "Tracking: calibration skipped (camera/mount inactive)")
+            return None
+        if not self._mount.is_connected():
+            log_info(self.out_log, "Tracking: calibration skipped (mount disconnected)")
+            return None
+
+        cfg = self._tracking_state.cfg.calib
+        steps = max(1, int(cfg.cal_steps_init))
+        max_steps = max(steps, int(cfg.cal_steps_max))
+        delay_us = int(cfg.cal_delay_us)
+        max_shift_px = max(
+            float(self._tracking_state.cfg.keyframe.abs_max_px),
+            float(self._tracking_state.cfg.rate.max_shift_per_frame_px),
+            float(cfg.cal_target_px_max) * 2.0,
+        )
+
+        for attempt in range(int(cfg.cal_try_max)):
+            before = self._tracking_capture_objects(timeout_s=1.5)
+            if before is None:
+                log_info(self.out_log, "Tracking: calibration failed (no frame)")
+                return None
+            fr0, obj0 = before
+            if obj0.size == 0:
+                log_info(self.out_log, "Tracking: calibration failed (no stars)")
+                return None
+
+            with self._mount_move_lock:
+                if self._mount_move_thr is not None and self._mount_move_thr.is_alive():
+                    log_info(self.out_log, "Tracking: calibration skipped (mount busy)")
+                    return None
+                try:
+                    self._mount.stop()
+                    self._mount.move_steps(axis, direction=1, steps=steps, delay_us=delay_us)
+                except (RuntimeError, ValueError, OSError, serial.SerialException) as exc:
+                    log_error(self.out_log, "Tracking: calibration move failed", exc)
+                    return None
+
+            after = self._tracking_capture_objects(wait_for_seq=fr0.seq, timeout_s=2.0)
+
+            with self._mount_move_lock:
+                try:
+                    self._mount.move_steps(axis, direction=-1, steps=steps, delay_us=delay_us)
+                except (RuntimeError, ValueError, OSError, serial.SerialException) as exc:
+                    log_error(self.out_log, "Tracking: calibration move-back failed", exc)
+
+            if after is None:
+                log_info(self.out_log, "Tracking: calibration failed (no post-move frame)")
+                return None
+            _, obj1 = after
+            if obj1.size == 0:
+                log_info(self.out_log, "Tracking: calibration failed (no post-move stars)")
+                return None
+
+            dx, dy, resp, matches = estimate_shift_from_objects(
+                obj0,
+                obj1,
+                max_shift_px=max_shift_px,
+            )
+            mag = float(np.hypot(dx, dy))
+
+            if float(resp) < float(cfg.cal_resp_min) or matches <= 0:
+                log_info(self.out_log, f"Tracking: calibration low response (resp={resp:.3f})")
+                return None
+
+            if mag < float(cfg.cal_target_px_min) and steps < max_steps:
+                steps = min(max_steps, steps * 2)
+                log_info(self.out_log, f"Tracking: calibration retry (shift={mag:.2f}px, steps={steps})")
+                continue
+
+            if mag > float(cfg.cal_target_px_max) and steps > 1:
+                steps = max(1, int(round(steps / 2)))
+                log_info(self.out_log, f"Tracking: calibration retry (shift={mag:.2f}px, steps={steps})")
+                continue
+
+            if steps <= 0:
+                raise ValueError("calibration steps must be positive")
+
+            col = np.array([dx / float(steps), dy / float(steps)], dtype=np.float64)
+            log_info(self.out_log, f"Tracking: calibration axis={axis.value} col={col}")
+            return col
+
+        log_info(self.out_log, "Tracking: calibration failed (max retries)")
+        return None
+
+    def _tracking_apply_calib_cols(self) -> bool:
+        az_col = self._tracking_calib_cols.get("az")
+        alt_col = self._tracking_calib_cols.get("alt")
+        if az_col is None or alt_col is None:
+            return False
+
+        A = np.column_stack([az_col, alt_col]).astype(np.float64, copy=False)
+        calib_set_A_micro(self._tracking_state, A, src="manual")
+        self._set_state_safe(
+            tracking_calib_src="manual",
+            tracking_detA=float(self._tracking_state.cal_det),
+        )
+        log_info(self.out_log, f"Tracking: calibration applied A={A}")
+        return True
+
+    def _tracking_calib_reset(self) -> None:
+        calib_reset(self._tracking_state)
+        self._tracking_state.cfg.calib.calib_A = None
+        self._tracking_state.cfg.calib.calib_b = None
+        self._tracking_calib_cols.clear()
+        self._set_state_safe(tracking_calib_src="none", tracking_detA=0.0)
+
+    def _tracking_bootstrap_reset(self) -> None:
+        boot = self._tracking_bootstrap
+        boot["active"] = False
+        boot["phase"] = "IDLE"
+        boot["t_phase"] = 0.0
+        boot["t_set"] = 0.0
+        boot["samples"] = []
+        boot["v_base"] = None
+        boot["v_az"] = None
+        boot["v_alt"] = None
+
+    def _tracking_bootstrap_start(self, now_t: float) -> None:
+        cfg = self._tracking_state.cfg.autoboost
+        if not cfg.enabled:
+            return
+        if self._mount is None or not self._mount.is_connected():
+            return
+        boot = self._tracking_bootstrap
+        boot["active"] = True
+        boot["phase"] = "BASE"
+        boot["t_phase"] = float(now_t)
+        boot["t_set"] = float(now_t)
+        boot["samples"] = []
+        boot["v_base"] = None
+        boot["v_az"] = None
+        boot["v_alt"] = None
+        self._mount_rate_safe(0.0, 0.0)
+        log_info(self.out_log, "Tracking: bootstrap start")
+
+    def _tracking_bootstrap_collect(self, vx: float, vy: float, resp_ok: bool) -> None:
+        if not resp_ok:
+            return
+        boot = self._tracking_bootstrap
+        if not boot["active"]:
+            return
+        boot["samples"].append((float(vx), float(vy)))
+
+    def _tracking_bootstrap_finish(self, v_base: np.ndarray, v_az: np.ndarray, v_alt: np.ndarray) -> None:
+        cfg = self._tracking_state.cfg.autoboost
+        rate = float(cfg.rate)
+        col_az = (v_az - v_base) / rate
+        col_alt = (v_alt - v_base) / rate
+        A = np.column_stack([col_az, col_alt]).astype(np.float64, copy=False)
+        auto_set_from_A(self._tracking_state, A_micro=A, b_pxps=v_base, src="boot")
+        self._set_state_safe(
+            tracking_calib_src="boot",
+            tracking_detA=float(self._tracking_state.auto.detA),
+        )
+        log_info(self.out_log, f"Tracking: bootstrap ok A={A}")
+        self._tracking_bootstrap_reset()
+
+    def _tracking_bootstrap_step(self, now_t: float) -> None:
+        boot = self._tracking_bootstrap
+        if not boot["active"]:
+            return
+
+        cfg = self._tracking_state.cfg.autoboost
+        phase = str(boot["phase"])
+        phase_dur = float(cfg.base_s if phase == "BASE" else cfg.axis_s)
+        if (float(now_t) - float(boot["t_set"])) < float(cfg.settle_s):
+            return
+
+        if (float(now_t) - float(boot["t_phase"])) < phase_dur:
+            return
+
+        samples = np.array(boot["samples"], dtype=np.float64) if boot["samples"] else None
+        if samples is None or samples.shape[0] < int(cfg.min_samples):
+            log_info(self.out_log, f"Tracking: bootstrap retry (phase={phase}, samples={len(boot['samples'])})")
+            boot["phase"] = "BASE"
+            boot["t_phase"] = float(now_t)
+            boot["t_set"] = float(now_t)
+            boot["samples"] = []
+            self._mount_rate_safe(0.0, 0.0)
+            return
+
+        v_mean = samples.mean(axis=0)
+        if phase == "BASE":
+            boot["v_base"] = v_mean
+            boot["phase"] = "AZ"
+            boot["t_phase"] = float(now_t)
+            boot["t_set"] = float(now_t)
+            boot["samples"] = []
+            self._mount_rate_safe(float(cfg.rate), 0.0)
+            log_info(self.out_log, f"Tracking: bootstrap base ok v0={v_mean}")
+            return
+
+        if phase == "AZ":
+            boot["v_az"] = v_mean
+            boot["phase"] = "ALT"
+            boot["t_phase"] = float(now_t)
+            boot["t_set"] = float(now_t)
+            boot["samples"] = []
+            self._mount_rate_safe(0.0, float(cfg.rate))
+            log_info(self.out_log, f"Tracking: bootstrap az ok v1={v_mean}")
+            return
+
+        if phase == "ALT":
+            boot["v_alt"] = v_mean
+            self._mount_rate_safe(0.0, 0.0)
+            v_base = boot["v_base"]
+            v_az = boot["v_az"]
+            v_alt = boot["v_alt"]
+            if v_base is None or v_az is None or v_alt is None:
+                raise ValueError("bootstrap state incomplete")
+            self._tracking_bootstrap_finish(
+                np.asarray(v_base, dtype=np.float64),
+                np.asarray(v_az, dtype=np.float64),
+                np.asarray(v_alt, dtype=np.float64),
+            )
+
+    def _tracking_bootstrap_calibration(self) -> None:
+        was_tracking = self._tracking_pause_for_calib()
+
+        az_col = self._tracking_calibrate_axis(Axis.AZ)
+        if az_col is not None:
+            self._tracking_calib_cols["az"] = az_col
+
+        alt_col = self._tracking_calibrate_axis(Axis.ALT)
+        if alt_col is not None:
+            self._tracking_calib_cols["alt"] = alt_col
+
+        if not self._tracking_apply_calib_cols():
+            log_info(self.out_log, "Tracking: bootstrap calibration incomplete")
+
+        self._tracking_resume_after_calib(was_tracking)
 
     # -------------------------
     # Camera
@@ -2131,22 +2429,34 @@ class AppRunner:
                         max_sources=None,
                     )
 
+                    calib_ready = bool(self._tracking_state.cal_A_pinv is not None) or bool(
+                        self._tracking_state.auto.ok and self._tracking_state.auto.A_pinv is not None
+                    )
+                    boot_active = bool(self._tracking_bootstrap.get("active", False))
+                    if (not boot_active) and (not calib_ready):
+                        self._tracking_bootstrap_start(_now_s())
+                        boot_active = bool(self._tracking_bootstrap.get("active", False))
+
                     try:
                         out = tracking_step(
                             self._tracking_state,
                             obj_xy,
                             now_t=_now_s(),
-                            tracking_enabled=True,
+                            tracking_enabled=bool(tracking_on and (not boot_active)),
                         )
                     except TypeError as exc:
                         log_error(self.out_log, "Tracking: falling back to legacy tracking_step signature", exc, throttle_s=60.0, throttle_key="tracking_step_signature")
                         out = tracking_step(self._tracking_state, img_det)
 
-                    try:
-                        self._mount.rate(float(out.rate_az), float(out.rate_alt))
-                    except Exception as exc:
-                        self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
-                        log_error(self.out_log, "Tracking: mount.rate failed", exc, throttle_s=2.0, throttle_key="tracking_mount_rate")
+                    if boot_active:
+                        self._tracking_bootstrap_collect(float(out.vx), float(out.vy), resp_ok=bool(out.ok))
+                        self._tracking_bootstrap_step(_now_s())
+                    else:
+                        try:
+                            self._mount.rate(float(out.rate_az), float(out.rate_alt))
+                        except Exception as exc:
+                            self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
+                            log_error(self.out_log, "Tracking: mount.rate failed", exc, throttle_s=2.0, throttle_key="tracking_mount_rate")
 
                     self._set_state_safe(
                         tracking_mode=str(out.mode),
@@ -2166,6 +2476,7 @@ class AppRunner:
             else:
                 if self._mount is not None:
                     self._mount_rate_safe(0.0, 0.0)
+                self._tracking_bootstrap_reset()
                 self._set_state_safe(
                     tracking_mode="IDLE",
                     tracking_rate_az=0.0,
@@ -2252,6 +2563,11 @@ class AppRunner:
                     ActionType.TRACKING_START,
                     ActionType.TRACKING_STOP,
                     ActionType.TRACKING_SET_PARAMS,
+                    ActionType.TRACKING_CALIB_AZ,
+                    ActionType.TRACKING_CALIB_ALT,
+                    ActionType.TRACKING_CALIB_RESET,
+                    ActionType.TRACKING_AUTO_RESET,
+                    ActionType.TRACKING_BOOTSTRAP,
                     ActionType.STACKING_START,
                     ActionType.STACKING_STOP,
                     ActionType.STACKING_RESET,
@@ -2365,6 +2681,40 @@ class AppRunner:
         if t == ActionType.RESET_TRACKING_DEFAULTS:
             self._reset_tracking_defaults()
             log_info(self.out_log, "Tracking: RESET_DEFAULTS")
+            return
+
+        if t == ActionType.TRACKING_CALIB_RESET:
+            self._tracking_calib_reset()
+            self._tracking_bootstrap_reset()
+            log_info(self.out_log, "Tracking: CALIB_RESET")
+            return
+
+        if t == ActionType.TRACKING_AUTO_RESET:
+            auto_reset(self._tracking_state, src="none")
+            self._tracking_bootstrap_reset()
+            log_info(self.out_log, "Tracking: AUTO_RESET")
+            return
+
+        if t == ActionType.TRACKING_CALIB_AZ:
+            was_tracking = self._tracking_pause_for_calib()
+            az_col = self._tracking_calibrate_axis(Axis.AZ)
+            if az_col is not None:
+                self._tracking_calib_cols["az"] = az_col
+                self._tracking_apply_calib_cols()
+            self._tracking_resume_after_calib(was_tracking)
+            return
+
+        if t == ActionType.TRACKING_CALIB_ALT:
+            was_tracking = self._tracking_pause_for_calib()
+            alt_col = self._tracking_calibrate_axis(Axis.ALT)
+            if alt_col is not None:
+                self._tracking_calib_cols["alt"] = alt_col
+                self._tracking_apply_calib_cols()
+            self._tracking_resume_after_calib(was_tracking)
+            return
+
+        if t == ActionType.TRACKING_BOOTSTRAP:
+            self._tracking_bootstrap_start(_now_s())
             return
 
         # ---- Stacking ----
