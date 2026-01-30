@@ -55,7 +55,6 @@ class MountConfig:
 
     rate_max: float = 600.0
     default_rate: float = 80.0
-    default_nudge_ms: int = 250
 
     invert_az: bool = False
     invert_alt: bool = False

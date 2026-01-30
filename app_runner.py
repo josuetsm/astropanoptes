@@ -18,7 +18,18 @@ import astropy.units as u
 from astropy.coordinates import AltAz, SkyCoord
 from astropy.time import Time
 
-from ap_types import SystemState, Axis, Frame
+from ap_types import (
+    AppState,
+    Axis,
+    CameraStatus,
+    Frame,
+    GotoStatus,
+    MountStatus,
+    PlatesolvingStatus,
+    StackingStatus,
+    TrackingMode,
+    TrackingStatus,
+)
 from config import AppConfig, PlatesolvingConfig, SepConfig
 from actions import Action, ActionType
 from logging_utils import log_info, log_error
@@ -78,7 +89,7 @@ class AppRunner:
     - Mantener la cámara capturando a máxima FPS (CameraStream).
     - Ejecutar un loop estable (control_hz) que:
         - aplica actions
-        - actualiza SystemState
+        - actualiza AppState
         - genera preview JPEG a view_hz
         - ejecuta tracking y envía RATE a la montura si tracking está ON
         - encola frames a stacking si stacking está ON
@@ -161,7 +172,7 @@ class AppRunner:
         self._mount_move_worker = MountMoveWorker(
             get_mount=lambda: self._mount,
             note_manual_move=self._goto.model.note_manual_move,
-            publish_state=self._set_state_safe,
+            publish_state=self._update_state,
             out_log=self.out_log,
         )
         self._goto_worker = GoToWorker(
@@ -197,7 +208,7 @@ class AppRunner:
         }
 
         # State + outputs (thread-safe)
-        self._state = SystemState()
+        self._state = AppState()
         self._state_lock = threading.Lock()
 
         self._latest_preview_jpeg: Optional[bytes] = None
@@ -223,64 +234,62 @@ class AppRunner:
         }
 
         # Estado inicial
-        self._set_state_safe(camera_status="DISCONNECTED", camera_connected=False)
-        self._set_state_safe(mount_status="DISCONNECTED", mount_connected=False)
-
-        # Tracking fields (si existen)
-        self._set_state_safe(
-            tracking_enabled=False,
-            tracking_mode="IDLE",
-            tracking_resp=0.0,
-            tracking_dx=0.0,
-            tracking_dy=0.0,
-            tracking_vx=0.0,
-            tracking_vy=0.0,
-            tracking_abs_resp=0.0,
-            tracking_x_hat=0.0,
-            tracking_y_hat=0.0,
-            tracking_rate_az=0.0,
-            tracking_rate_alt=0.0,
-            tracking_calib_src="none",
-            tracking_detA=0.0,
+        self._update_state(
+            {
+                "camera": {"status": CameraStatus.DISCONNECTED, "connected": False},
+                "mount": {"status": MountStatus.DISCONNECTED, "connected": False},
+            }
         )
 
-        # Stacking fields (si existen)
-        self._set_state_safe(
-            stacking_enabled=self._stacking_enabled,
-            stacking_mode="RUNNING" if self._stacking_enabled else "IDLE",
-            stacking_status="ON" if self._stacking_enabled else "OFF",
-            stacking_on=self._stacking_enabled,
-        )
-
-        # Platesolving fields (si existen)
-        self._set_state_safe(
-            platesolving_status="IDLE",
-            platesolving_busy=False,
-            platesolving_last_ok=False,
-            platesolving_theta_deg=0.0,
-            platesolving_dx_px=0.0,
-            platesolving_dy_px=0.0,
-            platesolving_resp=0.0,
-            platesolving_n_inliers=0,
-            platesolving_rms_px=0.0,
-            platesolving_overlay=[],
-            platesolving_guides=[],
-            platesolving_debug_jpeg=None,
-            platesolving_debug_info=None,
-            platesolving_center_ra_deg=0.0,
-            platesolving_center_dec_deg=0.0,
-        )
-
-        # GoTo fields
-        self._set_state_safe(
-            goto_busy=False,
-            goto_status="IDLE",
-            goto_synced=False,
-            goto_last_error_arcsec=0.0,
-            goto_J00=float(self._goto.model.J_deg_per_step[0,0]),
-            goto_J01=float(self._goto.model.J_deg_per_step[0,1]),
-            goto_J10=float(self._goto.model.J_deg_per_step[1,0]),
-            goto_J11=float(self._goto.model.J_deg_per_step[1,1]),
+        self._update_state(
+            {
+                "tracking": {
+                    "enabled": False,
+                    "status": TrackingStatus.OFF,
+                    "mode": TrackingMode.IDLE,
+                    "resp": 0.0,
+                    "dx": 0.0,
+                    "dy": 0.0,
+                    "vx": 0.0,
+                    "vy": 0.0,
+                    "abs_resp": 0.0,
+                    "rate_az": 0.0,
+                    "rate_alt": 0.0,
+                    "calib_src": "none",
+                    "calib_det": 0.0,
+                },
+                "stacking": {
+                    "enabled": self._stacking_enabled,
+                    "status": StackingStatus.RUNNING if self._stacking_enabled else StackingStatus.OFF,
+                },
+                "platesolving": {
+                    "status": PlatesolvingStatus.IDLE,
+                    "busy": False,
+                    "last_ok": False,
+                    "theta_deg": 0.0,
+                    "dx_px": 0.0,
+                    "dy_px": 0.0,
+                    "resp": 0.0,
+                    "n_inliers": 0,
+                    "rms_px": 0.0,
+                    "overlay": [],
+                    "guides": [],
+                    "debug_jpeg": None,
+                    "debug_info": None,
+                    "center_ra_deg": 0.0,
+                    "center_dec_deg": 0.0,
+                },
+                "goto": {
+                    "busy": False,
+                    "status": GotoStatus.IDLE,
+                    "synced": False,
+                    "last_error_arcsec": 0.0,
+                    "J00": float(self._goto.model.J_deg_per_step[0, 0]),
+                    "J01": float(self._goto.model.J_deg_per_step[0, 1]),
+                    "J10": float(self._goto.model.J_deg_per_step[1, 0]),
+                    "J11": float(self._goto.model.J_deg_per_step[1, 1]),
+                },
+            }
         )
 
     # -------------------------
@@ -313,6 +322,18 @@ class AppRunner:
             return None
         return self._cam_stream.latest()
 
+    def _frame_seq(self, fr: Frame) -> Optional[int]:
+        seq = fr.meta.get("seq")
+        if seq is None:
+            return None
+        return int(seq)
+
+    def _tracking_mode_from_output(self, mode: str) -> TrackingMode:
+        try:
+            return TrackingMode(str(mode))
+        except ValueError:
+            return TrackingMode.IDLE
+
     def _get_fps_capture(self) -> float:
         if self._cam_stream is None:
             return 0.0
@@ -327,9 +348,9 @@ class AppRunner:
             return None
         return fr.raw
 
-    def _publish_platesolving_state(self, **kwargs: Any) -> None:
-        result = kwargs.pop("platesolving_result", None)
-        self._set_state_safe(**kwargs)
+    def _publish_platesolving_state(self, patch: Dict[str, Dict[str, Any]]) -> None:
+        result = patch.pop("platesolving_result", None)
+        self._update_state(patch)
         if result is not None and bool(getattr(result, "success", False)):
             self._last_platesolving_result = result
 
@@ -381,10 +402,9 @@ class AppRunner:
     def enqueue(self, action: Action) -> None:
         self._actions.put(action)
 
-    def get_state(self) -> SystemState:
+    def get_state(self) -> AppState:
         with self._state_lock:
-            s = self._state
-            return SystemState(**s.__dict__)
+            return self._state.snapshot()
 
     def get_latest_preview_jpeg(self) -> Optional[bytes]:
         with self._preview_lock:
@@ -393,24 +413,13 @@ class AppRunner:
     # -------------------------
     # Internal helpers
     # -------------------------
-    def _set_state(self, **kwargs: Any) -> None:
+    def _update_state(self, patch: Dict[str, Dict[str, Any]]) -> None:
         with self._state_lock:
-            for k, v in kwargs.items():
-                setattr(self._state, k, v)
-
-    def _set_state_safe(self, **kwargs: Any) -> None:
-        """
-        Setea solo atributos existentes en SystemState (para no romper si aún
-        no agregaste campos).
-        """
-        with self._state_lock:
-            for k, v in kwargs.items():
-                if hasattr(self._state, k):
-                    setattr(self._state, k, v)
+            self._state.update(patch)
 
     def _get_tracking_enabled(self) -> bool:
         with self._state_lock:
-            return bool(getattr(self._state, "tracking_enabled", False))
+            return bool(self._state.tracking.enabled)
 
     def _tracking_keyframe_reset(self) -> None:
         try:
@@ -429,7 +438,17 @@ class AppRunner:
         try:
             self._mount.rate(float(az), float(alt))
         except Exception as exc:
-            self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
+            self._update_state(
+                {
+                    "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "RATE failed"},
+                    "tracking": {
+                        "enabled": False,
+                        "status": TrackingStatus.OFF,
+                        "mode": TrackingMode.IDLE,
+                        "last_error": "mount RATE failed",
+                    },
+                }
+            )
             log_error(
                 self.out_log,
                 "Mount: RATE failed",
@@ -446,25 +465,25 @@ class AppRunner:
     def _pause_tracking_for_goto(self) -> bool:
         was_tracking = self._get_tracking_enabled()
         if was_tracking:
-            self._set_state_safe(tracking_enabled=False)
+            self._update_state({"tracking": {"enabled": False, "status": TrackingStatus.PAUSED}})
             self._mount_rate_safe(0.0, 0.0)
         return was_tracking
 
     def _resume_tracking_after_goto(self) -> None:
-        self._set_state_safe(tracking_enabled=True)
+        self._update_state({"tracking": {"enabled": True, "status": TrackingStatus.RUNNING}})
         self._tracking_keyframe_reset()
 
     def _pause_stacking_for_goto(self) -> bool:
         was_stacking = bool(self._stacking_enabled)
         if was_stacking:
             self._stacking_enabled = False
-            self._set_state_safe(stacking_enabled=False, stacking_mode="IDLE", stacking_status="OFF", stacking_on=False)
+            self._update_state({"stacking": {"enabled": False, "status": StackingStatus.OFF}})
         return was_stacking
 
     def _resume_stacking_after_goto(self) -> None:
         self._stacking_enabled = True
         self._stacking.start()
-        self._set_state_safe(stacking_enabled=True, stacking_mode="RUNNING", stacking_status="ON", stacking_on=True)
+        self._update_state({"stacking": {"enabled": True, "status": StackingStatus.RUNNING}})
 
     def _tracking_capture_objects(
         self,
@@ -481,9 +500,11 @@ class AppRunner:
             if fr is None:
                 time.sleep(0.01)
                 continue
-            if wait_for_seq is not None and int(fr.seq) == int(wait_for_seq):
-                time.sleep(0.005)
-                continue
+            if wait_for_seq is not None:
+                seq = self._frame_seq(fr)
+                if seq is not None and int(seq) == int(wait_for_seq):
+                    time.sleep(0.005)
+                    continue
 
             raw16 = ensure_raw16_bayer(fr.raw)
             _, _, _, obj_xy = sep_detect_from_raw16(
@@ -501,14 +522,14 @@ class AppRunner:
     def _tracking_pause_for_calib(self) -> bool:
         was_tracking = self._get_tracking_enabled()
         if was_tracking:
-            self._set_state_safe(tracking_enabled=False)
+            self._update_state({"tracking": {"enabled": False, "status": TrackingStatus.PAUSED}})
             self._mount_rate_safe(0.0, 0.0)
             self._tracking_keyframe_reset()
         return was_tracking
 
     def _tracking_resume_after_calib(self, was_tracking: bool) -> None:
         if was_tracking:
-            self._set_state_safe(tracking_enabled=True)
+            self._update_state({"tracking": {"enabled": True, "status": TrackingStatus.RUNNING}})
             self._tracking_keyframe_reset()
 
     def _tracking_calibrate_axis(self, axis: Axis) -> Optional[np.ndarray]:
@@ -549,7 +570,8 @@ class AppRunner:
                 log_error(self.out_log, "Tracking: calibration move failed", exc)
                 return None
 
-            after = self._tracking_capture_objects(wait_for_seq=fr0.seq, timeout_s=2.0)
+            wait_seq = self._frame_seq(fr0)
+            after = self._tracking_capture_objects(wait_for_seq=wait_seq, timeout_s=2.0)
 
             try:
                 self._mount.move_steps(axis, direction=-1, steps=steps, delay_us=delay_us)
@@ -603,9 +625,14 @@ class AppRunner:
 
         A = np.column_stack([az_col, alt_col]).astype(np.float64, copy=False)
         calib_set_A_micro(self._tracking_state, A, src="manual")
-        self._set_state_safe(
-            tracking_calib_src="manual",
-            tracking_detA=float(self._tracking_state.cal_det),
+        self._update_state(
+            {
+                "tracking": {
+                    "calib_src": "manual",
+                    "calib_det": float(self._tracking_state.cal_det),
+                    "calib_manual_ok": True,
+                }
+            }
         )
         log_info(self.out_log, f"Tracking: calibration applied A={A}")
         return True
@@ -615,7 +642,7 @@ class AppRunner:
         self._tracking_state.cfg.calib.calib_A = None
         self._tracking_state.cfg.calib.calib_b = None
         self._tracking_calib_cols.clear()
-        self._set_state_safe(tracking_calib_src="none", tracking_detA=0.0)
+        self._update_state({"tracking": {"calib_src": "none", "calib_det": 0.0, "calib_manual_ok": False}})
 
     def _tracking_bootstrap_reset(self) -> None:
         boot = self._tracking_bootstrap
@@ -627,6 +654,9 @@ class AppRunner:
         boot["v_base"] = None
         boot["v_az"] = None
         boot["v_alt"] = None
+        self._update_state(
+            {"tracking": {"bootstrap_active": False, "bootstrap_phase": TrackingMode.IDLE}}
+        )
 
     def _tracking_bootstrap_start(self, now_t: float) -> None:
         cfg = self._tracking_state.cfg.autoboost
@@ -643,6 +673,9 @@ class AppRunner:
         boot["v_base"] = None
         boot["v_az"] = None
         boot["v_alt"] = None
+        self._update_state(
+            {"tracking": {"bootstrap_active": True, "bootstrap_phase": "BASE"}}
+        )
         self._mount_rate_safe(0.0, 0.0)
         log_info(self.out_log, "Tracking: bootstrap start")
 
@@ -661,9 +694,14 @@ class AppRunner:
         col_alt = (v_alt - v_base) / rate
         A = np.column_stack([col_az, col_alt]).astype(np.float64, copy=False)
         auto_set_from_A(self._tracking_state, A_micro=A, b_pxps=v_base, src="boot")
-        self._set_state_safe(
-            tracking_calib_src="boot",
-            tracking_detA=float(self._tracking_state.auto.detA),
+        self._update_state(
+            {
+                "tracking": {
+                    "calib_src": "boot",
+                    "calib_det": float(self._tracking_state.auto.detA),
+                    "calib_auto_ok": True,
+                }
+            }
         )
         log_info(self.out_log, f"Tracking: bootstrap ok A={A}")
         self._tracking_bootstrap_reset()
@@ -689,6 +727,7 @@ class AppRunner:
             boot["t_phase"] = float(now_t)
             boot["t_set"] = float(now_t)
             boot["samples"] = []
+            self._update_state({"tracking": {"bootstrap_phase": "BASE"}})
             self._mount_rate_safe(0.0, 0.0)
             return
 
@@ -699,6 +738,7 @@ class AppRunner:
             boot["t_phase"] = float(now_t)
             boot["t_set"] = float(now_t)
             boot["samples"] = []
+            self._update_state({"tracking": {"bootstrap_phase": "AZ"}})
             self._mount_rate_safe(float(cfg.rate), 0.0)
             log_info(self.out_log, f"Tracking: bootstrap base ok v0={v_mean}")
             return
@@ -709,6 +749,7 @@ class AppRunner:
             boot["t_phase"] = float(now_t)
             boot["t_set"] = float(now_t)
             boot["samples"] = []
+            self._update_state({"tracking": {"bootstrap_phase": "ALT"}})
             self._mount_rate_safe(0.0, float(cfg.rate))
             log_info(self.out_log, f"Tracking: bootstrap az ok v1={v_mean}")
             return
@@ -761,15 +802,19 @@ class AppRunner:
                 log_error(self.out_log, "Camera: device close failed", exc)
             self._cam_dev = None
 
-        self._set_state_safe(
-            camera_connected=False,
-            camera_status="DISCONNECTED",
-            fps_capture=0.0,
+        self._update_state(
+            {
+                "camera": {
+                    "connected": False,
+                    "status": CameraStatus.DISCONNECTED,
+                    "fps_capture": 0.0,
+                }
+            }
         )
 
     def _connect_camera(self, camera_index: int) -> None:
         self._shutdown_camera()
-        self._set_state_safe(camera_status="CONNECTING", camera_connected=False)
+        self._update_state({"camera": {"status": CameraStatus.CONNECTING, "connected": False}})
 
         try:
             dev = POACameraDevice()
@@ -781,10 +826,7 @@ class AppRunner:
             self._cam_dev = dev
             self._cam_stream = stream
 
-            self._set_state_safe(
-                camera_connected=True,
-                camera_status="OK",
-            )
+            self._update_state({"camera": {"connected": True, "status": CameraStatus.OK, "last_error": None}})
             log_info(
                 self.out_log,
                 f"Camera: connected id={info.camera_id} model={info.model} sensor={info.sensor} "
@@ -792,7 +834,15 @@ class AppRunner:
             )
         except Exception as exc:
             self._shutdown_camera()
-            self._set_state_safe(camera_connected=False, camera_status="ERR")
+            self._update_state(
+                {
+                    "camera": {
+                        "connected": False,
+                        "status": CameraStatus.ERROR,
+                        "last_error": "connect failed",
+                    }
+                }
+            )
             log_error(self.out_log, "Camera: connect failed (is it open in another app?)", exc)
 
     def _apply_camera_param(self, name: str, value: Any) -> None:
@@ -840,7 +890,7 @@ class AppRunner:
             log_info(self.out_log, f"Camera: reconfigure (restart stream) due to {reason}")
             self._connect_camera(cam_index)
         except Exception as exc:
-            self._set_state_safe(camera_status="ERR")
+            self._update_state({"camera": {"status": CameraStatus.ERROR, "last_error": "reconfigure failed"}})
             log_error(self.out_log, "Camera: failed to apply config (restart)", exc)
 
     def _reset_camera_defaults(self) -> None:
@@ -858,11 +908,15 @@ class AppRunner:
         self._goto.model.kin.microsteps_az = int(self.cfg.mount.ms_az)
         self._goto.model.kin.microsteps_alt = int(self.cfg.mount.ms_alt)
         self._goto.model.init_from_mechanics()
-        self._set_state_safe(
-            goto_J00=float(self._goto.model.J_deg_per_step[0, 0]),
-            goto_J01=float(self._goto.model.J_deg_per_step[0, 1]),
-            goto_J10=float(self._goto.model.J_deg_per_step[1, 0]),
-            goto_J11=float(self._goto.model.J_deg_per_step[1, 1]),
+        self._update_state(
+            {
+                "goto": {
+                    "J00": float(self._goto.model.J_deg_per_step[0, 0]),
+                    "J01": float(self._goto.model.J_deg_per_step[0, 1]),
+                    "J10": float(self._goto.model.J_deg_per_step[1, 0]),
+                    "J11": float(self._goto.model.J_deg_per_step[1, 1]),
+                }
+            }
         )
 
     def _reset_tracking_defaults(self) -> None:
@@ -940,7 +994,7 @@ class AppRunner:
                 fps_view = self._n_view / (now - self._t_fps_view0)
                 self._t_fps_view0 = now
                 self._n_view = 0
-                self._set_state_safe(fps_view=float(fps_view))
+                self._update_state({"camera": {"fps_view": float(fps_view)}})
 
         except Exception as exc:
             log_error(self.out_log, "Preview: failed", exc)
@@ -988,21 +1042,21 @@ class AppRunner:
             except Exception as exc:
                 log_error(self.out_log, "Mount: disconnect failed", exc)
         self._mount = None
-        self._set_state_safe(mount_connected=False, mount_status="DISCONNECTED")
+        self._update_state({"mount": {"connected": False, "status": MountStatus.DISCONNECTED}})
 
     def _connect_mount(self, port: str, baudrate: int) -> None:
         self._shutdown_mount()
-        self._set_state_safe(mount_status="CONNECTING", mount_connected=False)
+        self._update_state({"mount": {"status": MountStatus.CONNECTING, "connected": False}})
 
         try:
             m = ArduinoMount()
             msg = m.connect(port=str(port), baud=int(baudrate))
             self._mount = m
-            self._set_state_safe(mount_connected=True, mount_status="OK")
+            self._update_state({"mount": {"connected": True, "status": MountStatus.OK, "last_error": None}})
             log_info(self.out_log, f"Mount: connected ({msg})")
         except Exception as exc:
             self._shutdown_mount()
-            self._set_state_safe(mount_connected=False, mount_status="ERR")
+            self._update_state({"mount": {"connected": False, "status": MountStatus.ERROR, "last_error": "connect failed"}})
             log_error(self.out_log, "Mount: connect failed", exc)
 
     def _mount_stop(self) -> None:
@@ -1011,7 +1065,12 @@ class AppRunner:
         try:
             self._mount.stop()
         except Exception as exc:
-            self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
+            self._update_state(
+                {
+                    "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "stop failed"},
+                    "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE},
+                }
+            )
             log_error(self.out_log, "Mount: STOP failed", exc)
 
     def _mount_set_microsteps(self, az_div: int, alt_div: int) -> None:
@@ -1023,7 +1082,12 @@ class AppRunner:
             self._goto.model.set_microsteps(int(az_div), int(alt_div))
             log_info(self.out_log, f"Mount: MS set (AZ={int(az_div)} ALT={int(alt_div)})")
         except Exception as exc:
-            self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
+            self._update_state(
+                {
+                    "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "set microsteps failed"},
+                    "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE},
+                }
+            )
             log_error(self.out_log, "Mount: MS failed", exc)
 
     def _mount_move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
@@ -1056,7 +1120,7 @@ class AppRunner:
         if not target:
             return
         st = self.get_state()
-        if bool(getattr(st, "platesolving_busy", False)):
+        if bool(st.platesolving.busy):
             return
         now = _perf()
         if (now - float(self._platesolving_last_auto_t)) < max(2.0, float(cfg.solve_every_s)):
@@ -1163,7 +1227,7 @@ class AppRunner:
             # 2) stats capture
             if self._cam_stream is not None:
                 st = self._cam_stream.stats()
-                self._set_state_safe(fps_capture=float(st.get("fps_capture", 0.0)))
+                self._update_state({"camera": {"fps_capture": float(st.get("fps_capture", 0.0))}})
 
             # 2b) tracking
             tracking_on = self._get_tracking_enabled()
@@ -1171,7 +1235,6 @@ class AppRunner:
                 fr = self._cam_stream.latest()
                 if fr is not None:
                     # Tracking en RAW16 + SEP
-                    meta = dict(getattr(fr, "meta", {}) or {})
                     raw16 = ensure_raw16_bayer(fr.raw)
                     _, _, _, obj_xy = sep_detect_from_raw16(
                         raw16,
@@ -1190,16 +1253,12 @@ class AppRunner:
                         self._tracking_bootstrap_start(_now_s())
                         boot_active = bool(self._tracking_bootstrap.get("active", False))
 
-                    try:
-                        out = tracking_step(
-                            self._tracking_state,
-                            obj_xy,
-                            now_t=_now_s(),
-                            tracking_enabled=bool(tracking_on and (not boot_active)),
-                        )
-                    except TypeError as exc:
-                        log_error(self.out_log, "Tracking: falling back to legacy tracking_step signature", exc, throttle_s=60.0, throttle_key="tracking_step_signature")
-                        out = tracking_step(self._tracking_state, img_det)
+                    out = tracking_step(
+                        self._tracking_state,
+                        obj_xy,
+                        now_t=_now_s(),
+                        tracking_enabled=bool(tracking_on and (not boot_active)),
+                    )
 
                     if boot_active:
                         self._tracking_bootstrap_collect(float(out.vx), float(out.vy), resp_ok=bool(out.ok))
@@ -1208,32 +1267,48 @@ class AppRunner:
                         try:
                             self._mount.rate(float(out.rate_az), float(out.rate_alt))
                         except Exception as exc:
-                            self._set_state_safe(mount_status="ERR", mount_connected=False, tracking_enabled=False, tracking_mode="IDLE")
+                            self._update_state(
+                                {
+                                    "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "tracking rate failed"},
+                                    "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE},
+                                }
+                            )
                             log_error(self.out_log, "Tracking: mount.rate failed", exc, throttle_s=2.0, throttle_key="tracking_mount_rate")
 
-                    self._set_state_safe(
-                        tracking_mode=str(out.mode),
-                        tracking_resp=float(out.resp),
-                        tracking_dx=float(out.dx),
-                        tracking_dy=float(out.dy),
-                        tracking_vx=float(out.vx),
-                        tracking_vy=float(out.vy),
-                        tracking_abs_resp=float(out.abs_resp),
-                        tracking_x_hat=float(out.x_hat),
-                        tracking_y_hat=float(out.y_hat),
-                        tracking_rate_az=float(out.rate_az),
-                        tracking_rate_alt=float(out.rate_alt),
-                        tracking_calib_src=str(out.calib_src),
-                        tracking_detA=float(out.detA),
+                    tracking_mode = self._tracking_mode_from_output(out.mode)
+                    self._update_state(
+                        {
+                            "tracking": {
+                                "enabled": bool(tracking_on),
+                                "status": TrackingStatus.RUNNING,
+                                "mode": tracking_mode,
+                                "resp": float(out.resp),
+                                "dx": float(out.dx),
+                                "dy": float(out.dy),
+                                "vx": float(out.vx),
+                                "vy": float(out.vy),
+                                "abs_resp": float(out.abs_resp),
+                                "rate_az": float(out.rate_az),
+                                "rate_alt": float(out.rate_alt),
+                                "calib_src": str(out.calib_src),
+                                "calib_det": float(out.detA),
+                            }
+                        }
                     )
             else:
                 if self._mount is not None:
                     self._mount_rate_safe(0.0, 0.0)
                 self._tracking_bootstrap_reset()
-                self._set_state_safe(
-                    tracking_mode="IDLE",
-                    tracking_rate_az=0.0,
-                    tracking_rate_alt=0.0,
+                self._update_state(
+                    {
+                        "tracking": {
+                            "enabled": False,
+                            "status": TrackingStatus.OFF,
+                            "mode": TrackingMode.IDLE,
+                            "rate_az": 0.0,
+                            "rate_alt": 0.0,
+                        }
+                    }
                 )
 
             # 2c) stacking
@@ -1245,23 +1320,25 @@ class AppRunner:
 
             # 2d) publish stacking metrics
             m = self._stacking.engine.metrics
-            self._set_state_safe(
-                stacking_enabled=bool(m.enabled),
-                stacking_mode="RUNNING" if m.enabled else "IDLE",
-                stacking_status="ON" if m.enabled else "OFF",
-                stacking_on=bool(m.enabled),
-                stacking_fps=float(getattr(m, "stacking_fps", 0.0)),
-                stacking_tiles_used=int(getattr(m, "tiles_used", 0)),
-                stacking_tiles_evicted=int(getattr(m, "tiles_evicted", 0)),
-                stacking_frames_in=int(getattr(m, "frames_in", 0)),
-                stacking_frames_used=int(getattr(m, "frames_used", 0)),
-                stacking_frames_dropped=int(getattr(m, "frames_dropped", 0)),
-                stacking_frames_rejected=int(getattr(m, "frames_rejected", 0)),
-                stacking_last_resp=float(getattr(m, "last_resp", 0.0)),
-                stacking_last_dx=float(getattr(m, "last_dx", 0.0)),
-                stacking_last_dy=float(getattr(m, "last_dy", 0.0)),
-                stacking_last_theta_deg=float(getattr(m, "last_theta_deg", 0.0)),
-                stacking_preview_jpeg=self._stacking.engine.get_preview_jpeg(),
+            self._update_state(
+                {
+                    "stacking": {
+                        "enabled": bool(m.enabled),
+                        "status": StackingStatus.RUNNING if m.enabled else StackingStatus.OFF,
+                        "fps": float(getattr(m, "stacking_fps", 0.0)),
+                        "tiles_used": int(getattr(m, "tiles_used", 0)),
+                        "tiles_evicted": int(getattr(m, "tiles_evicted", 0)),
+                        "frames_in": int(getattr(m, "frames_in", 0)),
+                        "frames_used": int(getattr(m, "frames_used", 0)),
+                        "frames_dropped": int(getattr(m, "frames_dropped", 0)),
+                        "frames_rejected": int(getattr(m, "frames_rejected", 0)),
+                        "last_resp": float(getattr(m, "last_resp", 0.0)),
+                        "last_dx": float(getattr(m, "last_dx", 0.0)),
+                        "last_dy": float(getattr(m, "last_dy", 0.0)),
+                        "last_theta_deg": float(getattr(m, "last_theta_deg", 0.0)),
+                        "preview_jpeg": self._stacking.engine.get_preview_jpeg(),
+                    }
+                }
             )
 
             # 2e) platesolving autosolve scheduling (if enabled)
@@ -1273,14 +1350,14 @@ class AppRunner:
             # 4) loop stats
             t1 = _perf()
             frame_ms = (t1 - t0) * 1000.0
-            self._set_state_safe(frame_ms=float(frame_ms))
+            self._update_state({"camera": {"frame_ms": float(frame_ms)}})
 
             self._n_loop += 1
             if (t1 - self._t_fps_loop0) >= 1.0:
                 fps_loop = self._n_loop / (t1 - self._t_fps_loop0)
                 self._t_fps_loop0 = t1
                 self._n_loop = 0
-                self._set_state_safe(fps_control_loop=float(fps_loop))
+                self._update_state({"camera": {"fps_control_loop": float(fps_loop)}})
 
             # 5) sleep
             now = _perf()
@@ -1304,7 +1381,7 @@ class AppRunner:
                 self._handle_action(act)
             except Exception as exc:
                 if act.type in (ActionType.CAMERA_CONNECT, ActionType.CAMERA_SET_PARAM):
-                    self._set_state_safe(camera_status="ERR", camera_connected=False)
+                    self._update_state({"camera": {"status": CameraStatus.ERROR, "connected": False, "last_error": "action failed"}})
 
                 if act.type in (
                     ActionType.MOUNT_CONNECT,
@@ -1333,8 +1410,12 @@ class AppRunner:
                         ActionType.MOUNT_SET_MICROSTEPS,
                         ActionType.MOUNT_MOVE_STEPS,
                     ):
-                        self._set_state_safe(mount_status="ERR", mount_connected=False)
-                        self._set_state_safe(tracking_enabled=False, tracking_mode="IDLE")
+                        self._update_state(
+                            {
+                                "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "action failed"},
+                                "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE},
+                            }
+                        )
 
                 log_error(self.out_log, f"Action failed: {act.type}", exc)
 
@@ -1409,14 +1490,14 @@ class AppRunner:
 
         # ---- Tracking ----
         if t == ActionType.TRACKING_START:
-            self._set_state_safe(tracking_enabled=True)
+            self._update_state({"tracking": {"enabled": True, "status": TrackingStatus.RUNNING, "mode": TrackingMode.IDLE}})
             self._mount_rate_safe(0.0, 0.0)
             self._tracking_keyframe_reset()
             log_info(self.out_log, "Tracking: START")
             return
 
         if t == ActionType.TRACKING_STOP:
-            self._set_state_safe(tracking_enabled=False)
+            self._update_state({"tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE}})
             self._mount_rate_safe(0.0, 0.0)
             log_info(self.out_log, "Tracking: STOP")
             return
@@ -1470,14 +1551,14 @@ class AppRunner:
         if t == ActionType.STACKING_START:
             self._stacking_enabled = True
             self._stacking.start()
-            self._set_state_safe(stacking_enabled=True, stacking_mode="RUNNING", stacking_status="ON", stacking_on=True)
+            self._update_state({"stacking": {"enabled": True, "status": StackingStatus.RUNNING}})
             log_info(self.out_log, "Stacking: START")
             return
 
         if t == ActionType.STACKING_STOP:
             self._stacking_enabled = False
             self._stacking.stop()
-            self._set_state_safe(stacking_enabled=False, stacking_mode="IDLE", stacking_status="OFF", stacking_on=False)
+            self._update_state({"stacking": {"enabled": False, "status": StackingStatus.OFF}})
             log_info(self.out_log, "Stacking: STOP")
             return
 
@@ -1582,14 +1663,30 @@ class AppRunner:
             sol = getattr(self, '_last_platesolving_result', None)
             if sol is None or not bool(getattr(sol, 'success', False)):
                 log_info(self.out_log, 'GoTo: sync failed (no successful platesolving cached)')
-                self._set_state_safe(goto_synced=False, goto_status='SYNC_ERR')
+                self._update_state(
+                    {
+                        "goto": {
+                            "synced": False,
+                            "status": GotoStatus.FAIL,
+                            "reason": "SYNC_NO_SOLUTION",
+                        }
+                    }
+                )
                 return
             ok = False
             try:
                 ok = bool(self._goto.sync_from_platesolving(sol))
             except Exception as exc:
                 log_error(self.out_log, 'GoTo: sync exception', exc)
-            self._set_state_safe(goto_synced=bool(ok), goto_status='SYNC_OK' if ok else 'SYNC_ERR')
+            self._update_state(
+                {
+                    "goto": {
+                        "synced": bool(ok),
+                        "status": GotoStatus.OK if ok else GotoStatus.FAIL,
+                        "reason": None if ok else "SYNC_FAILED",
+                    }
+                }
+            )
             log_info(self.out_log, f"GoTo: sync {'OK' if ok else 'ERR'}")
             return
 
@@ -1611,7 +1708,7 @@ class AppRunner:
         if t == ActionType.GOTO_CANCEL:
             self._goto_worker.cancel()
             self._mount_stop()
-            self._set_state_safe(goto_busy=False, goto_status='CANCELLED')
+            self._update_state({"goto": {"busy": False, "status": GotoStatus.CANCELLED, "reason": "CANCELLED"}})
             return
 
         # ---- Otros ----        # ---- Otros ----

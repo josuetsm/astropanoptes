@@ -9,7 +9,8 @@ from typing import Optional, List, Callable, Any, Dict
 import serial
 import serial.tools.list_ports
 
-from ap_types import Axis
+from ap_types import Axis, MountStatus, TrackingMode, TrackingStatus
+from protocols import StatePublisherProtocol
 from logging_utils import log_error, log_info
 from workers import BaseWorker
 
@@ -394,18 +395,11 @@ class ArduinoMount:
       - stop()
       - set_microsteps(az_div, alt_div)     -> MS ...
       - move_steps(axis, direction, steps, delay_us) -> MOVE ...
-      - nudge(axis, direction, rate, duration_ms)    (legacy: RATE + sleep + STOP)
-      - start_continuous(axis, direction, rate)      (legacy: RATE continuo)
     """
 
     def __init__(self, cfg: Optional[ArduinoConfig] = None) -> None:
         self.cfg = cfg or ArduinoConfig()
         self.ctrl = ArduinoController(self.cfg)
-
-        # nudge thread control
-        self._nudge_lock = threading.Lock()
-        self._nudge_cancel = threading.Event()
-        self._nudge_thr: Optional[threading.Thread] = None
 
     def connect(self, port: str, baud: int = 115200) -> str:
         self.cfg.port = str(port)
@@ -425,14 +419,7 @@ class ArduinoMount:
         return self.ctrl.is_connected
 
     def stop(self) -> str:
-        # Cancela cualquier nudge en curso y manda STOP inmediato.
-        with self._nudge_lock:
-            self._nudge_cancel.set()
-        try:
-            return self.ctrl.stop()
-        finally:
-            with self._nudge_lock:
-                self._nudge_cancel.clear()
+        return self.ctrl.stop()
 
     def set_microsteps(self, az_div: int, alt_div: int) -> str:
         return self.ctrl.set_microsteps(int(az_div), int(alt_div))
@@ -463,75 +450,8 @@ class ArduinoMount:
 
         return self.ctrl.move(ax, dr, int(steps), int(delay_us))
 
-    def start_continuous(self, axis: Axis, direction: int, rate: float) -> None:
-        """
-        Movimiento continuo implementado con RATE (no MOVE), hasta STOP.
-
-        direction: -1 o +1
-        rate: magnitud (microsteps/s)
-        """
-        if direction not in (-1, 1):
-            raise ValueError("direction debe ser -1 o +1")
-
-        v = float(rate) * float(direction)
-        if axis == Axis.AZ:
-            self.ctrl.rate(v, 0.0)
-        else:
-            self.ctrl.rate(0.0, v)
-
     def rate(self, v_az: float, v_alt: float) -> str:
         return self.ctrl.rate(float(v_az), float(v_alt))
-
-    def nudge(self, axis: Axis, direction: int, rate: float, duration_ms: int) -> None:
-        """
-        Nudge no-bloqueante (legacy):
-          - envía RATE al eje
-          - duerme duration
-          - STOP
-
-        Se ejecuta en un thread corto para no bloquear el runner/UI.
-        """
-        if direction not in (-1, 1):
-            raise ValueError("direction debe ser -1 o +1")
-
-        dur_s = max(0.0, float(duration_ms) / 1000.0)
-        v = float(rate) * float(direction)
-
-        def _job():
-            try:
-                # arrancar movimiento
-                if axis == Axis.AZ:
-                    self.ctrl.rate(v, 0.0)
-                else:
-                    self.ctrl.rate(0.0, v)
-
-                t0 = time.perf_counter()
-                while (time.perf_counter() - t0) < dur_s:
-                    if self._nudge_cancel.is_set():
-                        break
-                    time.sleep(0.005)
-
-            finally:
-                # siempre detener
-                try:
-                    self.ctrl.stop()
-                except Exception as exc:
-                    log_error(None, "Mount: failed to stop after nudge", exc, throttle_s=5.0, throttle_key="mount_stop_after_nudge")
-
-        with self._nudge_lock:
-            # cancelar nudge anterior si existía
-            self._nudge_cancel.set()
-            thr = self._nudge_thr
-            if thr is not None and thr.is_alive():
-                # dejamos que el thread anterior observe el cancel y termine
-                pass
-            self._nudge_cancel.clear()
-
-            self._nudge_thr = threading.Thread(target=_job, name="ArduinoNudge", daemon=True)
-            self._nudge_thr.start()
-
-    def status(self) -> str:
-        return self.ctrl.status()
 
 
 class MountMoveWorker(BaseWorker):
@@ -541,7 +461,7 @@ class MountMoveWorker(BaseWorker):
     Dependencies injected:
       - get_mount(): returns ArduinoMount or None
       - note_manual_move(axis, direction, steps)
-      - publish_state(**kwargs)
+      - publish_state(patch)
     """
 
     def __init__(
@@ -549,7 +469,7 @@ class MountMoveWorker(BaseWorker):
         *,
         get_mount: Callable[[], Optional["ArduinoMount"]],
         note_manual_move: Callable[[Axis, int, int], None],
-        publish_state: Callable[..., None],
+        publish_state: StatePublisherProtocol,
         out_log: Any = None,
     ) -> None:
         super().__init__(name="MountMoveWorker")
@@ -586,9 +506,9 @@ class MountMoveWorker(BaseWorker):
             self._note_manual_move(axis, direction, steps)
         except (RuntimeError, ValueError, OSError, serial.SerialException) as exc:
             self._publish_state(
-                mount_status="ERR",
-                mount_connected=False,
-                tracking_enabled=False,
-                tracking_mode="IDLE",
+                {
+                    "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "manual move failed"},
+                    "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE},
+                }
             )
             log_error(self._out_log, "Mount: MOVE steps failed", exc)
