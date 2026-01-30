@@ -39,7 +39,6 @@ from tracking import (
 )
 from stacking import StackingWorker
 
-from hotpixels import HotpixelCalibrationWorker, load_hotpixel_mask
 from sep_utils import sep_detect_from_raw16, estimate_shift_from_objects
 
 from platesolving import (
@@ -98,7 +97,6 @@ class AppRunner:
         self.cfg.tracking = replace(cfg.tracking)
         self.cfg.stacking = replace(cfg.stacking)
         self.cfg.goto = replace(cfg.goto)
-        self.cfg.hotpixels = replace(cfg.hotpixels)
         self.cfg.platesolving = replace(cfg.platesolving)
         self.out_log = out_log
 
@@ -122,19 +120,6 @@ class AppRunner:
         self._platesolving_cfg_lock = threading.Lock()
         self._platesolving_last_auto_t = 0.0
         self._platesolving_auto_target: str = ""
-
-        # Hotpixel calibration worker
-        self._hotpix_lock = threading.Lock()
-        self._hotpix_mask: Optional[np.ndarray] = None
-        self._hotpix_meta: Optional[Dict[str, Any]] = None
-        self._load_hotpix_mask_if_available(self.cfg.hotpixels.mask_path_base)
-        self._hotpix_worker = HotpixelCalibrationWorker(
-            get_frame=self._get_latest_frame,
-            get_camera_cfg=self._get_camera_cfg_snapshot,
-            get_fps_capture=self._get_fps_capture,
-            publish_mask=self._set_hotpix_mask,
-            out_log=self.out_log,
-        )
 
         # Config platesolving (runtime copy, actualizable desde UI por action)
         self._platesolving_observer = ObserverConfig()  # Santiago por default en tu platesolving.py
@@ -334,11 +319,6 @@ class AppRunner:
         st = self._cam_stream.stats()
         return float(st.get("fps_capture", 0.0))
 
-    def _set_hotpix_mask(self, mask: np.ndarray, meta: Dict[str, Any]) -> None:
-        with self._hotpix_lock:
-            self._hotpix_mask = mask
-            self._hotpix_meta = meta
-
     def _get_live_frame_for_platesolving(self) -> Optional[np.ndarray]:
         if self._cam_stream is None:
             return None
@@ -372,10 +352,6 @@ class AppRunner:
 
         # detener platesolving worker si existe
         self._platesolving_worker.stop()
-
-        # detener hotpixel calibration worker
-        self._hotpix_worker.stop()
-        self._hotpix_worker.join(timeout=2.0)
 
         # detener GoTo worker
         self._goto_worker.stop()
@@ -902,10 +878,6 @@ class AppRunner:
         self.cfg.stacking = replace(self.default_cfg.stacking)
         self._stacking.engine.configure_from_cfg()
 
-    def _reset_hotpixels_defaults(self) -> None:
-        self.cfg.hotpixels = replace(self.default_cfg.hotpixels)
-        self._load_hotpix_mask_if_available(self.cfg.hotpixels.mask_path_base)
-
     def _reset_platesolving_defaults(self) -> None:
         with self._platesolving_cfg_lock:
             self.cfg.platesolving = replace(self.default_cfg.platesolving)
@@ -916,28 +888,6 @@ class AppRunner:
             "sep_minarea": int(self.cfg.sep.minarea),
             "max_det": int(self.cfg.platesolving.max_det),
         }
-
-    def _load_hotpix_mask_if_available(self, path_base: str) -> None:
-        try:
-            mask, meta = load_hotpixel_mask(path_base)
-        except FileNotFoundError:
-            self._hotpix_mask = None
-            self._hotpix_meta = None
-            return
-        except Exception as exc:
-            log_error(self.out_log, "Hotpix: failed to load mask", exc, throttle_s=5.0, throttle_key="hotpix_load")
-            self._hotpix_mask = None
-            self._hotpix_meta = None
-            return
-
-        if mask.ndim != 2:
-            log_info(self.out_log, f"Hotpix: invalid mask shape {mask.shape}")
-            self._hotpix_mask = None
-            self._hotpix_meta = None
-            return
-
-        self._hotpix_mask = mask
-        self._hotpix_meta = meta
 
     def _maybe_update_preview(self) -> None:
         if self._cam_stream is None:
@@ -1358,8 +1308,6 @@ class AppRunner:
 
                 if act.type in (
                     ActionType.MOUNT_CONNECT,
-                    ActionType.MOUNT_NUDGE,
-                    ActionType.MOUNT_START_CONTINUOUS,
                     ActionType.MOUNT_STOP,
                     ActionType.MOUNT_SET_MICROSTEPS,
                     ActionType.MOUNT_MOVE_STEPS,
@@ -1381,8 +1329,6 @@ class AppRunner:
                 ):
                     if act.type in (
                         ActionType.MOUNT_CONNECT,
-                        ActionType.MOUNT_NUDGE,
-                        ActionType.MOUNT_START_CONTINUOUS,
                         ActionType.MOUNT_STOP,
                         ActionType.MOUNT_SET_MICROSTEPS,
                         ActionType.MOUNT_MOVE_STEPS,
@@ -1565,32 +1511,6 @@ class AppRunner:
                 basename = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
                 fmt = "png"
                 self._save_stacking(out_dir, basename, fmt)
-            return
-
-        if t == ActionType.HOTPIX_CALIBRATE:
-            if self._cam_stream is None:
-                log_info(self.out_log, "Hotpix: calibration skipped (camera stream inactive)")
-                return
-            if self._get_tracking_enabled():
-                self._set_state_safe(tracking_enabled=False, tracking_mode="IDLE")
-                self._mount_rate_safe(0.0, 0.0)
-            n_frames = int(p.get("n_frames", self.cfg.hotpixels.calib_frames))
-            abs_percentile = float(p.get("abs_percentile", self.cfg.hotpixels.calib_abs_percentile))
-            var_percentile = float(p.get("var_percentile", self.cfg.hotpixels.calib_var_percentile))
-            max_component_area = int(p.get("max_component_area", self.cfg.hotpixels.max_component_area))
-            out_path_base = str(p.get("out_path_base", self.cfg.hotpixels.mask_path_base))
-            self._hotpix_worker.request(
-                n_frames=n_frames,
-                abs_percentile=abs_percentile,
-                var_percentile=var_percentile,
-                max_component_area=max_component_area,
-                out_path_base=out_path_base,
-            )
-            return
-
-        if t == ActionType.RESET_HOTPIXELS_DEFAULTS:
-            self._reset_hotpixels_defaults()
-            log_info(self.out_log, "Hotpix: RESET_DEFAULTS")
             return
 
         # ---- Platesolving ----

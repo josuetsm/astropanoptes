@@ -6,8 +6,6 @@ from typing import Tuple
 import numpy as np
 import cv2
 
-from hotpixels import apply_hotpixel_mask_replace
-
 
 _BAYER_CV2 = {
     "RGGB": cv2.COLOR_BayerRG2RGB,
@@ -45,39 +43,9 @@ def debayer_cv2(raw: np.ndarray, pattern: str = "RGGB", edge_aware: bool = False
     return cv2.cvtColor(raw, code)
 
 
-def bayer_green_u8_from_u16(u16: np.ndarray, bayer_pattern: str) -> np.ndarray:
-    """
-    Extrae una aproximación rápida del canal verde desde Bayer RAW16, sin debayer completo.
-
-    Retorna una imagen u8 submuestreada 2x, usando el promedio de los dos píxeles verdes
-    del mosaico 2x2 (cuando aplica).
-
-    bayer_pattern: "RGGB" | "BGGR" | "GRBG" | "GBRG"
-    """
-    if u16.dtype != np.uint16:
-        raise ValueError("bayer_green_u8_from_u16 espera uint16")
-
-    p = bayer_pattern.upper().strip()
-
-    # Coordenadas de verdes en una celda 2x2:
-    # RGGB: R G / G B  -> verdes en (0,1) y (1,0)
-    # BGGR: B G / G R  -> verdes en (0,1) y (1,0)
-    # GRBG: G R / B G  -> verdes en (0,0) y (1,1)
-    # GBRG: G B / R G  -> verdes en (0,0) y (1,1)
-    if p in ("RGGB", "BGGR"):
-        g1 = u16[0::2, 1::2]
-        g2 = u16[1::2, 0::2]
-    elif p in ("GRBG", "GBRG"):
-        g1 = u16[0::2, 0::2]
-        g2 = u16[1::2, 1::2]
-    else:
-        # fallback conservador
-        g1 = u16[0::2, 1::2]
-        g2 = u16[1::2, 0::2]
-
-    # promedio en 16-bit (evita overflow usando uint32)
-    g = ((g1.astype(np.uint32) + g2.astype(np.uint32)) // 2).astype(np.uint16)
-    return (g >> 8).astype(np.uint8, copy=False)
+def median_prefilter_raw16(img: np.ndarray, ksize: int = 3) -> np.ndarray:
+    base = cv2.medianBlur(img, ksize)
+    return base.astype(np.float32)
 
 
 def half_to_full_shift(dx_half: float, dy_half: float) -> Tuple[float, float]:
@@ -119,9 +87,8 @@ def warp_rgb16(rgb16: np.ndarray, M: np.ndarray, dsize: Tuple[int, int] | None =
 
 __all__ = [
     "ensure_raw16_bayer",
-    "apply_hotpixel_mask_replace",
-    "bayer_green_u8_from_u16",
     "debayer_cv2",
+    "median_prefilter_raw16",
     "warp_rgb16",
     "half_to_full_shift",
     "half_affine_to_full",
