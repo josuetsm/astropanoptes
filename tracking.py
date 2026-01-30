@@ -25,11 +25,6 @@ class TrackingPreprocConfig:
 
 
 @dataclass
-class HotPixelsConfig:
-    base_ksize: int = 3
-
-
-@dataclass
 class KeyframeConfig:
     abs_corr_every_s: float = 2.5
     abs_resp_min: float = 0.08
@@ -100,7 +95,6 @@ class AutoBoostConfig:
 @dataclass
 class TrackingConfig:
     preproc: TrackingPreprocConfig = field(default_factory=TrackingPreprocConfig)
-    hotpixels: HotPixelsConfig = field(default_factory=HotPixelsConfig)
     keyframe: KeyframeConfig = field(default_factory=KeyframeConfig)
     pi: PIConfig = field(default_factory=PIConfig)
     rate: RateLimiterConfig = field(default_factory=RateLimiterConfig)

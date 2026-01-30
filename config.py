@@ -104,21 +104,6 @@ class StackingConfig:
 
 
 @dataclass
-class HotPixelsConfig:
-    enabled: bool = False
-    base_ksize: int = 3
-    mask_enabled_for_stacking: bool = False
-    mask_path_base: str = "./hotpixel_mask"
-    mask_ksize: int = 3
-    thr_k: float = 8.0
-    min_hits_frac: float = 0.7
-    max_component_area: int = 4
-    calib_frames: int = 30
-    calib_abs_percentile: float = 99.9
-    calib_var_percentile: float = 10.0
-
-
-@dataclass
 class SepConfig:
     minarea: int = 5
     bw: int = 64
@@ -215,7 +200,6 @@ class AppConfig:
     mount: MountConfig = field(default_factory=MountConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     stacking: StackingConfig = field(default_factory=StackingConfig)
-    hotpixels: HotPixelsConfig = field(default_factory=HotPixelsConfig)
     sep: SepConfig = field(default_factory=SepConfig)
     platesolving: PlatesolvingConfig = field(default_factory=PlatesolvingConfig)
     goto: GoToConfig = field(default_factory=GoToConfig)
