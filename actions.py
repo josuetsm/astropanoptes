@@ -49,10 +49,10 @@ class ActionType(str, Enum):
     RESET_STACKING_DEFAULTS = "RESET_STACKING_DEFAULTS"
     RESET_HOTPIXELS_DEFAULTS = "RESET_HOTPIXELS_DEFAULTS"
 
-    # platesolve (OBLIGATORIO)
-    PLATESOLVE_RUN = "PLATESOLVE_RUN"
-    PLATESOLVE_SET_PARAMS = "PLATESOLVE_SET_PARAMS"
-    RESET_PLATESOLVE_DEFAULTS = "RESET_PLATESOLVE_DEFAULTS"
+    # platesolving (OBLIGATORIO)
+    PLATESOLVING_RUN = "PLATESOLVING_RUN"
+    PLATESOLVING_SET_PARAMS = "PLATESOLVING_SET_PARAMS"
+    RESET_PLATESOLVING_DEFAULTS = "RESET_PLATESOLVING_DEFAULTS"
     MOUNT_SYNC = "MOUNT_SYNC"
     MOUNT_GOTO = "MOUNT_GOTO"
 
@@ -246,19 +246,19 @@ def hotpixels_reset_defaults() -> Action:
     return Action(ActionType.RESET_HOTPIXELS_DEFAULTS, {}, _now())
 
 # -------------------------
-# Factories: PlateSolve
+# Factories: Platesolving
 # -------------------------
-def platesolve_run(target: Any, **kwargs: Any) -> Action:
+def platesolving_run(target: Any, **kwargs: Any) -> Action:
     payload = {"target": target}
     payload.update(dict(kwargs))
-    return Action(ActionType.PLATESOLVE_RUN, payload, _now())
+    return Action(ActionType.PLATESOLVING_RUN, payload, _now())
 
-def platesolve_set_params(**kwargs: Any) -> Action:
-    return Action(ActionType.PLATESOLVE_SET_PARAMS, dict(kwargs), _now())
+def platesolving_set_params(**kwargs: Any) -> Action:
+    return Action(ActionType.PLATESOLVING_SET_PARAMS, dict(kwargs), _now())
 
 
-def platesolve_reset_defaults() -> Action:
-    return Action(ActionType.RESET_PLATESOLVE_DEFAULTS, {}, _now())
+def platesolving_reset_defaults() -> Action:
+    return Action(ActionType.RESET_PLATESOLVING_DEFAULTS, {}, _now())
 
 
 # -------------------------

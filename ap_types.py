@@ -104,22 +104,22 @@ class SystemState:
     stacking_last_theta_deg: float = 0.0
     stacking_preview_jpeg: Optional[bytes] = None
 
-    # platesolve metrics (optional)
-    platesolve_status: str = "IDLE"
-    platesolve_busy: bool = False
-    platesolve_last_ok: bool = False
-    platesolve_theta_deg: float = 0.0
-    platesolve_dx_px: float = 0.0
-    platesolve_dy_px: float = 0.0
-    platesolve_resp: float = 0.0
-    platesolve_n_inliers: int = 0
-    platesolve_rms_px: float = 0.0
-    platesolve_overlay: Any = None
-    platesolve_guides: Any = None
-    platesolve_debug_jpeg: Optional[bytes] = None
-    platesolve_debug_info: Optional[Dict[str, Any]] = None
-    platesolve_center_ra_deg: float = 0.0
-    platesolve_center_dec_deg: float = 0.0
+    # platesolving metrics (optional)
+    platesolving_status: str = "IDLE"
+    platesolving_busy: bool = False
+    platesolving_last_ok: bool = False
+    platesolving_theta_deg: float = 0.0
+    platesolving_dx_px: float = 0.0
+    platesolving_dy_px: float = 0.0
+    platesolving_resp: float = 0.0
+    platesolving_n_inliers: int = 0
+    platesolving_rms_px: float = 0.0
+    platesolving_overlay: Any = None
+    platesolving_guides: Any = None
+    platesolving_debug_jpeg: Optional[bytes] = None
+    platesolving_debug_info: Optional[Dict[str, Any]] = None
+    platesolving_center_ra_deg: float = 0.0
+    platesolving_center_dec_deg: float = 0.0
 
     # goto metrics (optional)
     goto_busy: bool = False
