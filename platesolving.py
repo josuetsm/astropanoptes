@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-import threading
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
@@ -19,6 +18,7 @@ from sklearn.neighbors import KDTree
 from itertools import combinations, permutations
 
 from logging_utils import log_error, log_info
+from workers import BaseWorker
 from imaging import ensure_raw16_bayer
 from sep_utils import sep_detect_from_raw16
 from config import PlatesolvingConfig, SepConfig
@@ -1168,7 +1168,7 @@ def _build_platesolving_debug_info(result: Any) -> Dict[str, Any]:
     return info
 
 
-class PlatesolvingWorker:
+class PlatesolvingWorker(BaseWorker):
     """
     Worker de plate solving desacoplado del AppRunner.
 
@@ -1190,6 +1190,7 @@ class PlatesolvingWorker:
         publish_state: Callable[..., None],
         out_log: Any = None,
     ) -> None:
+        super().__init__(name="PlatesolvingWorker")
         self._get_frame = get_frame
         self._get_cfg = get_cfg
         self._get_sep_cfg = get_sep_cfg
@@ -1197,34 +1198,12 @@ class PlatesolvingWorker:
         self._publish_state = publish_state
         self._out_log = out_log
 
-        self._lock = threading.Lock()
-        self._pending: Optional[Dict[str, Any]] = None
-        self._cancel = threading.Event()
-        self._thread: Optional[threading.Thread] = None
-
     def request(self, *, target: Any) -> None:
-        with self._lock:
-            self._pending = {"target": target}
-        self._start_if_needed()
+        super().request(target=target)
 
     def stop(self) -> None:
-        self._cancel.set()
-        with self._lock:
-            thr = self._thread
-        if thr is not None and thr.is_alive():
-            thr.join(timeout=1.0)
-
-    def _start_if_needed(self) -> None:
-        with self._lock:
-            if self._thread is not None and self._thread.is_alive():
-                return
-            self._cancel.clear()
-            self._thread = threading.Thread(
-                target=self._run,
-                name="PlatesolvingWorker",
-                daemon=True,
-            )
-            self._thread.start()
+        super().stop()
+        self.join(timeout=1.0)
 
     def _log_input_stats(self, arr: np.ndarray, name: str, enabled: bool) -> None:
         if not enabled:
@@ -1246,110 +1225,101 @@ class PlatesolvingWorker:
         if a.dtype == np.uint8:
             log_info(self._out_log, f"  sat255={np.mean(flat == 255):.4f}")
 
-    def _run(self) -> None:
-        while not self._cancel.is_set():
-            with self._lock:
-                req = self._pending
-                self._pending = None
+    def _handle_request(self, request: Dict[str, Any]) -> None:
+        self._publish_state(
+            platesolving_busy=True,
+            platesolving_status="RUNNING",
+            platesolving_debug_jpeg=None,
+            platesolving_debug_info=None,
+        )
 
-            if req is None:
-                time.sleep(0.05)
-                continue
-
-            self._publish_state(
-                platesolving_busy=True,
-                platesolving_status="RUNNING",
-                platesolving_debug_jpeg=None,
-                platesolving_debug_info=None,
-            )
-
-            target = req.get("target", None)
-            if target is None:
-                self._publish_state(
-                    platesolving_busy=False,
-                    platesolving_status="ERR_NO_TARGET",
-                    platesolving_last_ok=False,
-                    platesolving_debug_jpeg=None,
-                    platesolving_debug_info={"status": "ERR_NO_TARGET"},
-                )
-                log_info(self._out_log, "Platesolving: ERR_NO_TARGET")
-                continue
-
-            frame = self._get_frame()
-            if frame is None:
-                self._publish_state(
-                    platesolving_busy=False,
-                    platesolving_status="ERR_NO_FRAME",
-                    platesolving_last_ok=False,
-                    platesolving_debug_jpeg=None,
-                    platesolving_debug_info={"status": "ERR_NO_FRAME"},
-                )
-                log_info(self._out_log, "Platesolving: ERR_NO_FRAME")
-                continue
-
-            raw16 = ensure_raw16_bayer(frame)
-            cfg = self._get_cfg()
-            sep_cfg = self._get_sep_cfg()
-            observer = self._get_observer()
-            debug_stats = bool(getattr(cfg, "debug_input_stats", False))
-
-            self._log_input_stats(raw16, "frame(raw16)", debug_stats)
-
-            try:
-                result = solve_plate(
-                    raw16,
-                    target=target,
-                    cfg=cfg,
-                    sep_cfg=sep_cfg,
-                    observer=observer,
-                    progress_cb=None,
-                )
-            except (RuntimeError, ValueError, TypeError) as exc:
-                self._publish_state(
-                    platesolving_busy=False,
-                    platesolving_status="ERR_EXCEPTION",
-                    platesolving_last_ok=False,
-                )
-                log_error(self._out_log, "Platesolving: failed", exc)
-                continue
-
-            debug_jpeg = _render_platesolving_debug_jpeg(
-                raw16,
-                list(getattr(result, "overlay", []) or []),
-            )
-            debug_info = _build_platesolving_debug_info(result)
-
+        target = request.get("target", None)
+        if target is None:
             self._publish_state(
                 platesolving_busy=False,
-                platesolving_status=getattr(result, "status", "UNKNOWN"),
-                platesolving_last_ok=bool(getattr(result, "success", False)),
-                platesolving_theta_deg=float(getattr(result, "theta_deg", 0.0)),
-                platesolving_dx_px=float(getattr(result, "dx_px", 0.0)),
-                platesolving_dy_px=float(getattr(result, "dy_px", 0.0)),
-                platesolving_resp=float(getattr(result, "response", 0.0)),
-                platesolving_n_inliers=int(getattr(result, "n_inliers", 0)),
-                platesolving_rms_px=float(getattr(result, "rms_px", 0.0)),
-                platesolving_overlay=list(getattr(result, "overlay", []) or []),
-                platesolving_guides=list(getattr(result, "guides", []) or []),
-                platesolving_debug_jpeg=debug_jpeg,
-                platesolving_debug_info=debug_info,
-                platesolving_center_ra_deg=float(getattr(result, "center_ra_deg", 0.0)),
-                platesolving_center_dec_deg=float(getattr(result, "center_dec_deg", 0.0)),
-                platesolving_result=result,
+                platesolving_status="ERR_NO_TARGET",
+                platesolving_last_ok=False,
+                platesolving_debug_jpeg=None,
+                platesolving_debug_info={"status": "ERR_NO_TARGET"},
             )
+            log_info(self._out_log, "Platesolving: ERR_NO_TARGET")
+            return
 
-            status = str(getattr(result, "status", "UNKNOWN"))
-            success = bool(getattr(result, "success", False))
-            resp = float(getattr(result, "response", 0.0))
-            n_inliers = int(getattr(result, "n_inliers", 0))
-            rms_px = float(getattr(result, "rms_px", 0.0))
-            if success:
-                log_info(
-                    self._out_log,
-                    f"Platesolving: OK status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
-                )
-            else:
-                log_info(
-                    self._out_log,
-                    f"Platesolving: ERR status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
-                )
+        frame = self._get_frame()
+        if frame is None:
+            self._publish_state(
+                platesolving_busy=False,
+                platesolving_status="ERR_NO_FRAME",
+                platesolving_last_ok=False,
+                platesolving_debug_jpeg=None,
+                platesolving_debug_info={"status": "ERR_NO_FRAME"},
+            )
+            log_info(self._out_log, "Platesolving: ERR_NO_FRAME")
+            return
+
+        raw16 = ensure_raw16_bayer(frame)
+        cfg = self._get_cfg()
+        sep_cfg = self._get_sep_cfg()
+        observer = self._get_observer()
+        debug_stats = bool(getattr(cfg, "debug_input_stats", False))
+
+        self._log_input_stats(raw16, "frame(raw16)", debug_stats)
+
+        try:
+            result = solve_plate(
+                raw16,
+                target=target,
+                cfg=cfg,
+                sep_cfg=sep_cfg,
+                observer=observer,
+                progress_cb=None,
+            )
+        except (RuntimeError, ValueError, TypeError) as exc:
+            self._publish_state(
+                platesolving_busy=False,
+                platesolving_status="ERR_EXCEPTION",
+                platesolving_last_ok=False,
+            )
+            log_error(self._out_log, "Platesolving: failed", exc)
+            return
+
+        debug_jpeg = _render_platesolving_debug_jpeg(
+            raw16,
+            list(getattr(result, "overlay", []) or []),
+        )
+        debug_info = _build_platesolving_debug_info(result)
+
+        self._publish_state(
+            platesolving_busy=False,
+            platesolving_status=getattr(result, "status", "UNKNOWN"),
+            platesolving_last_ok=bool(getattr(result, "success", False)),
+            platesolving_theta_deg=float(getattr(result, "theta_deg", 0.0)),
+            platesolving_dx_px=float(getattr(result, "dx_px", 0.0)),
+            platesolving_dy_px=float(getattr(result, "dy_px", 0.0)),
+            platesolving_resp=float(getattr(result, "response", 0.0)),
+            platesolving_n_inliers=int(getattr(result, "n_inliers", 0)),
+            platesolving_rms_px=float(getattr(result, "rms_px", 0.0)),
+            platesolving_overlay=list(getattr(result, "overlay", []) or []),
+            platesolving_guides=list(getattr(result, "guides", []) or []),
+            platesolving_debug_jpeg=debug_jpeg,
+            platesolving_debug_info=debug_info,
+            platesolving_center_ra_deg=float(getattr(result, "center_ra_deg", 0.0)),
+            platesolving_center_dec_deg=float(getattr(result, "center_dec_deg", 0.0)),
+            platesolving_result=result,
+        )
+
+        status = str(getattr(result, "status", "UNKNOWN"))
+        success = bool(getattr(result, "success", False))
+        resp = float(getattr(result, "response", 0.0))
+        n_inliers = int(getattr(result, "n_inliers", 0))
+        rms_px = float(getattr(result, "rms_px", 0.0))
+        if success:
+            log_info(
+                self._out_log,
+                f"Platesolving: OK status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+            )
+        else:
+            log_info(
+                self._out_log,
+                f"Platesolving: ERR status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+            )

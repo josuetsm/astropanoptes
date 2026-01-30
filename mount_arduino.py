@@ -4,13 +4,14 @@ from __future__ import annotations
 import threading
 import time
 from dataclasses import dataclass
-from typing import Optional, List
+from typing import Optional, List, Callable, Any, Dict
 
 import serial
 import serial.tools.list_ports
 
 from ap_types import Axis
 from logging_utils import log_error, log_info
+from workers import BaseWorker
 
 
 # =========================
@@ -531,3 +532,63 @@ class ArduinoMount:
 
     def status(self) -> str:
         return self.ctrl.status()
+
+
+class MountMoveWorker(BaseWorker):
+    """
+    Background worker for manual mount moves.
+
+    Dependencies injected:
+      - get_mount(): returns ArduinoMount or None
+      - note_manual_move(axis, direction, steps)
+      - publish_state(**kwargs)
+    """
+
+    def __init__(
+        self,
+        *,
+        get_mount: Callable[[], Optional["ArduinoMount"]],
+        note_manual_move: Callable[[Axis, int, int], None],
+        publish_state: Callable[..., None],
+        out_log: Any = None,
+    ) -> None:
+        super().__init__(name="MountMoveWorker")
+        self._get_mount = get_mount
+        self._note_manual_move = note_manual_move
+        self._publish_state = publish_state
+        self._out_log = out_log
+
+    def request(self, *, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
+        super().request(
+            axis=axis,
+            direction=int(direction),
+            steps=int(steps),
+            delay_us=int(delay_us),
+        )
+
+    def _handle_request(self, request: Dict[str, Any]) -> None:
+        mount = self._get_mount()
+        if mount is None or not mount.is_connected():
+            return
+        axis = request["axis"]
+        direction = int(request["direction"])
+        steps = int(request["steps"])
+        delay_us = int(request["delay_us"])
+
+        try:
+            mount.stop()
+            mount.move_steps(
+                axis=axis,
+                direction=direction,
+                steps=steps,
+                delay_us=delay_us,
+            )
+            self._note_manual_move(axis, direction, steps)
+        except (RuntimeError, ValueError, OSError, serial.SerialException) as exc:
+            self._publish_state(
+                mount_status="ERR",
+                mount_connected=False,
+                tracking_enabled=False,
+                tracking_mode="IDLE",
+            )
+            log_error(self._out_log, "Mount: MOVE steps failed", exc)
