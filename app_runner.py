@@ -31,7 +31,33 @@ from ap_types import (
     TrackingStatus,
 )
 from config import AppConfig, PlatesolvingConfig, SepConfig
-from actions import Action, ActionType
+from actions import (
+    Action,
+    ActionType,
+    camera_connect,
+    camera_disconnect,
+    camera_set_param,
+    goto_autocalibrate,
+    goto_calibrate,
+    goto_cancel,
+    live_sep_set_params,
+    mount_connect,
+    mount_disconnect,
+    mount_goto,
+    mount_move_steps,
+    mount_set_microsteps,
+    mount_stop,
+    mount_sync,
+    platesolving_run,
+    platesolving_set_params,
+    stacking_reset,
+    stacking_save,
+    stacking_start,
+    stacking_stop,
+    tracking_set_params,
+    tracking_start,
+    tracking_stop,
+)
 from logging_utils import log_info, log_error
 
 from camera_poa import POACameraDevice, CameraStream
@@ -409,6 +435,75 @@ class AppRunner:
     def get_latest_preview_jpeg(self) -> Optional[bytes]:
         with self._preview_lock:
             return self._latest_preview_jpeg
+
+    def request_camera_connect(self, camera_index: int) -> None:
+        self.enqueue(camera_connect(camera_index))
+
+    def request_camera_disconnect(self) -> None:
+        self.enqueue(camera_disconnect())
+
+    def request_camera_param(self, name: str, value: Any) -> None:
+        self.enqueue(camera_set_param(name, value))
+
+    def request_mount_connect(self, port: str, baudrate: int) -> None:
+        self.enqueue(mount_connect(port, baudrate))
+
+    def request_mount_disconnect(self) -> None:
+        self.enqueue(mount_disconnect())
+
+    def request_mount_set_microsteps(self, az_div: int, alt_div: int) -> None:
+        self.enqueue(mount_set_microsteps(az_div=az_div, alt_div=alt_div))
+
+    def request_mount_move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
+        self.enqueue(mount_move_steps(axis=axis, direction=direction, steps=steps, delay_us=delay_us))
+
+    def request_mount_stop(self) -> None:
+        self.enqueue(mount_stop())
+
+    def request_mount_sync(self) -> None:
+        self.enqueue(mount_sync())
+
+    def request_mount_goto(self, target: Any, **kwargs: Any) -> None:
+        self.enqueue(mount_goto(target, **kwargs))
+
+    def request_goto_calibrate(self, params: Dict[str, Any]) -> None:
+        self.enqueue(goto_calibrate(params))
+
+    def request_goto_autocalibrate(self) -> None:
+        self.enqueue(goto_autocalibrate())
+
+    def request_goto_cancel(self) -> None:
+        self.enqueue(goto_cancel())
+
+    def request_tracking_start(self) -> None:
+        self.enqueue(tracking_start())
+
+    def request_tracking_stop(self) -> None:
+        self.enqueue(tracking_stop())
+
+    def request_tracking_params(self, **kwargs: Any) -> None:
+        self.enqueue(tracking_set_params(**kwargs))
+
+    def request_stacking_start(self) -> None:
+        self.enqueue(stacking_start())
+
+    def request_stacking_stop(self) -> None:
+        self.enqueue(stacking_stop())
+
+    def request_stacking_reset(self) -> None:
+        self.enqueue(stacking_reset())
+
+    def request_stacking_save(self, **kwargs: Any) -> None:
+        self.enqueue(stacking_save(**kwargs))
+
+    def request_platesolving_run(self, target: str) -> None:
+        self.enqueue(platesolving_run(target=target))
+
+    def request_platesolving_params(self, **kwargs: Any) -> None:
+        self.enqueue(platesolving_set_params(**kwargs))
+
+    def request_live_sep_params(self, **kwargs: Any) -> None:
+        self.enqueue(live_sep_set_params(**kwargs))
 
     # -------------------------
     # Internal helpers
