@@ -30,8 +30,8 @@ from actions import (
     stacking_stop,
     stacking_reset,
     stacking_save,
-    platesolve_run,
-    platesolve_set_params,
+    platesolving_run,
+    platesolving_set_params,
     live_sep_set_params,
 )
 from ap_types import Axis
@@ -76,7 +76,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     w_out_log = W.Output(layout=W.Layout(border="1px solid #ddd", height="180px", overflow="auto"))
     runner.out_log = w_out_log  # conectar runner a este output
-    platesolve_cfg = cfg.platesolve
+    platesolving_cfg = cfg.platesolving
     sep_cfg = cfg.sep
     mount_cfg = cfg.mount
     tracking_cfg = cfg.tracking
@@ -170,7 +170,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_live_sep_max_det = W.BoundedIntText(
         description="max_det",
-        value=int(platesolve_cfg.max_det),
+        value=int(platesolving_cfg.max_det),
         min=1,
         max=5000,
         step=5,
@@ -384,7 +384,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------------------------------------------------------
     # Debounce logic for PlateSolve parameters.
     #
-    # The platesolve config is large; changing any field enqueues an action.  To
+    # The platesolving config is large; changing any field enqueues an action.  To
     # avoid spamming the runner, collect changes and apply them after 0.8s of
     # inactivity.  The existing _ps_send_params function is used to build the
     # payload; the timer simply invokes that function.
@@ -627,12 +627,12 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     ])
 
     # ============================================================
-    # TAB PLATESOLVE (integrado)
+    # TAB PLATESOLVING (integrado)
     # ============================================================
-    # Instrument params -> se convierten a SI para PlatesolveConfig
+    # Instrument params -> se convierten a SI para PlatesolvingConfig
     w_tf_ps_focal_mm = W.BoundedFloatText(
         description="focal (mm)",
-        value=float(platesolve_cfg.focal_m) * 1000.0,
+        value=float(platesolving_cfg.focal_m) * 1000.0,
         min=10.0,
         max=50000.0,
         step=1.0,
@@ -640,7 +640,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_pixel_um = W.BoundedFloatText(
         description="pixel (µm)",
-        value=float(platesolve_cfg.pixel_size_m) * 1e6,
+        value=float(platesolving_cfg.pixel_size_m) * 1e6,
         min=0.5,
         max=30.0,
         step=0.1,
@@ -660,7 +660,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # Solver params (subconjunto razonable)
     w_bi_ps_max_det = W.BoundedIntText(
         description="max_det",
-        value=int(platesolve_cfg.max_det),
+        value=int(platesolving_cfg.max_det),
         min=20,
         max=2000,
         step=10,
@@ -668,7 +668,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_det_sigma = W.BoundedFloatText(
         description="det_sigma",
-        value=float(platesolve_cfg.det_thresh_sigma),
+        value=float(platesolving_cfg.det_thresh_sigma),
         min=0.5,
         max=50.0,
         step=0.5,
@@ -676,7 +676,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_minarea = W.BoundedIntText(
         description="minarea",
-        value=int(platesolve_cfg.det_minarea),
+        value=int(platesolving_cfg.det_minarea),
         min=1,
         max=200,
         step=1,
@@ -684,7 +684,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_point_sigma = W.BoundedFloatText(
         description="point_sigma",
-        value=float(platesolve_cfg.point_sigma),
+        value=float(platesolving_cfg.point_sigma),
         min=0.2,
         max=10.0,
         step=0.1,
@@ -692,7 +692,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_gmax = W.BoundedFloatText(
         description="gmax",
-        value=float(platesolve_cfg.gmax),
+        value=float(platesolving_cfg.gmax),
         min=6.0,
         max=20.0,
         step=0.1,
@@ -700,11 +700,11 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_cb_ps_use_radius = W.Checkbox(
         description="use search_radius_deg",
-        value=platesolve_cfg.search_radius_deg is not None,
+        value=platesolving_cfg.search_radius_deg is not None,
     )
     w_tf_ps_search_radius_deg = W.BoundedFloatText(
         description="search_radius_deg",
-        value=float(platesolve_cfg.search_radius_deg or 2.0),
+        value=float(platesolving_cfg.search_radius_deg or 2.0),
         min=0.1,
         max=30.0,
         step=0.1,
@@ -712,7 +712,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_search_radius_factor = W.BoundedFloatText(
         description="search_radius_factor",
-        value=float(platesolve_cfg.search_radius_factor),
+        value=float(platesolving_cfg.search_radius_factor),
         min=0.5,
         max=10.0,
         step=0.1,
@@ -720,7 +720,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_theta_step = W.BoundedFloatText(
         description="theta_step (deg)",
-        value=float(platesolve_cfg.theta_step_deg),
+        value=float(platesolving_cfg.theta_step_deg),
         min=0.5,
         max=60.0,
         step=0.5,
@@ -728,7 +728,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_theta_refine_span = W.BoundedFloatText(
         description="theta_refine_span",
-        value=float(platesolve_cfg.theta_refine_span_deg),
+        value=float(platesolving_cfg.theta_refine_span_deg),
         min=0.5,
         max=60.0,
         step=0.5,
@@ -736,7 +736,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_theta_refine_step = W.BoundedFloatText(
         description="theta_refine_step",
-        value=float(platesolve_cfg.theta_refine_step_deg),
+        value=float(platesolving_cfg.theta_refine_step_deg),
         min=0.1,
         max=10.0,
         step=0.1,
@@ -744,7 +744,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_match_max = W.BoundedFloatText(
         description="match_max_px",
-        value=float(platesolve_cfg.match_max_px),
+        value=float(platesolving_cfg.match_max_px),
         min=0.5,
         max=25.0,
         step=0.1,
@@ -752,7 +752,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_min_inliers = W.BoundedIntText(
         description="min_inliers",
-        value=int(platesolve_cfg.min_inliers),
+        value=int(platesolving_cfg.min_inliers),
         min=1,
         max=200,
         step=1,
@@ -760,7 +760,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_bi_ps_guide_n = W.BoundedIntText(
         description="guide_n",
-        value=int(platesolve_cfg.guide_n),
+        value=int(platesolving_cfg.guide_n),
         min=0,
         max=20,
         step=1,
@@ -768,7 +768,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
     w_tf_ps_simbad_radius_arcsec = W.BoundedFloatText(
         description="simbad_radius\"",
-        value=float(platesolve_cfg.simbad_radius_arcsec),
+        value=float(platesolving_cfg.simbad_radius_arcsec),
         min=0.1,
         max=30.0,
         step=0.1,
@@ -786,13 +786,13 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
 
     w_tb_ps_auto = W.ToggleButton(
         description="Auto",
-        value=bool(platesolve_cfg.auto_solve),
+        value=bool(platesolving_cfg.auto_solve),
         disabled=False,
         layout=W.Layout(width="110px"),
     )
     w_tf_ps_every_s = W.BoundedFloatText(
         description="every (s)",
-        value=float(platesolve_cfg.solve_every_s),
+        value=float(platesolving_cfg.solve_every_s),
         min=2.0,
         max=600.0,
         step=1.0,
@@ -800,8 +800,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     )
 
     w_lbl_ps_status = W.HTML(value="PlateSolve: idle")
-    w_img_platesolve = W.Image(format="jpeg", layout=W.Layout(width="100%", max_width="980px"))
-    w_html_platesolve = W.HTML(value="")
+    w_img_platesolving = W.Image(format="jpeg", layout=W.Layout(width="100%", max_width="980px"))
+    w_html_platesolving = W.HTML(value="")
 
     def _ps_send_params(_=None) -> None:
         # Conversión:
@@ -830,14 +830,14 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             "solve_every_s": float(w_tf_ps_every_s.value),
             "auto_target": str(w_txt_ps_target.value),
         }
-        runner.enqueue(platesolve_set_params(**params))
+        runner.enqueue(platesolving_set_params(**params))
 
     def _ps_request_once() -> None:
         target = str(w_txt_ps_target.value).strip()
         if not target:
             log_info(w_out_log, "PlateSolve: missing target")
             return
-        runner.enqueue(platesolve_run(target=target))
+        runner.enqueue(platesolving_run(target=target))
 
     def _on_ps_solve(_btn):
         _ps_request_once()
@@ -845,7 +845,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_btn_ps_solve.on_click(_on_ps_solve)
 
     # Observers -> update runner cfg live
-    # Use the debounce handler for all platesolve parameter changes.  This
+    # Use the debounce handler for all platesolving parameter changes.  This
     # prevents flooding the runner when multiple parameters are edited in
     # sequence.  When the user finishes editing, the parameters are applied
     # together after a brief delay.
@@ -874,7 +874,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_tf_ps_every_s.observe(_debounce_ps_params, names="value")
     w_txt_ps_target.observe(_debounce_ps_params, names="value")
 
-    w_tab_platesolve = W.VBox(
+    w_tab_platesolving = W.VBox(
         [
             W.HTML("<b>PlateSolve</b>"),
             W.HBox([w_btn_ps_solve, w_tb_ps_auto, w_tf_ps_every_s]),
@@ -887,8 +887,8 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
             W.HBox([w_tf_ps_theta_step, w_tf_ps_theta_refine_span, w_tf_ps_theta_refine_step]),
             W.HBox([w_tf_ps_match_max, w_bi_ps_min_inliers, w_bi_ps_guide_n, w_tf_ps_simbad_radius_arcsec]),
             w_lbl_ps_status,
-            w_html_platesolve,
-            w_img_platesolve,
+            w_html_platesolving,
+            w_img_platesolving,
         ],
         layout=W.Layout(border="1px solid #eee", padding="8px", gap="6px"),
     )
@@ -933,7 +933,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     w_bi_goto_stages = W.BoundedIntText(value=int(cfg.goto.stages), min=1, max=50, step=1, description="Etapas:", layout=W.Layout(width="160px"))
     w_bt_goto_gain = W.BoundedFloatText(value=float(cfg.goto.gain), min=0.1, max=2.0, step=0.05, description="Gain:", layout=W.Layout(width="160px"))
     w_bt_goto_settle_s = W.BoundedFloatText(value=float(cfg.goto.settle_s), min=0.0, max=10.0, step=0.05, description="Settle(s):", layout=W.Layout(width="170px"))
-    w_cb_goto_feedback = W.Checkbox(value=bool(cfg.goto.platesolve_feedback), description="Feedback platesolve", indent=False)
+    w_cb_goto_feedback = W.Checkbox(value=bool(cfg.goto.platesolving_feedback), description="Feedback platesolving", indent=False)
 
     # Calibración
     w_bi_calib_samples = W.BoundedIntText(value=int(cfg.goto.calib_samples), min=1, max=80, step=1, description="Muestras:", layout=W.Layout(width="180px"))
@@ -998,7 +998,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
                 gain=float(w_bt_goto_gain.value),
                 settle_s=float(w_bt_goto_settle_s.value),
                 delay_us=int(w_bi_goto_delay_us.value),
-                platesolve_feedback=bool(w_cb_goto_feedback.value),
+                platesolving_feedback=bool(w_cb_goto_feedback.value),
             )
         )
 
@@ -1040,7 +1040,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     ])
     w_tab_logs = W.VBox([W.HTML("<b>Logs</b>"), w_out_log])
 
-    w_tabs = W.Tab(children=[w_tab_camera, w_tab_mount, w_tab_tracking, w_tab_stacking, w_tab_platesolve, w_tab_goto, w_tab_logs])
+    w_tabs = W.Tab(children=[w_tab_camera, w_tab_mount, w_tab_tracking, w_tab_stacking, w_tab_platesolving, w_tab_goto, w_tab_logs])
     for i, name in enumerate(["Camera", "Mount", "Tracking", "Stacking", "PlateSolve", "GoTo", "Logs"]):
         w_tabs.set_title(i, name)
 
@@ -1269,14 +1269,14 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
         "w_btn_stack_reset": w_btn_stack_reset,
         "w_btn_stack_start": w_btn_stack_start,
         "w_btn_stack_stop": w_btn_stack_stop,
-        # platesolve tab
+        # platesolving tab
         "w_txt_ps_target": w_txt_ps_target,
         "w_btn_ps_solve": w_btn_ps_solve,
         "w_tb_ps_auto": w_tb_ps_auto,
         "w_tf_ps_every_s": w_tf_ps_every_s,
         "w_lbl_ps_status": w_lbl_ps_status,
-        "w_img_platesolve": w_img_platesolve,
-        "w_html_platesolve": w_html_platesolve,
+        "w_img_platesolving": w_img_platesolving,
+        "w_html_platesolving": w_html_platesolving,
         "w_tf_ps_focal_mm": w_tf_ps_focal_mm,
         "w_tf_ps_pixel_um": w_tf_ps_pixel_um,
         "w_bi_ps_binning": w_bi_ps_binning,
@@ -1444,19 +1444,19 @@ class UILoop:
             else:
                 self.widgets["w_lbl_track_info"].value = "Tracking: idle"
 
-        # Platesolve status (si existe)
+        # Platesolving status (si existe)
         if "w_lbl_ps_status" in self.widgets:
-            ps_status = str(getattr(st, "platesolve_status", "IDLE"))
-            ps_busy = bool(getattr(st, "platesolve_busy", False))
-            ps_ok = bool(getattr(st, "platesolve_last_ok", False))
-            ra = float(getattr(st, "platesolve_center_ra_deg", 0.0))
-            dec = float(getattr(st, "platesolve_center_dec_deg", 0.0))
-            th = float(getattr(st, "platesolve_theta_deg", 0.0))
-            dx = float(getattr(st, "platesolve_dx_px", 0.0))
-            dy = float(getattr(st, "platesolve_dy_px", 0.0))
-            resp = float(getattr(st, "platesolve_resp", 0.0))
-            nin = int(getattr(st, "platesolve_n_inliers", 0))
-            rms = float(getattr(st, "platesolve_rms_px", 0.0))
+            ps_status = str(getattr(st, "platesolving_status", "IDLE"))
+            ps_busy = bool(getattr(st, "platesolving_busy", False))
+            ps_ok = bool(getattr(st, "platesolving_last_ok", False))
+            ra = float(getattr(st, "platesolving_center_ra_deg", 0.0))
+            dec = float(getattr(st, "platesolving_center_dec_deg", 0.0))
+            th = float(getattr(st, "platesolving_theta_deg", 0.0))
+            dx = float(getattr(st, "platesolving_dx_px", 0.0))
+            dy = float(getattr(st, "platesolving_dy_px", 0.0))
+            resp = float(getattr(st, "platesolving_resp", 0.0))
+            nin = int(getattr(st, "platesolving_n_inliers", 0))
+            rms = float(getattr(st, "platesolving_rms_px", 0.0))
 
             self.widgets["w_lbl_ps_status"].value = (
                 f"<b>PlateSolve</b>: {ps_status} | busy={ps_busy} | ok={ps_ok} | "
@@ -1464,8 +1464,8 @@ class UILoop:
                 f"theta={th:+.2f}° dx={dx:+.2f} dy={dy:+.2f} | "
                 f"resp={resp:.3f} inliers={nin} rms={rms:.2f}px"
             )
-        if "w_html_platesolve" in self.widgets:
-            debug_info = dict(getattr(st, "platesolve_debug_info", {}) or {})
+        if "w_html_platesolving" in self.widgets:
+            debug_info = dict(getattr(st, "platesolving_debug_info", {}) or {})
             if debug_info:
                 ordered = [
                     "status",
@@ -1495,11 +1495,11 @@ class UILoop:
                         continue
                     lines.append(f"<li><b>{key}</b>: {_fmt_value(val)}</li>")
                 if lines:
-                    self.widgets["w_html_platesolve"].value = "<ul>" + "".join(lines) + "</ul>"
+                    self.widgets["w_html_platesolving"].value = "<ul>" + "".join(lines) + "</ul>"
                 else:
-                    self.widgets["w_html_platesolve"].value = ""
+                    self.widgets["w_html_platesolving"].value = ""
             else:
-                self.widgets["w_html_platesolve"].value = ""
+                self.widgets["w_html_platesolving"].value = ""
 
         # opcional: mantener toggle en sync si cambia por fuera
         if "w_btn_tracking_toggle" in self.widgets:
@@ -1526,9 +1526,9 @@ class UILoop:
         if stack_jpg and "w_img_stack" in self.widgets:
             self.widgets["w_img_stack"].value = stack_jpg
 
-        ps_jpg = getattr(st, "platesolve_debug_jpeg", None)
-        if ps_jpg and "w_img_platesolve" in self.widgets:
-            self.widgets["w_img_platesolve"].value = ps_jpg
+        ps_jpg = getattr(st, "platesolving_debug_jpeg", None)
+        if ps_jpg and "w_img_platesolving" in self.widgets:
+            self.widgets["w_img_platesolving"].value = ps_jpg
 
         # -------------------------------------------------------------------
         # Enable/disable UI controls based on current state

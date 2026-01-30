@@ -17,9 +17,9 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 - `app.ipynb`: notebook de ejemplo para levantar UI y ejecutar el runner.
 - `app_runner.py`: orquestador principal de runtime; loop de control, captura, preview y tracking.
 - `ui.py`: UI en ipywidgets (estado, preview, control manual de montura, parámetros de cámara).
-- `actions.py`: definición de acciones y factories (connect, set params, tracking, stacking, platesolve, goto).
+- `actions.py`: definición de acciones y factories (connect, set params, tracking, stacking, platesolving, goto).
 - `ap_types.py`: tipos compartidos (ejes, modos, `Frame`, `SystemState`).
-- `config.py`: configuración de cámara, preview, montura, tracking, stacking, platesolve y app.
+- `config.py`: configuración de cámara, preview, montura, tracking, stacking, platesolving y app.
 - `camera_poa.py`: wrapper de alto nivel para cámara Player One (I/O, configuración, stream).
 - `pyPOACamera.py`: wrapper ctypes del SDK Player One (loader multiplataforma + constantes/structs).
 - `libPlayerOneCamera.3.9.0.dylib`: binario del SDK (macOS). En Linux/Windows se esperan `.so`/`.dll`.
@@ -46,14 +46,14 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 ### 2) Tipos, acciones y configuración
 - **`ap_types.py`**
   - Enum de ejes (`Axis`), modos de display y estructura de `Frame`.
-  - `SystemState` agrupa indicadores de estado y métricas (FPS, tracking, stacking, platesolve).
+  - `SystemState` agrupa indicadores de estado y métricas (FPS, tracking, stacking, platesolving).
 
 - **`actions.py`**
-  - Enum `ActionType` y factories para eventos (cámara, montura, tracking, stacking, platesolve, goto).
+  - Enum `ActionType` y factories para eventos (cámara, montura, tracking, stacking, platesolving, goto).
   - Sirve como contrato entre UI y runner (todo pasa por cola de acciones).
 
 - **`config.py`**
-  - Configs declarativas para cámara, preview, montura, tracking, stacking y platesolve.
+  - Configs declarativas para cámara, preview, montura, tracking, stacking y platesolving.
   - `AppConfig` agrega todo en una sola estructura.
 
 ### 3) Cámara y procesamiento de imagen

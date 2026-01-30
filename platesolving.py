@@ -1,13 +1,15 @@
-# platesolve.py
+# platesolving.py
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
 import time
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
+import threading
+from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
 import pandas as pd
+import cv2
 
 import astropy.units as u
 from astropy.coordinates import SkyCoord, EarthLocation, AltAz, ICRS
@@ -19,7 +21,7 @@ from itertools import combinations, permutations
 from logging_utils import log_error, log_info
 from imaging import ensure_raw16_bayer
 from sep_utils import sep_detect_from_raw16
-from config import PlatesolveConfig, SepConfig
+from config import PlatesolvingConfig, SepConfig
 
 # IMPORTANT: all Gaia/cache/auth logic must live in gaia_cache.py
 import gaia_cache as gc
@@ -34,12 +36,12 @@ save_gaia_auth = gc.save_gaia_auth
 
 __all__ = [
     "ObserverConfig",
-    "PlatesolveConfig",
     "OverlayItem",
     "GuideStar",
-    "PlatesolveResult",
+    "PlatesolvingResult",
     "TargetParseError",
-    "platesolve_sweep",
+    "solve_plate",
+    "PlatesolvingWorker",
     "pixel_to_radec",
     "load_gaia_auth",
     "save_gaia_auth",
@@ -53,11 +55,11 @@ ProgressCB = Callable[[str, Dict[str, Any]], None]
 # Errors
 # ============================================================
 
-class PlatesolveError(RuntimeError):
+class PlatesolvingError(RuntimeError):
     pass
 
 
-class TargetParseError(PlatesolveError):
+class TargetParseError(PlatesolvingError):
     pass
 
 
@@ -102,7 +104,7 @@ class GuideStar:
 
 
 @dataclass(frozen=True)
-class PlatesolveResult:
+class PlatesolvingResult:
     success: bool
     status: str
     theta_deg: float
@@ -203,7 +205,7 @@ _ICRS_FRAME = ICRS()
 
 def _ensure_icrs(coord: SkyCoord, *, label: str) -> SkyCoord:
     if not coord.frame.is_equivalent_frame(_ICRS_FRAME):
-        log_info(None, f"Platesolve: normalizing {label} from frame {coord.frame} to ICRS")
+        log_info(None, f"Platesolving: normalizing {label} from frame {coord.frame} to ICRS")
     return coord.icrs
 
 
@@ -459,7 +461,7 @@ def build_guides_from_solution(
     s_arcsec_per_px: float,
     R: np.ndarray,
     t_arcsec: np.ndarray,
-    cfg: PlatesolveConfig,
+    cfg: PlatesolvingConfig,
     progress_cb: Optional[ProgressCB],
 ) -> List[GuideStar]:
     """
@@ -494,8 +496,8 @@ def build_guides_from_solution(
         if hasattr(gc, "resolve_coord_name"):
             try:
                 name = str(gc.resolve_coord_name(SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs"), cfg=cfg))
-            except Exception as exc:
-                log_error(None, "Platesolve: failed to resolve Gaia coord name", exc)
+            except (RuntimeError, ValueError, TypeError) as exc:
+                log_error(None, "Platesolving: failed to resolve Gaia coord name", exc)
                 name = "GAIA"
 
         guides.append(GuideStar(name=name, ra_deg=ra, dec_deg=dec, gmag=gmag, x=x_ds, y=y_ds))
@@ -539,7 +541,7 @@ def _gaia_load_df(
     center_icrs: SkyCoord,
     radius_deg: float,
     *,
-    cfg: PlatesolveConfig,
+    cfg: PlatesolvingConfig,
     gaia_auth: Optional[Tuple[str, str]],
     progress_cb: Optional[ProgressCB],
 ) -> pd.DataFrame:
@@ -568,27 +570,26 @@ def _gaia_load_df(
     return df
 
 
-def platesolve_sweep(
+def solve_plate(
     frame: np.ndarray,
     *,
     target: TargetType,
-    cfg: PlatesolveConfig,
+    cfg: PlatesolvingConfig,
     sep_cfg: Optional[SepConfig] = None,
     observer: ObserverConfig = ObserverConfig(),
     obstime: Optional[Time] = None,
-    source: str = "live",
     gaia_auth: Optional[Tuple[str, str]] = None,
     progress_cb: Optional[ProgressCB] = None,
-) -> PlatesolveResult:
+) -> PlatesolvingResult:
     if obstime is None:
         obstime = Time.now()
 
     # 1) Parse target -> ICRS center
     try:
         center_icrs = parse_target_to_icrs(target, observer=observer, obstime=obstime)
-    except Exception as exc:
-        log_error(None, "Platesolve: target parse failed", exc)
-        return PlatesolveResult(
+    except (TargetParseError, ValueError, TypeError) as exc:
+        log_error(None, "Platesolving: target parse failed", exc)
+        return PlatesolvingResult(
             success=False,
             status="TARGET_PARSE_ERROR",
             theta_deg=0.0,
@@ -605,7 +606,7 @@ def platesolve_sweep(
             center_dec_deg=0.0,
             overlay=[],
             guides=[],
-            metrics={"source": 1.0},
+            metrics={},
         )
     center_icrs = _ensure_icrs(center_icrs, label="center")
 
@@ -628,7 +629,7 @@ def platesolve_sweep(
     overlay: List[OverlayItem] = [OverlayItem(float(x), float(y), "det", None) for x, y in img_xy_all]
 
     if img_xy_all.shape[0] < 3:
-        return PlatesolveResult(
+        return PlatesolvingResult(
             success=False,
             status="NOT_ENOUGH_DETECTIONS",
             theta_deg=0.0,
@@ -670,12 +671,12 @@ def platesolve_sweep(
     # 6) Load Gaia from gaia_cache.py
     try:
         if progress_cb:
-            progress_cb("gaia:load:start", {"radius_deg": float(radius_deg), "gmax": float(getattr(cfg, "gmax", 15.0)), "source": source})
+            progress_cb("gaia:load:start", {"radius_deg": float(radius_deg), "gmax": float(getattr(cfg, "gmax", 15.0))})
 
         gaia_df = _gaia_load_df(center_icrs, radius_deg, cfg=cfg, gaia_auth=gaia_auth, progress_cb=progress_cb)
 
     except gc.NeedGaiaAuthError as e:
-        return PlatesolveResult(
+        return PlatesolvingResult(
             success=False,
             status="NEED_GAIA_AUTH",
             theta_deg=0.0,
@@ -697,7 +698,7 @@ def platesolve_sweep(
 
     except gc.GaiaCacheMissError as e:
         missing_paths = getattr(e, "missing_paths", [])
-        return PlatesolveResult(
+        return PlatesolvingResult(
             success=False,
             status="GAIA_CACHE_MISS",
             theta_deg=0.0,
@@ -717,9 +718,9 @@ def platesolve_sweep(
             metrics={"missing": float(len(missing_paths))},
         )
 
-    except Exception as exc:
-        log_error(None, "Platesolve: Gaia load failed", exc)
-        return PlatesolveResult(
+    except (RuntimeError, ValueError, OSError, TypeError) as exc:
+        log_error(None, "Platesolving: Gaia load failed", exc)
+        return PlatesolvingResult(
             success=False,
             status="GAIA_LOAD_ERROR",
             theta_deg=0.0,
@@ -740,7 +741,7 @@ def platesolve_sweep(
         )
 
     if len(gaia_df) < int(max(8, 3 * img_xy_all.shape[0])):
-        return PlatesolveResult(
+        return PlatesolvingResult(
             success=False,
             status="GAIA_TOO_SMALL",
             theta_deg=0.0,
@@ -780,7 +781,7 @@ def platesolve_sweep(
     img_xy_seed = img_xy_all[:N_seed_eff]
 
     if img_xy_seed.shape[0] < 3:
-        return PlatesolveResult(
+        return PlatesolvingResult(
             success=False,
             status="NOT_ENOUGH_SEEDS",
             theta_deg=0.0,
@@ -813,7 +814,7 @@ def platesolve_sweep(
 
     candidates: List[Dict[str, Any]] = []
     if progress_cb:
-        progress_cb("platesolve:triplets:start", {"n_triplets": int(len(img_triplets))})
+        progress_cb("platesolving:triplets:start", {"n_triplets": int(len(img_triplets))})
 
     # Performance safeguard: cap how many Gaia "i" centers we scan per triplet
     # (otherwise O(N^2) can explode at high gmax/radius)
@@ -886,10 +887,10 @@ def platesolve_sweep(
     candidates.sort(key=lambda d: d["score"])
 
     if progress_cb:
-        progress_cb("platesolve:triplets:candidates", {"n_candidates": int(len(candidates))})
+        progress_cb("platesolving:triplets:candidates", {"n_candidates": int(len(candidates))})
 
     if len(candidates) == 0:
-        return PlatesolveResult(
+        return PlatesolvingResult(
             success=False,
             status="NO_TRIPLET_CANDIDATES",
             theta_deg=0.0,
@@ -963,7 +964,7 @@ def platesolve_sweep(
 
     best = None
     if progress_cb:
-        progress_cb("platesolve:validate:start", {"n_eval": int(len(to_eval))})
+        progress_cb("platesolving:validate:start", {"n_eval": int(len(to_eval))})
 
     for cand in to_eval:
         ev = evaluate_candidate(cand)
@@ -976,7 +977,7 @@ def platesolve_sweep(
             best = ev
 
     if best is None:
-        return PlatesolveResult(
+        return PlatesolvingResult(
             success=False,
             status="VALIDATION_FAILED",
             theta_deg=0.0,
@@ -1052,7 +1053,6 @@ def platesolve_sweep(
     response = float(best["num_inliers"]) / max(1.0, rms_px)
 
     metrics = {
-        "source": 1.0 if source == "live" else 2.0,
         "n_det": float(img_xy_all.shape[0]),
         "n_seed": float(img_xy_seed.shape[0]),
         "gaia_rows": float(len(gaia_df)),
@@ -1066,7 +1066,7 @@ def platesolve_sweep(
         "scale_arcsec_per_px": float(s),
     }
 
-    return PlatesolveResult(
+    return PlatesolvingResult(
         success=success,
         status="OK" if success else "LOW_INLIERS",
         theta_deg=theta_deg,
@@ -1085,3 +1085,271 @@ def platesolve_sweep(
         guides=guides,
         metrics=metrics,
     )
+
+
+def _render_platesolving_debug_jpeg(
+    frame: Optional[np.ndarray],
+    overlay: Optional[List[Any]],
+) -> Optional[bytes]:
+    if frame is None:
+        return None
+    gray = frame
+    if getattr(gray, "ndim", 0) == 3:
+        if gray.shape[2] == 1:
+            gray = gray[:, :, 0]
+        else:
+            gray = gray[:, :, :3].astype(np.float32).mean(axis=2)
+    gray = np.asarray(gray, dtype=np.float32)
+    if gray.ndim != 2:
+        return None
+
+    p1, p99 = np.percentile(gray, [1.0, 99.0])
+    if p99 <= p1:
+        p1 = float(gray.min()) if gray.size else 0.0
+        p99 = float(gray.max()) if gray.size else 1.0
+    scale = 255.0 / max(1e-6, float(p99 - p1))
+    u8 = np.clip((gray - p1) * scale, 0, 255).astype(np.uint8)
+    img = cv2.cvtColor(u8, cv2.COLOR_GRAY2BGR)
+
+    if overlay:
+        h, w = img.shape[:2]
+        colors = {
+            "det": (255, 0, 0),
+            "match": (0, 255, 0),
+            "guide": (0, 0, 255),
+        }
+        for item in overlay:
+            x = int(round(float(getattr(item, "x", 0.0))))
+            y = int(round(float(getattr(item, "y", 0.0))))
+            if x < 0 or y < 0 or x >= w or y >= h:
+                continue
+            kind = str(getattr(item, "kind", "det"))
+            color = colors.get(kind, (255, 255, 0))
+            radius = 10 if kind == "guide" else 8 if kind == "match" else 7
+            cv2.circle(img, (x, y), radius, color, 1, lineType=cv2.LINE_AA)
+            label = getattr(item, "label", None)
+            if kind == "guide" and label:
+                cv2.putText(
+                    img,
+                    str(label),
+                    (x + 6, y - 6),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.4,
+                    color,
+                    1,
+                    lineType=cv2.LINE_AA,
+                )
+
+    try:
+        ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
+    except cv2.error as exc:
+        log_error(None, "Platesolving: failed to encode debug JPEG", exc)
+        return None
+    if not ok:
+        return None
+    return bytes(buf.tobytes())
+
+
+def _build_platesolving_debug_info(result: Any) -> Dict[str, Any]:
+    metrics = dict(getattr(result, "metrics", {}) or {})
+    info = {
+        "status": str(getattr(result, "status", "")),
+        "response": float(getattr(result, "response", 0.0)),
+        "n_det": metrics.get("n_det"),
+        "gaia_rows": metrics.get("gaia_rows"),
+        "n_inliers": int(getattr(result, "n_inliers", 0)),
+        "rms_px": float(getattr(result, "rms_px", 0.0)),
+        "theta_deg": float(getattr(result, "theta_deg", 0.0)),
+        "dx_px": float(getattr(result, "dx_px", 0.0)),
+        "dy_px": float(getattr(result, "dy_px", 0.0)),
+        "radius_deg": metrics.get("radius_deg"),
+        "scale_arcsec_per_px": float(getattr(result, "scale_arcsec_per_px", metrics.get("scale_arcsec_per_px", 0.0))),
+    }
+    return info
+
+
+class PlatesolvingWorker:
+    """
+    Worker de plate solving desacoplado del AppRunner.
+
+    Dependencias inyectadas:
+      - get_frame(): devuelve el frame actual (numpy array)
+      - get_cfg(): devuelve PlatesolvingConfig
+      - get_sep_cfg(): devuelve SepConfig
+      - get_observer(): devuelve ObserverConfig
+      - publish_state(**kwargs): publica estado/resultados a la UI
+    """
+
+    def __init__(
+        self,
+        *,
+        get_frame: Callable[[], Optional[np.ndarray]],
+        get_cfg: Callable[[], PlatesolvingConfig],
+        get_sep_cfg: Callable[[], SepConfig],
+        get_observer: Callable[[], ObserverConfig],
+        publish_state: Callable[..., None],
+        out_log: Any = None,
+    ) -> None:
+        self._get_frame = get_frame
+        self._get_cfg = get_cfg
+        self._get_sep_cfg = get_sep_cfg
+        self._get_observer = get_observer
+        self._publish_state = publish_state
+        self._out_log = out_log
+
+        self._lock = threading.Lock()
+        self._pending: Optional[Dict[str, Any]] = None
+        self._cancel = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+
+    def request(self, *, target: Any) -> None:
+        with self._lock:
+            self._pending = {"target": target}
+        self._start_if_needed()
+
+    def stop(self) -> None:
+        self._cancel.set()
+        with self._lock:
+            thr = self._thread
+        if thr is not None and thr.is_alive():
+            thr.join(timeout=1.0)
+
+    def _start_if_needed(self) -> None:
+        with self._lock:
+            if self._thread is not None and self._thread.is_alive():
+                return
+            self._cancel.clear()
+            self._thread = threading.Thread(
+                target=self._run,
+                name="PlatesolvingWorker",
+                daemon=True,
+            )
+            self._thread.start()
+
+    def _log_input_stats(self, arr: np.ndarray, name: str, enabled: bool) -> None:
+        if not enabled:
+            return
+        a = np.asarray(arr)
+        log_info(self._out_log, f"[{name}] shape={a.shape} dtype={a.dtype} C={a.flags['C_CONTIGUOUS']}")
+        if a.size == 0:
+            log_info(self._out_log, "  EMPTY")
+            return
+        if a.ndim == 1:
+            log_info(self._out_log, f"  1D buffer: min={a.min()} max={a.max()} mean={a.mean():.3g}")
+            return
+        flat = a.reshape(-1)
+        p = np.percentile(flat, [0, 1, 5, 50, 95, 99, 100])
+        log_info(self._out_log, f"  min/p1/p5/p50/p95/p99/max = {p}")
+        log_info(self._out_log, f"  mean={flat.mean():.3g} std={flat.std():.3g}")
+        if a.dtype == np.uint16:
+            log_info(self._out_log, f"  sat65535={np.mean(flat == 65535):.4f}")
+        if a.dtype == np.uint8:
+            log_info(self._out_log, f"  sat255={np.mean(flat == 255):.4f}")
+
+    def _run(self) -> None:
+        while not self._cancel.is_set():
+            with self._lock:
+                req = self._pending
+                self._pending = None
+
+            if req is None:
+                time.sleep(0.05)
+                continue
+
+            self._publish_state(
+                platesolving_busy=True,
+                platesolving_status="RUNNING",
+                platesolving_debug_jpeg=None,
+                platesolving_debug_info=None,
+            )
+
+            target = req.get("target", None)
+            if target is None:
+                self._publish_state(
+                    platesolving_busy=False,
+                    platesolving_status="ERR_NO_TARGET",
+                    platesolving_last_ok=False,
+                    platesolving_debug_jpeg=None,
+                    platesolving_debug_info={"status": "ERR_NO_TARGET"},
+                )
+                log_info(self._out_log, "Platesolving: ERR_NO_TARGET")
+                continue
+
+            frame = self._get_frame()
+            if frame is None:
+                self._publish_state(
+                    platesolving_busy=False,
+                    platesolving_status="ERR_NO_FRAME",
+                    platesolving_last_ok=False,
+                    platesolving_debug_jpeg=None,
+                    platesolving_debug_info={"status": "ERR_NO_FRAME"},
+                )
+                log_info(self._out_log, "Platesolving: ERR_NO_FRAME")
+                continue
+
+            raw16 = ensure_raw16_bayer(frame)
+            cfg = self._get_cfg()
+            sep_cfg = self._get_sep_cfg()
+            observer = self._get_observer()
+            debug_stats = bool(getattr(cfg, "debug_input_stats", False))
+
+            self._log_input_stats(raw16, "frame(raw16)", debug_stats)
+
+            try:
+                result = solve_plate(
+                    raw16,
+                    target=target,
+                    cfg=cfg,
+                    sep_cfg=sep_cfg,
+                    observer=observer,
+                    progress_cb=None,
+                )
+            except (RuntimeError, ValueError, TypeError) as exc:
+                self._publish_state(
+                    platesolving_busy=False,
+                    platesolving_status="ERR_EXCEPTION",
+                    platesolving_last_ok=False,
+                )
+                log_error(self._out_log, "Platesolving: failed", exc)
+                continue
+
+            debug_jpeg = _render_platesolving_debug_jpeg(
+                raw16,
+                list(getattr(result, "overlay", []) or []),
+            )
+            debug_info = _build_platesolving_debug_info(result)
+
+            self._publish_state(
+                platesolving_busy=False,
+                platesolving_status=getattr(result, "status", "UNKNOWN"),
+                platesolving_last_ok=bool(getattr(result, "success", False)),
+                platesolving_theta_deg=float(getattr(result, "theta_deg", 0.0)),
+                platesolving_dx_px=float(getattr(result, "dx_px", 0.0)),
+                platesolving_dy_px=float(getattr(result, "dy_px", 0.0)),
+                platesolving_resp=float(getattr(result, "response", 0.0)),
+                platesolving_n_inliers=int(getattr(result, "n_inliers", 0)),
+                platesolving_rms_px=float(getattr(result, "rms_px", 0.0)),
+                platesolving_overlay=list(getattr(result, "overlay", []) or []),
+                platesolving_guides=list(getattr(result, "guides", []) or []),
+                platesolving_debug_jpeg=debug_jpeg,
+                platesolving_debug_info=debug_info,
+                platesolving_center_ra_deg=float(getattr(result, "center_ra_deg", 0.0)),
+                platesolving_center_dec_deg=float(getattr(result, "center_dec_deg", 0.0)),
+                platesolving_result=result,
+            )
+
+            status = str(getattr(result, "status", "UNKNOWN"))
+            success = bool(getattr(result, "success", False))
+            resp = float(getattr(result, "response", 0.0))
+            n_inliers = int(getattr(result, "n_inliers", 0))
+            rms_px = float(getattr(result, "rms_px", 0.0))
+            if success:
+                log_info(
+                    self._out_log,
+                    f"Platesolving: OK status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+                )
+            else:
+                log_info(
+                    self._out_log,
+                    f"Platesolving: ERR status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+                )
