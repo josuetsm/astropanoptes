@@ -1,9 +1,9 @@
 # ap_types.py
 from __future__ import annotations
 
-from dataclasses import dataclass
+from dataclasses import dataclass, field, replace
 from enum import Enum
-from typing import Optional, Dict, Any, Tuple
+from typing import Any, Dict, Optional
 
 import numpy as np
 
@@ -20,126 +20,215 @@ class DisplayMode(str, Enum):
     HISTEQ = "HistogramEq"
 
 
+class CameraStatus(str, Enum):
+    DISCONNECTED = "DISCONNECTED"
+    OK = "OK"
+    ERROR = "ERROR"
+    CONNECTING = "CONNECTING"
+
+
+class MountStatus(str, Enum):
+    DISCONNECTED = "DISCONNECTED"
+    OK = "OK"
+    ERROR = "ERROR"
+    CONNECTING = "CONNECTING"
+
+
+class TrackingStatus(str, Enum):
+    OFF = "OFF"
+    RUNNING = "RUNNING"
+    PAUSED = "PAUSED"
+    ERROR = "ERROR"
+
+
+class TrackingMode(str, Enum):
+    IDLE = "IDLE"
+    STABILIZE = "STABILIZE"
+    TRACK = "TRACK"
+    AUTOBOOST = "AUTOBOOST"
+
+
+class StackingStatus(str, Enum):
+    OFF = "OFF"
+    RUNNING = "RUNNING"
+    SAVING = "SAVING"
+    ERROR = "ERROR"
+
+
+class PlatesolvingStatus(str, Enum):
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    OK = "OK"
+    FAIL = "FAIL"
+
+
+class GotoStatus(str, Enum):
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    OK = "OK"
+    FAIL = "FAIL"
+    CANCELLED = "CANCELLED"
+
+
+class GotoAutocalStatus(str, Enum):
+    IDLE = "IDLE"
+    RUNNING = "RUNNING"
+    OK = "OK"
+    FAIL = "FAIL"
+
+
 @dataclass(frozen=True)
 class Frame:
     """
     Frame lógico del sistema.
 
     - raw: frame full-res (uint16 Bayer) para todo el pipeline geométrico
-    - u8_view: vista opcional para preview legacy (si existe)
+    - u8_view: vista opcional para preview
+    - meta: metadatos varios (seq, exp_ms, gain, binning, roi, etc.)
     """
-    t_capture: float
-    seq: int
-    w: int
-    h: int
-    fmt: str
 
     raw: np.ndarray
+    t_capture: float
+    meta: Dict[str, Any] = field(default_factory=dict)
     u8_view: Optional[np.ndarray] = None
-
-    meta: Optional[Dict[str, Any]] = None  # exp_ms, gain, binning, roi, etc.
 
 
 @dataclass
-class SystemState:
-    # connectivity
-    camera_connected: bool = False
-    mount_connected: bool = False
-
-    # runtime flags
-    tracking_on: bool = False
-    stacking_on: bool = False
-
-    # status strings (UI-friendly)
-    camera_status: str = "DISCONNECTED"   # DISCONNECTED|OK|ERR
-    mount_status: str = "DISCONNECTED"    # DISCONNECTED|OK|ERR
-    tracking_status: str = "OFF"          # OFF|ON|PAUSED
-    stacking_status: str = "OFF"          # OFF|ON|SAVING
-
-    # perf metrics
+class CameraState:
+    connected: bool = False
+    status: CameraStatus = CameraStatus.DISCONNECTED
     fps_capture: float = 0.0
     fps_view: float = 0.0
     fps_control_loop: float = 0.0
     frame_ms: float = 0.0
+    last_error: Optional[str] = None
 
-    # tracking metrics (optional)
-    tracking_enabled: bool = False
-    tracking_mode: str = "IDLE"
-    tracking_resp: float = 0.0
-    tracking_dx: float = 0.0
-    tracking_dy: float = 0.0
-    tracking_rate_az: float = 0.0
-    tracking_rate_alt: float = 0.0
-    tracking_vx: float = 0.0
-    tracking_vy: float = 0.0
-    tracking_abs_resp: float = 0.0
 
-    # calib / auto-cal / bootstrap status for UI
+@dataclass
+class MountState:
+    connected: bool = False
+    status: MountStatus = MountStatus.DISCONNECTED
+    last_error: Optional[str] = None
+
+
+@dataclass
+class TrackingState:
+    enabled: bool = False
+    status: TrackingStatus = TrackingStatus.OFF
+    mode: TrackingMode = TrackingMode.IDLE
+    resp: float = 0.0
+    dx: float = 0.0
+    dy: float = 0.0
+    rate_az: float = 0.0
+    rate_alt: float = 0.0
+    vx: float = 0.0
+    vy: float = 0.0
+    abs_resp: float = 0.0
     calib_manual_ok: bool = False
     calib_auto_ok: bool = False
-    calib_src: str = "none"        # none|manual|auto|boot
+    calib_src: str = "none"
     calib_det: float = 0.0
     calib_ms_az: int = 0
     calib_ms_alt: int = 0
     bootstrap_active: bool = False
-    bootstrap_phase: str = "IDLE"
+    bootstrap_phase: TrackingMode | str = TrackingMode.IDLE
+    last_error: Optional[str] = None
 
-    # stacking metrics (optional)
+
+@dataclass
+class StackingState:
+    enabled: bool = False
+    status: StackingStatus = StackingStatus.OFF
+    fps: float = 0.0
+    tiles_used: int = 0
+    tiles_evicted: int = 0
+    frames_in: int = 0
+    frames_used: int = 0
+    frames_dropped: int = 0
+    frames_rejected: int = 0
+    last_resp: float = 0.0
+    last_dx: float = 0.0
+    last_dy: float = 0.0
+    last_theta_deg: float = 0.0
+    preview_jpeg: Optional[bytes] = None
     stack_frames: int = 0
     stack_snr: float = 0.0
     stack_runtime_s: float = 0.0
+    last_error: Optional[str] = None
 
-    stacking_enabled: bool = False
-    stacking_mode: str = "IDLE"
-    stacking_fps: float = 0.0
-    stacking_tiles_used: int = 0
-    stacking_tiles_evicted: int = 0
-    stacking_frames_in: int = 0
-    stacking_frames_used: int = 0
-    stacking_frames_dropped: int = 0
-    stacking_frames_rejected: int = 0
-    stacking_last_resp: float = 0.0
-    stacking_last_dx: float = 0.0
-    stacking_last_dy: float = 0.0
-    stacking_last_theta_deg: float = 0.0
-    stacking_preview_jpeg: Optional[bytes] = None
 
-    # platesolving metrics (optional)
-    platesolving_status: str = "IDLE"
-    platesolving_busy: bool = False
-    platesolving_last_ok: bool = False
-    platesolving_theta_deg: float = 0.0
-    platesolving_dx_px: float = 0.0
-    platesolving_dy_px: float = 0.0
-    platesolving_resp: float = 0.0
-    platesolving_n_inliers: int = 0
-    platesolving_rms_px: float = 0.0
-    platesolving_overlay: Any = None
-    platesolving_guides: Any = None
-    platesolving_debug_jpeg: Optional[bytes] = None
-    platesolving_debug_info: Optional[Dict[str, Any]] = None
-    platesolving_center_ra_deg: float = 0.0
-    platesolving_center_dec_deg: float = 0.0
+@dataclass
+class PlatesolvingState:
+    status: PlatesolvingStatus = PlatesolvingStatus.IDLE
+    reason: Optional[str] = None
+    last_ok: bool = False
+    theta_deg: float = 0.0
+    dx_px: float = 0.0
+    dy_px: float = 0.0
+    resp: float = 0.0
+    n_inliers: int = 0
+    rms_px: float = 0.0
+    overlay: Any = None
+    guides: Any = None
+    debug_jpeg: Optional[bytes] = None
+    debug_info: Optional[Dict[str, Any]] = None
+    center_ra_deg: float = 0.0
+    center_dec_deg: float = 0.0
+    busy: bool = False
 
-    # goto metrics (optional)
-    goto_busy: bool = False
-    goto_status: str = "IDLE"
-    goto_synced: bool = False
-    goto_last_error_arcsec: float = 0.0
-    goto_J00: float = 0.0
-    goto_J01: float = 0.0
-    goto_J10: float = 0.0
-    goto_J11: float = 0.0
 
-    # goto autocal metrics (optional)
-    goto_autocal_status: str = "IDLE"
-    goto_autocal_last_ok: bool = False
-    goto_autocal_drift_px_s_x: float = 0.0
-    goto_autocal_drift_px_s_y: float = 0.0
-    goto_autocal_J_pix_per_step_00: float = 0.0
-    goto_autocal_J_pix_per_step_01: float = 0.0
-    goto_autocal_J_pix_per_step_10: float = 0.0
-    goto_autocal_J_pix_per_step_11: float = 0.0
-    goto_autocal_az_deg: float = 0.0
-    goto_autocal_alt_deg: float = 0.0
-    goto_autocal_radius_deg: float = 0.0
+@dataclass
+class GotoState:
+    status: GotoStatus = GotoStatus.IDLE
+    reason: Optional[str] = None
+    busy: bool = False
+    synced: bool = False
+    last_error_arcsec: float = 0.0
+    J00: float = 0.0
+    J01: float = 0.0
+    J10: float = 0.0
+    J11: float = 0.0
+    autocal_status: GotoAutocalStatus = GotoAutocalStatus.IDLE
+    autocal_reason: Optional[str] = None
+    autocal_last_ok: bool = False
+    autocal_drift_px_s_x: float = 0.0
+    autocal_drift_px_s_y: float = 0.0
+    autocal_J_pix_per_step_00: float = 0.0
+    autocal_J_pix_per_step_01: float = 0.0
+    autocal_J_pix_per_step_10: float = 0.0
+    autocal_J_pix_per_step_11: float = 0.0
+    autocal_az_deg: float = 0.0
+    autocal_alt_deg: float = 0.0
+    autocal_radius_deg: float = 0.0
+
+
+@dataclass
+class AppState:
+    camera: CameraState = field(default_factory=CameraState)
+    mount: MountState = field(default_factory=MountState)
+    tracking: TrackingState = field(default_factory=TrackingState)
+    stacking: StackingState = field(default_factory=StackingState)
+    platesolving: PlatesolvingState = field(default_factory=PlatesolvingState)
+    goto: GotoState = field(default_factory=GotoState)
+
+    def update(self, patch: Dict[str, Dict[str, Any]]) -> None:
+        for section, updates in patch.items():
+            if not hasattr(self, section):
+                raise KeyError(f"unknown AppState section: {section}")
+            sub = getattr(self, section)
+            if not isinstance(updates, dict):
+                raise TypeError(f"state patch for {section} must be dict")
+            for key, value in updates.items():
+                if not hasattr(sub, key):
+                    raise KeyError(f"unknown field {section}.{key}")
+                setattr(sub, key, value)
+
+    def snapshot(self) -> "AppState":
+        return AppState(
+            camera=replace(self.camera),
+            mount=replace(self.mount),
+            tracking=replace(self.tracking),
+            stacking=replace(self.stacking),
+            platesolving=replace(self.platesolving),
+            goto=replace(self.goto),
+        )
