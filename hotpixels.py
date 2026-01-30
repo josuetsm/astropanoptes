@@ -5,11 +5,16 @@ from __future__ import annotations
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Dict, Iterable, Tuple, Optional, List
+import time
+from typing import Any, Callable, Dict, Iterable, Tuple, Optional, List
 
 import cv2
 import numpy as np
 
+from ap_types import Frame
+from imaging import ensure_raw16_bayer
+from logging_utils import log_error, log_info
+from workers import BaseWorker
 
 _UINT16_MAX = np.iinfo(np.uint16).max
 
@@ -204,6 +209,128 @@ def load_hotpixel_mask(path_base: str) -> Tuple[np.ndarray, Dict[str, Any]]:
     mask = np.load(npy_path).astype(bool)
     meta = json.loads(json_path.read_text())
     return mask, meta
+
+
+def _perf() -> float:
+    return time.perf_counter()
+
+
+class HotpixelCalibrationWorker(BaseWorker):
+    """
+    Hotpixel calibration worker.
+
+    Dependencies injected:
+      - get_frame(): returns latest Frame (or None)
+      - get_camera_cfg(): returns a camera config snapshot
+      - get_fps_capture(): returns capture FPS (float)
+      - publish_mask(mask, meta): publish mask+meta to orchestrator
+    """
+
+    def __init__(
+        self,
+        *,
+        get_frame: Callable[[], Optional[Frame]],
+        get_camera_cfg: Callable[[], Any],
+        get_fps_capture: Callable[[], float],
+        publish_mask: Callable[[np.ndarray, Dict[str, Any]], None],
+        out_log: Any = None,
+    ) -> None:
+        super().__init__(name="HotpixelCalibrationWorker")
+        self._get_frame = get_frame
+        self._get_camera_cfg = get_camera_cfg
+        self._get_fps_capture = get_fps_capture
+        self._publish_mask = publish_mask
+        self._out_log = out_log
+
+    def request(
+        self,
+        *,
+        n_frames: int,
+        abs_percentile: float,
+        var_percentile: float,
+        max_component_area: int,
+        out_path_base: str,
+    ) -> None:
+        super().request(
+            n_frames=int(n_frames),
+            abs_percentile=float(abs_percentile),
+            var_percentile=float(var_percentile),
+            max_component_area=int(max_component_area),
+            out_path_base=str(out_path_base),
+        )
+
+    def _handle_request(self, request: Dict[str, Any]) -> None:
+        frame = self._get_frame()
+        if frame is None:
+            log_info(self._out_log, "Hotpix: camera frame not available")
+            return
+
+        n_frames = int(request.get("n_frames", 0))
+        abs_percentile = float(request.get("abs_percentile", 99.9))
+        var_percentile = float(request.get("var_percentile", 10.0))
+        max_component_area = int(request.get("max_component_area", 4))
+        out_path_base = str(request.get("out_path_base", "hotpix_mask"))
+
+        frames: List[np.ndarray] = []
+        last_seq = -1
+        fps_capture = float(self._get_fps_capture())
+        timeout_s = max(5.0, (n_frames / max(1.0, fps_capture)) * 3.0)
+        deadline = _perf() + timeout_s
+        last_frame: Optional[Frame] = None
+
+        while len(frames) < n_frames and _perf() < deadline:
+            if self._cancel.is_set():
+                return
+            fr = self._get_frame()
+            if fr is None or int(getattr(fr, "seq", -1)) == int(last_seq):
+                time.sleep(0.002)
+                continue
+            last_seq = int(getattr(fr, "seq", -1))
+            last_frame = fr
+
+            raw16 = ensure_raw16_bayer(fr.raw)
+            frames.append(raw16.copy())
+
+        if len(frames) < n_frames:
+            log_info(self._out_log, f"Hotpix: calibration timed out ({len(frames)}/{n_frames} frames)")
+            return
+
+        try:
+            mask = build_hotpixel_mask_temporal(
+                frames,
+                abs_percentile=float(abs_percentile),
+                var_percentile=float(var_percentile),
+                max_component_area=int(max_component_area),
+            )
+        except (ValueError, TypeError) as exc:
+            log_error(self._out_log, "Hotpix: failed to build mask", exc)
+            return
+
+        cam_cfg = self._get_camera_cfg()
+        frame_meta = last_frame.meta if last_frame and last_frame.meta else {}
+        roi = frame_meta.get("roi")
+
+        meta = {
+            "roi": list(roi) if roi is not None else None,
+            "exp_ms": float(getattr(cam_cfg, "exp_ms", 0.0)),
+            "gain": int(getattr(cam_cfg, "gain", 0)),
+            "fmt": str(getattr(last_frame, "fmt", "")) if last_frame is not None else "",
+            "camera_model": frame_meta.get("camera_model"),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "abs_percentile": float(abs_percentile),
+            "var_percentile": float(var_percentile),
+            "max_component_area": int(max_component_area),
+            "n_frames": int(n_frames),
+        }
+
+        try:
+            npy_path, json_path = save_hotpixel_mask(mask, meta, out_path_base)
+        except OSError as exc:
+            log_error(self._out_log, "Hotpix: failed to save mask", exc)
+            return
+
+        self._publish_mask(mask, meta)
+        log_info(self._out_log, f"Hotpix: mask saved ({npy_path.name}, {json_path.name})")
 
 
 def apply_hotpixel_mask_replace(img_u16: np.ndarray, mask: np.ndarray, ksize: int = 3) -> np.ndarray:
