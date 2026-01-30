@@ -1191,7 +1191,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     def _on_tracking_toggle(change):
         on = bool(change["new"])
-        current = bool(getattr(runner.get_state(), "tracking_enabled", False))
+        current = bool(runner.get_state().tracking.enabled)
         if on == current:
             return
         if on:
@@ -1208,7 +1208,7 @@ def build_ui(cfg: AppConfig, runner: AppRunner) -> Dict[str, Any]:
     # -------------------------
     def _on_stacking_toggle(change):
         on = bool(change["new"])
-        current = bool(getattr(runner.get_state(), "stacking_enabled", False))
+        current = bool(runner.get_state().stacking.enabled)
         if on == current:
             return
         if on:
@@ -1382,46 +1382,42 @@ class UILoop:
         st = self.runner.get_state()
 
         # Determine connectivity and running states for gating controls
-        cam_connected = bool(getattr(st, "camera_connected", False))
-        mount_connected = bool(getattr(st, "mount_connected", False))
-        stacking_running = bool(getattr(st, "stacking_enabled", False))
-        tracking_running = bool(getattr(st, "tracking_enabled", False))
+        cam_connected = bool(st.camera.connected)
+        mount_connected = bool(st.mount.connected)
+        stacking_running = bool(st.stacking.enabled)
+        tracking_running = bool(st.tracking.enabled)
 
         # status labels
-        self.widgets["w_status_camera"].value = f"Camera: <b>{st.camera_status}</b>"
-        self.widgets["w_status_mount"].value = f"Mount: <b>{st.mount_status}</b>"
+        self.widgets["w_status_camera"].value = f"Camera: <b>{st.camera.status.value}</b>"
+        self.widgets["w_status_mount"].value = f"Mount: <b>{st.mount.status.value}</b>"
 
         # Tracking (robusto a ausencia de campos)
-        tracking_enabled = bool(getattr(st, "tracking_enabled", False))
+        tracking_enabled = bool(st.tracking.enabled)
         if tracking_enabled:
-            mode = str(getattr(st, "tracking_mode", "ON"))
-            resp = float(getattr(st, "tracking_resp", 0.0))
+            mode = str(st.tracking.mode.value)
+            resp = float(st.tracking.resp)
             self.widgets["w_status_tracking"].value = f"Tracking: <b>{mode}</b> (resp={resp:.3f})"
         else:
             self.widgets["w_status_tracking"].value = "Tracking: <b>OFF</b>"
 
-        # Stacking placeholder
-        if hasattr(st, "stacking_mode"):
-            mode = str(getattr(st, "stacking_mode", "IDLE"))
-            fps = float(getattr(st, "stacking_fps", 0.0))
-            self.widgets["w_status_stacking"].value = f"Stacking: <b>{mode}</b> ({fps:.2f} fps)"
-        else:
-            self.widgets["w_status_stacking"].value = "Stacking: <b>OFF</b>"
+        mode = str(st.stacking.status.value)
+        fps = float(st.stacking.fps)
+        self.widgets["w_status_stacking"].value = f"Stacking: <b>{mode}</b> ({fps:.2f} fps)"
 
         self.widgets["w_lbl_fps"].value = (
-            f"FPS cap: {st.fps_capture:.2f} | view: {st.fps_view:.2f} | loop: {st.fps_control_loop:.2f}"
+            f"FPS cap: {st.camera.fps_capture:.2f} | view: {st.camera.fps_view:.2f} | loop: {st.camera.fps_control_loop:.2f}"
         )
-        self.widgets["w_lbl_frame_ms"].value = f"frame_ms: {st.frame_ms:.2f}"
+        self.widgets["w_lbl_frame_ms"].value = f"frame_ms: {st.camera.frame_ms:.2f}"
         # GoTo status (si existe)
         if "w_lbl_goto_status" in self.widgets:
-            busy = bool(getattr(st, "goto_busy", False))
-            status = str(getattr(st, "goto_status", "IDLE"))
-            synced = bool(getattr(st, "goto_synced", False))
-            err_as = float(getattr(st, "goto_last_error_arcsec", 0.0))
-            J00 = float(getattr(st, "goto_J00", 0.0))
-            J01 = float(getattr(st, "goto_J01", 0.0))
-            J10 = float(getattr(st, "goto_J10", 0.0))
-            J11 = float(getattr(st, "goto_J11", 0.0))
+            busy = bool(st.goto.busy)
+            status = str(st.goto.status.value)
+            synced = bool(st.goto.synced)
+            err_as = float(st.goto.last_error_arcsec)
+            J00 = float(st.goto.J00)
+            J01 = float(st.goto.J01)
+            J10 = float(st.goto.J10)
+            J11 = float(st.goto.J11)
             self.widgets["w_lbl_goto_status"].value = (
                 f"<b>GoTo</b>: {status} | busy={busy} | synced={synced} | "
                 f"err={err_as:.1f}\" | J=[[{J00:.6g},{J01:.6g}],[{J10:.6g},{J11:.6g}]]"
@@ -1431,12 +1427,12 @@ class UILoop:
         # tracking info panel (si existe)
         if "w_lbl_track_info" in self.widgets:
             if tracking_enabled:
-                mode = str(getattr(st, "tracking_mode", "ON"))
-                resp = float(getattr(st, "tracking_resp", 0.0))
-                dx = float(getattr(st, "tracking_dx", 0.0))
-                dy = float(getattr(st, "tracking_dy", 0.0))
-                raz = float(getattr(st, "tracking_rate_az", 0.0))
-                ralt = float(getattr(st, "tracking_rate_alt", 0.0))
+                mode = str(st.tracking.mode.value)
+                resp = float(st.tracking.resp)
+                dx = float(st.tracking.dx)
+                dy = float(st.tracking.dy)
+                raz = float(st.tracking.rate_az)
+                ralt = float(st.tracking.rate_alt)
                 self.widgets["w_lbl_track_info"].value = (
                     f"<b>Tracking</b>: {mode} | resp={resp:.3f} | "
                     f"dx={dx:+.2f} dy={dy:+.2f} | RATE=({raz:+.1f}, {ralt:+.1f})"
@@ -1446,17 +1442,17 @@ class UILoop:
 
         # Platesolving status (si existe)
         if "w_lbl_ps_status" in self.widgets:
-            ps_status = str(getattr(st, "platesolving_status", "IDLE"))
-            ps_busy = bool(getattr(st, "platesolving_busy", False))
-            ps_ok = bool(getattr(st, "platesolving_last_ok", False))
-            ra = float(getattr(st, "platesolving_center_ra_deg", 0.0))
-            dec = float(getattr(st, "platesolving_center_dec_deg", 0.0))
-            th = float(getattr(st, "platesolving_theta_deg", 0.0))
-            dx = float(getattr(st, "platesolving_dx_px", 0.0))
-            dy = float(getattr(st, "platesolving_dy_px", 0.0))
-            resp = float(getattr(st, "platesolving_resp", 0.0))
-            nin = int(getattr(st, "platesolving_n_inliers", 0))
-            rms = float(getattr(st, "platesolving_rms_px", 0.0))
+            ps_status = str(st.platesolving.status.value)
+            ps_busy = bool(st.platesolving.busy)
+            ps_ok = bool(st.platesolving.last_ok)
+            ra = float(st.platesolving.center_ra_deg)
+            dec = float(st.platesolving.center_dec_deg)
+            th = float(st.platesolving.theta_deg)
+            dx = float(st.platesolving.dx_px)
+            dy = float(st.platesolving.dy_px)
+            resp = float(st.platesolving.resp)
+            nin = int(st.platesolving.n_inliers)
+            rms = float(st.platesolving.rms_px)
 
             self.widgets["w_lbl_ps_status"].value = (
                 f"<b>PlateSolve</b>: {ps_status} | busy={ps_busy} | ok={ps_ok} | "
@@ -1465,7 +1461,7 @@ class UILoop:
                 f"resp={resp:.3f} inliers={nin} rms={rms:.2f}px"
             )
         if "w_html_platesolving" in self.widgets:
-            debug_info = dict(getattr(st, "platesolving_debug_info", {}) or {})
+            debug_info = dict(st.platesolving.debug_info or {})
             if debug_info:
                 ordered = [
                     "status",
@@ -1512,7 +1508,7 @@ class UILoop:
         if "w_btn_stacking_toggle" in self.widgets:
             try:
                 btn = self.widgets["w_btn_stacking_toggle"]
-                stacking_enabled = bool(getattr(st, "stacking_enabled", False))
+                stacking_enabled = bool(st.stacking.enabled)
                 if bool(btn.value) != stacking_enabled:
                     btn.value = stacking_enabled
             except Exception as exc:
@@ -1522,11 +1518,11 @@ class UILoop:
         if jpg:
             self.widgets["w_img_live"].value = jpg
 
-        stack_jpg = getattr(st, "stacking_preview_jpeg", None)
+        stack_jpg = st.stacking.preview_jpeg
         if stack_jpg and "w_img_stack" in self.widgets:
             self.widgets["w_img_stack"].value = stack_jpg
 
-        ps_jpg = getattr(st, "platesolving_debug_jpeg", None)
+        ps_jpg = st.platesolving.debug_jpeg
         if ps_jpg and "w_img_platesolving" in self.widgets:
             self.widgets["w_img_platesolving"].value = ps_jpg
 

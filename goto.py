@@ -50,7 +50,15 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from ap_types import Axis, Frame, SystemState
+from ap_types import (
+    AppState,
+    Axis,
+    Frame,
+    GotoAutocalStatus,
+    GotoStatus,
+    PlatesolvingStatus,
+)
+from protocols import StatePublisherProtocol
 from config import SepConfig, PlatesolvingConfig, MountConfig, CameraConfig
 
 # We reuse target parsing & observer from your plate-solver module.
@@ -1122,8 +1130,8 @@ class GoToWorker(BaseWorker):
     Background worker for GoTo / calibration / autocalibration.
 
     Dependencies injected:
-      - get_state(): SystemState snapshot
-      - publish_state(**kwargs): publish UI state
+      - get_state(): AppState snapshot
+      - publish_state(patch): publish UI state
       - get_frame(): latest Frame (or None)
       - get_goto_cfg(): GoToConfig snapshot
       - get_mount_cfg(): MountConfig snapshot
@@ -1142,8 +1150,8 @@ class GoToWorker(BaseWorker):
         self,
         *,
         goto_controller: GoToController,
-        get_state: Callable[[], SystemState],
-        publish_state: Callable[..., None],
+        get_state: Callable[[], AppState],
+        publish_state: StatePublisherProtocol,
         get_frame: Callable[[], Optional[Frame]],
         get_goto_cfg: Callable[[], GoToConfig],
         get_mount_cfg: Callable[[], MountConfig],
@@ -1193,6 +1201,12 @@ class GoToWorker(BaseWorker):
             return None
         return ensure_raw16_bayer(fr.raw)
 
+    def _frame_seq(self, fr: Frame) -> Optional[int]:
+        seq = fr.meta.get("seq")
+        if seq is None:
+            return None
+        return int(seq)
+
     def _autocal_detect(self, raw16: np.ndarray) -> Tuple[np.ndarray, int, float]:
         sep_cfg = self._get_sep_cfg()
         platesolving_cfg = self._get_platesolving_cfg()
@@ -1231,10 +1245,12 @@ class GoToWorker(BaseWorker):
             if fr is None:
                 time.sleep(0.01)
                 continue
-            if last_seq is not None and int(fr.seq) == last_seq:
+            seq = self._frame_seq(fr)
+            if last_seq is not None and seq is not None and int(seq) == last_seq:
                 time.sleep(0.005)
                 continue
-            last_seq = int(fr.seq)
+            if seq is not None:
+                last_seq = int(seq)
             if skip_remaining > 0:
                 skip_remaining -= 1
                 continue
@@ -1696,10 +1712,10 @@ class GoToWorker(BaseWorker):
         }
 
         st = self._get_state()
-        if not bool(getattr(st, "camera_connected", False)):
+        if not bool(st.camera.connected):
             out["status"] = "ERR_NO_CAMERA"
             return out
-        if not bool(getattr(st, "mount_connected", False)):
+        if not bool(st.mount.connected):
             out["status"] = "ERR_NO_MOUNT"
             return out
 
@@ -1803,7 +1819,9 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_BAD_PLATE_SCALE"
             return out
 
-        self._publish_state(goto_autocal_status="EXPOSURE_TUNE")
+        self._publish_state(
+            {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "EXPOSURE_TUNE"}}
+        )
         tuned = False
         for _ in range(int(tune_attempts)):
             if self._op_cancel.is_set():
@@ -1853,7 +1871,7 @@ class GoToWorker(BaseWorker):
             f"gain={int(getattr(cam_cfg, 'gain', 0))}",
         )
 
-        self._publish_state(goto_autocal_status="DRIFT")
+        self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "DRIFT"}})
         drift_frames_list = self._autocal_capture_frames(
             n_frames=drift_frames,
             timeout_s=drift_capture_timeout_s,
@@ -1889,11 +1907,15 @@ class GoToWorker(BaseWorker):
             return out
         out["drift_pix"] = drift_pix
         self._publish_state(
-            goto_autocal_drift_px_s_x=float(drift_pix[0]),
-            goto_autocal_drift_px_s_y=float(drift_pix[1]),
+            {
+                "goto": {
+                    "autocal_drift_px_s_x": float(drift_pix[0]),
+                    "autocal_drift_px_s_y": float(drift_pix[1]),
+                }
+            }
         )
 
-        self._publish_state(goto_autocal_status="JCAL")
+        self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "JCAL"}})
         col_az = self._autocal_measure_axis_j_with_fallback(
             axis=Axis.AZ,
             steps=jcal_steps_az,
@@ -1937,13 +1959,19 @@ class GoToWorker(BaseWorker):
         J_pix = np.column_stack([col_az, col_alt])
         out["J_pix_per_step"] = J_pix
         self._publish_state(
-            goto_autocal_J_pix_per_step_00=float(J_pix[0, 0]),
-            goto_autocal_J_pix_per_step_01=float(J_pix[0, 1]),
-            goto_autocal_J_pix_per_step_10=float(J_pix[1, 0]),
-            goto_autocal_J_pix_per_step_11=float(J_pix[1, 1]),
+            {
+                "goto": {
+                    "autocal_J_pix_per_step_00": float(J_pix[0, 0]),
+                    "autocal_J_pix_per_step_01": float(J_pix[0, 1]),
+                    "autocal_J_pix_per_step_10": float(J_pix[1, 0]),
+                    "autocal_J_pix_per_step_11": float(J_pix[1, 1]),
+                }
+            }
         )
 
-        self._publish_state(goto_autocal_status="POINTING_SOLVE")
+        self._publish_state(
+            {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "POINTING_SOLVE"}}
+        )
         e_az = J_pix[:, 0]
         e_alt = J_pix[:, 1]
         n_az = float(np.linalg.norm(e_az))
@@ -2038,12 +2066,18 @@ class GoToWorker(BaseWorker):
 
         out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
         self._publish_state(
-            goto_autocal_az_deg=float(az_hat),
-            goto_autocal_alt_deg=float(alt_hat),
-            goto_autocal_radius_deg=1.0,
+            {
+                "goto": {
+                    "autocal_az_deg": float(az_hat),
+                    "autocal_alt_deg": float(alt_hat),
+                    "autocal_radius_deg": 1.0,
+                }
+            }
         )
 
-        self._publish_state(goto_autocal_status="PLATESOLVING_LOOP")
+        self._publish_state(
+            {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "PLATESOLVING_LOOP"}}
+        )
         v_deg_s = np.rad2deg(v_obs)
         jitter_seq = [
             (0.0, 0.0),
@@ -2107,26 +2141,33 @@ class GoToWorker(BaseWorker):
             )
             debug_info = _build_platesolving_debug_info(platesolving_result)
 
+            ps_ok = bool(getattr(platesolving_result, "success", False))
+            ps_reason = str(getattr(platesolving_result, "status", "UNKNOWN"))
             self._publish_state(
-                platesolving_busy=False,
-                platesolving_status=getattr(platesolving_result, "status", "UNKNOWN"),
-                platesolving_last_ok=bool(getattr(platesolving_result, "success", False)),
-                platesolving_theta_deg=float(getattr(platesolving_result, "theta_deg", 0.0)),
-                platesolving_dx_px=float(getattr(platesolving_result, "dx_px", 0.0)),
-                platesolving_dy_px=float(getattr(platesolving_result, "dy_px", 0.0)),
-                platesolving_resp=float(getattr(platesolving_result, "response", 0.0)),
-                platesolving_n_inliers=int(getattr(platesolving_result, "n_inliers", 0)),
-                platesolving_rms_px=float(getattr(platesolving_result, "rms_px", 0.0)),
-                platesolving_overlay=list(getattr(platesolving_result, "overlay", []) or []),
-                platesolving_guides=list(getattr(platesolving_result, "guides", []) or []),
-                platesolving_debug_jpeg=debug_jpeg,
-                platesolving_debug_info=debug_info,
-                platesolving_center_ra_deg=float(getattr(platesolving_result, "center_ra_deg", 0.0)),
-                platesolving_center_dec_deg=float(getattr(platesolving_result, "center_dec_deg", 0.0)),
+                {
+                    "platesolving": {
+                        "busy": False,
+                        "status": PlatesolvingStatus.OK if ps_ok else PlatesolvingStatus.FAIL,
+                        "reason": None if ps_ok else ps_reason,
+                        "last_ok": ps_ok,
+                        "theta_deg": float(getattr(platesolving_result, "theta_deg", 0.0)),
+                        "dx_px": float(getattr(platesolving_result, "dx_px", 0.0)),
+                        "dy_px": float(getattr(platesolving_result, "dy_px", 0.0)),
+                        "resp": float(getattr(platesolving_result, "response", 0.0)),
+                        "n_inliers": int(getattr(platesolving_result, "n_inliers", 0)),
+                        "rms_px": float(getattr(platesolving_result, "rms_px", 0.0)),
+                        "overlay": list(getattr(platesolving_result, "overlay", []) or []),
+                        "guides": list(getattr(platesolving_result, "guides", []) or []),
+                        "debug_jpeg": debug_jpeg,
+                        "debug_info": debug_info,
+                        "center_ra_deg": float(getattr(platesolving_result, "center_ra_deg", 0.0)),
+                        "center_dec_deg": float(getattr(platesolving_result, "center_dec_deg", 0.0)),
+                    }
+                }
             )
 
-            if bool(getattr(platesolving_result, "success", False)):
-                self._publish_state(platesolving_result=platesolving_result)
+            if ps_ok:
+                self._publish_state({"platesolving_result": platesolving_result})
                 break
 
         if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
@@ -2135,14 +2176,24 @@ class GoToWorker(BaseWorker):
             return out
 
         out["platesolving_result"] = platesolving_result
-        self._publish_state(goto_autocal_status="SYNC")
+        self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "SYNC"}})
         ok_sync = bool(self._goto.sync_from_platesolving(platesolving_result))
-        self._publish_state(goto_synced=ok_sync, goto_status="SYNC_OK" if ok_sync else "SYNC_ERR")
+        self._publish_state(
+            {
+                "goto": {
+                    "synced": ok_sync,
+                    "status": GotoStatus.OK if ok_sync else GotoStatus.FAIL,
+                    "reason": None if ok_sync else "SYNC_FAILED",
+                }
+            }
+        )
         if not ok_sync:
             out["status"] = "ERR_SYNC"
             return out
 
-        self._publish_state(goto_autocal_status="CALIBRATE_J")
+        self._publish_state(
+            {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "CALIBRATE_J"}}
+        )
 
         def _get_live_frame_for_calib() -> Optional[np.ndarray]:
             return self._get_live_raw16()
@@ -2161,7 +2212,15 @@ class GoToWorker(BaseWorker):
 
         out["ok"] = True
         out["status"] = "OK"
-        self._publish_state(goto_autocal_last_ok=True, goto_autocal_status="READY")
+        self._publish_state(
+            {
+                "goto": {
+                    "autocal_last_ok": True,
+                    "autocal_status": GotoAutocalStatus.OK,
+                    "autocal_reason": "READY",
+                }
+            }
+        )
         return out
 
     def _publish_j_matrix_state(self) -> None:
@@ -2170,11 +2229,15 @@ class GoToWorker(BaseWorker):
             log_error(self._out_log, "GoTo: J matrix unavailable or invalid", ValueError("invalid J matrix"))
             return
         self._publish_state(
-            goto_J00=float(J[0, 0]),
-            goto_J01=float(J[0, 1]),
-            goto_J10=float(J[1, 0]),
-            goto_J11=float(J[1, 1]),
-            goto_synced=bool(getattr(self._goto.model, "synced", False)),
+            {
+                "goto": {
+                    "J00": float(J[0, 0]),
+                    "J01": float(J[0, 1]),
+                    "J10": float(J[1, 0]),
+                    "J11": float(J[1, 1]),
+                    "synced": bool(getattr(self._goto.model, "synced", False)),
+                }
+            }
         )
 
     def _handle_request(self, request: Dict[str, Any]) -> None:
@@ -2185,7 +2248,9 @@ class GoToWorker(BaseWorker):
         was_tracking = self._pause_tracking()
         was_stacking = self._pause_stacking()
 
-        self._publish_state(goto_busy=True, goto_status=kind.upper())
+        self._publish_state(
+            {"goto": {"busy": True, "status": GotoStatus.RUNNING, "reason": str(kind)}}
+        )
         self._op_cancel.clear()
 
         goto_cfg = self._get_goto_cfg()
@@ -2231,8 +2296,13 @@ class GoToWorker(BaseWorker):
                 )
                 err_norm = float(status.err_norm_arcsec())
                 self._publish_state(
-                    goto_last_error_arcsec=err_norm,
-                    goto_status="GOTO_OK" if status.ok else "GOTO_ERR",
+                    {
+                        "goto": {
+                            "last_error_arcsec": err_norm,
+                            "status": GotoStatus.OK if status.ok else GotoStatus.FAIL,
+                            "reason": str(status.status),
+                        }
+                    }
                 )
                 if status.ok:
                     log_info(
@@ -2272,21 +2342,34 @@ class GoToWorker(BaseWorker):
                 calib_ok = bool(calib_out.get("ok", False))
                 calib_status = str(calib_out.get("status", "UNKNOWN"))
                 calib_samples = int(calib_out.get("n_samples", 0))
-                self._publish_state(goto_status="CAL_OK" if calib_ok else "CAL_ERR")
+                self._publish_state(
+                    {
+                        "goto": {
+                            "status": GotoStatus.OK if calib_ok else GotoStatus.FAIL,
+                            "reason": f"CALIBRATE_{calib_status}",
+                        }
+                    }
+                )
                 log_info(
                     self._out_log,
                     f"GoTo: CALIBRATE status={calib_status} ok={calib_ok} samples={calib_samples}",
                 )
 
             elif kind == "autocal":
-                self._publish_state(goto_autocal_status="RUNNING")
+                self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "RUNNING"}})
                 autocal_out = self._goto_autocalibrate_blocking(params)
                 autocal_ok = bool(autocal_out.get("ok", False))
-                autocal_status = "READY" if autocal_ok else str(autocal_out.get("status", "UNKNOWN"))
+                autocal_reason = "READY" if autocal_ok else str(autocal_out.get("status", "UNKNOWN"))
                 self._publish_state(
-                    goto_status="AUTOCAL_DONE" if autocal_ok else "AUTOCAL_ERR",
-                    goto_autocal_last_ok=autocal_ok,
-                    goto_autocal_status=autocal_status,
+                    {
+                        "goto": {
+                            "status": GotoStatus.OK if autocal_ok else GotoStatus.FAIL,
+                            "reason": "AUTOCAL",
+                            "autocal_last_ok": autocal_ok,
+                            "autocal_status": GotoAutocalStatus.OK if autocal_ok else GotoAutocalStatus.FAIL,
+                            "autocal_reason": autocal_reason,
+                        }
+                    }
                 )
                 log_info(
                     self._out_log,
@@ -2294,20 +2377,22 @@ class GoToWorker(BaseWorker):
                 )
 
             else:
-                self._publish_state(goto_status=f"ERR_KIND_{kind}")
+                self._publish_state(
+                    {"goto": {"status": GotoStatus.FAIL, "reason": f"ERR_KIND_{kind}"}}
+                )
 
             self._publish_j_matrix_state()
 
         except (RuntimeError, ValueError, TypeError) as exc:
             log_error(self._out_log, f"GoTo worker failed ({kind})", exc)
-            self._publish_state(goto_status="ERR_EXCEPTION")
+            self._publish_state({"goto": {"status": GotoStatus.FAIL, "reason": "EXCEPTION"}})
 
         finally:
             if was_stacking:
                 self._resume_stacking()
             if was_tracking:
                 self._resume_tracking()
-            self._publish_state(goto_busy=False)
+            self._publish_state({"goto": {"busy": False}})
 
 
 # ============================================================

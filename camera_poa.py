@@ -446,15 +446,20 @@ class CameraStream:
 
             # Importante: raw/u8_view apuntan a memoria del ring buffer.
             # El consumidor debe copiar si necesita persistir.
+            meta = dict(meta_common)
+            meta.update(
+                {
+                    "seq": int(seq),
+                    "width": int(w),
+                    "height": int(h),
+                    "fmt": str(fmt.name),
+                }
+            )
             fr = Frame(
-                t_capture=t_cap,
-                seq=seq,
-                w=w,
-                h=h,
-                fmt=fmt.name,
                 raw=raw,
+                t_capture=float(t_cap),
+                meta=meta,
                 u8_view=u8_view,
-                meta=dict(meta_common),
             )
 
             with self._lock:

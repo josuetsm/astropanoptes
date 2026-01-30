@@ -18,7 +18,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 - `app_runner.py`: orquestador principal de runtime; loop de control, captura, preview y tracking.
 - `ui.py`: UI en ipywidgets (estado, preview, control manual de montura, parámetros de cámara).
 - `actions.py`: definición de acciones y factories (connect, set params, tracking, stacking, platesolving, goto).
-- `ap_types.py`: tipos compartidos (ejes, modos, `Frame`, `SystemState`).
+- `ap_types.py`: tipos compartidos (ejes, modos, `Frame`, `AppState`).
 - `config.py`: configuración de cámara, preview, montura, tracking, stacking, platesolving y app.
 - `camera_poa.py`: wrapper de alto nivel para cámara Player One (I/O, configuración, stream).
 - `pyPOACamera.py`: wrapper ctypes del SDK Player One (loader multiplataforma + constantes/structs).
@@ -36,7 +36,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 - **`app_runner.py`**
   - Controla el lifecycle de cámara, stream y montura.
   - Ejecuta el loop de control a `control_hz`, genera previews y aplica tracking.
-  - Mantiene el estado global (`SystemState`) para la UI.
+  - Mantiene el estado global (`AppState`) para la UI.
 
 - **`ui.py`**
   - Construye la UI en Jupyter (botones de conexión, estados, live view).
@@ -46,7 +46,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 ### 2) Tipos, acciones y configuración
 - **`ap_types.py`**
   - Enum de ejes (`Axis`), modos de display y estructura de `Frame`.
-  - `SystemState` agrupa indicadores de estado y métricas (FPS, tracking, stacking, platesolving).
+  - `AppState` agrupa indicadores de estado y métricas (FPS, tracking, stacking, platesolving).
 
 - **`actions.py`**
   - Enum `ActionType` y factories para eventos (cámara, montura, tracking, stacking, platesolving, goto).
@@ -91,7 +91,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 > Estos componentes están **declarados en tipos/configs/actions**, pero aún no existen como módulos dedicados o no están integrados en el runner/UI:
 
 1) **Stacking (apilado)**
-   - `actions.py` define `STACKING_*` y `SystemState` tiene métricas de stacking.
+  - `actions.py` define `STACKING_*` y `AppState` tiene métricas de stacking.
    - En `ui.py` hay botones/estados deshabilitados para stacking.
    - Falta un módulo que: alinee frames, integre/guarde resultados, y exponga métricas.
 
@@ -104,7 +104,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 1. **UI** genera acciones (`actions.py`).
 2. **AppRunner** consume acciones y coordina cámara, preview y montura.
 3. **Tracking** procesa frames y emite rates a la montura.
-4. **Estado** se refleja en `SystemState` y vuelve a la UI.
+4. **Estado** se refleja en `AppState` y vuelve a la UI.
 
 ## Requisitos (implícitos)
 

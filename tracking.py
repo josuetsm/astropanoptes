@@ -1,7 +1,6 @@
 # tracking.py
 from __future__ import annotations
 
-import time
 from dataclasses import dataclass, field
 from typing import Optional, Tuple, Dict, Any
 
@@ -386,7 +385,7 @@ def auto_set_from_A(state: TrackingState, *, A_micro: np.ndarray, b_pxps: Option
     state.auto.src = src
 
 
-def auto_rls_update(state: TrackingState, *, u_az: float, u_alt: float, vx: float, vy: float) -> None:
+def auto_rls_update(state: TrackingState, *, u_az: float, u_alt: float, vx: float, vy: float, now_t: float) -> None:
     cfg = state.cfg.autocal
     if (not cfg.enabled) or (not np.isfinite(vx)) or (not np.isfinite(vy)):
         return
@@ -417,7 +416,7 @@ def auto_rls_update(state: TrackingState, *, u_az: float, u_alt: float, vx: floa
     a.P = P_new
     a.A = theta_new[:, :2].copy()
     a.b = theta_new[:, 2].copy()
-    a.last_upd_t = time.time()
+    a.last_upd_t = float(now_t)
     a.src = "rls"
     _auto_recompute_pinv(state)
 
@@ -515,7 +514,7 @@ def make_tracking_state(cfg: Optional[TrackingConfig] = None) -> TrackingState:
     return st
 
 
-def reset_tracker(state: TrackingState, mode: str = "STABILIZE") -> None:
+def reset_tracker(state: TrackingState, *, now_t: float, mode: str = "STABILIZE") -> None:
     state.prev_obj_xy = None
     state.prev_t = None
     state.fail = 0
@@ -528,7 +527,7 @@ def reset_tracker(state: TrackingState, mode: str = "STABILIZE") -> None:
     state.rate_alt = 0.0
 
     state.current_mode = str(mode)
-    state.t_mode = time.time()
+    state.t_mode = float(now_t)
 
     state.key_obj_xy = None
     state.key_t = None
@@ -540,14 +539,14 @@ def reset_tracker(state: TrackingState, mode: str = "STABILIZE") -> None:
     state.abs_resp_last = 0.0
 
 
-def reset_keyframe(state: TrackingState, obj_xy: Optional[np.ndarray]) -> None:
+def reset_keyframe(state: TrackingState, obj_xy: Optional[np.ndarray], *, now_t: float) -> None:
     state.key_obj_xy = obj_xy
-    state.key_t = time.time()
+    state.key_t = float(now_t)
     state.x_hat = 0.0
     state.y_hat = 0.0
     state.eint_x = 0.0
     state.eint_y = 0.0
-    state.abs_last_t = time.time()
+    state.abs_last_t = float(now_t)
     state.abs_resp_last = 0.0
 
 
@@ -622,7 +621,7 @@ def tracking_step(
     state: TrackingState,
     obj_xy: np.ndarray,
     *,
-    now_t: Optional[float] = None,
+    now_t: float,
     tracking_enabled: bool = True,
 ) -> TrackingOutput:
     """
@@ -631,9 +630,6 @@ def tracking_step(
     - Si tracking_enabled y hay A_pinv (manual o auto), computa RATE targets (pero NO envía).
       AppRunner es quien envía RATE al Arduino.
     """
-    if now_t is None:
-        now_t = time.time()
-
     # resp_min configurable desde UI
     resp_min = float(getattr(state.cfg, "_resp_min", 0.06))
 
@@ -643,9 +639,9 @@ def tracking_step(
 
     # keyframe init/pending
     if state.key_obj_xy is None:
-        reset_keyframe(state, obj_xy)
+        reset_keyframe(state, obj_xy, now_t=now_t)
     elif isinstance(state.key_obj_xy, str) and state.key_obj_xy == "PENDING":
-        reset_keyframe(state, obj_xy)
+        reset_keyframe(state, obj_xy, now_t=now_t)
 
     # first frame
     if state.prev_obj_xy is None or state.prev_t is None:
@@ -717,7 +713,7 @@ def tracking_step(
     if state.fail >= int(state.cfg.rate.fail_reset_n):
         state.rate_az = 0.0
         state.rate_alt = 0.0
-        reset_tracker(state, mode="STABILIZE")
+        reset_tracker(state, now_t=now_t, mode="STABILIZE")
         return TrackingOutput(
             ok=False,
             mode=state.current_mode,
@@ -792,7 +788,7 @@ def tracking_step(
         # keyframe refresh when stable
         e_mag = float(np.hypot(ex, ey))
         if (e_mag <= float(state.cfg.keyframe.keyframe_refresh_px)) and (float(state.abs_resp_last) >= float(state.cfg.keyframe.abs_resp_min)):
-            reset_keyframe(state, obj_xy)
+            reset_keyframe(state, obj_xy, now_t=now_t)
 
     else:
         # no calib -> hold rates at 0
