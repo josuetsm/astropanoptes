@@ -4,9 +4,7 @@ from typing import Optional, Tuple
 
 import numpy as np
 import sep
-import cv2
-
-from imaging import ensure_raw16_bayer
+from imaging import ensure_raw16_bayer, median_prefilter_raw16
 
 
 def sep_detect_from_raw16(
@@ -36,7 +34,7 @@ def sep_detect_from_raw16(
         obj_xy: (N,2) float64 array of x,y positions.
     """
     raw = ensure_raw16_bayer(raw16)
-    img_med = cv2.medianBlur(raw, 3).astype(np.float32, copy=False)
+    img_med = median_prefilter_raw16(raw, ksize=3)
 
     bkg = sep.Background(img_med, bw=int(sep_bw), bh=int(sep_bh))
     img_sub = img_med - bkg.back()
