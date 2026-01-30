@@ -4,7 +4,7 @@
 
 This module is intentionally *self-contained*: it does not import AppRunner.
 AppRunner (or any orchestrator) should provide callbacks for:
-  - get_live_frame(): -> np.ndarray (uint16 RAW16 Bayer; platesolve will use SEP)
+  - get_live_frame(): -> np.ndarray (uint16 RAW16 Bayer; platesolving will use SEP)
   - move_steps(axis: Axis, direction: int, steps: int, delay_us: int) -> None/str
   - stop() -> None/str
   - (optional) set_tracking_enabled(bool) + tracking_keyframe_reset()
@@ -50,15 +50,14 @@ from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 import numpy as np
 
 from ap_types import Axis
-from config import SepConfig
+from config import SepConfig, PlatesolvingConfig
 
 # We reuse target parsing & observer from your plate-solver module.
-from platesolve import (
+from platesolving import (
     ObserverConfig,
-    PlatesolveConfig,
-    PlatesolveResult,
-    platesolve_sweep,
+    PlatesolvingResult,
     parse_target_to_icrs,
+    solve_plate,
 )
 from logging_utils import log_error, log_info
 
@@ -412,7 +411,7 @@ class GoToConfig:
     gain: float = 0.85
     max_step_per_iter: int = 150000  # hard clamp (microsteps)
     stages: int = 1
-    platesolve_feedback: bool = True
+    platesolving_feedback: bool = True
 
     # MOVE speed (blocking). delay_us ~ 1e6 / microsteps_per_s.
     slew_delay_us_az: int = 1200
@@ -420,9 +419,9 @@ class GoToConfig:
 
     settle_s: float = 0.25
 
-    # Platesolve retry strategy (expands search radius)
+    # Platesolving retry strategy (expands search radius)
     # None => use cfg.search_radius_deg (or its default estimate)
-    platesolve_radius_deg_seq: Tuple[Optional[float], ...] = (1.0, 2.5, 5.0)
+    platesolving_radius_deg_seq: Tuple[Optional[float], ...] = (1.0, 2.5, 5.0)
 
     # After each correction iteration, solve near:
     #   - predicted center (recommended)
@@ -439,7 +438,7 @@ class GoToStatus:
     err_az_arcsec: float = 0.0
     err_alt_arcsec: float = 0.0
 
-    last_solution: Optional[PlatesolveResult] = None
+    last_solution: Optional[PlatesolvingResult] = None
 
     def err_norm_arcsec(self) -> float:
         return float(math.hypot(float(self.err_az_arcsec), float(self.err_alt_arcsec)))
@@ -484,7 +483,7 @@ def resolve_target_icrs(
     """Resolve supported target representations to an ICRS SkyCoord.
 
     Supported:
-      - Anything supported by platesolve.parse_target_to_icrs (name, ra/dec, alt/az dict)
+      - Anything supported by platesolving.parse_target_to_icrs (name, ra/dec, alt/az dict)
       - Planets (and Moon) by name
 
     Planet resolution uses astropy's built-in solar system ephemeris.
@@ -522,7 +521,7 @@ def icrs_to_altaz_deg(
     return np.array([az, alt], dtype=np.float64)
 
 
-def platesolve_center_to_altaz_deg(
+def platesolving_center_to_altaz_deg(
     ra_deg: float,
     dec_deg: float,
     *,
@@ -559,12 +558,12 @@ class GoToController:
     # Sync
     # -------------------------
 
-    def sync_from_platesolve(self, sol: PlatesolveResult, *, obstime: Optional[Time] = None) -> bool:
+    def sync_from_platesolving(self, sol: PlatesolvingResult, *, obstime: Optional[Time] = None) -> bool:
         """Set the mount's absolute AZ/ALT reference using a plate-solve."""
         if not bool(getattr(sol, "success", False)):
             return False
 
-        az_alt = platesolve_center_to_altaz_deg(
+        az_alt = platesolving_center_to_altaz_deg(
             float(sol.center_ra_deg),
             float(sol.center_dec_deg),
             observer=self.cfg.observer,
@@ -579,24 +578,24 @@ class GoToController:
         return True
 
     # -------------------------
-    # Platesolve helper
+    # Platesolving helper
     # -------------------------
 
-    def _platesolve_live(
+    def _platesolving_live(
         self,
         *,
         get_live_frame: GetFrameFn,
         target_for_solver: TargetType,
-        platesolve_cfg: PlatesolveConfig,
+        platesolving_cfg: PlatesolvingConfig,
         radius_deg_seq: Optional[Tuple[Optional[float], ...]] = None,
         obstime: Optional[Time] = None,
-    ) -> PlatesolveResult:
+    ) -> PlatesolvingResult:
         if obstime is None:
             obstime = _now_time()
 
         frame = get_live_frame()
         if frame is None:
-            return PlatesolveResult(
+            return PlatesolvingResult(
                 success=False,
                 status="ERR_NO_FRAME",
                 theta_deg=0.0,
@@ -616,30 +615,30 @@ class GoToController:
                 metrics={"err": 1.0},
             )
 
-        last: Optional[PlatesolveResult] = None
-        radius_seq = radius_deg_seq if radius_deg_seq is not None else self.cfg.platesolve_radius_deg_seq
+        last: Optional[PlatesolvingResult] = None
+        radius_seq = radius_deg_seq if radius_deg_seq is not None else self.cfg.platesolving_radius_deg_seq
         for rad in radius_seq:
-            cfg2 = platesolve_cfg
+            cfg2 = platesolving_cfg
             if rad is not None:
                 try:
-                    cfg2 = replace(platesolve_cfg, search_radius_deg=float(rad))
+                    cfg2 = replace(platesolving_cfg, search_radius_deg=float(rad))
                 except Exception as exc:
                     log_info(
                         None,
-                        f"GoTo: failed to apply platesolve radius override ({rad}); using default",
+                        f"GoTo: failed to apply platesolving radius override ({rad}); using default",
                         throttle_s=5.0,
                         throttle_key="goto_radius_fallback",
                     )
                     log_error(
                         None,
-                        "GoTo: platesolve config override failed",
+                        "GoTo: platesolving config override failed",
                         exc,
                         throttle_s=5.0,
                         throttle_key="goto_radius_fallback_exc",
                     )
-                    cfg2 = platesolve_cfg
+                    cfg2 = platesolving_cfg
 
-            res = platesolve_sweep(
+            res = solve_plate(
                 frame,
                 target=target_for_solver,
                 cfg=cfg2,
@@ -665,13 +664,13 @@ class GoToController:
         target: TargetType,
         *,
         get_live_frame: GetFrameFn,
-        platesolve_cfg: PlatesolveConfig,
+        platesolving_cfg: PlatesolvingConfig,
         move_steps: MoveStepsFn,
         stop: Optional[StopFn] = None,
         tracking_pause: Optional[Callable[[bool], Any]] = None,
         tracking_keyframe_reset: Optional[Callable[[], Any]] = None,
         stages: int = 1,
-        platesolve_feedback: bool = True,
+        platesolving_feedback: bool = True,
         obstime: Optional[Time] = None,
     ) -> GoToStatus:
         """Closed-loop GoTo (blocking).
@@ -694,7 +693,7 @@ class GoToController:
                 log_error(None, "GoTo: failed to pause tracking", exc)
 
         stages = max(1, int(stages))
-        use_platesolve_feedback = bool(platesolve_feedback)
+        use_platesolving_feedback = bool(platesolving_feedback)
 
         try:
             # Resolve target once to ICRS; we will recompute AltAz each iter.
@@ -718,7 +717,7 @@ class GoToController:
                 altaz_tgt = icrs_to_altaz_deg(target_icrs, observer=self.cfg.observer, obstime=obstime)
 
                 # current mount altaz best estimate
-                if use_platesolve_feedback:
+                if use_platesolving_feedback:
                     altaz_cur = self.model.current_az_alt_deg()
                 else:
                     altaz_cur = self.model.predict_az_alt_deg()
@@ -813,17 +812,17 @@ class GoToController:
                 else:
                     target_for_solver = target
 
-                if use_platesolve_feedback:
-                    sol = self._platesolve_live(
+                if use_platesolving_feedback:
+                    sol = self._platesolving_live(
                         get_live_frame=get_live_frame,
                         target_for_solver=target_for_solver,
-                        platesolve_cfg=platesolve_cfg,
+                        platesolving_cfg=platesolving_cfg,
                         obstime=obstime,
                     )
                     st.last_solution = sol
 
                     if bool(getattr(sol, "success", False)):
-                        az_alt_new = platesolve_center_to_altaz_deg(
+                        az_alt_new = platesolving_center_to_altaz_deg(
                             float(sol.center_ra_deg),
                             float(sol.center_dec_deg),
                             observer=self.cfg.observer,
@@ -873,7 +872,7 @@ class GoToController:
         self,
         *,
         get_live_frame: GetFrameFn,
-        platesolve_cfg: PlatesolveConfig,
+        platesolving_cfg: PlatesolvingConfig,
         move_steps: MoveStepsFn,
         stop: Optional[StopFn] = None,
         tracking_pause: Optional[Callable[[bool], Any]] = None,
@@ -910,8 +909,8 @@ class GoToController:
             out["status"] = "ERR_NOT_SYNCED"
             return out
 
-        calib_platesolve_cfg = replace(
-            platesolve_cfg,
+        calib_platesolving_cfg = replace(
+            platesolving_cfg,
             search_radius_deg=1.0,
             gmax=15.0,
             nside=16,
@@ -940,17 +939,17 @@ class GoToController:
             # (This keeps calibration stable if you manually moved without a new solve.)
             if self.model.last_solve_az_alt_deg is None:
                 altaz_pred = self.model.predict_az_alt_deg()
-                sol0 = self._platesolve_live(
+                sol0 = self._platesolving_live(
                     get_live_frame=get_live_frame,
                     target_for_solver={"az_deg": float(altaz_pred[0]), "alt_deg": float(altaz_pred[1])},
-                    platesolve_cfg=calib_platesolve_cfg,
+                    platesolving_cfg=calib_platesolving_cfg,
                     radius_deg_seq=(1.0,),
                     obstime=obstime,
                 )
                 if not bool(getattr(sol0, "success", False)):
-                    out["status"] = "ERR_PLATESOLVE_BASE"
+                    out["status"] = "ERR_PLATESOLVING_BASE"
                     return out
-                altaz0 = platesolve_center_to_altaz_deg(
+                altaz0 = platesolving_center_to_altaz_deg(
                     float(sol0.center_ra_deg),
                     float(sol0.center_dec_deg),
                     observer=self.cfg.observer,
@@ -1025,10 +1024,10 @@ class GoToController:
 
                 # Plate-solve near predicted center (recommended)
                 altaz_pred = self.model.predict_az_alt_deg()
-                sol = self._platesolve_live(
+                sol = self._platesolving_live(
                     get_live_frame=get_live_frame,
                     target_for_solver={"az_deg": float(altaz_pred[0]), "alt_deg": float(altaz_pred[1])},
-                    platesolve_cfg=calib_platesolve_cfg,
+                    platesolving_cfg=calib_platesolving_cfg,
                     radius_deg_seq=(1.0,),
                     obstime=_now_time(),
                 )
@@ -1036,7 +1035,7 @@ class GoToController:
                     # skip sample
                     continue
 
-                altaz_new = platesolve_center_to_altaz_deg(
+                altaz_new = platesolving_center_to_altaz_deg(
                     float(sol.center_ra_deg),
                     float(sol.center_dec_deg),
                     observer=self.cfg.observer,

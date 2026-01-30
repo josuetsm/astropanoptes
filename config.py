@@ -127,7 +127,7 @@ class SepConfig:
 
 
 @dataclass
-class PlatesolveConfig:
+class PlatesolvingConfig:
     # Instrument (SI)
     pixel_size_m: float = 2.9e-6
     focal_m: float = 0.9
@@ -197,7 +197,7 @@ class GoToConfig:
     max_step_per_iter: int = 150000
     slew_delay_us: int = 1800
     stages: int = 6
-    platesolve_feedback: bool = True
+    platesolving_feedback: bool = True
 
     # Safe operating window
     alt_min_deg: float = 10.0
@@ -217,7 +217,7 @@ class AppConfig:
     stacking: StackingConfig = field(default_factory=StackingConfig)
     hotpixels: HotPixelsConfig = field(default_factory=HotPixelsConfig)
     sep: SepConfig = field(default_factory=SepConfig)
-    platesolve: PlatesolveConfig = field(default_factory=PlatesolveConfig)
+    platesolving: PlatesolvingConfig = field(default_factory=PlatesolvingConfig)
     goto: GoToConfig = field(default_factory=GoToConfig)
     
     control_hz: float = 120.0
