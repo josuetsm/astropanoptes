@@ -44,13 +44,14 @@ from __future__ import annotations
 import math
 import random
 import time
+import threading
 from dataclasses import dataclass, field, replace
 from typing import Any, Callable, Dict, List, Optional, Sequence, Tuple, Union
 
 import numpy as np
 
-from ap_types import Axis
-from config import SepConfig, PlatesolvingConfig
+from ap_types import Axis, Frame, SystemState
+from config import SepConfig, PlatesolvingConfig, MountConfig, CameraConfig
 
 # We reuse target parsing & observer from your plate-solver module.
 from platesolving import (
@@ -58,8 +59,13 @@ from platesolving import (
     PlatesolvingResult,
     parse_target_to_icrs,
     solve_plate,
+    _build_platesolving_debug_info,
+    _render_platesolving_debug_jpeg,
 )
 from logging_utils import log_error, log_info
+from workers import BaseWorker
+from imaging import ensure_raw16_bayer
+from sep_utils import sep_detect_from_raw16, estimate_shift_from_objects
 
 import astropy.units as u
 from astropy.coordinates import AltAz, SkyCoord, get_body, solar_system_ephemeris
@@ -1077,6 +1083,1231 @@ class GoToController:
                         tracking_keyframe_reset()
                     except Exception as exc:
                         log_error(None, "GoTo: failed to reset tracking keyframe (calibration)", exc)
+
+
+# ============================================================
+# Worker (threaded orchestration)
+# ============================================================
+
+def _perf() -> float:
+    return time.perf_counter()
+
+
+def _now_s() -> float:
+    return time.time()
+
+
+@dataclass(frozen=True)
+class _AutocalFrame:
+    raw16: np.ndarray
+    t_capture: float
+    obj_xy: np.ndarray
+    star_count: int
+    saturation_frac: float
+
+
+@dataclass(frozen=True)
+class _AutocalJResult:
+    col: Optional[np.ndarray]
+    ok_count: int
+    missing_base: int
+    missing_plus: int
+    missing_minus: int
+    resp_low: int
+    expanded_used: int
+
+
+class GoToWorker(BaseWorker):
+    """
+    Background worker for GoTo / calibration / autocalibration.
+
+    Dependencies injected:
+      - get_state(): SystemState snapshot
+      - publish_state(**kwargs): publish UI state
+      - get_frame(): latest Frame (or None)
+      - get_goto_cfg(): GoToConfig snapshot
+      - get_mount_cfg(): MountConfig snapshot
+      - get_sep_cfg(): SepConfig snapshot
+      - get_camera_cfg(): CameraConfig snapshot
+      - get_platesolving_cfg(): PlatesolvingConfig snapshot
+      - get_observer(): ObserverConfig snapshot
+      - apply_camera_param(name, value): set camera parameter
+      - pause_tracking()/resume_tracking()
+      - pause_stacking()/resume_stacking()
+      - move_steps(axis, direction, steps, delay_us)
+      - stop_mount()
+    """
+
+    def __init__(
+        self,
+        *,
+        goto_controller: GoToController,
+        get_state: Callable[[], SystemState],
+        publish_state: Callable[..., None],
+        get_frame: Callable[[], Optional[Frame]],
+        get_goto_cfg: Callable[[], GoToConfig],
+        get_mount_cfg: Callable[[], MountConfig],
+        get_sep_cfg: Callable[[], SepConfig],
+        get_camera_cfg: Callable[[], CameraConfig],
+        get_platesolving_cfg: Callable[[], PlatesolvingConfig],
+        get_observer: Callable[[], ObserverConfig],
+        apply_camera_param: Callable[[str, Any], None],
+        pause_tracking: Callable[[], bool],
+        resume_tracking: Callable[[], None],
+        pause_stacking: Callable[[], bool],
+        resume_stacking: Callable[[], None],
+        move_steps: Callable[[Axis, int, int, int], Any],
+        stop_mount: Callable[[], Any],
+        out_log: Any = None,
+    ) -> None:
+        super().__init__(name="GoToWorker")
+        self._goto = goto_controller
+        self._get_state = get_state
+        self._publish_state = publish_state
+        self._get_frame = get_frame
+        self._get_goto_cfg = get_goto_cfg
+        self._get_mount_cfg = get_mount_cfg
+        self._get_sep_cfg = get_sep_cfg
+        self._get_camera_cfg = get_camera_cfg
+        self._get_platesolving_cfg = get_platesolving_cfg
+        self._get_observer = get_observer
+        self._apply_camera_param = apply_camera_param
+        self._pause_tracking = pause_tracking
+        self._resume_tracking = resume_tracking
+        self._pause_stacking = pause_stacking
+        self._resume_stacking = resume_stacking
+        self._move_steps = move_steps
+        self._stop_mount = stop_mount
+        self._out_log = out_log
+        self._op_cancel = threading.Event()
+
+    def request(self, *, kind: str, target: Any, params: Dict[str, Any]) -> None:
+        super().request(kind=str(kind), target=target, params=dict(params))
+
+    def cancel(self) -> None:
+        self._op_cancel.set()
+
+    def _get_live_raw16(self) -> Optional[np.ndarray]:
+        fr = self._get_frame()
+        if fr is None:
+            return None
+        return ensure_raw16_bayer(fr.raw)
+
+    def _autocal_detect(self, raw16: np.ndarray) -> Tuple[np.ndarray, int, float]:
+        sep_cfg = self._get_sep_cfg()
+        platesolving_cfg = self._get_platesolving_cfg()
+        img_det, _bkg, objects, obj_xy = sep_detect_from_raw16(
+            raw16,
+            sep_bw=int(sep_cfg.bw),
+            sep_bh=int(sep_cfg.bh),
+            sep_thresh_sigma=float(sep_cfg.thresh_sigma),
+            sep_minarea=int(sep_cfg.minarea),
+            max_sources=int(platesolving_cfg.max_det),
+        )
+        _ = img_det, objects
+        star_count = int(obj_xy.shape[0])
+        max_val = np.iinfo(raw16.dtype).max
+        saturation_frac = float(np.mean(raw16 >= max_val))
+        return obj_xy, star_count, saturation_frac
+
+    def _autocal_capture_frames(
+        self,
+        *,
+        n_frames: int,
+        timeout_s: float,
+        min_dt_s: float = 0.0,
+        skip_frames: int = 0,
+    ) -> List[_AutocalFrame]:
+        frames: List[_AutocalFrame] = []
+        deadline = _perf() + float(timeout_s)
+        last_seq: Optional[int] = None
+        last_capture_t: Optional[float] = None
+        min_dt_s = max(0.0, float(min_dt_s))
+        skip_remaining = max(0, int(skip_frames))
+        while len(frames) < int(n_frames) and _perf() < deadline:
+            if self._op_cancel.is_set():
+                break
+            fr = self._get_frame()
+            if fr is None:
+                time.sleep(0.01)
+                continue
+            if last_seq is not None and int(fr.seq) == last_seq:
+                time.sleep(0.005)
+                continue
+            last_seq = int(fr.seq)
+            if skip_remaining > 0:
+                skip_remaining -= 1
+                continue
+            raw16 = ensure_raw16_bayer(fr.raw).copy()
+            obj_xy, star_count, saturation_frac = self._autocal_detect(raw16)
+            t_capture = float(getattr(fr, "t_capture", _now_s()))
+            if last_capture_t is not None and (t_capture - last_capture_t) < min_dt_s:
+                time.sleep(0.005)
+                continue
+            frames.append(
+                _AutocalFrame(
+                    raw16=raw16,
+                    t_capture=t_capture,
+                    obj_xy=obj_xy,
+                    star_count=star_count,
+                    saturation_frac=saturation_frac,
+                )
+            )
+            last_capture_t = t_capture
+        return frames
+
+    def _autocal_adjust_exposure(
+        self,
+        *,
+        star_count: int,
+        saturation_frac: float,
+        target_min: int,
+        target_max: int,
+        sat_max: float,
+        exp_min_ms: float,
+        exp_max_ms: float,
+        exp_step: float,
+        gain_min: int,
+        gain_max: int,
+        gain_step: int,
+        settle_s: float,
+    ) -> bool:
+        cam_cfg = self._get_camera_cfg()
+        exp_ms = float(getattr(cam_cfg, "exp_ms", 0.0))
+        gain = int(getattr(cam_cfg, "gain", 0))
+
+        need_more = int(star_count) < int(target_min)
+        need_less = int(star_count) > int(target_max) or float(saturation_frac) > float(sat_max)
+
+        if not need_more and not need_less:
+            return False
+
+        if need_more:
+            if exp_ms < float(exp_max_ms):
+                new_exp = min(float(exp_max_ms), exp_ms * float(exp_step))
+                if new_exp != exp_ms:
+                    self._apply_camera_param("exp_ms", new_exp)
+                    time.sleep(float(settle_s))
+                    return True
+            if gain < int(gain_max):
+                new_gain = min(int(gain_max), gain + int(gain_step))
+                if new_gain != gain:
+                    self._apply_camera_param("gain", new_gain)
+                    time.sleep(float(settle_s))
+                    return True
+        else:
+            if gain > int(gain_min):
+                new_gain = max(int(gain_min), gain - int(gain_step))
+                if new_gain != gain:
+                    self._apply_camera_param("gain", new_gain)
+                    time.sleep(float(settle_s))
+                    return True
+            if exp_ms > float(exp_min_ms):
+                new_exp = max(float(exp_min_ms), exp_ms / float(exp_step))
+                if new_exp != exp_ms:
+                    self._apply_camera_param("exp_ms", new_exp)
+                    time.sleep(float(settle_s))
+                    return True
+        return False
+
+    def _autocal_exposure_in_range(
+        self,
+        *,
+        star_count: int,
+        saturation_frac: float,
+        target_min: int,
+        target_max: int,
+        sat_max: float,
+    ) -> bool:
+        if int(star_count) < int(target_min):
+            return False
+        if int(star_count) > int(target_max):
+            return False
+        if float(saturation_frac) > float(sat_max):
+            return False
+        return True
+
+    def _autocal_estimate_drift(
+        self,
+        frames: List[_AutocalFrame],
+        *,
+        dt_min_s: float,
+        dt_max_s: float,
+        max_pairs: int,
+        max_shift_px: float,
+        min_resp: float,
+    ) -> Optional[np.ndarray]:
+        if len(frames) < 2:
+            log_info(
+                self._out_log,
+                f"GoTo: AutoCal drift needs >=2 frames, got {len(frames)}",
+            )
+            return None
+        pairs: List[Tuple[int, int, float]] = []
+        for i in range(len(frames)):
+            for j in range(i + 1, len(frames)):
+                dt = float(frames[j].t_capture - frames[i].t_capture)
+                if float(dt_min_s) <= dt <= float(dt_max_s):
+                    pairs.append((i, j, dt))
+        if not pairs:
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal drift has no frame pairs in dt range "
+                f"[{float(dt_min_s):.3f}, {float(dt_max_s):.3f}]s",
+            )
+            return None
+
+        pair_count = len(pairs)
+        if pair_count > int(max_pairs):
+            idx = np.linspace(0, len(pairs) - 1, int(max_pairs)).round().astype(int)
+            pairs = [pairs[i] for i in idx]
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal drift pairing "
+            f"frames={len(frames)} pairs={pair_count}->{len(pairs)} "
+            f"dt_range=[{float(dt_min_s):.3f}, {float(dt_max_s):.3f}]s "
+            f"max_shift_px={float(max_shift_px):.1f} min_resp={float(min_resp):.3f}",
+        )
+
+        v_list: List[np.ndarray] = []
+        resp_list: List[float] = []
+        resp_low = 0
+        for i, j, dt in pairs:
+            dx, dy, resp, _n = estimate_shift_from_objects(
+                frames[i].obj_xy,
+                frames[j].obj_xy,
+                max_shift_px=float(max_shift_px),
+            )
+            if float(resp) < float(min_resp):
+                resp_low += 1
+                continue
+            v = np.array([-dx / dt, -dy / dt], dtype=np.float64)
+            v_list.append(v)
+            resp_list.append(float(resp))
+
+        if len(v_list) < 2:
+            resp_min = min(resp_list) if resp_list else 0.0
+            resp_med = float(np.median(resp_list)) if resp_list else 0.0
+            resp_max = max(resp_list) if resp_list else 0.0
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal drift insufficient valid pairs "
+                f"valid={len(v_list)} total={len(pairs)} resp_low={resp_low} "
+                f"resp_stats=[{resp_min:.3f},{resp_med:.3f},{resp_max:.3f}]",
+            )
+            return None
+        drift = np.median(np.stack(v_list, axis=0), axis=0)
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal drift estimate "
+            f"vx={float(drift[0]):.3f}px/s vy={float(drift[1]):.3f}px/s "
+            f"valid_pairs={len(v_list)}",
+        )
+        return drift
+
+    def _autocal_shift_with_retry(
+        self,
+        ref_xy: np.ndarray,
+        cur_xy: np.ndarray,
+        *,
+        max_shift_px: float,
+        min_resp: float,
+    ) -> Tuple[float, float, float, int, bool]:
+        dx, dy, resp, matches = estimate_shift_from_objects(
+            ref_xy,
+            cur_xy,
+            max_shift_px=float(max_shift_px),
+        )
+        if float(resp) >= float(min_resp):
+            return dx, dy, resp, matches, False
+        expanded = float(max_shift_px) * 2.0
+        if expanded <= float(max_shift_px):
+            return dx, dy, resp, matches, False
+        dx2, dy2, resp2, matches2 = estimate_shift_from_objects(
+            ref_xy,
+            cur_xy,
+            max_shift_px=expanded,
+        )
+        if float(resp2) <= float(resp):
+            return dx, dy, resp, matches, False
+        return dx2, dy2, resp2, matches2, True
+
+    def _autocal_pick_best_frame(
+        self,
+        frames: Sequence[_AutocalFrame],
+    ) -> Optional[_AutocalFrame]:
+        if not frames:
+            return None
+        return max(
+            frames,
+            key=lambda fr: (int(fr.star_count), -float(fr.saturation_frac)),
+        )
+
+    def _autocal_measure_axis_j(
+        self,
+        *,
+        axis: Axis,
+        steps: int,
+        repeats: int,
+        block_frames: int,
+        drift_pix: np.ndarray,
+        max_shift_px: float,
+        min_resp: float,
+        delay_us: int,
+        settle_s: float,
+        skip_frames: int,
+        capture_timeout_s: float,
+    ) -> _AutocalJResult:
+        def _format_obj_xy(obj_xy: np.ndarray, max_items: int = 8) -> str:
+            count = int(obj_xy.shape[0])
+            if count == 0:
+                return "count=0"
+            sample = obj_xy[:max_items]
+            sample_str = ", ".join(f"({float(x):.1f},{float(y):.1f})" for x, y in sample)
+            suffix = "..." if count > max_items else ""
+            return f"count={count} sample=[{sample_str}{suffix}]"
+
+        step_count = int(abs(int(steps)))
+        if step_count <= 0:
+            return _AutocalJResult(
+                col=None,
+                ok_count=0,
+                missing_base=0,
+                missing_plus=0,
+                missing_minus=0,
+                resp_low=0,
+                expanded_used=0,
+            )
+
+        cols: List[np.ndarray] = []
+        missing_base = 0
+        missing_plus = 0
+        missing_minus = 0
+        resp_low = 0
+        expanded_used = 0
+        for _ in range(int(repeats)):
+            if self._op_cancel.is_set():
+                return _AutocalJResult(
+                    col=None,
+                    ok_count=0,
+                    missing_base=missing_base,
+                    missing_plus=missing_plus,
+                    missing_minus=missing_minus,
+                    resp_low=resp_low,
+                    expanded_used=expanded_used,
+                )
+
+            base_frames = self._autocal_capture_frames(
+                n_frames=int(block_frames),
+                timeout_s=float(capture_timeout_s),
+                skip_frames=int(skip_frames),
+            )
+            base = self._autocal_pick_best_frame(base_frames)
+            if base is None:
+                missing_base += 1
+                continue
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal J base objects "
+                f"axis={axis.name} steps={step_count} {_format_obj_xy(base.obj_xy)}",
+            )
+
+            self._goto._exec_steps(self._move_steps, axis, float(step_count), delay_us=int(delay_us))
+            time.sleep(float(settle_s))
+            plus_frames = self._autocal_capture_frames(
+                n_frames=int(block_frames),
+                timeout_s=float(capture_timeout_s),
+                skip_frames=int(skip_frames),
+            )
+            plus = self._autocal_pick_best_frame(plus_frames)
+            if plus is None:
+                missing_plus += 1
+                continue
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal J plus objects "
+                f"axis={axis.name} steps={step_count} {_format_obj_xy(plus.obj_xy)}",
+            )
+
+            self._goto._exec_steps(self._move_steps, axis, float(-2 * step_count), delay_us=int(delay_us))
+            time.sleep(float(settle_s))
+            minus_frames = self._autocal_capture_frames(
+                n_frames=int(block_frames),
+                timeout_s=float(capture_timeout_s),
+                skip_frames=int(skip_frames),
+            )
+            minus = self._autocal_pick_best_frame(minus_frames)
+            if minus is None:
+                missing_minus += 1
+                continue
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal J minus objects "
+                f"axis={axis.name} steps={step_count} {_format_obj_xy(minus.obj_xy)}",
+            )
+
+            self._goto._exec_steps(self._move_steps, axis, float(step_count), delay_us=int(delay_us))
+            time.sleep(float(settle_s))
+
+            dx_p, dy_p, resp_p, _n_p, expanded_p = self._autocal_shift_with_retry(
+                base.obj_xy,
+                plus.obj_xy,
+                max_shift_px=float(max_shift_px),
+                min_resp=float(min_resp),
+            )
+            dx_m, dy_m, resp_m, _n_m, expanded_m = self._autocal_shift_with_retry(
+                base.obj_xy,
+                minus.obj_xy,
+                max_shift_px=float(max_shift_px),
+                min_resp=float(min_resp),
+            )
+            if expanded_p or expanded_m:
+                expanded_used += 1
+            if float(resp_p) < float(min_resp) or float(resp_m) < float(min_resp):
+                resp_low += 1
+                continue
+
+            dt_plus = float(plus.t_capture - base.t_capture)
+            dt_minus = float(minus.t_capture - base.t_capture)
+            dp_plus = np.array([-dx_p, -dy_p], dtype=np.float64) - drift_pix * dt_plus
+            dp_minus = np.array([-dx_m, -dy_m], dtype=np.float64) - drift_pix * dt_minus
+            dp_axis = (dp_plus - dp_minus) * 0.5
+            cols.append(dp_axis / float(step_count))
+
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal J axis "
+            f"axis={axis.name} repeats={int(repeats)} ok={len(cols)} "
+            f"missing_base={missing_base} missing_plus={missing_plus} "
+            f"missing_minus={missing_minus} resp_low={resp_low} "
+            f"expanded_shift={expanded_used}",
+        )
+        if not cols:
+            return _AutocalJResult(
+                col=None,
+                ok_count=0,
+                missing_base=missing_base,
+                missing_plus=missing_plus,
+                missing_minus=missing_minus,
+                resp_low=resp_low,
+                expanded_used=expanded_used,
+            )
+        return _AutocalJResult(
+            col=np.median(np.stack(cols, axis=0), axis=0),
+            ok_count=len(cols),
+            missing_base=missing_base,
+            missing_plus=missing_plus,
+            missing_minus=missing_minus,
+            resp_low=resp_low,
+            expanded_used=expanded_used,
+        )
+
+    def _autocal_measure_axis_j_with_fallback(
+        self,
+        *,
+        axis: Axis,
+        steps: int,
+        repeats: int,
+        block_frames: int,
+        drift_pix: np.ndarray,
+        max_shift_px: float,
+        min_resp: float,
+        delay_us: int,
+        settle_s: float,
+        skip_frames: int,
+        capture_timeout_s: float,
+        min_steps: int,
+        step_scale: float,
+        max_attempts: int,
+    ) -> Optional[np.ndarray]:
+        step_count = int(abs(int(steps)))
+        if step_count <= 0:
+            return None
+        min_steps = max(1, int(min_steps))
+        step_scale = float(step_scale)
+        max_attempts = max(1, int(max_attempts))
+
+        def _candidate_scale_down(start: int) -> List[int]:
+            candidates_down: List[int] = []
+            step_val = int(start)
+            while step_val >= min_steps and len(candidates_down) < max_attempts:
+                next_step = int(round(step_val * step_scale))
+                if next_step >= step_val:
+                    next_step = step_val - 1
+                step_val = next_step
+                if step_val >= min_steps and step_val not in candidates_down:
+                    candidates_down.append(step_val)
+            return candidates_down
+
+        if self._op_cancel.is_set():
+            return None
+        initial = self._autocal_measure_axis_j(
+            axis=axis,
+            steps=int(step_count),
+            repeats=repeats,
+            block_frames=block_frames,
+            drift_pix=drift_pix,
+            max_shift_px=max_shift_px,
+            min_resp=min_resp,
+            delay_us=delay_us,
+            settle_s=settle_s,
+            skip_frames=skip_frames,
+            capture_timeout_s=capture_timeout_s,
+        )
+        if initial.col is not None:
+            return initial.col
+
+        candidates: List[int] = []
+        candidates.extend(_candidate_scale_down(step_count))
+
+        for candidate in candidates:
+            if self._op_cancel.is_set():
+                return None
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal J axis retry "
+                f"axis={axis.name} steps={int(candidate)}",
+            )
+            attempt = self._autocal_measure_axis_j(
+                axis=axis,
+                steps=int(candidate),
+                repeats=repeats,
+                block_frames=block_frames,
+                drift_pix=drift_pix,
+                max_shift_px=max_shift_px,
+                min_resp=min_resp,
+                delay_us=delay_us,
+                settle_s=settle_s,
+                skip_frames=skip_frames,
+                capture_timeout_s=capture_timeout_s,
+            )
+            if attempt.col is not None:
+                return attempt.col
+        return None
+
+    def _goto_autocalibrate_blocking(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "ok": False,
+            "status": "RUNNING",
+            "drift_pix": None,
+            "J_pix_per_step": None,
+            "pointing_estimate": None,
+            "platesolving_result": None,
+        }
+
+        st = self._get_state()
+        if not bool(getattr(st, "camera_connected", False)):
+            out["status"] = "ERR_NO_CAMERA"
+            return out
+        if not bool(getattr(st, "mount_connected", False)):
+            out["status"] = "ERR_NO_MOUNT"
+            return out
+
+        goto_cfg = self._get_goto_cfg()
+        mount_cfg = self._get_mount_cfg()
+        platesolving_cfg = self._get_platesolving_cfg()
+        sep_cfg = self._get_sep_cfg()
+        observer = self._get_observer()
+
+        target_star_min = int(params.get("target_star_min", 3))
+        target_star_max = int(params.get("target_star_max", 200))
+        target_sat_max = float(params.get("target_sat_max", 0.01))
+        exp_min_ms = float(params.get("exp_min_ms", 20.0))
+        exp_max_ms = float(params.get("exp_max_ms", 1200.0))
+        exp_step = float(params.get("exp_step", 1.5))
+        gain_min = int(params.get("gain_min", 0))
+        gain_max = int(params.get("gain_max", 600))
+        gain_step = int(params.get("gain_step", 50))
+        settle_s = float(params.get("settle_s", goto_cfg.settle_s))
+        tune_attempts = int(params.get("tune_attempts", 5))
+        tune_settle_s = float(params.get("tune_settle_s", 0.4))
+
+        drift_frames = int(params.get("drift_frames", 10))
+        drift_dt_min = float(params.get("drift_dt_min_s", 1.0))
+        drift_dt_max = float(params.get("drift_dt_max_s", 10.0))
+        drift_pairs = int(params.get("drift_pairs", 20))
+        drift_max_shift_px = float(params.get("drift_max_shift_px", 25.0))
+        drift_min_resp = float(params.get("drift_min_resp", 0.2))
+        drift_capture_timeout_s = float(params.get("drift_capture_timeout_s", 12.0))
+
+        jcal_steps_az_base = int(params.get("jcal_steps_az", mount_cfg.slew_steps_az))
+        jcal_steps_alt_base = int(params.get("jcal_steps_alt", mount_cfg.slew_steps_alt))
+        jcal_steps_scale = float(params.get("jcal_steps_scale", 0.1))
+        jcal_repeats = int(params.get("jcal_repeats", 2))
+        jcal_block_frames = int(params.get("jcal_block_frames", 5))
+        jcal_max_shift_px = float(params.get("jcal_max_shift_px", 30.0))
+        jcal_min_resp = float(params.get("jcal_min_resp", 0.2))
+        jcal_settle_s = float(params.get("jcal_settle_s", max(settle_s, 0.6)))
+        jcal_capture_timeout_s = float(params.get("jcal_capture_timeout_s", 4.0))
+        jcal_skip_frames = int(params.get("jcal_skip_frames", 0))
+        jcal_delay_us = int(params.get("jcal_delay_us", goto_cfg.slew_delay_us))
+        jcal_min_steps = int(params.get("jcal_min_steps", 50))
+        jcal_step_scale = float(params.get("jcal_step_scale", 0.5))
+        jcal_step_attempts = int(params.get("jcal_step_attempts", 3))
+
+        solve_attempts = int(params.get("solve_attempts", 5))
+        jitter_deg = float(params.get("solve_jitter_deg", 0.2))
+
+        if jcal_min_steps <= 0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_step_scale <= 0.0 or jcal_step_scale >= 1.0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_step_attempts <= 0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_steps_scale <= 0.0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_settle_s < 0.0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_capture_timeout_s <= 0.0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if jcal_skip_frames < 0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+        if drift_capture_timeout_s <= 0.0:
+            out["status"] = "ERR_DRIFT_PARAMS"
+            return out
+        if jcal_delay_us <= 0:
+            out["status"] = "ERR_JCAL_PARAMS"
+            return out
+
+        jcal_steps_az = max(1, int(round(jcal_steps_az_base * jcal_steps_scale)))
+        jcal_steps_alt = max(1, int(round(jcal_steps_alt_base * jcal_steps_scale)))
+
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal config "
+            f"stars=[{target_star_min},{target_star_max}] sat_max={target_sat_max:.3f} "
+            f"exp_ms=[{exp_min_ms:.1f},{exp_max_ms:.1f}] gain=[{gain_min},{gain_max}] "
+            f"drift_frames={drift_frames} drift_dt=[{drift_dt_min:.2f},{drift_dt_max:.2f}] "
+            f"drift_pairs={drift_pairs} drift_min_resp={drift_min_resp:.2f} "
+            f"drift_capture_timeout_s={drift_capture_timeout_s:.2f} "
+            f"jcal_steps=[{jcal_steps_az},{jcal_steps_alt}] jcal_repeats={jcal_repeats} "
+            f"jcal_min_resp={jcal_min_resp:.2f} "
+            f"jcal_settle_s={jcal_settle_s:.2f} "
+            f"jcal_capture_timeout_s={jcal_capture_timeout_s:.2f} "
+            f"jcal_skip_frames={jcal_skip_frames} "
+            f"jcal_delay_us={jcal_delay_us} "
+            f"jcal_steps_scale={jcal_steps_scale:.2f} "
+            f"jcal_min_steps={jcal_min_steps} step_scale={jcal_step_scale:.2f} "
+            f"step_attempts={jcal_step_attempts}",
+        )
+
+        plate_scale_rad = float(platesolving_cfg.pixel_size_m) / float(platesolving_cfg.focal_m)
+        if not np.isfinite(plate_scale_rad) or plate_scale_rad <= 0.0:
+            out["status"] = "ERR_BAD_PLATE_SCALE"
+            return out
+
+        self._publish_state(goto_autocal_status="EXPOSURE_TUNE")
+        tuned = False
+        for _ in range(int(tune_attempts)):
+            if self._op_cancel.is_set():
+                out["status"] = "CANCELLED"
+                return out
+            frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
+            if not frames:
+                continue
+            fr = frames[0]
+            changed = self._autocal_adjust_exposure(
+                star_count=fr.star_count,
+                saturation_frac=fr.saturation_frac,
+                target_min=target_star_min,
+                target_max=target_star_max,
+                sat_max=target_sat_max,
+                exp_min_ms=exp_min_ms,
+                exp_max_ms=exp_max_ms,
+                exp_step=exp_step,
+                gain_min=gain_min,
+                gain_max=gain_max,
+                gain_step=gain_step,
+                settle_s=tune_settle_s,
+            )
+            if not changed:
+                tuned = True
+                break
+        if not tuned:
+            frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
+            if frames:
+                fr = frames[0]
+                tuned = self._autocal_exposure_in_range(
+                    star_count=fr.star_count,
+                    saturation_frac=fr.saturation_frac,
+                    target_min=target_star_min,
+                    target_max=target_star_max,
+                    sat_max=target_sat_max,
+                )
+        if not tuned:
+            out["status"] = "ERR_EXPOSURE_TUNE"
+            log_info(self._out_log, "GoTo: AutoCal exposure tune failed")
+            return out
+        cam_cfg = self._get_camera_cfg()
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal exposure tuned "
+            f"exp_ms={float(getattr(cam_cfg, 'exp_ms', 0.0)):.2f} "
+            f"gain={int(getattr(cam_cfg, 'gain', 0))}",
+        )
+
+        self._publish_state(goto_autocal_status="DRIFT")
+        drift_frames_list = self._autocal_capture_frames(
+            n_frames=drift_frames,
+            timeout_s=drift_capture_timeout_s,
+            min_dt_s=drift_dt_min,
+        )
+        if len(drift_frames_list) < 2:
+            out["status"] = "ERR_DRIFT_FRAMES"
+            log_info(
+                self._out_log,
+                f"GoTo: AutoCal drift capture insufficient frames ({len(drift_frames_list)})",
+            )
+            return out
+        star_counts = [fr.star_count for fr in drift_frames_list]
+        sat_fracs = [fr.saturation_frac for fr in drift_frames_list]
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal drift frames "
+            f"count={len(drift_frames_list)} "
+            f"stars=[{min(star_counts)},{int(np.median(star_counts))},{max(star_counts)}] "
+            f"sat=[{min(sat_fracs):.3f},{float(np.median(sat_fracs)):.3f},{max(sat_fracs):.3f}]",
+        )
+        drift_pix = self._autocal_estimate_drift(
+            drift_frames_list,
+            dt_min_s=drift_dt_min,
+            dt_max_s=drift_dt_max,
+            max_pairs=drift_pairs,
+            max_shift_px=drift_max_shift_px,
+            min_resp=drift_min_resp,
+        )
+        if drift_pix is None:
+            out["status"] = "ERR_DRIFT"
+            log_info(self._out_log, "GoTo: AutoCal drift estimate failed")
+            return out
+        out["drift_pix"] = drift_pix
+        self._publish_state(
+            goto_autocal_drift_px_s_x=float(drift_pix[0]),
+            goto_autocal_drift_px_s_y=float(drift_pix[1]),
+        )
+
+        self._publish_state(goto_autocal_status="JCAL")
+        col_az = self._autocal_measure_axis_j_with_fallback(
+            axis=Axis.AZ,
+            steps=jcal_steps_az,
+            repeats=jcal_repeats,
+            block_frames=jcal_block_frames,
+            drift_pix=drift_pix,
+            max_shift_px=jcal_max_shift_px,
+            min_resp=jcal_min_resp,
+            delay_us=jcal_delay_us,
+            settle_s=jcal_settle_s,
+            skip_frames=jcal_skip_frames,
+            capture_timeout_s=jcal_capture_timeout_s,
+            min_steps=jcal_min_steps,
+            step_scale=jcal_step_scale,
+            max_attempts=jcal_step_attempts,
+        )
+        if col_az is None:
+            out["status"] = "ERR_JCAL_AZ"
+            return out
+
+        col_alt = self._autocal_measure_axis_j_with_fallback(
+            axis=Axis.ALT,
+            steps=jcal_steps_alt,
+            repeats=jcal_repeats,
+            block_frames=jcal_block_frames,
+            drift_pix=drift_pix,
+            max_shift_px=jcal_max_shift_px,
+            min_resp=jcal_min_resp,
+            delay_us=jcal_delay_us,
+            settle_s=jcal_settle_s,
+            skip_frames=jcal_skip_frames,
+            capture_timeout_s=jcal_capture_timeout_s,
+            min_steps=jcal_min_steps,
+            step_scale=jcal_step_scale,
+            max_attempts=jcal_step_attempts,
+        )
+        if col_alt is None:
+            out["status"] = "ERR_JCAL_ALT"
+            return out
+
+        J_pix = np.column_stack([col_az, col_alt])
+        out["J_pix_per_step"] = J_pix
+        self._publish_state(
+            goto_autocal_J_pix_per_step_00=float(J_pix[0, 0]),
+            goto_autocal_J_pix_per_step_01=float(J_pix[0, 1]),
+            goto_autocal_J_pix_per_step_10=float(J_pix[1, 0]),
+            goto_autocal_J_pix_per_step_11=float(J_pix[1, 1]),
+        )
+
+        self._publish_state(goto_autocal_status="POINTING_SOLVE")
+        e_az = J_pix[:, 0]
+        e_alt = J_pix[:, 1]
+        n_az = float(np.linalg.norm(e_az))
+        n_alt = float(np.linalg.norm(e_alt))
+        if n_az <= 0.0 or n_alt <= 0.0:
+            out["status"] = "ERR_JCAL_NORM"
+            return out
+
+        e_az_hat = e_az / n_az
+        e_alt_hat = e_alt / n_alt
+
+        v_az_pix = float(np.dot(drift_pix, e_az_hat))
+        v_alt_pix = float(np.dot(drift_pix, e_alt_hat))
+        v_obs = np.array([v_az_pix * plate_scale_rad, v_alt_pix * plate_scale_rad], dtype=np.float64)
+
+        def _wrap_deg_180(x: float) -> float:
+            y = (float(x) + 180.0) % 360.0 - 180.0
+            if y <= -180.0:
+                y += 360.0
+            return float(y)
+
+        def _wrap_deg_360(x: float) -> float:
+            y = float(x) % 360.0
+            if y < 0.0:
+                y += 360.0
+            return float(y)
+
+        def _predict_rate(az_deg: float, alt_deg: float, t0: Time, dt_s: float = 1.0) -> np.ndarray:
+            loc = observer.location()
+            altaz0 = AltAz(az=float(az_deg) * u.deg, alt=float(alt_deg) * u.deg, obstime=t0, location=loc)
+            coord = SkyCoord(altaz0)
+            altaz1 = coord.transform_to(AltAz(obstime=t0 + float(dt_s) * u.s, location=loc))
+            daz = _wrap_deg_180(float(altaz1.az.deg) - float(az_deg))
+            dalt = float(altaz1.alt.deg) - float(alt_deg)
+            return np.array(
+                [
+                    np.deg2rad(daz) / float(dt_s),
+                    np.deg2rad(dalt) / float(dt_s),
+                ],
+                dtype=np.float64,
+            )
+
+        t_ref = Time.now()
+        seeds = params.get(
+            "pointing_seeds",
+            [
+                (90.0, 45.0),
+                (270.0, 45.0),
+                (60.0, 35.0),
+                (300.0, 35.0),
+            ],
+        )
+        best = None
+        best_res = float("inf")
+        for seed in seeds:
+            if self._op_cancel.is_set():
+                out["status"] = "CANCELLED"
+                return out
+            az = float(seed[0])
+            alt = float(seed[1])
+            for _ in range(8):
+                pred = _predict_rate(az, alt, t_ref)
+                resid = pred - v_obs
+                if float(np.linalg.norm(resid)) < 1e-7:
+                    break
+                delta = 0.1
+                pred_az = _predict_rate(az + delta, alt, t_ref)
+                pred_alt = _predict_rate(az, alt + delta, t_ref)
+                J = np.column_stack([(pred_az - pred) / delta, (pred_alt - pred) / delta])
+                if np.linalg.matrix_rank(J) < 2:
+                    break
+                step = np.linalg.solve(J, -resid)
+                step = np.clip(step, -5.0, 5.0)
+                az = _wrap_deg_360(az + float(step[0]))
+                alt = float(alt + float(step[1]))
+                alt = float(np.clip(alt, goto_cfg.alt_min_deg, goto_cfg.alt_max_deg))
+            resid_norm = float(np.linalg.norm(_predict_rate(az, alt, t_ref) - v_obs))
+            if resid_norm < best_res:
+                best_res = resid_norm
+                best = (az, alt)
+
+        if best is None:
+            out["status"] = "ERR_POINTING_SOLVE"
+            return out
+
+        az_hat, alt_hat = best
+        dist_to_0 = min(az_hat, 360.0 - az_hat)
+        dist_to_180 = abs(az_hat - 180.0)
+        if dist_to_0 < 15.0 or dist_to_180 < 15.0:
+            out["status"] = "ERR_DEGENERATE_AZ"
+            return out
+
+        out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
+        self._publish_state(
+            goto_autocal_az_deg=float(az_hat),
+            goto_autocal_alt_deg=float(alt_hat),
+            goto_autocal_radius_deg=1.0,
+        )
+
+        self._publish_state(goto_autocal_status="PLATESOLVING_LOOP")
+        v_deg_s = np.rad2deg(v_obs)
+        jitter_seq = [
+            (0.0, 0.0),
+            (jitter_deg, 0.0),
+            (-jitter_deg, 0.0),
+            (0.0, jitter_deg),
+            (0.0, -jitter_deg),
+        ]
+        platesolving_result = None
+        attempts = 0
+        while attempts < int(solve_attempts):
+            if self._op_cancel.is_set():
+                out["status"] = "CANCELLED"
+                return out
+            frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
+            if not frames:
+                attempts += 1
+                continue
+            fr = frames[0]
+            changed = self._autocal_adjust_exposure(
+                star_count=fr.star_count,
+                saturation_frac=fr.saturation_frac,
+                target_min=target_star_min,
+                target_max=target_star_max,
+                sat_max=target_sat_max,
+                exp_min_ms=exp_min_ms,
+                exp_max_ms=exp_max_ms,
+                exp_step=exp_step,
+                gain_min=gain_min,
+                gain_max=gain_max,
+                gain_step=gain_step,
+                settle_s=tune_settle_s,
+            )
+            if changed:
+                continue
+
+            t_now = Time.now()
+            dt_s = float((t_now - t_ref).to_value(u.s))
+            az_c = _wrap_deg_360(az_hat + float(v_deg_s[0]) * dt_s)
+            alt_c = float(alt_hat + float(v_deg_s[1]) * dt_s)
+            alt_c = float(np.clip(alt_c, goto_cfg.alt_min_deg, goto_cfg.alt_max_deg))
+
+            jitter = jitter_seq[attempts % len(jitter_seq)]
+            target = {"az_deg": float(az_c + jitter[0]), "alt_deg": float(alt_c + jitter[1])}
+
+            ps_cfg = replace(platesolving_cfg, search_radius_deg=1.0)
+            platesolving_result = solve_plate(
+                fr.raw16,
+                target=target,
+                cfg=ps_cfg,
+                sep_cfg=sep_cfg,
+                observer=observer,
+                obstime=t_now,
+                progress_cb=None,
+            )
+            attempts += 1
+
+            debug_jpeg = _render_platesolving_debug_jpeg(
+                fr.raw16,
+                list(getattr(platesolving_result, "overlay", []) or []),
+            )
+            debug_info = _build_platesolving_debug_info(platesolving_result)
+
+            self._publish_state(
+                platesolving_busy=False,
+                platesolving_status=getattr(platesolving_result, "status", "UNKNOWN"),
+                platesolving_last_ok=bool(getattr(platesolving_result, "success", False)),
+                platesolving_theta_deg=float(getattr(platesolving_result, "theta_deg", 0.0)),
+                platesolving_dx_px=float(getattr(platesolving_result, "dx_px", 0.0)),
+                platesolving_dy_px=float(getattr(platesolving_result, "dy_px", 0.0)),
+                platesolving_resp=float(getattr(platesolving_result, "response", 0.0)),
+                platesolving_n_inliers=int(getattr(platesolving_result, "n_inliers", 0)),
+                platesolving_rms_px=float(getattr(platesolving_result, "rms_px", 0.0)),
+                platesolving_overlay=list(getattr(platesolving_result, "overlay", []) or []),
+                platesolving_guides=list(getattr(platesolving_result, "guides", []) or []),
+                platesolving_debug_jpeg=debug_jpeg,
+                platesolving_debug_info=debug_info,
+                platesolving_center_ra_deg=float(getattr(platesolving_result, "center_ra_deg", 0.0)),
+                platesolving_center_dec_deg=float(getattr(platesolving_result, "center_dec_deg", 0.0)),
+            )
+
+            if bool(getattr(platesolving_result, "success", False)):
+                self._publish_state(platesolving_result=platesolving_result)
+                break
+
+        if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
+            out["status"] = "ERR_PLATESOLVING"
+            out["platesolving_result"] = platesolving_result
+            return out
+
+        out["platesolving_result"] = platesolving_result
+        self._publish_state(goto_autocal_status="SYNC")
+        ok_sync = bool(self._goto.sync_from_platesolving(platesolving_result))
+        self._publish_state(goto_synced=ok_sync, goto_status="SYNC_OK" if ok_sync else "SYNC_ERR")
+        if not ok_sync:
+            out["status"] = "ERR_SYNC"
+            return out
+
+        self._publish_state(goto_autocal_status="CALIBRATE_J")
+
+        def _get_live_frame_for_calib() -> Optional[np.ndarray]:
+            return self._get_live_raw16()
+
+        calib_out = self._goto.calibrate_blocking(
+            get_live_frame=_get_live_frame_for_calib,
+            move_steps=self._move_steps,
+            stop=self._stop_mount,
+            platesolving_cfg=platesolving_cfg,
+            n_samples=int(params.get("calib_samples", goto_cfg.calib_samples)),
+            max_radius_deg=float(params.get("calib_max_radius_deg", goto_cfg.calib_max_radius_deg)),
+        )
+        if not bool(calib_out.get("ok", False)):
+            out["status"] = "ERR_CALIBRATE_J"
+            return out
+
+        out["ok"] = True
+        out["status"] = "OK"
+        self._publish_state(goto_autocal_last_ok=True, goto_autocal_status="READY")
+        return out
+
+    def _publish_j_matrix_state(self) -> None:
+        J = getattr(self._goto.model, "J_deg_per_step", None)
+        if J is None or getattr(J, "shape", None) != (2, 2):
+            log_error(self._out_log, "GoTo: J matrix unavailable or invalid", ValueError("invalid J matrix"))
+            return
+        self._publish_state(
+            goto_J00=float(J[0, 0]),
+            goto_J01=float(J[0, 1]),
+            goto_J10=float(J[1, 0]),
+            goto_J11=float(J[1, 1]),
+            goto_synced=bool(getattr(self._goto.model, "synced", False)),
+        )
+
+    def _handle_request(self, request: Dict[str, Any]) -> None:
+        kind = str(request.get("kind", "goto"))
+        target = request.get("target", None)
+        params = dict(request.get("params", {}) or {})
+
+        was_tracking = self._pause_tracking()
+        was_stacking = self._pause_stacking()
+
+        self._publish_state(goto_busy=True, goto_status=kind.upper())
+        self._op_cancel.clear()
+
+        goto_cfg = self._get_goto_cfg()
+        platesolving_cfg = self._get_platesolving_cfg()
+
+        try:
+            if kind == "goto":
+                delay_us = int(params.get("delay_us", goto_cfg.slew_delay_us))
+                tol_arcsec = float(params.get("tol_arcsec", goto_cfg.tol_arcsec))
+                stages = int(params.get("stages", goto_cfg.stages))
+                platesolving_feedback = bool(params.get("platesolving_feedback", goto_cfg.platesolving_feedback))
+                gain = float(params.get("gain", goto_cfg.gain))
+                max_step_per_iter = int(goto_cfg.max_step_per_iter)
+                if "max_step_per_iter" in params:
+                    max_step_per_iter = int(params.get("max_step_per_iter"))
+                else:
+                    max_step_deg = float(params.get("max_step_deg", 5.0))
+                    j_matrix = self._goto.model.J_deg_per_step
+                    max_abs_deg_per_step = float(np.max(np.abs(j_matrix))) if j_matrix is not None and j_matrix.size else 0.0
+                    if max_abs_deg_per_step > 0.0:
+                        max_step_per_iter = int(max(1, round(max_step_deg / max_abs_deg_per_step)))
+
+                self._goto.cfg = replace(
+                    self._goto.cfg,
+                    tol_arcsec=tol_arcsec,
+                    max_iters=stages,
+                    gain=gain,
+                    max_step_per_iter=max_step_per_iter,
+                    slew_delay_us_az=delay_us,
+                    slew_delay_us_alt=delay_us,
+                    stages=stages,
+                    platesolving_feedback=platesolving_feedback,
+                )
+
+                status = self._goto.goto_blocking(
+                    target,
+                    get_live_frame=self._get_live_raw16,
+                    move_steps=self._move_steps,
+                    stop=self._stop_mount,
+                    platesolving_cfg=platesolving_cfg,
+                    stages=stages,
+                    platesolving_feedback=platesolving_feedback,
+                )
+                err_norm = float(status.err_norm_arcsec())
+                self._publish_state(
+                    goto_last_error_arcsec=err_norm,
+                    goto_status="GOTO_OK" if status.ok else "GOTO_ERR",
+                )
+                if status.ok:
+                    log_info(
+                        self._out_log,
+                        f"GoTo: OK status={status.status} iters={status.iters} err_arcsec={err_norm:.2f}",
+                    )
+                else:
+                    log_info(
+                        self._out_log,
+                        f"GoTo: ERR status={status.status} iters={status.iters} err_arcsec={err_norm:.2f}",
+                    )
+
+            elif kind == "calibrate":
+                if "n_samples" not in params and "samples" in params:
+                    params["n_samples"] = params.get("samples")
+                if "max_radius_deg" not in params and "radius_deg" in params:
+                    params["max_radius_deg"] = params.get("radius_deg")
+
+                delay_us = int(params.get("delay_us", goto_cfg.slew_delay_us))
+                n_samples = int(params.get("n_samples", goto_cfg.calib_samples))
+                max_radius_deg = float(params.get("max_radius_deg", goto_cfg.calib_max_radius_deg))
+
+                self._goto.cfg = replace(
+                    self._goto.cfg,
+                    slew_delay_us_az=delay_us,
+                    slew_delay_us_alt=delay_us,
+                )
+
+                calib_out = self._goto.calibrate_blocking(
+                    get_live_frame=self._get_live_raw16,
+                    move_steps=self._move_steps,
+                    stop=self._stop_mount,
+                    platesolving_cfg=platesolving_cfg,
+                    n_samples=n_samples,
+                    max_radius_deg=max_radius_deg,
+                )
+                calib_ok = bool(calib_out.get("ok", False))
+                calib_status = str(calib_out.get("status", "UNKNOWN"))
+                calib_samples = int(calib_out.get("n_samples", 0))
+                self._publish_state(goto_status="CAL_OK" if calib_ok else "CAL_ERR")
+                log_info(
+                    self._out_log,
+                    f"GoTo: CALIBRATE status={calib_status} ok={calib_ok} samples={calib_samples}",
+                )
+
+            elif kind == "autocal":
+                self._publish_state(goto_autocal_status="RUNNING")
+                autocal_out = self._goto_autocalibrate_blocking(params)
+                autocal_ok = bool(autocal_out.get("ok", False))
+                autocal_status = "READY" if autocal_ok else str(autocal_out.get("status", "UNKNOWN"))
+                self._publish_state(
+                    goto_status="AUTOCAL_DONE" if autocal_ok else "AUTOCAL_ERR",
+                    goto_autocal_last_ok=autocal_ok,
+                    goto_autocal_status=autocal_status,
+                )
+                log_info(
+                    self._out_log,
+                    f"GoTo: AUTOCAL status={autocal_out.get('status')} ok={autocal_ok}",
+                )
+
+            else:
+                self._publish_state(goto_status=f"ERR_KIND_{kind}")
+
+            self._publish_j_matrix_state()
+
+        except (RuntimeError, ValueError, TypeError) as exc:
+            log_error(self._out_log, f"GoTo worker failed ({kind})", exc)
+            self._publish_state(goto_status="ERR_EXCEPTION")
+
+        finally:
+            if was_stacking:
+                self._resume_stacking()
+            if was_tracking:
+                self._resume_tracking()
+            self._publish_state(goto_busy=False)
 
 
 # ============================================================

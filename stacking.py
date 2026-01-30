@@ -18,6 +18,7 @@ from imaging import (
 )
 from preview import stretch_to_u8
 from logging_utils import log_error
+from workers import BaseWorker
 from sep_utils import sep_detect_from_raw16, estimate_shift_from_objects
 
 # ============================================================
@@ -569,7 +570,7 @@ class StackEngine:
 # Worker thread wrapper
 # ============================================================
 
-class StackingWorker:
+class StackingWorker(BaseWorker):
     """
     Owns a StackEngine and a queue.
     Call enqueue_frame(...) from AppRunner loop (non-blocking),
@@ -577,27 +578,24 @@ class StackingWorker:
     """
 
     def __init__(self, cfg: AppConfig):
+        super().__init__(name="StackingWorker")
         self.cfg = cfg
         self.engine = StackEngine(cfg)
         self.engine.configure_from_cfg()
 
         self._q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=cfg.stacking.max_queue)
-        self._stop = threading.Event()
-        self._thr: Optional[threading.Thread] = None
 
         if bool(cfg.stacking.enabled_init):
             self.start()
 
     def start(self) -> None:
         self.engine.start()
-        self._stop.clear()
-        if self._thr is None or not self._thr.is_alive():
-            self._thr = threading.Thread(target=self._run, name="stacking-worker", daemon=True)
-            self._thr.start()
+        super().start()
 
     def stop(self) -> None:
         self.engine.stop()
-        self._stop.set()
+        super().stop()
+        self.join(timeout=1.0)
 
     def reset(self) -> None:
         self.engine.reset()
@@ -613,15 +611,18 @@ class StackingWorker:
             self._q.put_nowait(item)
         except queue.Full:
             self.engine.metrics.frames_dropped += 1
+            return
+        self.request(op="process")
 
-    def _run(self) -> None:
+    def _handle_request(self, request: Dict[str, Any]) -> None:
+        _ = request
         batch_size = int(self.cfg.stacking.batch_size)
-        while not self._stop.is_set():
+        while not self._cancel.is_set():
             batch: List[Dict[str, Any]] = []
             try:
-                batch.append(self._q.get(timeout=0.1))
+                batch.append(self._q.get_nowait())
             except queue.Empty:
-                continue
+                break
 
             for _ in range(batch_size - 1):
                 try:
