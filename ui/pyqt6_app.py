@@ -344,6 +344,11 @@ class AstroPanoptesWindow(QMainWindow):
         self.lbl_fps = QLabel("FPS view/max: --/--")
         self.lbl_drift = QLabel("drift vx/vy: --/-- px/s")
         self.lbl_coords = QLabel("RA/Dec: -- -- | Alt/Az: -- --")
+        self.lbl_errors = QLabel("Errors: none")
+        self.lbl_errors.setStyleSheet(
+            "QLabel { padding:4px 10px; border:1px solid #5a2a2a; border-radius:10px; "
+            "background:#1b0f0f; color:#ffdada; }"
+        )
         for label in (self.lbl_fps, self.lbl_drift, self.lbl_coords):
             label.setStyleSheet(
                 "QLabel { padding:4px 10px; border:1px solid #3a3a3a; border-radius:10px; "
@@ -375,6 +380,7 @@ class AstroPanoptesWindow(QMainWindow):
         metrics.addWidget(self.lbl_fps)
         metrics.addWidget(self.lbl_drift)
         metrics.addWidget(self.lbl_coords, stretch=1)
+        metrics.addWidget(self.lbl_errors)
 
         layout = QVBoxLayout(top)
         layout.setContentsMargins(0, 0, 0, 0)
@@ -1015,6 +1021,7 @@ class AstroPanoptesWindow(QMainWindow):
 
         self._update_chips_from_state(state)
         self._update_ps_outputs(state)
+        self._update_error_banner(state)
 
     def _render_frame(self) -> None:
         preview = self.runner.get_latest_preview_jpeg()
@@ -1099,6 +1106,25 @@ class AstroPanoptesWindow(QMainWindow):
         self.ch_od.set_mode("active" if self.od_enabled else "neutral")
         self.ch_ps.set_mode("active" if state.platesolving.busy else "neutral")
         self.ch_goto.set_mode("active" if state.goto.busy else "neutral")
+
+    def _update_error_banner(self, state) -> None:
+        errors = []
+        if state.camera.last_error:
+            errors.append(f"camera: {state.camera.last_error}")
+        if state.mount.last_error:
+            errors.append(f"mount: {state.mount.last_error}")
+        if state.tracking.last_error:
+            errors.append(f"tracking: {state.tracking.last_error}")
+        if state.stacking.last_error:
+            errors.append(f"stacking: {state.stacking.last_error}")
+        if state.platesolving.reason:
+            errors.append(f"platesolving: {state.platesolving.reason}")
+        if state.goto.reason:
+            errors.append(f"goto: {state.goto.reason}")
+        if errors:
+            self.lbl_errors.setText(f\"Errors: {' | '.join(errors)}\")
+        else:
+            self.lbl_errors.setText(\"Errors: none\")
 
     def _format_ra_deg(self, ra_deg: float) -> str:
         total_seconds = ra_deg * 240.0
