@@ -4,7 +4,7 @@ import math
 import random
 import sys
 from dataclasses import dataclass
-from typing import List, Optional, Sequence
+from typing import Optional, Sequence
 
 import numpy as np
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
@@ -34,6 +34,13 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
+from actions import (
+    tracking_keyframe_reset,
+)
+from ap_types import Axis
+from app_runner import AppRunner
+from config import AppConfig
+
 
 @dataclass
 class Detection:
@@ -59,15 +66,6 @@ class OverlayToggles:
 class DriftInfo:
     vx_px_s: float = 0.0
     vy_px_s: float = 0.0
-
-
-@dataclass
-class SyncInfo:
-    synced: bool = False
-    ra_str: str = "--"
-    dec_str: str = "--"
-    alt_str: str = "--"
-    az_str: str = "--"
 
 
 @dataclass
@@ -130,7 +128,7 @@ class OverlayRenderer:
                 self._draw_ellipse(painter, det)
                 painter.drawEllipse(QPointF(det.x, det.y), 1.5, 1.5)
 
-        seeds = []
+        seeds: list[Detection] = []
         if det_list and n_seeds > 0:
             seeds = sorted(det_list, key=lambda det: det.flux, reverse=True)[: int(n_seeds)]
 
@@ -221,30 +219,15 @@ class Chip(QLabel):
 
 
 class AstroPanoptesWindow(QMainWindow):
-    def __init__(self) -> None:
+    def __init__(self, runner: AppRunner, cfg: AppConfig) -> None:
         super().__init__()
+        self.runner = runner
+        self.cfg = cfg
+
         self.setWindowTitle("AstroPanoptes")
         self.resize(1280, 760)
 
-        self.cam_connected = False
-        self.mount_connected = False
-        self.synced = False
-
-        self.tracking_on = False
-        self.stacking_on = False
-        self.od_on = False
-        self.platesolve_running = False
-        self.goto_running = False
-
-        self.vx = 0.0
-        self.vy = 0.0
-        self.fps_view = 0.0
-
-        self.sync_info = SyncInfo(False, "--", "--", "--", "--")
-        self.ps = PlatesolveSummary(False, "idle", 0, 0.0, 0.0, 0.0, 0.0, "--", "--")
-
-        self.exp_ms = 20.0
-        self.gain = 100
+        self.od_enabled = False
 
         self.overlay_toggles = OverlayToggles(
             show_detections=True,
@@ -267,7 +250,7 @@ class AstroPanoptesWindow(QMainWindow):
         self._build_menu()
 
         self._tick = QTimer(self)
-        self._tick.setInterval(50)
+        self._tick.setInterval(100)
         self._tick.timeout.connect(self._on_tick)
         self._tick.start()
 
@@ -277,7 +260,11 @@ class AstroPanoptesWindow(QMainWindow):
         self._frame_timer.start()
 
         self._t_ms = 0.0
-        self._log("Demo loaded.")
+        self._log("PyQt6 UI ready.")
+
+    def closeEvent(self, event) -> None:  # noqa: N802
+        self.runner.stop()
+        super().closeEvent(event)
 
     def _build_central(self) -> None:
         self.view_tabs = QTabWidget()
@@ -398,7 +385,7 @@ class AstroPanoptesWindow(QMainWindow):
         self.tb_top.addWidget(top)
         self.addToolBar(Qt.ToolBarArea.TopToolBarArea, self.tb_top)
 
-        self._update_chips()
+        self._update_chips_from_state(self.runner.get_state())
 
     def _build_docks(self) -> None:
         self.setDockOptions(
@@ -509,11 +496,11 @@ class AstroPanoptesWindow(QMainWindow):
         grid.addWidget(self.b_right, 1, 2)
         grid.addWidget(self.b_down, 2, 1)
 
-        self.b_up.clicked.connect(lambda: self._manual_move("alt+"))
-        self.b_down.clicked.connect(lambda: self._manual_move("alt-"))
-        self.b_left.clicked.connect(lambda: self._manual_move("az-"))
-        self.b_right.clicked.connect(lambda: self._manual_move("az+"))
-        self.b_stop.clicked.connect(lambda: self._log("[manual] STOP"))
+        self.b_up.clicked.connect(lambda: self._manual_move(Axis.ALT, 1))
+        self.b_down.clicked.connect(lambda: self._manual_move(Axis.ALT, -1))
+        self.b_left.clicked.connect(lambda: self._manual_move(Axis.AZ, -1))
+        self.b_right.clicked.connect(lambda: self._manual_move(Axis.AZ, 1))
+        self.b_stop.clicked.connect(self._manual_stop)
 
         dwrap = QHBoxLayout()
         dwrap.addStretch(1)
@@ -557,12 +544,12 @@ class AstroPanoptesWindow(QMainWindow):
         self.ds_exp_ms = QDoubleSpinBox()
         self.ds_exp_ms.setRange(0.1, 10_000.0)
         self.ds_exp_ms.setDecimals(1)
-        self.ds_exp_ms.setValue(self.exp_ms)
+        self.ds_exp_ms.setValue(self.cfg.camera.exp_ms)
         self.ds_exp_ms.setSuffix(" ms")
 
         self.sb_gain = QSpinBox()
         self.sb_gain.setRange(0, 6000)
-        self.sb_gain.setValue(self.gain)
+        self.sb_gain.setValue(self.cfg.camera.gain)
 
         self.btn_apply_cam = QPushButton("Apply")
         self.btn_apply_cam.clicked.connect(self._camera_apply)
@@ -594,9 +581,9 @@ class AstroPanoptesWindow(QMainWindow):
         row.addWidget(self.btn_tr_reset)
         row.addStretch(1)
 
-        self.btn_tr_start.clicked.connect(lambda: self._set_tracking(True))
-        self.btn_tr_stop.clicked.connect(lambda: self._set_tracking(False))
-        self.btn_tr_reset.clicked.connect(lambda: self._log("[tracking] Reset"))
+        self.btn_tr_start.clicked.connect(self._tracking_start)
+        self.btn_tr_stop.clicked.connect(self._tracking_stop)
+        self.btn_tr_reset.clicked.connect(self._tracking_reset)
 
         form.addRow(row)
         box.setLayout(form)
@@ -623,10 +610,10 @@ class AstroPanoptesWindow(QMainWindow):
             row.addWidget(button)
         row.addStretch(1)
 
-        self.btn_st_start.clicked.connect(lambda: self._set_stacking(True))
-        self.btn_st_stop.clicked.connect(lambda: self._set_stacking(False))
-        self.btn_st_reset.clicked.connect(lambda: self._log("[stacking] Reset"))
-        self.btn_st_save.clicked.connect(lambda: self._log("[stacking] Save Stack"))
+        self.btn_st_start.clicked.connect(self._stacking_start)
+        self.btn_st_stop.clicked.connect(self._stacking_stop)
+        self.btn_st_reset.clicked.connect(self._stacking_reset)
+        self.btn_st_save.clicked.connect(self._stacking_save)
 
         form.addRow(row)
         box.setLayout(form)
@@ -656,23 +643,23 @@ class AstroPanoptesWindow(QMainWindow):
 
         self.sb_od_minarea = QSpinBox()
         self.sb_od_minarea.setRange(1, 500)
-        self.sb_od_minarea.setValue(5)
+        self.sb_od_minarea.setValue(self.cfg.sep.minarea)
 
         self.ds_od_sigma = QDoubleSpinBox()
         self.ds_od_sigma.setRange(0.1, 20.0)
-        self.ds_od_sigma.setValue(3.0)
+        self.ds_od_sigma.setValue(self.cfg.sep.thresh_sigma)
 
         self.sb_od_maxdet = QSpinBox()
         self.sb_od_maxdet.setRange(1, 5000)
-        self.sb_od_maxdet.setValue(500)
+        self.sb_od_maxdet.setValue(self.cfg.platesolving.max_det)
 
         self.sb_od_bw = QSpinBox()
         self.sb_od_bw.setRange(4, 512)
-        self.sb_od_bw.setValue(64)
+        self.sb_od_bw.setValue(self.cfg.sep.bw)
 
         self.sb_od_bh = QSpinBox()
         self.sb_od_bh.setRange(4, 512)
-        self.sb_od_bh.setValue(64)
+        self.sb_od_bh.setValue(self.cfg.sep.bh)
 
         form.addRow(row)
         form.addRow("minarea:", self.sb_od_minarea)
@@ -699,20 +686,20 @@ class AstroPanoptesWindow(QMainWindow):
 
         self.ds_ps_radius = QDoubleSpinBox()
         self.ds_ps_radius.setRange(0.1, 30.0)
-        self.ds_ps_radius.setValue(1.0)
+        self.ds_ps_radius.setValue(self.cfg.platesolving.search_radius_deg or 1.0)
         self.ds_ps_radius.setSuffix(" deg")
 
         self.sb_ps_maxdet = QSpinBox()
-        self.sb_ps_maxdet.setRange(3, 200)
-        self.sb_ps_maxdet.setValue(7)
+        self.sb_ps_maxdet.setRange(3, 2000)
+        self.sb_ps_maxdet.setValue(self.cfg.platesolving.max_det)
 
         self.sb_ps_nseeds = QSpinBox()
         self.sb_ps_nseeds.setRange(0, 10)
-        self.sb_ps_nseeds.setValue(3)
+        self.sb_ps_nseeds.setValue(self.cfg.platesolving.N_seed)
 
         self.sb_ps_mininl = QSpinBox()
         self.sb_ps_mininl.setRange(1, 100)
-        self.sb_ps_mininl.setValue(4)
+        self.sb_ps_mininl.setValue(self.cfg.platesolving.min_inliers)
 
         self.btn_ps_solve = QPushButton("Solve")
         self.btn_ps_solve.clicked.connect(self._platesolve_start)
@@ -798,8 +785,9 @@ class AstroPanoptesWindow(QMainWindow):
         self.cb_fb = QCheckBox("Platesolve feedback")
         self.sb_stages = QSpinBox()
         self.sb_stages.setRange(0, 20)
-        self.sb_stages.setValue(0)
-        self.sb_stages.setEnabled(False)
+        self.sb_stages.setValue(self.cfg.goto.stages)
+        self.sb_stages.setEnabled(self.cfg.goto.platesolving_feedback)
+        self.cb_fb.setChecked(self.cfg.goto.platesolving_feedback)
         self.cb_fb.toggled.connect(self.sb_stages.setEnabled)
 
         rowfb = QHBoxLayout()
@@ -893,137 +881,176 @@ class AstroPanoptesWindow(QMainWindow):
             self.tgt_v.addWidget(wrap)
 
     def _camera_apply(self) -> None:
-        self.exp_ms = float(self.ds_exp_ms.value())
-        self.gain = int(self.sb_gain.value())
-        self._log(f"[camera] apply exposure={self.exp_ms:.1f} ms gain={self.gain}")
+        exp_ms = float(self.ds_exp_ms.value())
+        gain = int(self.sb_gain.value())
+        self.runner.request_camera_param("exp_ms", exp_ms)
+        self.runner.request_camera_param("gain", gain)
+        self._log(f"[camera] apply exposure={exp_ms:.1f} ms gain={gain}")
 
     def _connect_all(self) -> None:
-        self.cam_connected = True
-        self.mount_connected = True
+        self.runner.request_camera_connect(self.cfg.camera.camera_index)
+        self.runner.request_mount_connect(self.cfg.mount.port, self.cfg.mount.baudrate)
         self._log("[top] Connect all")
-        self._update_chips()
 
     def _disconnect_all(self) -> None:
-        self.cam_connected = False
-        self.mount_connected = False
-        self.synced = False
-        self.sync_info = SyncInfo(False, "--", "--", "--", "--")
+        self.runner.request_camera_disconnect()
+        self.runner.request_mount_disconnect()
         self._log("[top] Disconnect all")
-        self._update_chips()
 
     def _od_start(self) -> None:
-        self.od_on = True
+        self.od_enabled = True
+        self.runner.request_live_sep_params(
+            enabled=True,
+            sep_minarea=int(self.sb_od_minarea.value()),
+            sep_thresh_sigma=float(self.ds_od_sigma.value()),
+            max_det=int(self.sb_od_maxdet.value()),
+            sep_bw=int(self.sb_od_bw.value()),
+            sep_bh=int(self.sb_od_bh.value()),
+        )
         self._log("[od] Start")
-        self._update_chips()
 
     def _od_stop(self) -> None:
-        self.od_on = False
+        self.od_enabled = False
+        self.runner.request_live_sep_params(enabled=False)
         self._log("[od] Stop")
-        self._update_chips()
 
-    def _set_tracking(self, on: bool) -> None:
-        self.tracking_on = on
-        self._log(f"[tracking] {'Start' if on else 'Stop'}")
-        self._update_chips()
+    def _tracking_start(self) -> None:
+        self.runner.request_tracking_start()
+        self._log("[tracking] Start")
 
-    def _set_stacking(self, on: bool) -> None:
-        self.stacking_on = on
-        self._log(f"[stacking] {'Start' if on else 'Stop'}")
-        self._update_chips()
+    def _tracking_stop(self) -> None:
+        self.runner.request_tracking_stop()
+        self._log("[tracking] Stop")
+
+    def _tracking_reset(self) -> None:
+        self.runner.enqueue(tracking_keyframe_reset())
+        self._log("[tracking] Reset")
+
+    def _stacking_start(self) -> None:
+        self.runner.request_stacking_start()
+        self._log("[stacking] Start")
+
+    def _stacking_stop(self) -> None:
+        self.runner.request_stacking_stop()
+        self._log("[stacking] Stop")
+
+    def _stacking_reset(self) -> None:
+        self.runner.request_stacking_reset()
+        self._log("[stacking] Reset")
+
+    def _stacking_save(self) -> None:
+        self.runner.request_stacking_save(out_dir="stack_output", basename="stack", fmt="png")
+        self._log("[stacking] Save Stack -> stack_output/stack.png")
 
     def _platesolve_start(self) -> None:
-        if self.platesolve_running:
+        target = self.ed_ps_target.text().strip()
+        if not target:
+            self._log("[plate solving] target empty; ignored")
             return
-        self.platesolve_running = True
-        self.ps.running = True
-        self.ps.status = "running"
-        self._log("[plate solving] Solve (mock) started")
-        self._update_chips()
-        QTimer.singleShot(2000, self._platesolve_finish)
-
-    def _platesolve_finish(self) -> None:
-        self.platesolve_running = False
-        self.ps.running = False
-        self.ps.status = "ok"
-        self.ps.inliers = random.randint(4, 15)
-        self.ps.rms_px = random.random() * 1.5
-        self.ps.theta_deg = random.uniform(-5, 5)
-        self.ps.dx_px = random.uniform(-50, 50)
-        self.ps.dy_px = random.uniform(-50, 50)
-        self.ps.center_ra = "05:35:17.3"
-        self.ps.center_dec = "-05:23:28"
-        self._log("[plate solving] finished OK (mock)")
-        self._update_ps_outputs()
-        self._update_chips()
+        self.runner.request_platesolving_params(
+            search_radius_deg=float(self.ds_ps_radius.value()),
+            max_det=int(self.sb_ps_maxdet.value()),
+            N_seed=int(self.sb_ps_nseeds.value()),
+            min_inliers=int(self.sb_ps_mininl.value()),
+        )
+        self.runner.request_platesolving_run(target=target)
+        self._log(f"[plate solving] Solve target={target}")
 
     def _goto_start(self) -> None:
-        if self.goto_running:
+        target = self._build_goto_target()
+        if target is None:
+            self._log("[goto] missing target; ignored")
             return
-        self.goto_running = True
-        self._log(
-            f"[goto] GoTo started (mock) feedback={self.cb_fb.isChecked()} stages={self.sb_stages.value()}"
-        )
-        self._update_chips()
-        QTimer.singleShot(2500, self._goto_finish)
-
-    def _goto_finish(self) -> None:
-        self.goto_running = False
-        self._log("[goto] GoTo finished (mock)")
-        self._update_chips()
+        params = {
+            "platesolving_feedback": bool(self.cb_fb.isChecked()),
+            "stages": int(self.sb_stages.value()),
+        }
+        self.runner.request_mount_goto(target, **params)
+        self._log(f"[goto] GoTo target={target}")
 
     def _goto_cancel(self) -> None:
-        self.goto_running = False
-        self._log("[goto] Cancel (mock)")
-        self._update_chips()
+        self.runner.request_goto_cancel()
+        self._log("[goto] Cancel")
 
     def _autocalibrate(self) -> None:
-        self.synced = True
-        self.sync_info = SyncInfo(
-            True,
-            ra_str="05:35:17.3",
-            dec_str="-05:23:28",
-            alt_str="45.12°",
-            az_str="132.80°",
-        )
-        self._log("[goto] AutoCalibrate -> Sync=True (mock)")
-        self._update_chips()
+        self.runner.request_goto_autocalibrate()
+        self._log("[goto] AutoCalibrate")
 
     def _home(self) -> None:
-        self._log("[goto] Home -> startup pose (mock)")
+        target = {
+            "az_deg": 0.0,
+            "alt_deg": float(self.cfg.goto.alt_min_deg),
+        }
+        self.runner.request_mount_goto(target)
+        self._log("[goto] Home -> alt/az safe default")
 
-    def _manual_move(self, direction: str) -> None:
+    def _manual_move(self, axis: Axis, direction: int) -> None:
         steps = int(self.sb_steps.value())
         delay_us = int(self.sb_delay.value())
-        self._log(f"[manual] move dir={direction} steps={steps} delay_us={delay_us} (mock enqueue)")
+        if axis == Axis.AZ and self.cfg.mount.invert_az:
+            direction *= -1
+        if axis == Axis.ALT and self.cfg.mount.invert_alt:
+            direction *= -1
+        self.runner.request_mount_move_steps(axis, direction, steps, delay_us)
+        self._log(f"[manual] move axis={axis.value} direction={direction} steps={steps} delay_us={delay_us}")
+
+    def _manual_stop(self) -> None:
+        self.runner.request_mount_stop()
+        self._log("[manual] STOP")
 
     def _on_tick(self) -> None:
-        self._t_ms += 50.0
-        t = self._t_ms / 1000.0
+        self._t_ms += 100.0
+        state = self.runner.get_state()
 
-        self.vx = 15.0 * math.cos(t * 0.7) + 5.0 * math.sin(t * 1.4)
-        self.vy = 8.0 * math.sin(t * 0.5)
+        fps_max = max(0.1, 1000.0 / max(0.1, float(self.ds_exp_ms.value())))
+        self.lbl_fps.setText(f"FPS view/max: {state.camera.fps_view:.2f}/{fps_max:.2f}")
+        self.lbl_drift.setText(f"drift vx/vy: {state.tracking.vx:.2f}/{state.tracking.vy:.2f} px/s")
 
-        fps_max = max(0.1, 1000.0 / max(0.1, float(self.exp_ms)))
-        self.lbl_fps.setText(f"FPS view/max: {self.fps_view:.2f}/{fps_max:.2f}")
-        self.lbl_drift.setText(f"drift vx/vy: {self.vx:.2f}/{self.vy:.2f} px/s")
-
-        if self.synced:
-            self.lbl_coords.setText(
-                f"RA/Dec: {self.sync_info.ra_str} {self.sync_info.dec_str} | "
-                f"Alt/Az: {self.sync_info.alt_str} {self.sync_info.az_str}"
-            )
+        if state.goto.synced or state.platesolving.last_ok:
+            ra_str = self._format_ra_deg(state.platesolving.center_ra_deg)
+            dec_str = self._format_dec_deg(state.platesolving.center_dec_deg)
+            self.lbl_coords.setText(f"RA/Dec: {ra_str} {dec_str} | Alt/Az: -- --")
         else:
             self.lbl_coords.setText("RA/Dec: -- -- | Alt/Az: -- --")
 
+        self._update_chips_from_state(state)
+        self._update_ps_outputs(state)
+
     def _render_frame(self) -> None:
+        preview = self.runner.get_latest_preview_jpeg()
+        live_pix = self._pixmap_from_jpeg(preview)
+        if live_pix is None:
+            live_pix = QPixmap.fromImage(self._render_mock_frame())
+
+        stack_preview = self.runner.get_state().stacking.preview_jpeg
+        stack_pix = self._pixmap_from_jpeg(stack_preview)
+        if stack_pix is None:
+            stack_pix = live_pix
+
+        self.live_view.setPixmap(
+            live_pix.scaled(
+                self.live_view.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+        self.stacked_view.setPixmap(
+            stack_pix.scaled(
+                self.stacked_view.size(),
+                Qt.AspectRatioMode.KeepAspectRatio,
+                Qt.TransformationMode.SmoothTransformation,
+            )
+        )
+
+    def _render_mock_frame(self) -> QImage:
         img = QImage(self.base_w, self.base_h, QImage.Format.Format_RGB32)
         img.fill(0x101014)
 
         painter = QPainter(img)
         painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
 
-        dx = self.vx * 0.02
-        dy = self.vy * 0.02
+        dx = math.cos(self._t_ms / 1000.0) * 0.5
+        dy = math.sin(self._t_ms / 1000.0) * 0.5
 
         for (x, y, amp) in self._stars:
             xx = (x + dx) % self.base_w
@@ -1034,45 +1061,76 @@ class AstroPanoptesWindow(QMainWindow):
 
         painter.end()
 
-        dets: List[Detection] = []
-        if self.od_on:
-            for i in range(min(80, len(self._stars))):
-                x, y, amp = self._stars[i]
-                jx = x + random.uniform(-1.2, 1.2)
-                jy = y + random.uniform(-1.2, 1.2)
-                flux = float(amp) + random.random() * 20.0
-                a = 3.0 + random.random() * 2.0
-                b = 3.0 + random.random() * 2.0
-                th = random.uniform(-0.5, 0.5)
-                dets.append(Detection(jx, jy, a, b, th, flux))
-            dets = sorted(dets, key=lambda det: det.flux, reverse=True)[: int(self.sb_od_maxdet.value())]
-
-        self.fps_view = 1000.0 / max(1.0, float(self._frame_timer.interval()))
-        n_seeds = int(self.sb_ps_nseeds.value())
-
-        out = self.renderer.render(
+        return self.renderer.render(
             img,
             toggles=self.overlay_toggles,
-            detections=dets,
-            n_seeds=n_seeds,
-            drift=DriftInfo(self.vx, self.vy),
+            detections=[],
+            n_seeds=0,
+            drift=DriftInfo(0.0, 0.0),
         )
 
-        pix = QPixmap.fromImage(out)
-        self.live_view.setPixmap(
-            pix.scaled(
-                self.live_view.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
-        self.stacked_view.setPixmap(
-            pix.scaled(
-                self.stacked_view.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
-            )
-        )
+    def _pixmap_from_jpeg(self, data: Optional[bytes]) -> Optional[QPixmap]:
+        if not data:
+            return None
+        image = QImage.fromData(data)
+        if image.isNull():
+            return None
+        return QPixmap.fromImage(image)
+
+    def _update_ps_outputs(self, state) -> None:
+        self.lbl_ps_status.setText(state.platesolving.status.value)
+        self.lbl_ps_inliers.setText(str(state.platesolving.n_inliers))
+        self.lbl_ps_rms.setText(f"{state.platesolving.rms_px:.2f}")
+        if state.platesolving.last_ok:
+            center_ra = self._format_ra_deg(state.platesolving.center_ra_deg)
+            center_dec = self._format_dec_deg(state.platesolving.center_dec_deg)
+            self.lbl_ps_center.setText(f"{center_ra} / {center_dec}")
+        else:
+            self.lbl_ps_center.setText("-- / --")
+        self.lbl_ps_theta.setText(f"{state.platesolving.theta_deg:.2f}")
+        self.lbl_ps_dxdy.setText(f"{state.platesolving.dx_px:.1f} / {state.platesolving.dy_px:.1f}")
+
+    def _update_chips_from_state(self, state) -> None:
+        self.ch_cam.set_mode("green" if state.camera.connected else "red")
+        self.ch_mount.set_mode("green" if state.mount.connected else "red")
+        self.ch_sync.set_mode("green" if state.goto.synced else "red")
+        self.ch_tracking.set_mode("active" if state.tracking.enabled else "neutral")
+        self.ch_stacking.set_mode("active" if state.stacking.enabled else "neutral")
+        self.ch_od.set_mode("active" if self.od_enabled else "neutral")
+        self.ch_ps.set_mode("active" if state.platesolving.busy else "neutral")
+        self.ch_goto.set_mode("active" if state.goto.busy else "neutral")
+
+    def _format_ra_deg(self, ra_deg: float) -> str:
+        total_seconds = ra_deg * 240.0
+        hours = int(total_seconds // 3600)
+        minutes = int((total_seconds % 3600) // 60)
+        seconds = total_seconds % 60
+        return f"{hours:02d}:{minutes:02d}:{seconds:05.2f}"
+
+    def _format_dec_deg(self, dec_deg: float) -> str:
+        sign = "+" if dec_deg >= 0 else "-"
+        dec_abs = abs(dec_deg)
+        degrees = int(dec_abs)
+        minutes = int((dec_abs - degrees) * 60)
+        seconds = (dec_abs - degrees - minutes / 60) * 3600
+        return f"{sign}{degrees:02d}:{minutes:02d}:{seconds:05.2f}"
+
+    def _build_goto_target(self) -> Optional[object]:
+        mode = self.dd_goto_mode.currentText()
+        if mode.startswith("name"):
+            value = self.ed_goto_name.text().strip()
+            return value or None
+        if mode.startswith("planet"):
+            return self.dd_goto_planet.currentText().strip()
+        if mode == "radec":
+            if self.dd_radec_fmt.currentText() == "deg":
+                return {"ra_deg": float(self.ds_ra.value()), "dec_deg": float(self.ds_dec.value())}
+            ra = self.ed_ra_hms.text().strip()
+            dec = self.ed_dec_dms.text().strip()
+            if not ra or not dec:
+                return None
+            return f"{ra} {dec}"
+        return {"az_deg": float(self.ds_az.value()), "alt_deg": float(self.ds_alt.value())}
 
     def _init_star_catalog(self, n: int = 100) -> list[tuple[float, float, float]]:
         stars: list[tuple[float, float, float]] = []
@@ -1084,24 +1142,6 @@ class AstroPanoptesWindow(QMainWindow):
         stars.sort(key=lambda t: t[2], reverse=True)
         return stars
 
-    def _update_ps_outputs(self) -> None:
-        self.lbl_ps_status.setText(self.ps.status)
-        self.lbl_ps_inliers.setText(str(self.ps.inliers))
-        self.lbl_ps_rms.setText(f"{self.ps.rms_px:.2f}")
-        self.lbl_ps_center.setText(f"{self.ps.center_ra} / {self.ps.center_dec}")
-        self.lbl_ps_theta.setText(f"{self.ps.theta_deg:.2f}")
-        self.lbl_ps_dxdy.setText(f"{self.ps.dx_px:.1f} / {self.ps.dy_px:.1f}")
-
-    def _update_chips(self) -> None:
-        self.ch_cam.set_mode("green" if self.cam_connected else "red")
-        self.ch_mount.set_mode("green" if self.mount_connected else "red")
-        self.ch_sync.set_mode("green" if self.synced else "red")
-        self.ch_tracking.set_mode("active" if self.tracking_on else "neutral")
-        self.ch_stacking.set_mode("active" if self.stacking_on else "neutral")
-        self.ch_od.set_mode("active" if self.od_on else "neutral")
-        self.ch_ps.set_mode("active" if self.platesolve_running else "neutral")
-        self.ch_goto.set_mode("active" if self.goto_running else "neutral")
-
     def _log(self, msg: str) -> None:
         self.log.append(msg)
 
@@ -1110,26 +1150,42 @@ class AstroPanoptesWindow(QMainWindow):
 class UI:
     app: QApplication
     window: AstroPanoptesWindow
+    runner: AppRunner
 
 
-def build_ui() -> AstroPanoptesWindow:
-    return AstroPanoptesWindow()
+def build_ui(runner: Optional[AppRunner] = None, *, cfg: Optional[AppConfig] = None) -> AstroPanoptesWindow:
+    if runner is None:
+        cfg = cfg or AppConfig()
+        runner = AppRunner(cfg)
+        runner.start()
+    else:
+        cfg = cfg or runner.cfg
+    return AstroPanoptesWindow(runner, cfg)
 
 
-def show_ui(*, start_app: bool = True) -> UI:
+def show_ui(*, start_app: bool = True, start_runner: bool = True) -> UI:
     app = QApplication.instance()
     created = False
     if app is None:
         app = QApplication(sys.argv)
         created = True
 
-    window = AstroPanoptesWindow()
+    cfg = AppConfig()
+    runner = AppRunner(cfg)
+    if start_runner:
+        runner.start()
+
+    window = AstroPanoptesWindow(runner, cfg)
     window.showMaximized()
 
     if start_app and created:
         app.exec()
 
-    return UI(app=app, window=window)
+    return UI(app=app, window=window, runner=runner)
+
+
+def main() -> None:
+    show_ui()
 
 
 __all__ = [
@@ -1137,4 +1193,9 @@ __all__ = [
     "UI",
     "build_ui",
     "show_ui",
+    "main",
 ]
+
+
+if __name__ == "__main__":
+    main()
