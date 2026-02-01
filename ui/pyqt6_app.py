@@ -344,7 +344,7 @@ class AstroPanoptesWindow(QMainWindow):
         self.ch_ps = Chip("Plate Solving")
         self.ch_goto = Chip("GoTo")
 
-        self.lbl_fps = QLabel("FPS cap/view/max: --/--/--")
+        self.lbl_fps = QLabel("FPS cap/max: --/--/--")
         self.lbl_drift = QLabel("drift vx/vy: --/-- px/s")
         self.lbl_coords = QLabel("RA/Dec: -- -- | Alt/Az: -- --")
         self.lbl_errors = QLabel("Errors: none")
@@ -1013,8 +1013,8 @@ class AstroPanoptesWindow(QMainWindow):
 
         fps_max = max(0.1, 1000.0 / max(0.1, float(self.ds_exp_ms.value())))
         self.lbl_fps.setText(
-            f"FPS cap/view/max: {state.camera.fps_capture:.2f}/"
-            f"{state.camera.fps_view:.2f}/{fps_max:.2f}"
+            f"FPS cap/max: {state.camera.fps_capture:.2f}/"
+            f"{fps_max:.2f}"
         )
         self.lbl_drift.setText(f"drift vx/vy: {state.tracking.vx:.2f}/{state.tracking.vy:.2f} px/s")
 
