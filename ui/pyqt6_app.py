@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 import sys
+from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
@@ -34,9 +35,11 @@ from PyQt6.QtWidgets import (
     QWidget,
 )
 
-from actions import (
-    tracking_keyframe_reset,
-)
+ROOT_DIR = Path(__file__).resolve().parents[1]
+if str(ROOT_DIR) not in sys.path:
+    sys.path.insert(0, str(ROOT_DIR))
+
+from actions import tracking_keyframe_reset
 from ap_types import Axis
 from app_runner import AppRunner
 from config import AppConfig
@@ -1122,9 +1125,9 @@ class AstroPanoptesWindow(QMainWindow):
         if state.goto.reason:
             errors.append(f"goto: {state.goto.reason}")
         if errors:
-            self.lbl_errors.setText(f\"Errors: {' | '.join(errors)}\")
+            self.lbl_errors.setText(f"Errors: {' | '.join(errors)}")
         else:
-            self.lbl_errors.setText(\"Errors: none\")
+            self.lbl_errors.setText("Errors: none")
 
     def _format_ra_deg(self, ra_deg: float) -> str:
         total_seconds = ra_deg * 240.0
