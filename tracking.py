@@ -5,22 +5,13 @@ from dataclasses import dataclass, field
 from typing import Optional, Tuple, Any
 
 import numpy as np
-import cv2
 from logging_utils import log_error
+from sep_utils import sep_detect_from_raw16
 
 
 # ============================================================
 # Config dataclasses
 # ============================================================
-
-@dataclass
-class TrackingPreprocConfig:
-    subtract_bg_ema: bool = True
-    bg_ema_alpha: float = 0.03
-    sigma_hp: float = 10.0
-    sigma_smooth: float = 2.0
-    bright_percentile: float = 99.3
-
 
 @dataclass
 class KeyframeConfig:
@@ -51,6 +42,10 @@ class RateLimiterConfig:
 
 @dataclass
 class SepTrackingConfig:
+    bw: int = 64
+    bh: int = 64
+    thresh_sigma: float = 3.0
+    minarea: int = 5
     max_sources: int = 50
     min_sources: int = 1
 
@@ -61,7 +56,7 @@ class CalibrationConfig:
     Modelo: v_pxps = A * u + b
 
     - u: [u_az, u_alt] en µsteps/s (tal como envías RATE)
-    - v: [vx, vy] en px/s (medido por phase correlation)
+    - v: [vx, vy] en px/s (medido por SEP: centroides/flux)
     """
     lambda_dls: float = 0.05               # DLS para pinv
 
@@ -76,7 +71,7 @@ class AutoCalConfig:
 
 @dataclass
 class TrackingConfig:
-    preproc: TrackingPreprocConfig = field(default_factory=TrackingPreprocConfig)
+    resp_min: float = 0.06
     keyframe: KeyframeConfig = field(default_factory=KeyframeConfig)
     pi: PIConfig = field(default_factory=PIConfig)
     rate: RateLimiterConfig = field(default_factory=RateLimiterConfig)
@@ -109,9 +104,6 @@ class AutoCalState:
 @dataclass
 class TrackingState:
     cfg: TrackingConfig = field(default_factory=TrackingConfig)
-
-    # preproc background
-    bg_ema: Optional[np.ndarray] = None
 
     # incremental tracking
     prev_obj_xy: Optional[np.ndarray] = None
@@ -195,7 +187,7 @@ def compute_A_pinv_dls(A: np.ndarray, lam: float) -> np.ndarray:
     return np.linalg.inv(M) @ A.T
 
 
-def _extract_obj_xy_and_flux(obj_xy: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+def _extract_obj_xy_and_flux(obj_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
     """
     Accepts SEP structured arrays and returns (xy, flux).
     """
@@ -211,27 +203,6 @@ def _extract_obj_xy_and_flux(obj_xy: np.ndarray) -> Tuple[np.ndarray, Optional[n
         return xy, flux
 
     raise ValueError("obj_xy must be a SEP structured array with fields x,y,flux")
-
-
-def _select_brightest_sources(
-    obj_xy: np.ndarray,
-    obj_flux: Optional[np.ndarray],
-    max_sources: int,
-) -> Tuple[np.ndarray, Optional[np.ndarray]]:
-    """
-    Select the brightest sources using flux (if provided) or assume current order.
-    """
-    if max_sources is None:
-        return obj_xy, obj_flux
-    n_max = int(max_sources)
-    if n_max <= 0 or obj_xy.shape[0] <= n_max:
-        return obj_xy, obj_flux
-
-    if obj_flux is None:
-        return obj_xy[:n_max], obj_flux
-
-    order = np.argsort(-obj_flux.astype(np.float64))[:n_max]
-    return obj_xy[order], obj_flux[order]
 
 
 def estimate_shift_from_flux_match(
@@ -277,93 +248,6 @@ def estimate_shift_from_flux_match(
 
     resp = float(int(np.count_nonzero(good)) / n)
     return dx, dy, resp, int(np.count_nonzero(good))
-
-
-# ============================================================
-# Image preproc + phase correlation
-# ============================================================
-
-def preprocess_for_phasecorr(img_det: np.ndarray, state: TrackingState, *, update_bg: bool = True) -> np.ndarray:
-    cfg = state.cfg
-    pre = cfg.preproc
-    x = np.asarray(img_det, dtype=np.float32)
-
-    if pre.subtract_bg_ema:
-        if state.bg_ema is None:
-            state.bg_ema = x.copy()
-        else:
-            if update_bg:
-                a = float(pre.bg_ema_alpha)
-                state.bg_ema = (1.0 - a) * state.bg_ema + a * x
-        x = x - state.bg_ema
-
-    if pre.sigma_hp and pre.sigma_hp > 0:
-        low = cv2.GaussianBlur(x, (0, 0), float(pre.sigma_hp))
-        x = x - low
-
-    x = np.maximum(x, 0.0)
-
-    if pre.sigma_smooth and pre.sigma_smooth > 0:
-        x = cv2.GaussianBlur(x, (0, 0), float(pre.sigma_smooth))
-
-    samp = x[::4, ::4] if (x.shape[0] > 64 and x.shape[1] > 64) else x
-    thr = float(np.percentile(samp, float(pre.bright_percentile)))
-    mask = x >= thr
-
-    reg = np.zeros_like(x, dtype=np.float32)
-    if np.any(mask):
-        vals = x[mask]
-        m = float(vals.mean())
-        s = float(vals.std()) + 1e-6
-        reg[mask] = (vals - m) / s
-
-    return reg.astype(np.float32)
-
-
-def warp_translate(img: np.ndarray, dx: float, dy: float, *, is_mask: bool = False) -> np.ndarray:
-    H, W = img.shape[:2]
-    M = np.array([[1.0, 0.0, dx],
-                  [0.0, 1.0, dy]], dtype=np.float32)
-    interp = cv2.INTER_NEAREST if is_mask else cv2.INTER_LINEAR
-    return cv2.warpAffine(img, M, (W, H), flags=interp, borderMode=cv2.BORDER_CONSTANT, borderValue=0)
-
-
-def phasecorr_delta(ref: np.ndarray, cur: np.ndarray) -> Tuple[float, float, float]:
-    """
-    devuelve dx,dy tal que warp(cur, dx,dy) ~ ref
-    """
-    H, W = ref.shape
-    win = cv2.createHanningWindow((W, H), cv2.CV_32F)
-    shift, resp = cv2.phaseCorrelate(ref * win, cur * win)
-    dx, dy = shift
-    return (-float(dx), -float(dy), float(resp))
-
-
-def pyramid_phasecorr_delta(ref: np.ndarray, cur: np.ndarray, levels: int = 3) -> Tuple[float, float, float]:
-    if levels <= 1:
-        return phasecorr_delta(ref, cur)
-
-    ref_p = [ref]
-    cur_p = [cur]
-    for _ in range(levels - 1):
-        ref_p.append(cv2.pyrDown(ref_p[-1]))
-        cur_p.append(cv2.pyrDown(cur_p[-1]))
-
-    dx_tot = 0.0
-    dy_tot = 0.0
-    resp_last = 0.0
-    for lvl in reversed(range(levels)):
-        if lvl != levels - 1:
-            dx_tot *= 2.0
-            dy_tot *= 2.0
-        r = ref_p[lvl]
-        c = cur_p[lvl]
-        c_w = warp_translate(c, dx_tot, dy_tot)
-        dx, dy, resp = phasecorr_delta(r, c_w)
-        dx_tot += dx
-        dy_tot += dy
-        resp_last = resp
-    return dx_tot, dy_tot, resp_last
 
 
 # ============================================================
@@ -436,7 +320,7 @@ def _auto_recompute_pinv(state: TrackingState) -> None:
 
 def auto_rls_update(state: TrackingState, *, u_az: float, u_alt: float, vx: float, vy: float, now_t: float) -> None:
     cfg = state.cfg.autocal
-    if (not cfg.enabled) or (not np.isfinite(vx)) or (not np.isfinite(vy)):
+    if (not np.isfinite(vx)) or (not np.isfinite(vy)):
         return
 
     a = state.auto
@@ -538,25 +422,14 @@ def reset_keyframe(
 
 def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
     """
-    Actualiza config de tracking (robusto a kwargs extra).
+    Actualiza config de tracking.
     """
     cfg = state.cfg
 
     for k, v in kwargs.items():
         try:
-            if k == "sigma_hp":
-                cfg.preproc.sigma_hp = float(v)
-            elif k == "sigma_smooth":
-                cfg.preproc.sigma_smooth = float(v)
-            elif k == "bright_percentile":
-                cfg.preproc.bright_percentile = float(v)
-            elif k == "resp_min":
-                cfg.rate.max_shift_per_frame_px = float(cfg.rate.max_shift_per_frame_px)  # noop
-                # resp_min vive en control loop (tracking_step)
-                state.cfg.preproc  # keep
-                state.cfg.__dict__  # noop
-                # guardamos en un campo "virtual" por compat con tu UI
-                setattr(cfg, "_resp_min", float(v))
+            if k == "resp_min":
+                cfg.resp_min = float(v)
             elif k == "kp":
                 cfg.pi.kp = float(v)
             elif k == "ki":
@@ -568,13 +441,20 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
                 _auto_recompute_pinv(state)
             elif k == "rls_forget":
                 cfg.autocal.rls_forget = float(v)
+            elif k == "sep_bw":
+                cfg.sep_track.bw = int(v)
+            elif k == "sep_bh":
+                cfg.sep_track.bh = int(v)
+            elif k == "sep_thresh_sigma":
+                cfg.sep_track.thresh_sigma = float(v)
+            elif k == "sep_minarea":
+                cfg.sep_track.minarea = int(v)
             elif k == "sep_max_sources":
                 cfg.sep_track.max_sources = int(v)
             elif k == "sep_min_sources":
                 cfg.sep_track.min_sources = int(v)
             else:
-                # ignore extras
-                pass
+                log_error(None, f"Tracking: unknown param {k}", ValueError(f"unknown param {k}"), throttle_s=5.0, throttle_key=f"tracking_param_unknown_{k}")
         except Exception as exc:
             log_error(None, f"Tracking: failed to apply param {k}", exc, throttle_s=5.0, throttle_key=f"tracking_param_{k}")
             continue
@@ -582,24 +462,34 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
 
 def tracking_step(
     state: TrackingState,
-    obj_xy: np.ndarray,
+    raw16: np.ndarray,
     *,
     now_t: float,
     tracking_enabled: bool = True,
 ) -> TrackingOutput:
     """
     Un paso de tracking puro (sin tocar hardware):
-    - Alineación por centroides con matching por flux (SEP, fuentes brillantes) incremental (v) + keyframe abs correction (x_hat/y_hat).
+    - SEP sobre RAW16 con median blur k=3 para hotpixels.
+    - Alineación por centroides con matching por flux (fuentes brillantes) incremental (v)
+      + keyframe abs correction (x_hat/y_hat).
     - Si tracking_enabled y hay A_pinv (auto), computa RATE targets (pero NO envía).
       AppRunner es quien envía RATE al Arduino.
 
-    obj_xy debe ser un array SEP estructurado con campos "x","y","flux".
+    raw16 debe ser un frame Bayer RAW16 uint16.
     """
-    # resp_min configurable desde UI
-    resp_min = float(getattr(state.cfg, "_resp_min", 0.06))
+    cfg_sep = state.cfg.sep_track
+    _, _, objects, _ = sep_detect_from_raw16(
+        raw16,
+        sep_bw=int(cfg_sep.bw),
+        sep_bh=int(cfg_sep.bh),
+        sep_thresh_sigma=float(cfg_sep.thresh_sigma),
+        sep_minarea=int(cfg_sep.minarea),
+        max_sources=int(cfg_sep.max_sources),
+    )
 
-    obj_xy, obj_flux = _extract_obj_xy_and_flux(obj_xy)
-    obj_xy, obj_flux = _select_brightest_sources(obj_xy, obj_flux, state.cfg.sep_track.max_sources)
+    resp_min = float(state.cfg.resp_min)
+
+    obj_xy, _ = _extract_obj_xy_and_flux(objects)
 
     if (not state.auto.ok) or state.auto.A_pinv is None:
         auto_reset(state, src="auto")
@@ -640,6 +530,7 @@ def tracking_step(
         1.0,
         4.0,
     )
+    # vector de deriva (px) por matching de flujo
     dx_inc, dy_inc, resp_inc, _ = estimate_shift_from_flux_match(
         state.prev_obj_xy,
         obj_xy,

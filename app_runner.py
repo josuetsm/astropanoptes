@@ -145,6 +145,15 @@ class AppRunner:
 
         # Tracking subsystem
         self._tracking_state = make_tracking_state()
+        tracking_set_params(
+            self._tracking_state,
+            resp_min=self.cfg.tracking.resp_min,
+            sep_bw=int(self.cfg.sep.bw),
+            sep_bh=int(self.cfg.sep.bh),
+            sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
+            sep_minarea=int(self.cfg.sep.minarea),
+            sep_max_sources=int(self.cfg.platesolving.max_det),
+        )
 
         # Stacking subsystem
         self._stacking = StackingWorker(self.cfg)
@@ -704,8 +713,12 @@ class AppRunner:
         self.cfg.tracking = replace(self.default_cfg.tracking)
         tracking_set_params(
             self._tracking_state,
-            sigma_hp=self.cfg.tracking.sigma_hp,
             resp_min=self.cfg.tracking.resp_min,
+            sep_bw=int(self.cfg.sep.bw),
+            sep_bh=int(self.cfg.sep.bh),
+            sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
+            sep_minarea=int(self.cfg.sep.minarea),
+            sep_max_sources=int(self.cfg.platesolving.max_det),
         )
         self._tracking_keyframe_reset()
 
@@ -1017,18 +1030,9 @@ class AppRunner:
                 if fr is not None:
                     # Tracking en RAW16 + SEP
                     raw16 = ensure_raw16_bayer(fr.raw)
-                    _, _, objects, _ = sep_detect_from_raw16(
-                        raw16,
-                        sep_bw=int(self.cfg.sep.bw),
-                        sep_bh=int(self.cfg.sep.bh),
-                        sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
-                        sep_minarea=int(self.cfg.sep.minarea),
-                        max_sources=None,
-                    )
-
                     out = tracking_step(
                         self._tracking_state,
-                        objects,
+                        raw16,
                         now_t=_now_s(),
                         tracking_enabled=bool(tracking_on),
                     )
@@ -1396,7 +1400,18 @@ class AppRunner:
                     self.cfg.sep.thresh_sigma = float(p.get("sep_thresh_sigma"))
                 if "sep_minarea" in p:
                     self.cfg.sep.minarea = int(p.get("sep_minarea"))
+                if "max_det" in p:
+                    self.cfg.platesolving.max_det = int(p.get("max_det"))
+                    self._live_sep_params["max_det"] = int(p.get("max_det"))
                 self._goto.cfg.sep = self.cfg.sep
+                tracking_set_params(
+                    self._tracking_state,
+                    sep_bw=int(self.cfg.sep.bw),
+                    sep_bh=int(self.cfg.sep.bh),
+                    sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
+                    sep_minarea=int(self.cfg.sep.minarea),
+                    sep_max_sources=int(self.cfg.platesolving.max_det),
+                )
                 log_info(self.out_log, "Live SEP: params updated")
             return
 

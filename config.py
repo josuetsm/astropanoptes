@@ -68,8 +68,6 @@ class MountConfig:
 
 @dataclass
 class TrackingConfig:
-    track_method: str = "PyramidPhaseCorr"
-    sigma_hp: float = 10.0
     resp_min: float = 0.06
 
 

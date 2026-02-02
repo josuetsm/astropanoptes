@@ -9,8 +9,6 @@ from config import AppConfig
 
 @dataclass
 class TrackingPanelHandles:
-    mode: W.Dropdown
-    sigma_hp: W.BoundedFloatText
     resp_min: W.BoundedFloatText
     btn_start: W.Button
     btn_stop: W.Button
@@ -20,21 +18,6 @@ class TrackingPanelHandles:
 def build_tracking_panel(cfg: AppConfig) -> tuple[W.Widget, TrackingPanelHandles]:
     tracking_cfg = cfg.tracking
 
-    mode = W.Dropdown(
-        description="Mode",
-        options=["AUTO", "STARS", "PLANET"],
-        value="AUTO",
-        layout=W.Layout(width="200px"),
-    )
-
-    sigma_hp = W.BoundedFloatText(
-        description="sigma_hp",
-        value=float(tracking_cfg.sigma_hp),
-        min=0.5,
-        max=300.0,
-        step=0.5,
-        layout=W.Layout(width="260px"),
-    )
     resp_min = W.BoundedFloatText(
         description="resp_min",
         value=float(tracking_cfg.resp_min),
@@ -52,15 +35,13 @@ def build_tracking_panel(cfg: AppConfig) -> tuple[W.Widget, TrackingPanelHandles
     widget = W.VBox(
         [
             W.HTML("<b>Tracking</b>"),
-            W.HBox([btn_start, btn_stop, mode]),
-            W.HBox([sigma_hp, resp_min]),
+            W.HBox([btn_start, btn_stop]),
+            W.HBox([resp_min]),
             info,
         ]
     )
 
     handles = TrackingPanelHandles(
-        mode=mode,
-        sigma_hp=sigma_hp,
         resp_min=resp_min,
         btn_start=btn_start,
         btn_stop=btn_stop,

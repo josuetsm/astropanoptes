@@ -370,7 +370,7 @@ class StackEngine:
                 sep_bh=int(self.cfg.sep.bh),
                 sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
                 sep_minarea=int(self.cfg.sep.minarea),
-                max_sources=None,
+                max_sources=int(self.cfg.platesolving.max_det),
             )
             align_xy.append(obj_xy)
 

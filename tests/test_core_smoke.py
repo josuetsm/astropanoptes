@@ -7,24 +7,31 @@ from config import AppConfig
 from goto import GoToModel, MountKinematics
 from platesolving import select_guide_star_indices
 from stacking import StackEngine
-from tracking import make_tracking_state, tracking_step
+from tracking import make_tracking_state, tracking_step, tracking_set_params
 
 
 class CoreSmokeTests(unittest.TestCase):
     def test_tracking_step_smoke(self) -> None:
         state = make_tracking_state()
-        obj = np.array(
-            [(0.0, 0.0, 200.0), (10.0, 10.0, 100.0)],
-            dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")],
+        tracking_set_params(
+            state,
+            resp_min=0.0,
+            sep_bw=16,
+            sep_bh=16,
+            sep_thresh_sigma=0.5,
+            sep_minarea=1,
+            sep_max_sources=50,
         )
-        out = tracking_step(state, obj, now_t=0.0, tracking_enabled=False)
+        raw = np.zeros((32, 32), dtype=np.uint16)
+        raw[8:11, 8:11] = 60000
+        raw[20:23, 20:23] = 50000
+        out = tracking_step(state, raw, now_t=0.0, tracking_enabled=False)
         self.assertTrue(out.ok)
 
-        obj2 = np.array(
-            [(0.5, 0.5, 200.0), (10.5, 10.5, 100.0)],
-            dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")],
-        )
-        out2 = tracking_step(state, obj2, now_t=1.0, tracking_enabled=False)
+        raw2 = np.zeros((32, 32), dtype=np.uint16)
+        raw2[9:12, 9:12] = 60000
+        raw2[21:24, 21:24] = 50000
+        out2 = tracking_step(state, raw2, now_t=1.0, tracking_enabled=False)
         self.assertIsNotNone(out2)
 
     def test_stacking_engine_smoke(self) -> None:
