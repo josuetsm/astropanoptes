@@ -277,6 +277,7 @@ class AppRunner:
                     "rate_alt": 0.0,
                     "calib_src": "none",
                     "calib_det": 0.0,
+                    "n_det": 0,
                 },
                 "stacking": {
                     "enabled": self._stacking_enabled,
@@ -1044,7 +1045,7 @@ class AppRunner:
                             self._update_state(
                                 {
                                     "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "tracking rate failed"},
-                                    "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE},
+                                    "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE, "last_error": "mount.rate failed", "n_det": int(out.n_det)},
                                 }
                             )
                             log_error(self.out_log, "Tracking: mount.rate failed", exc, throttle_s=2.0, throttle_key="tracking_mount_rate")
@@ -1066,6 +1067,8 @@ class AppRunner:
                                 "rate_alt": float(out.rate_alt),
                                 "calib_src": str(out.calib_src),
                                 "calib_det": float(out.detA),
+                                "n_det": int(out.n_det),
+                                "last_error": "SEP: no detections" if int(out.n_det) == 0 else None,
                             }
                         }
                     )
@@ -1080,6 +1083,8 @@ class AppRunner:
                             "mode": TrackingMode.IDLE,
                             "rate_az": 0.0,
                             "rate_alt": 0.0,
+                            "n_det": 0,
+                            "last_error": None,
                         }
                     }
                 )

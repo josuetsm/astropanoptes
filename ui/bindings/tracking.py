@@ -16,6 +16,7 @@ def bind_tracking(
     def send_track_params() -> None:
         runner.request_tracking_params(
             resp_min=float(tracking_panel.resp_min.value),
+            sep_min_sources=int(tracking_panel.min_sources.value),
         )
 
     def on_tracking_toggle(change) -> None:
@@ -34,6 +35,7 @@ def bind_tracking(
     top_bar.tracking_toggle.observe(on_tracking_toggle, names="value")
 
     tracking_panel.resp_min.observe(lambda _change: send_track_params(), names="value")
+    tracking_panel.min_sources.observe(lambda _change: send_track_params(), names="value")
 
     tracking_panel.btn_start.on_click(lambda _btn: (send_track_params(), runner.request_tracking_start()))
     tracking_panel.btn_stop.on_click(lambda _btn: runner.request_tracking_stop())

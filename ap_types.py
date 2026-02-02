@@ -45,7 +45,6 @@ class TrackingMode(str, Enum):
     IDLE = "IDLE"
     STABILIZE = "STABILIZE"
     TRACK = "TRACK"
-    AUTOBOOST = "AUTOBOOST"
 
 
 class StackingStatus(str, Enum):
@@ -128,6 +127,7 @@ class TrackingState:
     calib_auto_ok: bool = False
     calib_src: str = "none"
     calib_det: float = 0.0
+    n_det: int = 0
     calib_ms_az: int = 0
     calib_ms_alt: int = 0
     bootstrap_active: bool = False

@@ -136,10 +136,12 @@ class UILoop:
             dy = float(state.tracking.dy)
             raz = float(state.tracking.rate_az)
             ralt = float(state.tracking.rate_alt)
+            n_det = int(state.tracking.n_det)
+            sep_txt = "SEP=0 (no detections)" if n_det == 0 else f"SEP={n_det}"
             set_html(
                 tracking_panel.info,
                 (
-                    f"<b>Tracking</b>: {mode} | resp={resp:.3f} | dx={dx:+.2f} dy={dy:+.2f} | "
+                    f"<b>Tracking</b>: {mode} | {sep_txt} | resp={resp:.3f} | dx={dx:+.2f} dy={dy:+.2f} | "
                     f"RATE=({raz:+.1f}, {ralt:+.1f})"
                 ),
                 self.guard,

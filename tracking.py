@@ -160,6 +160,7 @@ class TrackingOutput:
     rate_alt: float
     calib_src: str
     detA: float
+    n_det: int
 
 
 # ============================================================
@@ -490,6 +491,7 @@ def tracking_step(
     resp_min = float(state.cfg.resp_min)
 
     obj_xy, _ = _extract_obj_xy_and_flux(objects)
+    n_det = int(obj_xy.shape[0])
 
     if (not state.auto.ok) or state.auto.A_pinv is None:
         auto_reset(state, src="auto")
@@ -519,6 +521,7 @@ def tracking_step(
             rate_alt=float(state.rate_alt),
             calib_src="none",
             detA=0.0,
+            n_det=int(n_det),
         )
 
     dt = float(now_t - float(state.prev_t))
@@ -588,6 +591,7 @@ def tracking_step(
             rate_alt=float(state.rate_alt),
             calib_src="none",
             detA=0.0,
+            n_det=int(n_det),
         )
 
     # ABS correction against keyframe
@@ -680,4 +684,5 @@ def tracking_step(
         rate_alt=float(state.rate_alt),
         calib_src=str(src),
         detA=float(detA),
+        n_det=int(n_det),
     )
