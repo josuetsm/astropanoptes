@@ -13,11 +13,18 @@ from tracking import make_tracking_state, tracking_step
 class CoreSmokeTests(unittest.TestCase):
     def test_tracking_step_smoke(self) -> None:
         state = make_tracking_state()
-        obj = np.array([[0.0, 0.0], [10.0, 10.0]], dtype=np.float64)
+        obj = np.array(
+            [(0.0, 0.0, 200.0), (10.0, 10.0, 100.0)],
+            dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")],
+        )
         out = tracking_step(state, obj, now_t=0.0, tracking_enabled=False)
         self.assertTrue(out.ok)
 
-        out2 = tracking_step(state, obj + 0.5, now_t=1.0, tracking_enabled=False)
+        obj2 = np.array(
+            [(0.5, 0.5, 200.0), (10.5, 10.5, 100.0)],
+            dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")],
+        )
+        out2 = tracking_step(state, obj2, now_t=1.0, tracking_enabled=False)
         self.assertIsNotNone(out2)
 
     def test_stacking_engine_smoke(self) -> None:

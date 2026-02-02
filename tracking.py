@@ -2,12 +2,11 @@
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Optional, Tuple, Dict, Any
+from typing import Optional, Tuple, Any
 
 import numpy as np
 import cv2
 from logging_utils import log_error
-from sep_utils import estimate_shift_from_objects
 
 
 # ============================================================
@@ -51,6 +50,12 @@ class RateLimiterConfig:
 
 
 @dataclass
+class SepTrackingConfig:
+    max_sources: int = 50
+    min_sources: int = 1
+
+
+@dataclass
 class CalibrationConfig:
     """
     Modelo: v_pxps = A * u + b
@@ -58,37 +63,15 @@ class CalibrationConfig:
     - u: [u_az, u_alt] en µsteps/s (tal como envías RATE)
     - v: [vx, vy] en px/s (medido por phase correlation)
     """
-    calib_A: Optional[np.ndarray] = None   # 2x2 (px/s)/(µstep/s)
-    calib_b: Optional[np.ndarray] = None   # 2 (px/s)
     lambda_dls: float = 0.05               # DLS para pinv
-
-    # manual dither defaults (como tu script)
-    cal_try_max: int = 6
-    cal_steps_init: int = 6       # en microsteps (MOVE)
-    cal_steps_max: int = 140
-    cal_delay_us: int = 5000
-    cal_target_px_min: float = 1.0
-    cal_target_px_max: float = 5.0
-    cal_resp_min: float = 0.08
 
 
 @dataclass
 class AutoCalConfig:
-    enabled: bool = True
     rls_forget: float = 0.990
     P0: float = 2000.0
     min_det: float = 1e-4
     max_cond: float = 250.0
-
-
-@dataclass
-class AutoBoostConfig:
-    enabled: bool = True
-    rate: float = 25.0
-    base_s: float = 2.0
-    axis_s: float = 2.0
-    settle_s: float = 0.6
-    min_samples: int = 8
 
 
 @dataclass
@@ -97,9 +80,9 @@ class TrackingConfig:
     keyframe: KeyframeConfig = field(default_factory=KeyframeConfig)
     pi: PIConfig = field(default_factory=PIConfig)
     rate: RateLimiterConfig = field(default_factory=RateLimiterConfig)
+    sep_track: SepTrackingConfig = field(default_factory=SepTrackingConfig)
     calib: CalibrationConfig = field(default_factory=CalibrationConfig)
     autocal: AutoCalConfig = field(default_factory=AutoCalConfig)
-    autoboost: AutoBoostConfig = field(default_factory=AutoBoostConfig)
 
 
 # ============================================================
@@ -109,7 +92,7 @@ class TrackingConfig:
 @dataclass
 class AutoCalState:
     ok: bool = False
-    src: str = "none"   # none|manual_init|boot|rls
+    src: str = "none"   # none|auto|rls
 
     theta: Optional[np.ndarray] = None  # 2x3: [A|b]
     P: Optional[np.ndarray] = None      # 3x3
@@ -159,21 +142,14 @@ class TrackingState:
     rate_alt: float = 0.0
 
     # mode
-    current_mode: str = "IDLE"   # IDLE|STABILIZE|TRACK|AUTOBOOST
+    current_mode: str = "IDLE"   # IDLE|STABILIZE|TRACK
     t_mode: Optional[float] = None
-
-    # manual calibration columns (px/fullstep) then A_micro in calib cache
-    cal_az_full: Optional[np.ndarray] = None  # shape (2,)
-    cal_alt_full: Optional[np.ndarray] = None # shape (2,)
-    cal_A_micro: Optional[np.ndarray] = None  # 2x2 (px/s)/(µstep/s) [aquí µstep/s, no fullstep]
-    cal_A_pinv: Optional[np.ndarray] = None   # 2x2
-    cal_det: float = 0.0
 
     # autocal state
     auto: AutoCalState = field(default_factory=AutoCalState)
 
     # last used calibration source for control
-    calib_src_last: str = "none"  # none|manual|auto
+    calib_src_last: str = "none"  # none|auto
 
 
 @dataclass
@@ -217,6 +193,90 @@ def compute_A_pinv_dls(A: np.ndarray, lam: float) -> np.ndarray:
     I = np.eye(2, dtype=np.float64)
     M = AtA + (float(lam) * float(lam)) * I
     return np.linalg.inv(M) @ A.T
+
+
+def _extract_obj_xy_and_flux(obj_xy: np.ndarray) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Accepts SEP structured arrays and returns (xy, flux).
+    """
+    if isinstance(obj_xy, np.ndarray) and obj_xy.dtype.names is not None:
+        if "x" not in obj_xy.dtype.names or "y" not in obj_xy.dtype.names:
+            raise ValueError("SEP objects must include 'x' and 'y' fields")
+        x = obj_xy["x"].astype(np.float64)
+        y = obj_xy["y"].astype(np.float64)
+        xy = np.column_stack([x, y])
+        if "flux" not in obj_xy.dtype.names:
+            raise ValueError("SEP objects must include 'flux' field")
+        flux = obj_xy["flux"].astype(np.float64)
+        return xy, flux
+
+    raise ValueError("obj_xy must be a SEP structured array with fields x,y,flux")
+
+
+def _select_brightest_sources(
+    obj_xy: np.ndarray,
+    obj_flux: Optional[np.ndarray],
+    max_sources: int,
+) -> Tuple[np.ndarray, Optional[np.ndarray]]:
+    """
+    Select the brightest sources using flux (if provided) or assume current order.
+    """
+    if max_sources is None:
+        return obj_xy, obj_flux
+    n_max = int(max_sources)
+    if n_max <= 0 or obj_xy.shape[0] <= n_max:
+        return obj_xy, obj_flux
+
+    if obj_flux is None:
+        return obj_xy[:n_max], obj_flux
+
+    order = np.argsort(-obj_flux.astype(np.float64))[:n_max]
+    return obj_xy[order], obj_flux[order]
+
+
+def estimate_shift_from_flux_match(
+    ref_xy: np.ndarray,
+    cur_xy: np.ndarray,
+    *,
+    max_shift_px: float,
+    min_sources: int,
+) -> Tuple[float, float, float, int]:
+    """
+    Estimate translation to align cur_xy onto ref_xy by matching sources by flux order.
+    Assumes inputs are already sorted brightest->dimmest.
+    Returns (dx, dy, resp, n_used).
+    """
+    ref = np.asarray(ref_xy, dtype=np.float64)
+    cur = np.asarray(cur_xy, dtype=np.float64)
+
+    if ref.ndim != 2 or ref.shape[1] != 2:
+        raise ValueError(f"ref_xy must have shape (N,2), got {ref.shape}")
+    if cur.ndim != 2 or cur.shape[1] != 2:
+        raise ValueError(f"cur_xy must have shape (N,2), got {cur.shape}")
+
+    n_ref = int(ref.shape[0])
+    n_cur = int(cur.shape[0])
+    n_min = int(min_sources)
+    if n_ref < n_min or n_cur < n_min:
+        return 0.0, 0.0, 0.0, 0
+
+    n = min(n_ref, n_cur)
+    shifts = ref[:n] - cur[:n]
+    mags = np.hypot(shifts[:, 0], shifts[:, 1])
+    good = mags <= float(max_shift_px)
+    if not np.any(good):
+        return 0.0, 0.0, 0.0, 0
+
+    shifts = shifts[good]
+    dx = float(shifts[:, 0].mean())
+    dy = float(shifts[:, 1].mean())
+
+    mag = float(np.hypot(dx, dy))
+    if not np.isfinite(mag):
+        return 0.0, 0.0, 0.0, 0
+
+    resp = float(int(np.count_nonzero(good)) / n)
+    return dx, dy, resp, int(np.count_nonzero(good))
 
 
 # ============================================================
@@ -374,17 +434,6 @@ def _auto_recompute_pinv(state: TrackingState) -> None:
         a.ok = False
 
 
-def auto_set_from_A(state: TrackingState, *, A_micro: np.ndarray, b_pxps: Optional[np.ndarray] = None, src: str = "boot") -> None:
-    A_micro = np.asarray(A_micro, dtype=np.float64).reshape(2, 2)
-    if b_pxps is None:
-        b_pxps = np.zeros(2, dtype=np.float64)
-    b_pxps = np.asarray(b_pxps, dtype=np.float64).reshape(2,)
-
-    theta = np.concatenate([A_micro, b_pxps.reshape(2, 1)], axis=1)  # 2x3
-    auto_reset(state, src=src, theta=theta)
-    state.auto.src = src
-
-
 def auto_rls_update(state: TrackingState, *, u_az: float, u_alt: float, vx: float, vy: float, now_t: float) -> None:
     cfg = state.cfg.autocal
     if (not cfg.enabled) or (not np.isfinite(vx)) or (not np.isfinite(vy)):
@@ -421,82 +470,14 @@ def auto_rls_update(state: TrackingState, *, u_az: float, u_alt: float, vx: floa
     _auto_recompute_pinv(state)
 
 
-# ============================================================
-# Manual calibration cache (A from measured columns)
-# ============================================================
-
-def calib_reset(state: TrackingState) -> None:
-    state.cal_az_full = None
-    state.cal_alt_full = None
-    state.cal_A_micro = None
-    state.cal_A_pinv = None
-    state.cal_det = 0.0
-
-
-def calib_set_column_fullstep(state: TrackingState, axis: str, col_full: np.ndarray, *, ms_div: int) -> None:
-    """
-    axis: "AZ" or "ALT"
-    col_full: px/fullstep (shape (2,))
-    ms_div: microstep divisor (p.ej. 64) para convertir a px/µstep (A_micro)
-    """
-    col_full = np.asarray(col_full, dtype=np.float64).reshape(2,)
-    if axis.upper() == "AZ":
-        state.cal_az_full = col_full
-    else:
-        state.cal_alt_full = col_full
-
-    if state.cal_az_full is None or state.cal_alt_full is None:
-        state.cal_A_micro = None
-        state.cal_A_pinv = None
-        state.cal_det = 0.0
-        return
-
-    # construir A_micro con columnas (px/µstep) a partir de px/fullstep y ms_div
-    # Nota: en tu firmware/convención, RATE está en µsteps/s, por lo que A debe ser px/s por µstep/s.
-    # col_full (px/fullstep) / ms_div = px/µstep.
-    # A_micro col0 = AZ, col1 = ALT.
-    # ms_div de AZ/ALT puede ser distinto; por eso lo hacemos por separado en el AppRunner,
-    # y aquí asumimos que col_full ya fue dividido por su ms_div *antes* o pasamos ms_div por columna.
-    # Para mantener API clara, AppRunner llamará calib_set_A_micro directamente.
-    pass
-
-
-def calib_set_A_micro(state: TrackingState, A_micro: np.ndarray, *, src: str = "manual") -> None:
-    A = np.asarray(A_micro, dtype=np.float64).reshape(2, 2)
-    state.cal_A_micro = A
-    state.cal_det = float(np.linalg.det(A))
-
-    # manual overrides -> también setea cfg.calib.calib_A
-    state.cfg.calib.calib_A = A.copy()
-
-    try:
-        pinv = compute_A_pinv_dls(A, float(state.cfg.calib.lambda_dls))
-    except Exception as exc:
-        log_error(None, "Tracking: failed to compute A_pinv (manual)", exc, throttle_s=10.0, throttle_key="tracking_pinv_manual")
-        pinv = None
-
-    state.cal_A_pinv = pinv
-    state.cfg.calib.calib_b = np.asarray(state.cfg.calib.calib_b if state.cfg.calib.calib_b is not None else np.zeros(2), dtype=np.float64)
-
-    # opcional: seed autocal
-    if state.cfg.autocal.enabled:
-        auto_set_from_A(state, A_micro=A, b_pxps=np.array([0.0, 0.0], dtype=np.float64), src="manual_init")
-        state.auto.src = "manual_init"
-
-
 def _get_A_pinv_use(state: TrackingState) -> Tuple[Optional[np.ndarray], np.ndarray, str, float]:
     """
     retorna (A_pinv, b, src, detA)
     """
-    # manual primero
-    if state.cal_A_pinv is not None and state.cal_A_micro is not None:
-        b = np.asarray(state.cfg.calib.calib_b if state.cfg.calib.calib_b is not None else np.zeros(2), dtype=np.float64).reshape(2,)
-        return state.cal_A_pinv, b, "manual", float(state.cal_det)
-
-    # luego auto
+    # solo autocalibración automática
     if state.auto.ok and state.auto.A_pinv is not None:
         b = np.asarray(state.auto.b if state.auto.b is not None else np.zeros(2), dtype=np.float64).reshape(2,)
-        return state.auto.A_pinv, b, ("boot" if state.auto.src == "boot" else "auto"), float(state.auto.detA)
+        return state.auto.A_pinv, b, "auto", float(state.auto.detA)
 
     # none
     b = np.zeros(2, dtype=np.float64)
@@ -539,7 +520,12 @@ def reset_tracker(state: TrackingState, *, now_t: float, mode: str = "STABILIZE"
     state.abs_resp_last = 0.0
 
 
-def reset_keyframe(state: TrackingState, obj_xy: Optional[np.ndarray], *, now_t: float) -> None:
+def reset_keyframe(
+    state: TrackingState,
+    obj_xy: Optional[np.ndarray],
+    *,
+    now_t: float,
+) -> None:
     state.key_obj_xy = obj_xy
     state.key_t = float(now_t)
     state.x_hat = 0.0
@@ -577,38 +563,15 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
                 cfg.pi.ki = float(v)
             elif k == "kd":
                 cfg.pi.kd = float(v)
-            elif k == "calib_A":
-                arr = np.asarray(v, dtype=np.float64).reshape(2, 2)
-                cfg.calib.calib_A = arr
-                # invalidar cache manual explícita si el usuario setea A directo
-                state.cal_A_micro = arr.copy()
-                try:
-                    state.cal_A_pinv = compute_A_pinv_dls(arr, float(cfg.calib.lambda_dls))
-                    state.cal_det = float(np.linalg.det(arr))
-                except Exception as exc:
-                    log_error(None, "Tracking: failed to update manual calibration A_pinv", exc, throttle_s=10.0, throttle_key="tracking_calib_A")
-                    state.cal_A_pinv = None
-                    state.cal_det = 0.0
-            elif k == "calib_b":
-                cfg.calib.calib_b = np.asarray(v, dtype=np.float64).reshape(2,)
             elif k == "calib_lambda_dls":
                 cfg.calib.lambda_dls = float(v)
-                # recompute pinv (manual y auto)
-                if state.cal_A_micro is not None:
-                    try:
-                        state.cal_A_pinv = compute_A_pinv_dls(state.cal_A_micro, float(cfg.calib.lambda_dls))
-                    except Exception as exc:
-                        log_error(None, "Tracking: failed to recompute manual calibration pinv", exc, throttle_s=10.0, throttle_key="tracking_calib_lambda")
-                        state.cal_A_pinv = None
                 _auto_recompute_pinv(state)
-            elif k == "autocal_enabled":
-                cfg.autocal.enabled = bool(v)
             elif k == "rls_forget":
                 cfg.autocal.rls_forget = float(v)
-            elif k == "autoboost_enabled":
-                cfg.autoboost.enabled = bool(v)
-            elif k == "autoboost_rate":
-                cfg.autoboost.rate = float(v)
+            elif k == "sep_max_sources":
+                cfg.sep_track.max_sources = int(v)
+            elif k == "sep_min_sources":
+                cfg.sep_track.min_sources = int(v)
             else:
                 # ignore extras
                 pass
@@ -626,16 +589,20 @@ def tracking_step(
 ) -> TrackingOutput:
     """
     Un paso de tracking puro (sin tocar hardware):
-    - Alineación por objetos (SEP) incremental (v) + keyframe abs correction (x_hat/y_hat).
-    - Si tracking_enabled y hay A_pinv (manual o auto), computa RATE targets (pero NO envía).
+    - Alineación por centroides con matching por flux (SEP, fuentes brillantes) incremental (v) + keyframe abs correction (x_hat/y_hat).
+    - Si tracking_enabled y hay A_pinv (auto), computa RATE targets (pero NO envía).
       AppRunner es quien envía RATE al Arduino.
+
+    obj_xy debe ser un array SEP estructurado con campos "x","y","flux".
     """
     # resp_min configurable desde UI
     resp_min = float(getattr(state.cfg, "_resp_min", 0.06))
 
-    obj_xy = np.asarray(obj_xy, dtype=np.float64)
-    if obj_xy.ndim != 2 or obj_xy.shape[1] != 2:
-        raise ValueError(f"obj_xy must have shape (N,2), got {obj_xy.shape}")
+    obj_xy, obj_flux = _extract_obj_xy_and_flux(obj_xy)
+    obj_xy, obj_flux = _select_brightest_sources(obj_xy, obj_flux, state.cfg.sep_track.max_sources)
+
+    if (not state.auto.ok) or state.auto.A_pinv is None:
+        auto_reset(state, src="auto")
 
     # keyframe init/pending
     if state.key_obj_xy is None:
@@ -673,10 +640,11 @@ def tracking_step(
         1.0,
         4.0,
     )
-    dx_inc, dy_inc, resp_inc, _ = estimate_shift_from_objects(
+    dx_inc, dy_inc, resp_inc, _ = estimate_shift_from_flux_match(
         state.prev_obj_xy,
         obj_xy,
         max_shift_px=max_shift_inc,
+        min_sources=int(state.cfg.sep_track.min_sources),
     )
     mag_inc = float(np.hypot(dx_inc, dy_inc))
 
@@ -734,10 +702,11 @@ def tracking_step(
     # ABS correction against keyframe
     if isinstance(state.key_obj_xy, np.ndarray):
         if (state.abs_last_t is None) or ((now_t - float(state.abs_last_t)) >= float(state.cfg.keyframe.abs_corr_every_s)):
-            dx_abs, dy_abs, resp_abs, _ = estimate_shift_from_objects(
+            dx_abs, dy_abs, resp_abs, _ = estimate_shift_from_flux_match(
                 state.key_obj_xy,
                 obj_xy,
                 max_shift_px=float(state.cfg.keyframe.abs_max_px),
+                min_sources=int(state.cfg.sep_track.min_sources),
             )
             state.abs_last_t = now_t
             state.abs_resp_last = float(resp_abs)
@@ -784,6 +753,16 @@ def tracking_step(
 
         state.rate_az = rate_ramp(float(state.rate_az), rate_az_t, float(state.cfg.rate.rate_slew_per_update))
         state.rate_alt = rate_ramp(float(state.rate_alt), rate_alt_t, float(state.cfg.rate.rate_slew_per_update))
+
+        if good_inc:
+            auto_rls_update(
+                state,
+                u_az=float(state.rate_az),
+                u_alt=float(state.rate_alt),
+                vx=float(state.vx_inst),
+                vy=float(state.vy_inst),
+                now_t=float(now_t),
+            )
 
         # keyframe refresh when stable
         e_mag = float(np.hypot(ex, ey))
