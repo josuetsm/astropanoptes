@@ -1373,6 +1373,7 @@ class GoToWorker(BaseWorker):
         max_pairs: int,
         max_shift_px: float,
         min_resp: float,
+        pair_gap: int,
     ) -> Optional[np.ndarray]:
         if len(frames) < 2:
             log_info(
@@ -1380,24 +1381,50 @@ class GoToWorker(BaseWorker):
                 f"GoTo: AutoCal drift needs >=2 frames, got {len(frames)}",
             )
             return None
-        if len(frames) - 1 > int(max_pairs):
-            idx = np.linspace(0, len(frames) - 1, int(max_pairs) + 1).round().astype(int)
-            frames = [frames[i] for i in idx]
+        pair_gap = max(1, int(pair_gap))
+        if len(frames) <= pair_gap:
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal drift needs more frames for pair gap "
+                f"gap={pair_gap} frames={len(frames)}",
+            )
+            return None
+
+        pair_indices = [(i, i + pair_gap) for i in range(len(frames) - pair_gap)]
+        if len(pair_indices) > int(max_pairs):
+            idx = (
+                np.linspace(0, len(pair_indices) - 1, int(max_pairs))
+                .round()
+                .astype(int)
+            )
+            pair_indices = [pair_indices[i] for i in idx]
 
         v_list: List[np.ndarray] = []
         resp_list: List[float] = []
         resp_low = 0
         used = 0
-        for idx in range(1, len(frames)):
-            ref = frames[idx - 1]
-            fr = frames[idx]
+        for i, j in pair_indices:
+            ref = frames[i]
+            fr = frames[j]
             dt = float(fr.t_capture - ref.t_capture)
             if not (float(dt_min_s) <= dt <= float(dt_max_s)):
+                log_info(
+                    self._out_log,
+                    "GoTo: AutoCal drift pair skip "
+                    f"i={i} j={j} dt={dt:.3f}s "
+                    f"range=[{float(dt_min_s):.3f},{float(dt_max_s):.3f}]",
+                )
                 continue
             dx, dy, resp, _n = estimate_shift_from_objects(
                 ref.obj_xy,
                 fr.obj_xy,
                 max_shift_px=float(max_shift_px),
+            )
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal drift pair "
+                f"i={i} j={j} dt={dt:.3f}s "
+                f"dx={dx:.3f}px dy={dy:.3f}px resp={float(resp):.3f} matches={_n}",
             )
             used += 1
             if float(resp) < float(min_resp):
@@ -1414,7 +1441,7 @@ class GoToWorker(BaseWorker):
             log_info(
                 self._out_log,
                 "GoTo: AutoCal drift insufficient valid pairs "
-                f"valid={len(v_list)} total={used} resp_low={resp_low} "
+                f"valid={len(v_list)} total={used} resp_low={resp_low} gap={pair_gap} "
                 f"resp_stats=[{resp_min:.3f},{resp_med:.3f},{resp_max:.3f}]",
             )
             return None
@@ -1608,6 +1635,8 @@ class GoToWorker(BaseWorker):
         drift_dt_min = float(params.get("drift_dt_min_s", 1.0))
         drift_dt_max = float(params.get("drift_dt_max_s", 10.0))
         drift_pairs = int(params.get("drift_pairs", 20))
+        drift_pair_dt_s = float(params.get("drift_pair_dt_s", 0.0))
+        drift_pair_gap = max(1, int(params.get("drift_pair_gap", 1)))
         drift_max_shift_px = float(params.get("drift_max_shift_px", 25.0))
         drift_min_resp = float(params.get("drift_min_resp", 0.2))
         drift_capture_timeout_s = float(params.get("drift_capture_timeout_s", 12.0))
@@ -1655,7 +1684,9 @@ class GoToWorker(BaseWorker):
             f"stars=[{target_star_min},{target_star_max}] sat_max={target_sat_max:.3f} "
             f"exp_ms=[{exp_min_ms:.1f},{exp_max_ms:.1f}] gain=[{gain_min},{gain_max}] "
             f"drift_frames={drift_frames} drift_dt=[{drift_dt_min:.2f},{drift_dt_max:.2f}] "
-            f"drift_pairs={drift_pairs} drift_min_resp={drift_min_resp:.2f} "
+            f"drift_pairs={drift_pairs} drift_pair_gap={drift_pair_gap} "
+            f"drift_pair_dt_s={drift_pair_dt_s:.2f} "
+            f"drift_min_resp={drift_min_resp:.2f} "
             f"drift_capture_timeout_s={drift_capture_timeout_s:.2f} "
             f"jcal_rate_scale={jcal_rate_scale:.2f} "
             f"jcal_ramp_s={jcal_ramp_s:.2f} ramp_hz={jcal_ramp_hz:.1f} "
@@ -1754,6 +1785,26 @@ class GoToWorker(BaseWorker):
                     f"idx={idx} dt={dt:.3f}s stars={fr.star_count} "
                     f"top3={self._format_autocal_sources(fr.top_sources)}",
                 )
+        pair_gap = drift_pair_gap
+        if drift_pair_dt_s > 0.0 and len(drift_frames_list) >= 2:
+            dt_list = [
+                float(drift_frames_list[i].t_capture - drift_frames_list[i - 1].t_capture)
+                for i in range(1, len(drift_frames_list))
+            ]
+            dt_list = [dt for dt in dt_list if dt > 0.0]
+            if dt_list:
+                dt_med = float(np.median(dt_list))
+                if dt_med > 0.0:
+                    gap_auto = max(1, int(round(float(drift_pair_dt_s) / dt_med)))
+                    gap_auto = min(gap_auto, len(drift_frames_list) - 1)
+                    pair_gap = gap_auto
+                    log_info(
+                        self._out_log,
+                        "GoTo: AutoCal drift gap auto "
+                        f"dt_target={float(drift_pair_dt_s):.3f}s "
+                        f"dt_med={dt_med:.3f}s gap={pair_gap} fallback_gap={drift_pair_gap}",
+                    )
+
         drift_pix = self._autocal_estimate_drift(
             drift_frames_list,
             dt_min_s=drift_dt_min,
@@ -1761,6 +1812,7 @@ class GoToWorker(BaseWorker):
             max_pairs=drift_pairs,
             max_shift_px=drift_max_shift_px,
             min_resp=drift_min_resp,
+            pair_gap=pair_gap,
         )
         if drift_pix is None:
             out["status"] = "ERR_DRIFT"
@@ -1911,6 +1963,13 @@ class GoToWorker(BaseWorker):
         v_az_pix = float(np.dot(drift_pix, e_az_hat))
         v_alt_pix = float(np.dot(drift_pix, e_alt_hat))
         v_obs = np.array([v_az_pix * plate_scale_rad, v_alt_pix * plate_scale_rad], dtype=np.float64)
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal drift projection "
+            f"v_az_pix={v_az_pix:.3f}px/s v_alt_pix={v_alt_pix:.3f}px/s "
+            f"e_az_hat=[{float(e_az_hat[0]):.3f},{float(e_az_hat[1]):.3f}] "
+            f"e_alt_hat=[{float(e_alt_hat[0]):.3f},{float(e_alt_hat[1]):.3f}]",
+        )
 
         def _wrap_deg_180(x: float) -> float:
             y = (float(x) + 180.0) % 360.0 - 180.0
@@ -1989,6 +2048,12 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_DEGENERATE_AZ"
             return out
 
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal pointing estimate "
+            f"az={float(az_hat):.3f}deg alt={float(alt_hat):.3f}deg "
+            f"resid={float(best_res):.3e} v_obs_rad_s=[{float(v_obs[0]):.6e},{float(v_obs[1]):.6e}]",
+        )
         out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
         self._publish_state(
             {
@@ -2049,6 +2114,16 @@ class GoToWorker(BaseWorker):
             target = {"az_deg": float(az_c + jitter[0]), "alt_deg": float(alt_c + jitter[1])}
 
             ps_cfg = replace(platesolving_cfg, search_radius_deg=1.0)
+            if attempts == 0:
+                log_info(
+                    self._out_log,
+                    "GoTo: AutoCal platesolve first target "
+                    f"az={float(target['az_deg']):.3f}deg "
+                    f"alt={float(target['alt_deg']):.3f}deg "
+                    f"radius={float(ps_cfg.search_radius_deg):.3f}deg "
+                    f"jitter=({float(jitter[0]):.3f},{float(jitter[1]):.3f}) "
+                    f"dt={dt_s:.3f}s",
+                )
             platesolving_result = solve_plate(
                 fr.raw16,
                 target=target,
