@@ -1112,6 +1112,7 @@ class _AutocalFrame:
     obj_xy: np.ndarray
     star_count: int
     saturation_frac: float
+    top_sources: Tuple[Tuple[float, float, float], ...]
 
 
 @dataclass(frozen=True)
@@ -1207,7 +1208,9 @@ class GoToWorker(BaseWorker):
             return None
         return int(seq)
 
-    def _autocal_detect(self, raw16: np.ndarray) -> Tuple[np.ndarray, int, float]:
+    def _autocal_detect(
+        self, raw16: np.ndarray
+    ) -> Tuple[np.ndarray, int, float, Tuple[Tuple[float, float, float], ...]]:
         sep_cfg = self._get_sep_cfg()
         platesolving_cfg = self._get_platesolving_cfg()
         img_det, _bkg, objects, obj_xy = sep_detect_from_raw16(
@@ -1218,11 +1221,28 @@ class GoToWorker(BaseWorker):
             sep_minarea=int(sep_cfg.minarea),
             max_sources=int(platesolving_cfg.max_det),
         )
-        _ = img_det, objects
+        _ = img_det
         star_count = int(obj_xy.shape[0])
         max_val = np.iinfo(raw16.dtype).max
         saturation_frac = float(np.mean(raw16 >= max_val))
-        return obj_xy, star_count, saturation_frac
+        top_sources: Tuple[Tuple[float, float, float], ...] = ()
+        if objects is not None and len(objects) > 0:
+            n_use = min(3, len(objects))
+            xs = objects["x"][:n_use].astype(np.float64)
+            ys = objects["y"][:n_use].astype(np.float64)
+            fluxes = objects["flux"][:n_use].astype(np.float64)
+            top_sources = tuple(
+                (float(xs[i]), float(ys[i]), float(fluxes[i])) for i in range(n_use)
+            )
+        return obj_xy, star_count, saturation_frac, top_sources
+
+    def _format_autocal_sources(
+        self, sources: Sequence[Tuple[float, float, float]]
+    ) -> str:
+        if not sources:
+            return "[]"
+        parts = [f"{flux:.1f}@({x:.1f},{y:.1f})" for x, y, flux in sources]
+        return "[" + ", ".join(parts) + "]"
 
     def _autocal_capture_frames(
         self,
@@ -1255,7 +1275,7 @@ class GoToWorker(BaseWorker):
                 skip_remaining -= 1
                 continue
             raw16 = ensure_raw16_bayer(fr.raw).copy()
-            obj_xy, star_count, saturation_frac = self._autocal_detect(raw16)
+            obj_xy, star_count, saturation_frac, top_sources = self._autocal_detect(raw16)
             t_capture = float(getattr(fr, "t_capture", _now_s()))
             if last_capture_t is not None and (t_capture - last_capture_t) < min_dt_s:
                 time.sleep(0.005)
@@ -1267,6 +1287,7 @@ class GoToWorker(BaseWorker):
                     obj_xy=obj_xy,
                     star_count=star_count,
                     saturation_frac=saturation_frac,
+                    top_sources=top_sources,
                 )
             )
             last_capture_t = t_capture
@@ -1722,6 +1743,16 @@ class GoToWorker(BaseWorker):
             f"stars=[{min(star_counts)},{int(np.median(star_counts))},{max(star_counts)}] "
             f"sat=[{min(sat_fracs):.3f},{float(np.median(sat_fracs)):.3f},{max(sat_fracs):.3f}]",
         )
+        if len(drift_frames_list) > 1:
+            ref_t = float(drift_frames_list[0].t_capture)
+            for idx, fr in enumerate(drift_frames_list):
+                dt = float(fr.t_capture - ref_t)
+                log_info(
+                    self._out_log,
+                    "GoTo: AutoCal drift frame sources "
+                    f"idx={idx} dt={dt:.3f}s stars={fr.star_count} "
+                    f"top3={self._format_autocal_sources(fr.top_sources)}",
+                )
         drift_pix = self._autocal_estimate_drift(
             drift_frames_list,
             dt_min_s=drift_dt_min,
