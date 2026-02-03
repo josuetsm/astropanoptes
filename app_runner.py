@@ -203,6 +203,7 @@ class AppRunner:
         self._last_platesolving_result: Optional[Any] = None
         self._mount_move_worker = MountMoveWorker(
             get_mount=lambda: self._mount,
+            get_mount_cfg=self._get_mount_cfg_snapshot,
             note_manual_move=self._goto.model.note_manual_move,
             publish_state=self._update_state,
             out_log=self.out_log,

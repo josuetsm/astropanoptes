@@ -464,6 +464,29 @@ class AstroPanoptesWindow(QMainWindow):
         self.sb_delay.setValue(1000)
         self.sb_delay.setSuffix(" µs")
 
+        self.cb_ramp_enable = QCheckBox("ramp enable")
+        self.cb_ramp_enable.setChecked(bool(self.cfg.mount.manual_ramp_enable))
+
+        self.ds_ramp_frac = QDoubleSpinBox()
+        self.ds_ramp_frac.setRange(0.0, 0.8)
+        self.ds_ramp_frac.setDecimals(2)
+        self.ds_ramp_frac.setSingleStep(0.05)
+        self.ds_ramp_frac.setValue(float(self.cfg.mount.manual_ramp_frac))
+
+        self.sb_ramp_min_steps = QSpinBox()
+        self.sb_ramp_min_steps.setRange(0, 2_000_000)
+        self.sb_ramp_min_steps.setValue(int(self.cfg.mount.manual_ramp_min_steps))
+
+        self.ds_ramp_start_scale = QDoubleSpinBox()
+        self.ds_ramp_start_scale.setRange(1.0, 6.0)
+        self.ds_ramp_start_scale.setDecimals(2)
+        self.ds_ramp_start_scale.setSingleStep(0.1)
+        self.ds_ramp_start_scale.setValue(float(self.cfg.mount.manual_ramp_start_delay_scale))
+
+        self.sb_ramp_segments = QSpinBox()
+        self.sb_ramp_segments.setRange(1, 32)
+        self.sb_ramp_segments.setValue(int(self.cfg.mount.manual_ramp_segments))
+
         toprow = QHBoxLayout()
         toprow.addWidget(QLabel("steps:"))
         toprow.addWidget(self.sb_steps)
@@ -471,6 +494,15 @@ class AstroPanoptesWindow(QMainWindow):
         toprow.addWidget(QLabel("delay_us:"))
         toprow.addWidget(self.sb_delay)
         toprow.addStretch(1)
+
+        ramp_box = QGroupBox("Ramps")
+        ramp_form = QFormLayout()
+        ramp_form.addRow("Enable:", self.cb_ramp_enable)
+        ramp_form.addRow("Ramp frac:", self.ds_ramp_frac)
+        ramp_form.addRow("Min steps:", self.sb_ramp_min_steps)
+        ramp_form.addRow("Start x:", self.ds_ramp_start_scale)
+        ramp_form.addRow("Segments:", self.sb_ramp_segments)
+        ramp_box.setLayout(ramp_form)
 
         def mk_btn(text: str, danger: bool = False) -> QToolButton:
             button = QToolButton()
@@ -520,7 +552,14 @@ class AstroPanoptesWindow(QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
         layout.addLayout(toprow)
+        layout.addWidget(ramp_box)
         layout.addLayout(dwrap)
+
+        self.cb_ramp_enable.toggled.connect(self._manual_ramp_apply)
+        self.ds_ramp_frac.valueChanged.connect(self._manual_ramp_apply)
+        self.sb_ramp_min_steps.valueChanged.connect(self._manual_ramp_apply)
+        self.ds_ramp_start_scale.valueChanged.connect(self._manual_ramp_apply)
+        self.sb_ramp_segments.valueChanged.connect(self._manual_ramp_apply)
 
         return card
 
@@ -994,6 +1033,7 @@ class AstroPanoptesWindow(QMainWindow):
         self._log("[goto] Home -> alt/az safe default")
 
     def _manual_move(self, axis: Axis, direction: int) -> None:
+        self._manual_ramp_apply()
         steps = int(self.sb_steps.value())
         delay_us = int(self.sb_delay.value())
         if axis == Axis.AZ and self.cfg.mount.invert_az:
@@ -1006,6 +1046,20 @@ class AstroPanoptesWindow(QMainWindow):
     def _manual_stop(self) -> None:
         self.runner.request_mount_stop()
         self._log("[manual] STOP")
+
+    def _manual_ramp_apply(self) -> None:
+        cfg = self.runner.cfg.mount
+        cfg.manual_ramp_enable = bool(self.cb_ramp_enable.isChecked())
+        cfg.manual_ramp_frac = float(self.ds_ramp_frac.value())
+        cfg.manual_ramp_min_steps = int(self.sb_ramp_min_steps.value())
+        cfg.manual_ramp_start_delay_scale = float(self.ds_ramp_start_scale.value())
+        cfg.manual_ramp_segments = int(self.sb_ramp_segments.value())
+
+        self.cfg.mount.manual_ramp_enable = cfg.manual_ramp_enable
+        self.cfg.mount.manual_ramp_frac = cfg.manual_ramp_frac
+        self.cfg.mount.manual_ramp_min_steps = cfg.manual_ramp_min_steps
+        self.cfg.mount.manual_ramp_start_delay_scale = cfg.manual_ramp_start_delay_scale
+        self.cfg.mount.manual_ramp_segments = cfg.manual_ramp_segments
 
     def _on_tick(self) -> None:
         self._t_ms += 100.0

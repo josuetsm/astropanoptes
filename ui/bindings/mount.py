@@ -51,11 +51,31 @@ def bind_mount(
     manual_mount.ms_az.observe(on_microstep_change, names="value")
     manual_mount.ms_alt.observe(on_microstep_change, names="value")
 
+    def on_ramp_change(_change=None) -> None:
+        if guard.active:
+            return
+        cfg = runner.cfg.mount
+        cfg.manual_ramp_enable = bool(manual_mount.ramp_enable.value)
+        cfg.manual_ramp_frac = float(manual_mount.ramp_frac.value)
+        cfg.manual_ramp_min_steps = int(manual_mount.ramp_min_steps.value)
+        cfg.manual_ramp_start_delay_scale = float(manual_mount.ramp_start_scale.value)
+        cfg.manual_ramp_segments = int(manual_mount.ramp_segments.value)
+
+    for widget in [
+        manual_mount.ramp_enable,
+        manual_mount.ramp_frac,
+        manual_mount.ramp_min_steps,
+        manual_mount.ramp_start_scale,
+        manual_mount.ramp_segments,
+    ]:
+        widget.observe(on_ramp_change, names="value")
+
     def enqueue_move(axis: Axis, direction: int, steps: int, delay_us: int) -> None:
         if steps <= 0:
             return
         if delay_us <= 0:
             return
+        on_ramp_change()
         runner.request_mount_move_steps(axis=axis, direction=direction, steps=steps, delay_us=delay_us)
 
     manual_mount.btn_az_left.on_click(

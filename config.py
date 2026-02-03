@@ -65,6 +65,13 @@ class MountConfig:
     slew_delay_us_az: int = 1800
     slew_delay_us_alt: int = 1800
 
+    # Manual move ramps (MOVE commands)
+    manual_ramp_enable: bool = True
+    manual_ramp_frac: float = 0.2
+    manual_ramp_min_steps: int = 120
+    manual_ramp_start_delay_scale: float = 2.0
+    manual_ramp_segments: int = 8
+
 
 @dataclass
 class TrackingConfig:
