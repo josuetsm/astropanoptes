@@ -1118,11 +1118,8 @@ class _AutocalFrame:
 class _AutocalJResult:
     col: Optional[np.ndarray]
     ok_count: int
-    missing_base: int
-    missing_plus: int
-    missing_minus: int
     resp_low: int
-    expanded_used: int
+    missing_frames: int
 
 
 class GoToWorker(BaseWorker):
@@ -1142,6 +1139,7 @@ class GoToWorker(BaseWorker):
       - apply_camera_param(name, value): set camera parameter
       - pause_tracking()/resume_tracking()
       - pause_stacking()/resume_stacking()
+      - rate_mount(az_rate, alt_rate)
       - move_steps(axis, direction, steps, delay_us)
       - stop_mount()
     """
@@ -1164,6 +1162,7 @@ class GoToWorker(BaseWorker):
         resume_tracking: Callable[[], None],
         pause_stacking: Callable[[], bool],
         resume_stacking: Callable[[], None],
+        rate_mount: Callable[[float, float], Any],
         move_steps: Callable[[Axis, int, int, int], Any],
         stop_mount: Callable[[], Any],
         out_log: Any = None,
@@ -1184,6 +1183,7 @@ class GoToWorker(BaseWorker):
         self._resume_tracking = resume_tracking
         self._pause_stacking = pause_stacking
         self._resume_stacking = resume_stacking
+        self._rate_mount = rate_mount
         self._move_steps = move_steps
         self._stop_mount = stop_mount
         self._out_log = out_log
@@ -1359,41 +1359,25 @@ class GoToWorker(BaseWorker):
                 f"GoTo: AutoCal drift needs >=2 frames, got {len(frames)}",
             )
             return None
-        pairs: List[Tuple[int, int, float]] = []
-        for i in range(len(frames)):
-            for j in range(i + 1, len(frames)):
-                dt = float(frames[j].t_capture - frames[i].t_capture)
-                if float(dt_min_s) <= dt <= float(dt_max_s):
-                    pairs.append((i, j, dt))
-        if not pairs:
-            log_info(
-                self._out_log,
-                "GoTo: AutoCal drift has no frame pairs in dt range "
-                f"[{float(dt_min_s):.3f}, {float(dt_max_s):.3f}]s",
-            )
-            return None
+        if len(frames) - 1 > int(max_pairs):
+            idx = np.linspace(0, len(frames) - 1, int(max_pairs) + 1).round().astype(int)
+            frames = [frames[i] for i in idx]
 
-        pair_count = len(pairs)
-        if pair_count > int(max_pairs):
-            idx = np.linspace(0, len(pairs) - 1, int(max_pairs)).round().astype(int)
-            pairs = [pairs[i] for i in idx]
-        log_info(
-            self._out_log,
-            "GoTo: AutoCal drift pairing "
-            f"frames={len(frames)} pairs={pair_count}->{len(pairs)} "
-            f"dt_range=[{float(dt_min_s):.3f}, {float(dt_max_s):.3f}]s "
-            f"max_shift_px={float(max_shift_px):.1f} min_resp={float(min_resp):.3f}",
-        )
-
+        ref = frames[0]
         v_list: List[np.ndarray] = []
         resp_list: List[float] = []
         resp_low = 0
-        for i, j, dt in pairs:
+        used = 0
+        for fr in frames[1:]:
+            dt = float(fr.t_capture - ref.t_capture)
+            if not (float(dt_min_s) <= dt <= float(dt_max_s)):
+                continue
             dx, dy, resp, _n = estimate_shift_from_objects(
-                frames[i].obj_xy,
-                frames[j].obj_xy,
+                ref.obj_xy,
+                fr.obj_xy,
                 max_shift_px=float(max_shift_px),
             )
+            used += 1
             if float(resp) < float(min_resp):
                 resp_low += 1
                 continue
@@ -1408,7 +1392,7 @@ class GoToWorker(BaseWorker):
             log_info(
                 self._out_log,
                 "GoTo: AutoCal drift insufficient valid pairs "
-                f"valid={len(v_list)} total={len(pairs)} resp_low={resp_low} "
+                f"valid={len(v_list)} total={used} resp_low={resp_low} "
                 f"resp_stats=[{resp_min:.3f},{resp_med:.3f},{resp_max:.3f}]",
             )
             return None
@@ -1421,33 +1405,6 @@ class GoToWorker(BaseWorker):
         )
         return drift
 
-    def _autocal_shift_with_retry(
-        self,
-        ref_xy: np.ndarray,
-        cur_xy: np.ndarray,
-        *,
-        max_shift_px: float,
-        min_resp: float,
-    ) -> Tuple[float, float, float, int, bool]:
-        dx, dy, resp, matches = estimate_shift_from_objects(
-            ref_xy,
-            cur_xy,
-            max_shift_px=float(max_shift_px),
-        )
-        if float(resp) >= float(min_resp):
-            return dx, dy, resp, matches, False
-        expanded = float(max_shift_px) * 2.0
-        if expanded <= float(max_shift_px):
-            return dx, dy, resp, matches, False
-        dx2, dy2, resp2, matches2 = estimate_shift_from_objects(
-            ref_xy,
-            cur_xy,
-            max_shift_px=expanded,
-        )
-        if float(resp2) <= float(resp):
-            return dx, dy, resp, matches, False
-        return dx2, dy2, resp2, matches2, True
-
     def _autocal_pick_best_frame(
         self,
         frames: Sequence[_AutocalFrame],
@@ -1459,247 +1416,134 @@ class GoToWorker(BaseWorker):
             key=lambda fr: (int(fr.star_count), -float(fr.saturation_frac)),
         )
 
-    def _autocal_measure_axis_j(
+    def _autocal_axis_rates(self, axis: Axis, rate: float) -> Tuple[float, float]:
+        if axis == Axis.AZ:
+            return float(rate), 0.0
+        return 0.0, float(rate)
+
+    def _autocal_rate_ramp(
         self,
         *,
         axis: Axis,
-        steps: int,
-        repeats: int,
-        block_frames: int,
+        start_rate: float,
+        end_rate: float,
+        ramp_s: float,
+        ramp_hz: float,
+    ) -> None:
+        if self._rate_mount is None:
+            return
+        ramp_s = max(0.0, float(ramp_s))
+        ramp_hz = max(1.0, float(ramp_hz))
+        if ramp_s <= 0.0:
+            az_rate, alt_rate = self._autocal_axis_rates(axis, float(end_rate))
+            self._rate_mount(az_rate, alt_rate)
+            return
+        steps = max(1, int(round(ramp_s * ramp_hz)))
+        for i in range(1, steps + 1):
+            if self._op_cancel.is_set():
+                break
+            f = float(i) / float(steps)
+            rate = float(start_rate) + (float(end_rate) - float(start_rate)) * f
+            az_rate, alt_rate = self._autocal_axis_rates(axis, rate)
+            self._rate_mount(az_rate, alt_rate)
+            time.sleep(1.0 / float(ramp_hz))
+
+    def _autocal_axis_rate_scan(
+        self,
+        *,
+        axis: Axis,
+        rate_steps_s: float,
+        ramp_s: float,
+        ramp_hz: float,
+        plateau_s: float,
+        plateau_frames: int,
+        plateau_min_dt_s: float,
+        plateau_skip_frames: int,
         drift_pix: np.ndarray,
         max_shift_px: float,
         min_resp: float,
-        delay_us: int,
-        settle_s: float,
-        skip_frames: int,
-        capture_timeout_s: float,
     ) -> _AutocalJResult:
-        def _format_obj_xy(obj_xy: np.ndarray, max_items: int = 8) -> str:
-            count = int(obj_xy.shape[0])
-            if count == 0:
-                return "count=0"
-            sample = obj_xy[:max_items]
-            sample_str = ", ".join(f"({float(x):.1f},{float(y):.1f})" for x, y in sample)
-            suffix = "..." if count > max_items else ""
-            return f"count={count} sample=[{sample_str}{suffix}]"
+        if self._rate_mount is None:
+            return _AutocalJResult(col=None, ok_count=0, resp_low=0, missing_frames=1)
 
-        step_count = int(abs(int(steps)))
-        if step_count <= 0:
-            return _AutocalJResult(
-                col=None,
-                ok_count=0,
-                missing_base=0,
-                missing_plus=0,
-                missing_minus=0,
-                resp_low=0,
-                expanded_used=0,
+        plateau_frames = max(2, int(plateau_frames))
+        plateau_s = max(0.1, float(plateau_s))
+
+        self._autocal_rate_ramp(
+            axis=axis,
+            start_rate=0.0,
+            end_rate=float(rate_steps_s),
+            ramp_s=ramp_s,
+            ramp_hz=ramp_hz,
+        )
+        if self._op_cancel.is_set():
+            self._autocal_rate_ramp(
+                axis=axis,
+                start_rate=float(rate_steps_s),
+                end_rate=0.0,
+                ramp_s=ramp_s,
+                ramp_hz=ramp_hz,
             )
+            return _AutocalJResult(col=None, ok_count=0, resp_low=0, missing_frames=1)
 
+        frames = self._autocal_capture_frames(
+            n_frames=int(plateau_frames),
+            timeout_s=float(plateau_s),
+            min_dt_s=float(plateau_min_dt_s),
+            skip_frames=int(plateau_skip_frames),
+        )
+
+        self._autocal_rate_ramp(
+            axis=axis,
+            start_rate=float(rate_steps_s),
+            end_rate=0.0,
+            ramp_s=ramp_s,
+            ramp_hz=ramp_hz,
+        )
+        if self._rate_mount is not None:
+            self._rate_mount(0.0, 0.0)
+
+        if len(frames) < 2:
+            return _AutocalJResult(col=None, ok_count=0, resp_low=0, missing_frames=1)
+
+        base = frames[0]
         cols: List[np.ndarray] = []
-        missing_base = 0
-        missing_plus = 0
-        missing_minus = 0
         resp_low = 0
-        expanded_used = 0
-        for _ in range(int(repeats)):
-            if self._op_cancel.is_set():
-                return _AutocalJResult(
-                    col=None,
-                    ok_count=0,
-                    missing_base=missing_base,
-                    missing_plus=missing_plus,
-                    missing_minus=missing_minus,
-                    resp_low=resp_low,
-                    expanded_used=expanded_used,
-                )
-
-            base_frames = self._autocal_capture_frames(
-                n_frames=int(block_frames),
-                timeout_s=float(capture_timeout_s),
-                skip_frames=int(skip_frames),
-            )
-            base = self._autocal_pick_best_frame(base_frames)
-            if base is None:
-                missing_base += 1
+        for fr in frames[1:]:
+            dt = float(fr.t_capture - base.t_capture)
+            if dt <= 0.0:
                 continue
-            log_info(
-                self._out_log,
-                "GoTo: AutoCal J base objects "
-                f"axis={axis.name} steps={step_count} {_format_obj_xy(base.obj_xy)}",
-            )
-
-            self._goto._exec_steps(self._move_steps, axis, float(step_count), delay_us=int(delay_us))
-            time.sleep(float(settle_s))
-            plus_frames = self._autocal_capture_frames(
-                n_frames=int(block_frames),
-                timeout_s=float(capture_timeout_s),
-                skip_frames=int(skip_frames),
-            )
-            plus = self._autocal_pick_best_frame(plus_frames)
-            if plus is None:
-                missing_plus += 1
-                continue
-            log_info(
-                self._out_log,
-                "GoTo: AutoCal J plus objects "
-                f"axis={axis.name} steps={step_count} {_format_obj_xy(plus.obj_xy)}",
-            )
-
-            self._goto._exec_steps(self._move_steps, axis, float(-2 * step_count), delay_us=int(delay_us))
-            time.sleep(float(settle_s))
-            minus_frames = self._autocal_capture_frames(
-                n_frames=int(block_frames),
-                timeout_s=float(capture_timeout_s),
-                skip_frames=int(skip_frames),
-            )
-            minus = self._autocal_pick_best_frame(minus_frames)
-            if minus is None:
-                missing_minus += 1
-                continue
-            log_info(
-                self._out_log,
-                "GoTo: AutoCal J minus objects "
-                f"axis={axis.name} steps={step_count} {_format_obj_xy(minus.obj_xy)}",
-            )
-
-            self._goto._exec_steps(self._move_steps, axis, float(step_count), delay_us=int(delay_us))
-            time.sleep(float(settle_s))
-
-            dx_p, dy_p, resp_p, _n_p, expanded_p = self._autocal_shift_with_retry(
+            dx, dy, resp, _n = estimate_shift_from_objects(
                 base.obj_xy,
-                plus.obj_xy,
+                fr.obj_xy,
                 max_shift_px=float(max_shift_px),
-                min_resp=float(min_resp),
             )
-            dx_m, dy_m, resp_m, _n_m, expanded_m = self._autocal_shift_with_retry(
-                base.obj_xy,
-                minus.obj_xy,
-                max_shift_px=float(max_shift_px),
-                min_resp=float(min_resp),
-            )
-            if expanded_p or expanded_m:
-                expanded_used += 1
-            if float(resp_p) < float(min_resp) or float(resp_m) < float(min_resp):
+            if float(resp) < float(min_resp):
                 resp_low += 1
                 continue
+            dp = np.array([-dx, -dy], dtype=np.float64) - drift_pix * dt
+            steps = float(rate_steps_s) * dt
+            if steps == 0.0:
+                continue
+            cols.append(dp / steps)
 
-            dt_plus = float(plus.t_capture - base.t_capture)
-            dt_minus = float(minus.t_capture - base.t_capture)
-            dp_plus = np.array([-dx_p, -dy_p], dtype=np.float64) - drift_pix * dt_plus
-            dp_minus = np.array([-dx_m, -dy_m], dtype=np.float64) - drift_pix * dt_minus
-            dp_axis = (dp_plus - dp_minus) * 0.5
-            cols.append(dp_axis / float(step_count))
-
-        log_info(
-            self._out_log,
-            "GoTo: AutoCal J axis "
-            f"axis={axis.name} repeats={int(repeats)} ok={len(cols)} "
-            f"missing_base={missing_base} missing_plus={missing_plus} "
-            f"missing_minus={missing_minus} resp_low={resp_low} "
-            f"expanded_shift={expanded_used}",
-        )
         if not cols:
-            return _AutocalJResult(
-                col=None,
-                ok_count=0,
-                missing_base=missing_base,
-                missing_plus=missing_plus,
-                missing_minus=missing_minus,
-                resp_low=resp_low,
-                expanded_used=expanded_used,
-            )
-        return _AutocalJResult(
-            col=np.median(np.stack(cols, axis=0), axis=0),
-            ok_count=len(cols),
-            missing_base=missing_base,
-            missing_plus=missing_plus,
-            missing_minus=missing_minus,
-            resp_low=resp_low,
-            expanded_used=expanded_used,
-        )
-
-    def _autocal_measure_axis_j_with_fallback(
-        self,
-        *,
-        axis: Axis,
-        steps: int,
-        repeats: int,
-        block_frames: int,
-        drift_pix: np.ndarray,
-        max_shift_px: float,
-        min_resp: float,
-        delay_us: int,
-        settle_s: float,
-        skip_frames: int,
-        capture_timeout_s: float,
-        min_steps: int,
-        step_scale: float,
-        max_attempts: int,
-    ) -> Optional[np.ndarray]:
-        step_count = int(abs(int(steps)))
-        if step_count <= 0:
-            return None
-        min_steps = max(1, int(min_steps))
-        step_scale = float(step_scale)
-        max_attempts = max(1, int(max_attempts))
-
-        def _candidate_scale_down(start: int) -> List[int]:
-            candidates_down: List[int] = []
-            step_val = int(start)
-            while step_val >= min_steps and len(candidates_down) < max_attempts:
-                next_step = int(round(step_val * step_scale))
-                if next_step >= step_val:
-                    next_step = step_val - 1
-                step_val = next_step
-                if step_val >= min_steps and step_val not in candidates_down:
-                    candidates_down.append(step_val)
-            return candidates_down
-
-        if self._op_cancel.is_set():
-            return None
-        initial = self._autocal_measure_axis_j(
-            axis=axis,
-            steps=int(step_count),
-            repeats=repeats,
-            block_frames=block_frames,
-            drift_pix=drift_pix,
-            max_shift_px=max_shift_px,
-            min_resp=min_resp,
-            delay_us=delay_us,
-            settle_s=settle_s,
-            skip_frames=skip_frames,
-            capture_timeout_s=capture_timeout_s,
-        )
-        if initial.col is not None:
-            return initial.col
-
-        candidates: List[int] = []
-        candidates.extend(_candidate_scale_down(step_count))
-
-        for candidate in candidates:
-            if self._op_cancel.is_set():
-                return None
             log_info(
                 self._out_log,
-                "GoTo: AutoCal J axis retry "
-                f"axis={axis.name} steps={int(candidate)}",
+                "GoTo: AutoCal J axis scan "
+                f"axis={axis.name} rate={float(rate_steps_s):.2f} "
+                f"frames={len(frames)} resp_low={resp_low} ok=0",
             )
-            attempt = self._autocal_measure_axis_j(
-                axis=axis,
-                steps=int(candidate),
-                repeats=repeats,
-                block_frames=block_frames,
-                drift_pix=drift_pix,
-                max_shift_px=max_shift_px,
-                min_resp=min_resp,
-                delay_us=delay_us,
-                settle_s=settle_s,
-                skip_frames=skip_frames,
-                capture_timeout_s=capture_timeout_s,
-            )
-            if attempt.col is not None:
-                return attempt.col
-        return None
+            return _AutocalJResult(col=None, ok_count=0, resp_low=resp_low, missing_frames=0)
+
+        col = np.median(np.stack(cols, axis=0), axis=0)
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal J axis scan "
+            f"axis={axis.name} rate={float(rate_steps_s):.2f} "
+            f"frames={len(frames)} resp_low={resp_low} ok={len(cols)}",
+        )
+        return _AutocalJResult(col=col, ok_count=len(cols), resp_low=resp_low, missing_frames=0)
 
     def _goto_autocalibrate_blocking(self, params: Dict[str, Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {
@@ -1746,54 +1590,42 @@ class GoToWorker(BaseWorker):
         drift_min_resp = float(params.get("drift_min_resp", 0.2))
         drift_capture_timeout_s = float(params.get("drift_capture_timeout_s", 12.0))
 
-        jcal_steps_az_base = int(params.get("jcal_steps_az", mount_cfg.slew_steps_az))
-        jcal_steps_alt_base = int(params.get("jcal_steps_alt", mount_cfg.slew_steps_alt))
-        jcal_steps_scale = float(params.get("jcal_steps_scale", 0.1))
-        jcal_repeats = int(params.get("jcal_repeats", 2))
-        jcal_block_frames = int(params.get("jcal_block_frames", 5))
+        jcal_rate_scale = float(params.get("jcal_rate_scale", 1.0))
+        jcal_ramp_s = float(params.get("jcal_ramp_s", 0.6))
+        jcal_ramp_hz = float(params.get("jcal_ramp_hz", 25.0))
+        jcal_plateau_s = float(params.get("jcal_plateau_s", 2.0))
+        jcal_plateau_frames = int(params.get("jcal_plateau_frames", 4))
+        jcal_plateau_min_dt_s = float(params.get("jcal_plateau_min_dt_s", 0.2))
+        jcal_plateau_skip_frames = int(params.get("jcal_plateau_skip_frames", 1))
+        jcal_probe_s = float(params.get("jcal_probe_s", 0.5))
+        jcal_probe_scale = float(params.get("jcal_probe_scale", 0.35))
         jcal_max_shift_px = float(params.get("jcal_max_shift_px", 30.0))
         jcal_min_resp = float(params.get("jcal_min_resp", 0.2))
-        jcal_settle_s = float(params.get("jcal_settle_s", max(settle_s, 0.6)))
-        jcal_capture_timeout_s = float(params.get("jcal_capture_timeout_s", 4.0))
-        jcal_skip_frames = int(params.get("jcal_skip_frames", 0))
-        jcal_delay_us = int(params.get("jcal_delay_us", goto_cfg.slew_delay_us))
-        jcal_min_steps = int(params.get("jcal_min_steps", 50))
-        jcal_step_scale = float(params.get("jcal_step_scale", 0.5))
-        jcal_step_attempts = int(params.get("jcal_step_attempts", 3))
 
         solve_attempts = int(params.get("solve_attempts", 5))
         jitter_deg = float(params.get("solve_jitter_deg", 0.2))
 
-        if jcal_min_steps <= 0:
+        if self._rate_mount is None:
+            out["status"] = "ERR_NO_RATE"
+            return out
+        if jcal_rate_scale <= 0.0:
             out["status"] = "ERR_JCAL_PARAMS"
             return out
-        if jcal_step_scale <= 0.0 or jcal_step_scale >= 1.0:
+        if jcal_ramp_s < 0.0 or jcal_ramp_hz <= 0.0:
             out["status"] = "ERR_JCAL_PARAMS"
             return out
-        if jcal_step_attempts <= 0:
+        if jcal_plateau_s <= 0.0 or jcal_plateau_frames < 2:
             out["status"] = "ERR_JCAL_PARAMS"
             return out
-        if jcal_steps_scale <= 0.0:
+        if jcal_plateau_min_dt_s < 0.0 or jcal_plateau_skip_frames < 0:
             out["status"] = "ERR_JCAL_PARAMS"
             return out
-        if jcal_settle_s < 0.0:
-            out["status"] = "ERR_JCAL_PARAMS"
-            return out
-        if jcal_capture_timeout_s <= 0.0:
-            out["status"] = "ERR_JCAL_PARAMS"
-            return out
-        if jcal_skip_frames < 0:
+        if jcal_probe_s < 0.0 or jcal_probe_scale < 0.0:
             out["status"] = "ERR_JCAL_PARAMS"
             return out
         if drift_capture_timeout_s <= 0.0:
             out["status"] = "ERR_DRIFT_PARAMS"
             return out
-        if jcal_delay_us <= 0:
-            out["status"] = "ERR_JCAL_PARAMS"
-            return out
-
-        jcal_steps_az = max(1, int(round(jcal_steps_az_base * jcal_steps_scale)))
-        jcal_steps_alt = max(1, int(round(jcal_steps_alt_base * jcal_steps_scale)))
 
         log_info(
             self._out_log,
@@ -1803,15 +1635,12 @@ class GoToWorker(BaseWorker):
             f"drift_frames={drift_frames} drift_dt=[{drift_dt_min:.2f},{drift_dt_max:.2f}] "
             f"drift_pairs={drift_pairs} drift_min_resp={drift_min_resp:.2f} "
             f"drift_capture_timeout_s={drift_capture_timeout_s:.2f} "
-            f"jcal_steps=[{jcal_steps_az},{jcal_steps_alt}] jcal_repeats={jcal_repeats} "
-            f"jcal_min_resp={jcal_min_resp:.2f} "
-            f"jcal_settle_s={jcal_settle_s:.2f} "
-            f"jcal_capture_timeout_s={jcal_capture_timeout_s:.2f} "
-            f"jcal_skip_frames={jcal_skip_frames} "
-            f"jcal_delay_us={jcal_delay_us} "
-            f"jcal_steps_scale={jcal_steps_scale:.2f} "
-            f"jcal_min_steps={jcal_min_steps} step_scale={jcal_step_scale:.2f} "
-            f"step_attempts={jcal_step_attempts}",
+            f"jcal_rate_scale={jcal_rate_scale:.2f} "
+            f"jcal_ramp_s={jcal_ramp_s:.2f} ramp_hz={jcal_ramp_hz:.1f} "
+            f"jcal_plateau_s={jcal_plateau_s:.2f} frames={jcal_plateau_frames} "
+            f"plateau_min_dt_s={jcal_plateau_min_dt_s:.2f} skip_frames={jcal_plateau_skip_frames} "
+            f"jcal_probe_s={jcal_probe_s:.2f} probe_scale={jcal_probe_scale:.2f} "
+            f"jcal_min_resp={jcal_min_resp:.2f} jcal_max_shift_px={jcal_max_shift_px:.1f}",
         )
 
         plate_scale_rad = float(platesolving_cfg.pixel_size_m) / float(platesolving_cfg.focal_m)
@@ -1916,47 +1745,111 @@ class GoToWorker(BaseWorker):
         )
 
         self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "JCAL"}})
-        col_az = self._autocal_measure_axis_j_with_fallback(
-            axis=Axis.AZ,
-            steps=jcal_steps_az,
-            repeats=jcal_repeats,
-            block_frames=jcal_block_frames,
-            drift_pix=drift_pix,
-            max_shift_px=jcal_max_shift_px,
-            min_resp=jcal_min_resp,
-            delay_us=jcal_delay_us,
-            settle_s=jcal_settle_s,
-            skip_frames=jcal_skip_frames,
-            capture_timeout_s=jcal_capture_timeout_s,
-            min_steps=jcal_min_steps,
-            step_scale=jcal_step_scale,
-            max_attempts=jcal_step_attempts,
+        drift_norm = float(np.linalg.norm(drift_pix))
+        if drift_norm <= 0.0:
+            out["status"] = "ERR_JCAL_RATE"
+            return out
+
+        steps_per_rad_az = float(self._goto.model.kin.steps_per_deg(Axis.AZ)) * (180.0 / math.pi)
+        steps_per_rad_alt = float(self._goto.model.kin.steps_per_deg(Axis.ALT)) * (180.0 / math.pi)
+        v_rad_mag = drift_norm * float(plate_scale_rad)
+        rate_az_mag = v_rad_mag * steps_per_rad_az * float(jcal_rate_scale)
+        rate_alt_mag = v_rad_mag * steps_per_rad_alt * float(jcal_rate_scale)
+
+        rate_max = float(getattr(mount_cfg, "rate_max", 0.0))
+        if rate_max > 0.0:
+            rate_az_mag = min(rate_az_mag, rate_max)
+            rate_alt_mag = min(rate_alt_mag, rate_max)
+
+        if rate_az_mag <= 0.0 or rate_alt_mag <= 0.0:
+            out["status"] = "ERR_JCAL_RATE"
+            return out
+
+        def _px_per_step(axis: Axis) -> float:
+            dps = abs(float(self._goto.model.kin.deg_per_step(axis)))
+            rad_per_step = dps * (math.pi / 180.0)
+            return float(rad_per_step / plate_scale_rad)
+
+        def _expected_shift(rate_steps_s: float, duration_s: float, axis: Axis) -> float:
+            return abs(float(rate_steps_s)) * float(duration_s) * _px_per_step(axis)
+
+        drift_dir = drift_pix / drift_norm
+
+        def _pick_rate_sign(axis: Axis, rate_mag: float, probe_s: float, probe_scale: float) -> float:
+            if probe_s <= 0.0 or probe_scale <= 0.0:
+                return 1.0
+            probe_rate = float(rate_mag) * float(probe_scale)
+            if probe_rate <= 0.0:
+                return 1.0
+            probe_frames = max(2, int(round(float(jcal_plateau_frames) * 0.5)))
+            probe_shift = max(
+                float(jcal_max_shift_px),
+                _expected_shift(probe_rate, probe_s, axis) * 1.2,
+            )
+            probe = self._autocal_axis_rate_scan(
+                axis=axis,
+                rate_steps_s=probe_rate,
+                ramp_s=jcal_ramp_s,
+                ramp_hz=jcal_ramp_hz,
+                plateau_s=probe_s,
+                plateau_frames=probe_frames,
+                plateau_min_dt_s=jcal_plateau_min_dt_s,
+                plateau_skip_frames=jcal_plateau_skip_frames,
+                drift_pix=drift_pix,
+                max_shift_px=probe_shift,
+                min_resp=jcal_min_resp,
+            )
+            if probe.col is None:
+                return 1.0
+            return 1.0 if float(np.dot(probe.col, drift_dir)) >= 0.0 else -1.0
+
+        max_shift_az = max(
+            float(jcal_max_shift_px),
+            _expected_shift(rate_az_mag, jcal_plateau_s, Axis.AZ) * 1.2,
         )
-        if col_az is None:
+        max_shift_alt = max(
+            float(jcal_max_shift_px),
+            _expected_shift(rate_alt_mag, jcal_plateau_s, Axis.ALT) * 1.2,
+        )
+
+        sign_az = _pick_rate_sign(Axis.AZ, rate_az_mag, jcal_probe_s, jcal_probe_scale)
+        sign_alt = _pick_rate_sign(Axis.ALT, rate_alt_mag, jcal_probe_s, jcal_probe_scale)
+
+        col_az_res = self._autocal_axis_rate_scan(
+            axis=Axis.AZ,
+            rate_steps_s=sign_az * rate_az_mag,
+            ramp_s=jcal_ramp_s,
+            ramp_hz=jcal_ramp_hz,
+            plateau_s=jcal_plateau_s,
+            plateau_frames=jcal_plateau_frames,
+            plateau_min_dt_s=jcal_plateau_min_dt_s,
+            plateau_skip_frames=jcal_plateau_skip_frames,
+            drift_pix=drift_pix,
+            max_shift_px=max_shift_az,
+            min_resp=jcal_min_resp,
+        )
+        if col_az_res.col is None:
             out["status"] = "ERR_JCAL_AZ"
             return out
 
-        col_alt = self._autocal_measure_axis_j_with_fallback(
+        col_alt_res = self._autocal_axis_rate_scan(
             axis=Axis.ALT,
-            steps=jcal_steps_alt,
-            repeats=jcal_repeats,
-            block_frames=jcal_block_frames,
+            rate_steps_s=sign_alt * rate_alt_mag,
+            ramp_s=jcal_ramp_s,
+            ramp_hz=jcal_ramp_hz,
+            plateau_s=jcal_plateau_s,
+            plateau_frames=jcal_plateau_frames,
+            plateau_min_dt_s=jcal_plateau_min_dt_s,
+            plateau_skip_frames=jcal_plateau_skip_frames,
             drift_pix=drift_pix,
-            max_shift_px=jcal_max_shift_px,
+            max_shift_px=max_shift_alt,
             min_resp=jcal_min_resp,
-            delay_us=jcal_delay_us,
-            settle_s=jcal_settle_s,
-            skip_frames=jcal_skip_frames,
-            capture_timeout_s=jcal_capture_timeout_s,
-            min_steps=jcal_min_steps,
-            step_scale=jcal_step_scale,
-            max_attempts=jcal_step_attempts,
         )
-        if col_alt is None:
+        if col_alt_res.col is None:
             out["status"] = "ERR_JCAL_ALT"
             return out
 
-        J_pix = np.column_stack([col_az, col_alt])
+        J_pix = np.column_stack([col_az_res.col, col_alt_res.col])
         out["J_pix_per_step"] = J_pix
         self._publish_state(
             {

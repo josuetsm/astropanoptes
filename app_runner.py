@@ -223,6 +223,7 @@ class AppRunner:
             resume_tracking=self._resume_tracking_after_goto,
             pause_stacking=self._pause_stacking_for_goto,
             resume_stacking=self._resume_stacking_after_goto,
+            rate_mount=self._mount_rate_safe,
             move_steps=self._goto_move_steps,
             stop_mount=self._mount_stop,
             out_log=self.out_log,
@@ -1073,7 +1074,8 @@ class AppRunner:
                         }
                     )
             else:
-                if self._mount is not None:
+                goto_busy = bool(self.get_state().goto.busy)
+                if self._mount is not None and not goto_busy:
                     self._mount_rate_safe(0.0, 0.0)
                 self._update_state(
                     {
