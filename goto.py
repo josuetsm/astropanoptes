@@ -1384,12 +1384,13 @@ class GoToWorker(BaseWorker):
             idx = np.linspace(0, len(frames) - 1, int(max_pairs) + 1).round().astype(int)
             frames = [frames[i] for i in idx]
 
-        ref = frames[0]
         v_list: List[np.ndarray] = []
         resp_list: List[float] = []
         resp_low = 0
         used = 0
-        for fr in frames[1:]:
+        for idx in range(1, len(frames)):
+            ref = frames[idx - 1]
+            fr = frames[idx]
             dt = float(fr.t_capture - ref.t_capture)
             if not (float(dt_min_s) <= dt <= float(dt_max_s)):
                 continue
