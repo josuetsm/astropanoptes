@@ -450,19 +450,6 @@ class ArduinoMount:
 
         return self.ctrl.move(ax, dr, int(steps), int(delay_us))
 
-    def move_steps_no_stop(self, axis: Axis, direction: int, steps: int, delay_us: int) -> str:
-        """
-        MOVE sin STOP previo (para rampas segmentadas).
-        """
-        if int(steps) <= 0:
-            return ""
-        if int(delay_us) <= 0:
-            return ""
-
-        ax = _axis_to_fw(axis)
-        dr = _dir_to_fw(int(direction))
-        return self.ctrl.move(ax, dr, int(steps), int(delay_us))
-
     def rate(self, v_az: float, v_alt: float) -> str:
         return self.ctrl.rate(float(v_az), float(v_alt))
 
@@ -473,7 +460,6 @@ class MountMoveWorker(BaseWorker):
 
     Dependencies injected:
       - get_mount(): returns ArduinoMount or None
-      - get_mount_cfg(): MountConfig snapshot
       - note_manual_move(axis, direction, steps)
       - publish_state(patch)
     """
@@ -482,14 +468,12 @@ class MountMoveWorker(BaseWorker):
         self,
         *,
         get_mount: Callable[[], Optional["ArduinoMount"]],
-        get_mount_cfg: Callable[[], "MountConfig"],
         note_manual_move: Callable[[Axis, int, int], None],
         publish_state: StatePublisherProtocol,
         out_log: Any = None,
     ) -> None:
         super().__init__(name="MountMoveWorker")
         self._get_mount = get_mount
-        self._get_mount_cfg = get_mount_cfg
         self._note_manual_move = note_manual_move
         self._publish_state = publish_state
         self._out_log = out_log
@@ -510,70 +494,15 @@ class MountMoveWorker(BaseWorker):
         direction = int(request["direction"])
         steps = int(request["steps"])
         delay_us = int(request["delay_us"])
-        cfg = self._get_mount_cfg()
 
         try:
             mount.stop()
-            ramp_enabled = bool(getattr(cfg, "manual_ramp_enable", False))
-            ramp_frac = float(getattr(cfg, "manual_ramp_frac", 0.0))
-            ramp_min_steps = int(getattr(cfg, "manual_ramp_min_steps", 0))
-            ramp_scale = float(getattr(cfg, "manual_ramp_start_delay_scale", 1.0))
-            ramp_segments = int(getattr(cfg, "manual_ramp_segments", 1))
-
-            ramp_steps = int(round(float(steps) * max(0.0, ramp_frac))) if ramp_enabled else 0
-            if ramp_steps < int(ramp_min_steps):
-                ramp_steps = 0
-            if ramp_steps * 2 >= steps:
-                ramp_steps = 0
-
-            if ramp_steps <= 0 or ramp_segments <= 1 or ramp_scale <= 1.0:
-                mount.move_steps(
-                    axis=axis,
-                    direction=direction,
-                    steps=steps,
-                    delay_us=delay_us,
-                )
-            else:
-                ramp_segments = max(1, min(int(ramp_segments), int(ramp_steps)))
-                base = int(ramp_steps) // ramp_segments
-                extra = int(ramp_steps) % ramp_segments
-                seg_steps = [base + (1 if i < extra else 0) for i in range(ramp_segments)]
-
-                start_delay = int(round(float(delay_us) * float(ramp_scale)))
-                start_delay = max(int(delay_us), start_delay)
-                seg_delays = [
-                    max(1, int(round(start_delay + (float(delay_us) - float(start_delay)) * ((i + 1) / ramp_segments))))
-                    for i in range(ramp_segments)
-                ]
-
-                for n_steps, seg_delay in zip(seg_steps, seg_delays):
-                    if n_steps <= 0:
-                        continue
-                    mount.move_steps_no_stop(
-                        axis=axis,
-                        direction=direction,
-                        steps=n_steps,
-                        delay_us=seg_delay,
-                    )
-
-                plateau = int(steps) - (2 * int(ramp_steps))
-                if plateau > 0:
-                    mount.move_steps_no_stop(
-                        axis=axis,
-                        direction=direction,
-                        steps=plateau,
-                        delay_us=delay_us,
-                    )
-
-                for n_steps, seg_delay in zip(reversed(seg_steps), reversed(seg_delays)):
-                    if n_steps <= 0:
-                        continue
-                    mount.move_steps_no_stop(
-                        axis=axis,
-                        direction=direction,
-                        steps=n_steps,
-                        delay_us=seg_delay,
-                    )
+            mount.move_steps(
+                axis=axis,
+                direction=direction,
+                steps=steps,
+                delay_us=delay_us,
+            )
 
             self._note_manual_move(axis, direction, steps)
         except (RuntimeError, ValueError, OSError, serial.SerialException) as exc:

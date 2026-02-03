@@ -203,7 +203,6 @@ class AppRunner:
         self._last_platesolving_result: Optional[Any] = None
         self._mount_move_worker = MountMoveWorker(
             get_mount=lambda: self._mount,
-            get_mount_cfg=self._get_mount_cfg_snapshot,
             note_manual_move=self._goto.model.note_manual_move,
             publish_state=self._update_state,
             out_log=self.out_log,
@@ -850,6 +849,8 @@ class AppRunner:
             msg = m.connect(port=str(port), baud=int(baudrate))
             self._mount = m
             self._update_state({"mount": {"connected": True, "status": MountStatus.OK, "last_error": None}})
+            # Ensure microstep settings are applied on every connect so manual speed is consistent.
+            self._mount_set_microsteps(self.cfg.mount.ms_az, self.cfg.mount.ms_alt)
             log_info(self.out_log, f"Mount: connected ({msg})")
         except Exception as exc:
             self._shutdown_mount()

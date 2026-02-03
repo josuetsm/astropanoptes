@@ -23,11 +23,6 @@ class ManualMountHandles:
     delay_az: W.BoundedIntText
     steps_alt: W.BoundedIntText
     delay_alt: W.BoundedIntText
-    ramp_enable: W.Checkbox
-    ramp_frac: W.BoundedFloatText
-    ramp_min_steps: W.BoundedIntText
-    ramp_start_scale: W.BoundedFloatText
-    ramp_segments: W.BoundedIntText
     btn_az_left: W.Button
     btn_az_right: W.Button
     btn_alt_up: W.Button
@@ -149,44 +144,6 @@ def build_manual_mount(cfg: AppConfig) -> tuple[W.Widget, ManualMountHandles]:
         layout=W.Layout(width="230px"),
     )
 
-    ramp_enable = W.Checkbox(
-        value=bool(getattr(mount_cfg, "manual_ramp_enable", True)),
-        description="Ramp enable",
-        indent=False,
-    )
-    ramp_frac = W.BoundedFloatText(
-        value=float(getattr(mount_cfg, "manual_ramp_frac", 0.2)),
-        min=0.0,
-        max=0.8,
-        step=0.05,
-        description="Ramp frac",
-        layout=W.Layout(width="180px"),
-    )
-    ramp_min_steps = W.BoundedIntText(
-        value=int(getattr(mount_cfg, "manual_ramp_min_steps", 120)),
-        min=0,
-        max=500000,
-        step=10,
-        description="Min steps",
-        layout=W.Layout(width="180px"),
-    )
-    ramp_start_scale = W.BoundedFloatText(
-        value=float(getattr(mount_cfg, "manual_ramp_start_delay_scale", 2.0)),
-        min=1.0,
-        max=6.0,
-        step=0.1,
-        description="Start x",
-        layout=W.Layout(width="160px"),
-    )
-    ramp_segments = W.BoundedIntText(
-        value=int(getattr(mount_cfg, "manual_ramp_segments", 8)),
-        min=1,
-        max=32,
-        step=1,
-        description="Segments",
-        layout=W.Layout(width="170px"),
-    )
-
     btn_az_left = W.Button(description="AZ ←", layout=W.Layout(width="80px"))
     btn_az_right = W.Button(description="AZ →", layout=W.Layout(width="80px"))
     btn_alt_up = W.Button(description="ALT ↑", layout=W.Layout(width="80px"))
@@ -224,17 +181,6 @@ def build_manual_mount(cfg: AppConfig) -> tuple[W.Widget, ManualMountHandles]:
                         ],
                         layout=W.Layout(border="1px solid #eee", padding="6px"),
                     ),
-                    W.VBox(
-                        [
-                            W.HTML("<b>Rampa</b>"),
-                            ramp_enable,
-                            ramp_frac,
-                            ramp_min_steps,
-                            ramp_start_scale,
-                            ramp_segments,
-                        ],
-                        layout=W.Layout(border="1px solid #eee", padding="6px"),
-                    ),
                 ]
             ),
         ],
@@ -248,11 +194,6 @@ def build_manual_mount(cfg: AppConfig) -> tuple[W.Widget, ManualMountHandles]:
         delay_az=delay_az,
         steps_alt=steps_alt,
         delay_alt=delay_alt,
-        ramp_enable=ramp_enable,
-        ramp_frac=ramp_frac,
-        ramp_min_steps=ramp_min_steps,
-        ramp_start_scale=ramp_start_scale,
-        ramp_segments=ramp_segments,
         btn_az_left=btn_az_left,
         btn_az_right=btn_az_right,
         btn_alt_up=btn_alt_up,
