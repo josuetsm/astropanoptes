@@ -129,6 +129,211 @@ def _as_array2(x: Sequence[float]) -> np.ndarray:
     return a
 
 
+def _flatten_points(xy: np.ndarray) -> np.ndarray:
+    P = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
+    return P
+
+
+def _peak_score_from_hist(counts: np.ndarray, *, topk: int = 6) -> float:
+    c = counts.astype(np.float64, copy=False)
+    N = float(np.sum(c))
+    if N <= 0.0:
+        return 0.0
+    nb = int(c.size)
+    if nb <= 0:
+        return 0.0
+    expected = N / float(nb)
+    excess = np.maximum(c - expected, 0.0)
+    k = int(min(max(1, int(topk)), nb))
+    top = np.partition(excess, -k)[-k:]
+    return float(np.sum(top) / N)
+
+
+def _angle_sweep_best_direction(
+    xy: np.ndarray,
+    *,
+    deg_min: float = 0.0,
+    deg_max: float = 180.0,
+    deg_step: float = 0.1,
+    bin_width_px: float = 2.0,
+    topk_bins_for_score: int = 6,
+) -> Tuple[Dict[str, Any], np.ndarray, np.ndarray]:
+    """
+    Returns best dict plus (degs, scores).
+    """
+    P = _flatten_points(xy)
+    if P.size == 0:
+        raise ValueError("no points for angle sweep")
+    P0 = P - np.median(P, axis=0, keepdims=True)
+    degs = np.arange(float(deg_min), float(deg_max), float(deg_step), dtype=np.float64)
+    if degs.size == 0:
+        raise ValueError("empty angle grid")
+    scores = np.zeros_like(degs)
+
+    best: Dict[str, Any] = {
+        "deg": None,
+        "u": None,
+        "v": None,
+        "s": None,
+        "score": -1.0,
+        "hist": None,
+        "edges": None,
+    }
+
+    rmax = float(np.max(np.linalg.norm(P0, axis=1)))
+    if not np.isfinite(rmax) or rmax < 1e-6:
+        raise ValueError("degenerate point cloud")
+
+    bw = float(bin_width_px)
+    if not np.isfinite(bw) or bw <= 0.0:
+        bw = 1.0
+
+    s_min = -rmax
+    s_max = +rmax
+    nbins = int(np.ceil((s_max - s_min) / bw))
+    nbins = max(nbins, 16)
+
+    for i, deg in enumerate(degs):
+        th = np.deg2rad(deg)
+        u = np.array([np.cos(th), np.sin(th)], dtype=np.float64)
+        v = np.array([-np.sin(th), np.cos(th)], dtype=np.float64)
+        s = P0 @ v
+        counts, edges = np.histogram(s, bins=nbins, range=(s_min, s_max))
+        score = _peak_score_from_hist(counts, topk=topk_bins_for_score)
+        scores[i] = float(score)
+        if float(score) > float(best["score"]):
+            best.update(
+                {
+                    "deg": float(deg),
+                    "u": u,
+                    "v": v,
+                    "s": s,
+                    "score": float(score),
+                    "hist": counts,
+                    "edges": edges,
+                }
+            )
+
+    return best, degs, scores
+
+
+def _robust_line_fit_slope(x: np.ndarray, y: np.ndarray) -> float:
+    """
+    Theil-Sen slope (median of pairwise slopes).
+    """
+    x = np.asarray(x, dtype=np.float64).reshape(-1)
+    y = np.asarray(y, dtype=np.float64).reshape(-1)
+    n = int(x.size)
+    if n < 2:
+        return 0.0
+    slopes: List[np.ndarray] = []
+    for i in range(n - 1):
+        dx = x[i + 1 :] - x[i]
+        m = dx != 0
+        if np.any(m):
+            slopes.append((y[i + 1 :][m] - y[i]) / dx[m])
+    if not slopes:
+        return 0.0
+    slopes_cat = np.concatenate(slopes, axis=0)
+    return float(np.median(slopes_cat))
+
+
+def _drift_to_az_alt(
+    vx: float,
+    vy: float,
+    *,
+    phi_deg: float,
+    omega_deg_s: float,
+    scale_px_per_deg: float,
+    dedup_tol_deg: float = 1e-3,
+    sort_by_forward_err: bool = True,
+) -> List[Tuple[float, float]]:
+    """
+    Closed form inversion from drift (vx, vy) to (az, alt).
+
+    Conventions:
+      - +x right (east), +y up
+      - omega in deg/s
+      - scale in px/deg
+    Returns 0, 1 or 2 solutions.
+    """
+    phi = math.radians(float(phi_deg))
+    C = math.cos(phi)
+    S = math.sin(phi)
+    if abs(C) < 1e-12:
+        return []
+
+    omega = float(omega_deg_s)
+    scale = float(scale_px_per_deg)
+    if omega <= 0.0 or scale <= 0.0:
+        return []
+
+    u = (float(vy) * scale) / (omega * C)
+    q = (float(vx) * scale) / omega
+
+    if abs(u) > 1.0 + 1e-9:
+        return []
+    u = float(max(-1.0, min(1.0, u)))
+
+    c0 = math.sqrt(max(0.0, 1.0 - u * u))
+    cos_az_candidates = (+c0, -c0)
+
+    sols: List[Tuple[float, float]] = []
+    for c in cos_az_candidates:
+        az = math.atan2(u, c)
+        az_deg = float(math.degrees(az) % 360.0)
+
+        K = C * c
+        R2 = K * K + S * S
+        if q * q > R2 + 1e-12:
+            continue
+        if abs(S) < 1e-12:
+            continue
+
+        sqrt_term = abs(S) * math.sqrt(max(0.0, R2 - q * q))
+        for sh in ((-q * K + sqrt_term) / R2, (-q * K - sqrt_term) / R2):
+            if sh < -1e-9 or sh > 1.0 + 1e-9:
+                continue
+            sh = float(max(0.0, min(1.0, sh)))
+            ch = (q + K * sh) / S
+            if ch < -1e-9:
+                continue
+            ch = float(max(0.0, min(1.0, ch)))
+            alt_deg = float(math.degrees(math.atan2(sh, ch)))
+            if 0.0 <= alt_deg <= 90.0:
+                sols.append((az_deg, alt_deg))
+
+    if not sols:
+        return []
+
+    def _circ_dist_deg(a: float, b: float) -> float:
+        d = (a - b) % 360.0
+        return min(d, 360.0 - d)
+
+    def _forward_err(az_deg: float, alt_deg: float) -> float:
+        az = math.radians(az_deg)
+        alt = math.radians(alt_deg)
+        d_alt = omega * C * math.sin(az)
+        d_x = omega * (S * math.cos(alt) - C * math.sin(alt) * math.cos(az))
+        vx2 = d_x / scale
+        vy2 = d_alt / scale
+        return (vx2 - float(vx)) ** 2 + (vy2 - float(vy)) ** 2
+
+    uniq: List[Tuple[float, float]] = []
+    for az_deg, alt_deg in sols:
+        is_new = True
+        for az2, alt2 in uniq:
+            if _circ_dist_deg(az_deg, az2) <= float(dedup_tol_deg) and abs(alt_deg - alt2) <= float(dedup_tol_deg):
+                is_new = False
+                break
+        if is_new:
+            uniq.append((az_deg, alt_deg))
+
+    if sort_by_forward_err and len(uniq) > 1:
+        uniq.sort(key=lambda p: (_forward_err(p[0], p[1]), p[0], p[1]))
+    return uniq
+
+
 def _now_time() -> Time:
     # astropy Time uses UTC by default
     return Time.now()
@@ -1109,6 +1314,7 @@ def _now_s() -> float:
 class _AutocalFrame:
     raw16: np.ndarray
     t_capture: float
+    t_wall: float
     obj_xy: np.ndarray
     star_count: int
     saturation_frac: float
@@ -1277,6 +1483,7 @@ class GoToWorker(BaseWorker):
             raw16 = ensure_raw16_bayer(fr.raw).copy()
             obj_xy, star_count, saturation_frac, top_sources = self._autocal_detect(raw16)
             t_capture = float(getattr(fr, "t_capture", _now_s()))
+            t_wall = float(_now_s())
             if last_capture_t is not None and (t_capture - last_capture_t) < min_dt_s:
                 time.sleep(0.005)
                 continue
@@ -1284,6 +1491,7 @@ class GoToWorker(BaseWorker):
                 _AutocalFrame(
                     raw16=raw16,
                     t_capture=t_capture,
+                    t_wall=t_wall,
                     obj_xy=obj_xy,
                     star_count=star_count,
                     saturation_frac=saturation_frac,
@@ -1364,95 +1572,103 @@ class GoToWorker(BaseWorker):
             return False
         return True
 
-    def _autocal_estimate_drift(
+    def _autocal_estimate_drift_line_sweep(
         self,
         frames: List[_AutocalFrame],
         *,
-        dt_min_s: float,
-        dt_max_s: float,
-        max_pairs: int,
-        max_shift_px: float,
-        min_resp: float,
-        pair_gap: int,
+        min_frames: int,
+        min_duration_s: float,
+        min_sources: int,
+        topk_sources: int,
+        deg_step: float,
+        bin_width_px: float,
+        topk_bins_for_score: int,
+        use_theil_sen: bool,
     ) -> Optional[np.ndarray]:
-        if len(frames) < 2:
+        if len(frames) < int(min_frames):
             log_info(
                 self._out_log,
-                f"GoTo: AutoCal drift needs >=2 frames, got {len(frames)}",
-            )
-            return None
-        pair_gap = max(1, int(pair_gap))
-        if len(frames) <= pair_gap:
-            log_info(
-                self._out_log,
-                "GoTo: AutoCal drift needs more frames for pair gap "
-                f"gap={pair_gap} frames={len(frames)}",
+                f"GoTo: AutoCal drift line sweep needs >= {int(min_frames)} frames, got {len(frames)}",
             )
             return None
 
-        pair_indices = [(i, i + pair_gap) for i in range(len(frames) - pair_gap)]
-        if len(pair_indices) > int(max_pairs):
-            idx = (
-                np.linspace(0, len(pair_indices) - 1, int(max_pairs))
-                .round()
-                .astype(int)
-            )
-            pair_indices = [pair_indices[i] for i in idx]
-
-        v_list: List[np.ndarray] = []
-        resp_list: List[float] = []
-        resp_low = 0
-        used = 0
-        for i, j in pair_indices:
-            ref = frames[i]
-            fr = frames[j]
-            dt = float(fr.t_capture - ref.t_capture)
-            if not (float(dt_min_s) <= dt <= float(dt_max_s)):
-                log_info(
-                    self._out_log,
-                    "GoTo: AutoCal drift pair skip "
-                    f"i={i} j={j} dt={dt:.3f}s "
-                    f"range=[{float(dt_min_s):.3f},{float(dt_max_s):.3f}]",
-                )
+        per_frame: List[np.ndarray] = []
+        t_list: List[float] = []
+        for fr in frames:
+            n = int(fr.obj_xy.shape[0])
+            if n < int(min_sources):
                 continue
-            dx, dy, resp, _n = estimate_shift_from_objects(
-                ref.obj_xy,
-                fr.obj_xy,
-                max_shift_px=float(max_shift_px),
-            )
-            log_info(
-                self._out_log,
-                "GoTo: AutoCal drift pair "
-                f"i={i} j={j} dt={dt:.3f}s "
-                f"dx={dx:.3f}px dy={dy:.3f}px resp={float(resp):.3f} matches={_n}",
-            )
-            used += 1
-            if float(resp) < float(min_resp):
-                resp_low += 1
+            k = int(min(int(topk_sources), n))
+            if k <= 0:
                 continue
-            v = np.array([-dx / dt, -dy / dt], dtype=np.float64)
-            v_list.append(v)
-            resp_list.append(float(resp))
+            per_frame.append(fr.obj_xy[:k].astype(np.float64, copy=False))
+            t_list.append(float(fr.t_capture))
 
-        if len(v_list) < 2:
-            resp_min = min(resp_list) if resp_list else 0.0
-            resp_med = float(np.median(resp_list)) if resp_list else 0.0
-            resp_max = max(resp_list) if resp_list else 0.0
+        if len(per_frame) < int(min_frames):
             log_info(
                 self._out_log,
-                "GoTo: AutoCal drift insufficient valid pairs "
-                f"valid={len(v_list)} total={used} resp_low={resp_low} gap={pair_gap} "
-                f"resp_stats=[{resp_min:.3f},{resp_med:.3f},{resp_max:.3f}]",
+                f"GoTo: AutoCal drift line sweep insufficient usable frames "
+                f"usable={len(per_frame)} min={int(min_frames)}",
             )
             return None
-        drift = np.median(np.stack(v_list, axis=0), axis=0)
+
+        t = np.asarray(t_list, dtype=np.float64)
+        if t.size < 2:
+            return None
+        duration_s = float(t[-1] - t[0])
+        if not np.isfinite(duration_s) or duration_s < float(min_duration_s):
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal drift line sweep duration too short "
+                f"dt={duration_s:.3f}s min={float(min_duration_s):.3f}s",
+            )
+            return None
+
+        xy_all = np.vstack(per_frame)
+        try:
+            best, _degs, _scores = _angle_sweep_best_direction(
+                xy_all,
+                deg_min=0.0,
+                deg_max=180.0,
+                deg_step=float(deg_step),
+                bin_width_px=float(bin_width_px),
+                topk_bins_for_score=int(topk_bins_for_score),
+            )
+        except Exception as exc:
+            log_info(
+                self._out_log,
+                f"GoTo: AutoCal drift line sweep failed: {exc}",
+            )
+            return None
+
+        u = best.get("u", None)
+        if u is None:
+            return None
+        u = np.asarray(u, dtype=np.float64).reshape(2,)
+
+        t_rel = t - t[0]
+        t_f = np.array([np.median(p @ u) for p in per_frame], dtype=np.float64)
+        if not np.all(np.isfinite(t_f)):
+            return None
+
+        if bool(use_theil_sen):
+            slope = _robust_line_fit_slope(t_rel, t_f)
+        else:
+            A = np.column_stack([t_rel, np.ones_like(t_rel)])
+            slope, _b = np.linalg.lstsq(A, t_f, rcond=None)[0]
+
+        v = float(slope) * u
+        if not np.all(np.isfinite(v)):
+            return None
+
         log_info(
             self._out_log,
-            "GoTo: AutoCal drift estimate "
-            f"vx={float(drift[0]):.3f}px/s vy={float(drift[1]):.3f}px/s "
-            f"valid_pairs={len(v_list)}",
+            "GoTo: AutoCal drift line sweep "
+            f"deg={float(best.get('deg', 0.0)):.2f} score={float(best.get('score', 0.0)):.3f} "
+            f"slope={float(slope):.6f} v=[{float(v[0]):.3f},{float(v[1]):.3f}] "
+            f"frames={len(per_frame)} pts={xy_all.shape[0]}",
         )
-        return drift
+        return v
 
     def _autocal_pick_best_frame(
         self,
@@ -1464,6 +1680,60 @@ class GoToWorker(BaseWorker):
             frames,
             key=lambda fr: (int(fr.star_count), -float(fr.saturation_frac)),
         )
+
+    def _autocal_run_platesolve(
+        self,
+        raw16: np.ndarray,
+        *,
+        target: Any,
+        platesolving_cfg: PlatesolvingConfig,
+        sep_cfg: SepConfig,
+        observer: ObserverConfig,
+        obstime: Time,
+    ) -> PlatesolvingResult:
+        ps_cfg = replace(platesolving_cfg, search_radius_deg=1.0)
+        result = solve_plate(
+            raw16,
+            target=target,
+            cfg=ps_cfg,
+            sep_cfg=sep_cfg,
+            observer=observer,
+            obstime=obstime,
+            progress_cb=None,
+        )
+        debug_jpeg = _render_platesolving_debug_jpeg(
+            raw16,
+            list(getattr(result, "overlay", []) or []),
+        )
+        debug_info = _build_platesolving_debug_info(result)
+
+        ps_ok = bool(getattr(result, "success", False))
+        ps_reason = str(getattr(result, "status", "UNKNOWN"))
+        self._publish_state(
+            {
+                "platesolving": {
+                    "busy": False,
+                    "status": PlatesolvingStatus.OK if ps_ok else PlatesolvingStatus.FAIL,
+                    "reason": None if ps_ok else ps_reason,
+                    "last_ok": ps_ok,
+                    "theta_deg": float(getattr(result, "theta_deg", 0.0)),
+                    "dx_px": float(getattr(result, "dx_px", 0.0)),
+                    "dy_px": float(getattr(result, "dy_px", 0.0)),
+                    "resp": float(getattr(result, "response", 0.0)),
+                    "n_inliers": int(getattr(result, "n_inliers", 0)),
+                    "rms_px": float(getattr(result, "rms_px", 0.0)),
+                    "overlay": list(getattr(result, "overlay", []) or []),
+                    "guides": list(getattr(result, "guides", []) or []),
+                    "debug_jpeg": debug_jpeg,
+                    "debug_info": debug_info,
+                    "center_ra_deg": float(getattr(result, "center_ra_deg", 0.0)),
+                    "center_dec_deg": float(getattr(result, "center_dec_deg", 0.0)),
+                }
+            }
+        )
+        if ps_ok:
+            self._publish_state({"platesolving_result": result})
+        return result
 
     def _autocal_axis_rates(self, axis: Axis, rate: float) -> Tuple[float, float]:
         if axis == Axis.AZ:
@@ -1633,13 +1903,17 @@ class GoToWorker(BaseWorker):
 
         drift_frames = int(params.get("drift_frames", 10))
         drift_dt_min = float(params.get("drift_dt_min_s", 1.0))
-        drift_dt_max = float(params.get("drift_dt_max_s", 10.0))
-        drift_pairs = int(params.get("drift_pairs", 20))
-        drift_pair_dt_s = float(params.get("drift_pair_dt_s", 0.0))
-        drift_pair_gap = max(1, int(params.get("drift_pair_gap", 1)))
-        drift_max_shift_px = float(params.get("drift_max_shift_px", 25.0))
-        drift_min_resp = float(params.get("drift_min_resp", 0.2))
         drift_capture_timeout_s = float(params.get("drift_capture_timeout_s", 12.0))
+        drift_line_topk_sources = int(params.get("drift_line_topk_sources", 4))
+        drift_line_min_sources = int(params.get("drift_line_min_sources", 3))
+        drift_line_min_frames = int(params.get("drift_line_min_frames", 10))
+        drift_line_min_duration_s = float(params.get("drift_line_min_duration_s", 5.0))
+        drift_line_deg_step = float(params.get("drift_line_deg_step", 0.1))
+        drift_line_bin_width_px = float(params.get("drift_line_bin_width_px", 2.0))
+        drift_line_topk_bins = int(params.get("drift_line_topk_bins", 4))
+        drift_line_use_theil_sen = bool(params.get("drift_line_use_theil_sen", True))
+        pointing_method = str(params.get("pointing_method", "horiz_drift")).strip().lower()
+        drift_pointing_omega = float(params.get("drift_pointing_omega_deg_s", 15.041))
 
         jcal_rate_scale = float(params.get("jcal_rate_scale", 1.0))
         jcal_ramp_s = float(params.get("jcal_ramp_s", 0.6))
@@ -1683,11 +1957,13 @@ class GoToWorker(BaseWorker):
             "GoTo: AutoCal config "
             f"stars=[{target_star_min},{target_star_max}] sat_max={target_sat_max:.3f} "
             f"exp_ms=[{exp_min_ms:.1f},{exp_max_ms:.1f}] gain=[{gain_min},{gain_max}] "
-            f"drift_frames={drift_frames} drift_dt=[{drift_dt_min:.2f},{drift_dt_max:.2f}] "
-            f"drift_pairs={drift_pairs} drift_pair_gap={drift_pair_gap} "
-            f"drift_pair_dt_s={drift_pair_dt_s:.2f} "
-            f"drift_min_resp={drift_min_resp:.2f} "
+            f"drift_frames={drift_frames} drift_dt_min={drift_dt_min:.2f} "
             f"drift_capture_timeout_s={drift_capture_timeout_s:.2f} "
+            f"drift_line_topk={drift_line_topk_sources} min_sources={drift_line_min_sources} "
+            f"drift_line_min_frames={drift_line_min_frames} min_dt={drift_line_min_duration_s:.2f} "
+            f"drift_line_deg_step={drift_line_deg_step:.2f} bin_width={drift_line_bin_width_px:.2f} "
+            f"drift_line_topk_bins={drift_line_topk_bins} "
+            f"pointing_method={pointing_method} omega={drift_pointing_omega:.3f} "
             f"jcal_rate_scale={jcal_rate_scale:.2f} "
             f"jcal_ramp_s={jcal_ramp_s:.2f} ramp_hz={jcal_ramp_hz:.1f} "
             f"jcal_plateau_s={jcal_plateau_s:.2f} frames={jcal_plateau_frames} "
@@ -1785,34 +2061,18 @@ class GoToWorker(BaseWorker):
                     f"idx={idx} dt={dt:.3f}s stars={fr.star_count} "
                     f"top3={self._format_autocal_sources(fr.top_sources)}",
                 )
-        pair_gap = drift_pair_gap
-        if drift_pair_dt_s > 0.0 and len(drift_frames_list) >= 2:
-            dt_list = [
-                float(drift_frames_list[i].t_capture - drift_frames_list[i - 1].t_capture)
-                for i in range(1, len(drift_frames_list))
-            ]
-            dt_list = [dt for dt in dt_list if dt > 0.0]
-            if dt_list:
-                dt_med = float(np.median(dt_list))
-                if dt_med > 0.0:
-                    gap_auto = max(1, int(round(float(drift_pair_dt_s) / dt_med)))
-                    gap_auto = min(gap_auto, len(drift_frames_list) - 1)
-                    pair_gap = gap_auto
-                    log_info(
-                        self._out_log,
-                        "GoTo: AutoCal drift gap auto "
-                        f"dt_target={float(drift_pair_dt_s):.3f}s "
-                        f"dt_med={dt_med:.3f}s gap={pair_gap} fallback_gap={drift_pair_gap}",
-                    )
+        best_drift_frame = self._autocal_pick_best_frame(drift_frames_list)
 
-        drift_pix = self._autocal_estimate_drift(
+        drift_pix = self._autocal_estimate_drift_line_sweep(
             drift_frames_list,
-            dt_min_s=drift_dt_min,
-            dt_max_s=drift_dt_max,
-            max_pairs=drift_pairs,
-            max_shift_px=drift_max_shift_px,
-            min_resp=drift_min_resp,
-            pair_gap=pair_gap,
+            min_frames=drift_line_min_frames,
+            min_duration_s=drift_line_min_duration_s,
+            min_sources=drift_line_min_sources,
+            topk_sources=drift_line_topk_sources,
+            deg_step=drift_line_deg_step,
+            bin_width_px=drift_line_bin_width_px,
+            topk_bins_for_score=drift_line_topk_bins,
+            use_theil_sen=drift_line_use_theil_sen,
         )
         if drift_pix is None:
             out["status"] = "ERR_DRIFT"
@@ -1971,204 +2231,251 @@ class GoToWorker(BaseWorker):
             f"e_alt_hat=[{float(e_alt_hat[0]):.3f},{float(e_alt_hat[1]):.3f}]",
         )
 
-        def _wrap_deg_180(x: float) -> float:
-            y = (float(x) + 180.0) % 360.0 - 180.0
-            if y <= -180.0:
-                y += 360.0
-            return float(y)
-
-        def _wrap_deg_360(x: float) -> float:
-            y = float(x) % 360.0
-            if y < 0.0:
-                y += 360.0
-            return float(y)
-
-        def _predict_rate(az_deg: float, alt_deg: float, t0: Time, dt_s: float = 1.0) -> np.ndarray:
-            loc = observer.location()
-            altaz0 = AltAz(az=float(az_deg) * u.deg, alt=float(alt_deg) * u.deg, obstime=t0, location=loc)
-            coord = SkyCoord(altaz0)
-            altaz1 = coord.transform_to(AltAz(obstime=t0 + float(dt_s) * u.s, location=loc))
-            daz = _wrap_deg_180(float(altaz1.az.deg) - float(az_deg))
-            dalt = float(altaz1.alt.deg) - float(alt_deg)
-            return np.array(
-                [
-                    np.deg2rad(daz) / float(dt_s),
-                    np.deg2rad(dalt) / float(dt_s),
-                ],
-                dtype=np.float64,
-            )
-
-        t_ref = Time.now()
-        seeds = params.get(
-            "pointing_seeds",
-            [
-                (90.0, 45.0),
-                (270.0, 45.0),
-                (60.0, 35.0),
-                (300.0, 35.0),
-            ],
-        )
-        best = None
-        best_res = float("inf")
-        for seed in seeds:
-            if self._op_cancel.is_set():
-                out["status"] = "CANCELLED"
-                return out
-            az = float(seed[0])
-            alt = float(seed[1])
-            for _ in range(8):
-                pred = _predict_rate(az, alt, t_ref)
-                resid = pred - v_obs
-                if float(np.linalg.norm(resid)) < 1e-7:
-                    break
-                delta = 0.1
-                pred_az = _predict_rate(az + delta, alt, t_ref)
-                pred_alt = _predict_rate(az, alt + delta, t_ref)
-                J = np.column_stack([(pred_az - pred) / delta, (pred_alt - pred) / delta])
-                if np.linalg.matrix_rank(J) < 2:
-                    break
-                step = np.linalg.solve(J, -resid)
-                step = np.clip(step, -5.0, 5.0)
-                az = _wrap_deg_360(az + float(step[0]))
-                alt = float(alt + float(step[1]))
-                alt = float(np.clip(alt, goto_cfg.alt_min_deg, goto_cfg.alt_max_deg))
-            resid_norm = float(np.linalg.norm(_predict_rate(az, alt, t_ref) - v_obs))
-            if resid_norm < best_res:
-                best_res = resid_norm
-                best = (az, alt)
-
-        if best is None:
-            out["status"] = "ERR_POINTING_SOLVE"
-            return out
-
-        az_hat, alt_hat = best
-        dist_to_0 = min(az_hat, 360.0 - az_hat)
-        dist_to_180 = abs(az_hat - 180.0)
-        if dist_to_0 < 15.0 or dist_to_180 < 15.0:
-            out["status"] = "ERR_DEGENERATE_AZ"
-            return out
-
-        log_info(
-            self._out_log,
-            "GoTo: AutoCal pointing estimate "
-            f"az={float(az_hat):.3f}deg alt={float(alt_hat):.3f}deg "
-            f"resid={float(best_res):.3e} v_obs_rad_s=[{float(v_obs[0]):.6e},{float(v_obs[1]):.6e}]",
-        )
-        out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
-        self._publish_state(
-            {
-                "goto": {
-                    "autocal_az_deg": float(az_hat),
-                    "autocal_alt_deg": float(alt_hat),
-                    "autocal_radius_deg": 1.0,
-                }
-            }
-        )
-
-        self._publish_state(
-            {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "PLATESOLVING_LOOP"}}
-        )
-        v_deg_s = np.rad2deg(v_obs)
-        jitter_seq = [
-            (0.0, 0.0),
-            (jitter_deg, 0.0),
-            (-jitter_deg, 0.0),
-            (0.0, jitter_deg),
-            (0.0, -jitter_deg),
-        ]
         platesolving_result = None
-        attempts = 0
-        while attempts < int(solve_attempts):
-            if self._op_cancel.is_set():
-                out["status"] = "CANCELLED"
-                return out
-            frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
-            if not frames:
-                attempts += 1
-                continue
-            fr = frames[0]
-            changed = self._autocal_adjust_exposure(
-                star_count=fr.star_count,
-                saturation_frac=fr.saturation_frac,
-                target_min=target_star_min,
-                target_max=target_star_max,
-                sat_max=target_sat_max,
-                exp_min_ms=exp_min_ms,
-                exp_max_ms=exp_max_ms,
-                exp_step=exp_step,
-                gain_min=gain_min,
-                gain_max=gain_max,
-                gain_step=gain_step,
-                settle_s=tune_settle_s,
+        az_hat = None
+        alt_hat = None
+
+        use_horizontal = pointing_method in (
+            "horiz_drift",
+            "horizontal",
+            "horiz",
+            "drift",
+            "drift_horiz",
+            "horizontal_drift",
+            "auto",
+        )
+        if use_horizontal and best_drift_frame is not None:
+            deg_per_px = float(np.rad2deg(plate_scale_rad))
+            scale_px_per_deg = 1.0 / deg_per_px if deg_per_px > 0.0 else 0.0
+            vx = float(drift_pix[0])
+            vy_up = -float(drift_pix[1])
+            sols = _drift_to_az_alt(
+                vx,
+                vy_up,
+                phi_deg=float(getattr(observer, "lat_deg", 0.0)),
+                omega_deg_s=float(drift_pointing_omega),
+                scale_px_per_deg=scale_px_per_deg,
             )
-            if changed:
-                continue
+            if sols:
+                t_wall = float(getattr(best_drift_frame, "t_wall", 0.0))
+                obstime = Time(t_wall, format="unix") if t_wall > 0.0 else Time.now()
+                candidates: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
+                for az_deg, alt_deg in sols:
+                    try:
+                        coord = parse_target_to_icrs(
+                            {"az_deg": float(az_deg), "alt_deg": float(alt_deg)},
+                            observer=observer,
+                            obstime=obstime,
+                        )
+                        target = (float(coord.ra.deg), float(coord.dec.deg))
+                        candidates.append(((float(az_deg), float(alt_deg)), target))
+                    except Exception as exc:
+                        log_info(self._out_log, f"GoTo: AutoCal drift target parse failed: {exc}")
 
-            t_now = Time.now()
-            dt_s = float((t_now - t_ref).to_value(u.s))
-            az_c = _wrap_deg_360(az_hat + float(v_deg_s[0]) * dt_s)
-            alt_c = float(alt_hat + float(v_deg_s[1]) * dt_s)
-            alt_c = float(np.clip(alt_c, goto_cfg.alt_min_deg, goto_cfg.alt_max_deg))
+                if candidates:
+                    self._publish_state(
+                        {
+                            "goto": {
+                                "autocal_status": GotoAutocalStatus.RUNNING,
+                                "autocal_reason": "PLATESOLVING_LOOP",
+                            }
+                        }
+                    )
+                    for idx, (azalt, target) in enumerate(candidates):
+                        if self._op_cancel.is_set():
+                            out["status"] = "CANCELLED"
+                            return out
+                        log_info(
+                            self._out_log,
+                            "GoTo: AutoCal platesolve (drift) "
+                            f"cand={idx} az={azalt[0]:.3f} alt={azalt[1]:.3f}",
+                        )
+                        platesolving_result = self._autocal_run_platesolve(
+                            best_drift_frame.raw16,
+                            target=target,
+                            platesolving_cfg=platesolving_cfg,
+                            sep_cfg=sep_cfg,
+                            observer=observer,
+                            obstime=obstime,
+                        )
+                        if bool(getattr(platesolving_result, "success", False)):
+                            az_hat, alt_hat = float(azalt[0]), float(azalt[1])
+                            out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
+                            self._publish_state(
+                                {
+                                    "goto": {
+                                        "autocal_az_deg": float(az_hat),
+                                        "autocal_alt_deg": float(alt_hat),
+                                        "autocal_radius_deg": 1.0,
+                                    }
+                                }
+                            )
+                            break
 
-            jitter = jitter_seq[attempts % len(jitter_seq)]
-            target = {"az_deg": float(az_c + jitter[0]), "alt_deg": float(alt_c + jitter[1])}
+        if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
+            def _wrap_deg_180(x: float) -> float:
+                y = (float(x) + 180.0) % 360.0 - 180.0
+                if y <= -180.0:
+                    y += 360.0
+                return float(y)
 
-            ps_cfg = replace(platesolving_cfg, search_radius_deg=1.0)
-            if attempts == 0:
-                log_info(
-                    self._out_log,
-                    "GoTo: AutoCal platesolve first target "
-                    f"az={float(target['az_deg']):.3f}deg "
-                    f"alt={float(target['alt_deg']):.3f}deg "
-                    f"radius={float(ps_cfg.search_radius_deg):.3f}deg "
-                    f"jitter=({float(jitter[0]):.3f},{float(jitter[1]):.3f}) "
-                    f"dt={dt_s:.3f}s",
+            def _wrap_deg_360(x: float) -> float:
+                y = float(x) % 360.0
+                if y < 0.0:
+                    y += 360.0
+                return float(y)
+
+            def _predict_rate(az_deg: float, alt_deg: float, t0: Time, dt_s: float = 1.0) -> np.ndarray:
+                loc = observer.location()
+                altaz0 = AltAz(az=float(az_deg) * u.deg, alt=float(alt_deg) * u.deg, obstime=t0, location=loc)
+                coord = SkyCoord(altaz0)
+                altaz1 = coord.transform_to(AltAz(obstime=t0 + float(dt_s) * u.s, location=loc))
+                daz = _wrap_deg_180(float(altaz1.az.deg) - float(az_deg))
+                dalt = float(altaz1.alt.deg) - float(alt_deg)
+                return np.array(
+                    [
+                        np.deg2rad(daz) / float(dt_s),
+                        np.deg2rad(dalt) / float(dt_s),
+                    ],
+                    dtype=np.float64,
                 )
-            platesolving_result = solve_plate(
-                fr.raw16,
-                target=target,
-                cfg=ps_cfg,
-                sep_cfg=sep_cfg,
-                observer=observer,
-                obstime=t_now,
-                progress_cb=None,
-            )
-            attempts += 1
 
-            debug_jpeg = _render_platesolving_debug_jpeg(
-                fr.raw16,
-                list(getattr(platesolving_result, "overlay", []) or []),
+            t_ref = Time.now()
+            seeds = params.get(
+                "pointing_seeds",
+                [
+                    (90.0, 45.0),
+                    (270.0, 45.0),
+                    (60.0, 35.0),
+                    (300.0, 35.0),
+                ],
             )
-            debug_info = _build_platesolving_debug_info(platesolving_result)
+            best = None
+            best_res = float("inf")
+            for seed in seeds:
+                if self._op_cancel.is_set():
+                    out["status"] = "CANCELLED"
+                    return out
+                az = float(seed[0])
+                alt = float(seed[1])
+                for _ in range(8):
+                    pred = _predict_rate(az, alt, t_ref)
+                    resid = pred - v_obs
+                    if float(np.linalg.norm(resid)) < 1e-7:
+                        break
+                    delta = 0.1
+                    pred_az = _predict_rate(az + delta, alt, t_ref)
+                    pred_alt = _predict_rate(az, alt + delta, t_ref)
+                    J = np.column_stack([(pred_az - pred) / delta, (pred_alt - pred) / delta])
+                    if np.linalg.matrix_rank(J) < 2:
+                        break
+                    step = np.linalg.solve(J, -resid)
+                    step = np.clip(step, -5.0, 5.0)
+                    az = _wrap_deg_360(az + float(step[0]))
+                    alt = float(alt + float(step[1]))
+                    alt = float(np.clip(alt, goto_cfg.alt_min_deg, goto_cfg.alt_max_deg))
+                resid_norm = float(np.linalg.norm(_predict_rate(az, alt, t_ref) - v_obs))
+                if resid_norm < best_res:
+                    best_res = resid_norm
+                    best = (az, alt)
 
-            ps_ok = bool(getattr(platesolving_result, "success", False))
-            ps_reason = str(getattr(platesolving_result, "status", "UNKNOWN"))
+            if best is None:
+                out["status"] = "ERR_POINTING_SOLVE"
+                return out
+
+            az_hat, alt_hat = best
+            dist_to_0 = min(az_hat, 360.0 - az_hat)
+            dist_to_180 = abs(az_hat - 180.0)
+            if dist_to_0 < 15.0 or dist_to_180 < 15.0:
+                out["status"] = "ERR_DEGENERATE_AZ"
+                return out
+
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal pointing estimate "
+                f"az={float(az_hat):.3f}deg alt={float(alt_hat):.3f}deg "
+                f"resid={float(best_res):.3e} v_obs_rad_s=[{float(v_obs[0]):.6e},{float(v_obs[1]):.6e}]",
+            )
+            out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
             self._publish_state(
                 {
-                    "platesolving": {
-                        "busy": False,
-                        "status": PlatesolvingStatus.OK if ps_ok else PlatesolvingStatus.FAIL,
-                        "reason": None if ps_ok else ps_reason,
-                        "last_ok": ps_ok,
-                        "theta_deg": float(getattr(platesolving_result, "theta_deg", 0.0)),
-                        "dx_px": float(getattr(platesolving_result, "dx_px", 0.0)),
-                        "dy_px": float(getattr(platesolving_result, "dy_px", 0.0)),
-                        "resp": float(getattr(platesolving_result, "response", 0.0)),
-                        "n_inliers": int(getattr(platesolving_result, "n_inliers", 0)),
-                        "rms_px": float(getattr(platesolving_result, "rms_px", 0.0)),
-                        "overlay": list(getattr(platesolving_result, "overlay", []) or []),
-                        "guides": list(getattr(platesolving_result, "guides", []) or []),
-                        "debug_jpeg": debug_jpeg,
-                        "debug_info": debug_info,
-                        "center_ra_deg": float(getattr(platesolving_result, "center_ra_deg", 0.0)),
-                        "center_dec_deg": float(getattr(platesolving_result, "center_dec_deg", 0.0)),
+                    "goto": {
+                        "autocal_az_deg": float(az_hat),
+                        "autocal_alt_deg": float(alt_hat),
+                        "autocal_radius_deg": 1.0,
                     }
                 }
             )
 
-            if ps_ok:
-                self._publish_state({"platesolving_result": platesolving_result})
-                break
+            self._publish_state(
+                {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "PLATESOLVING_LOOP"}}
+            )
+            v_deg_s = np.rad2deg(v_obs)
+            jitter_seq = [
+                (0.0, 0.0),
+                (jitter_deg, 0.0),
+                (-jitter_deg, 0.0),
+                (0.0, jitter_deg),
+                (0.0, -jitter_deg),
+            ]
+            platesolving_result = None
+            attempts = 0
+            while attempts < int(solve_attempts):
+                if self._op_cancel.is_set():
+                    out["status"] = "CANCELLED"
+                    return out
+                frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
+                if not frames:
+                    attempts += 1
+                    continue
+                fr = frames[0]
+                changed = self._autocal_adjust_exposure(
+                    star_count=fr.star_count,
+                    saturation_frac=fr.saturation_frac,
+                    target_min=target_star_min,
+                    target_max=target_star_max,
+                    sat_max=target_sat_max,
+                    exp_min_ms=exp_min_ms,
+                    exp_max_ms=exp_max_ms,
+                    exp_step=exp_step,
+                    gain_min=gain_min,
+                    gain_max=gain_max,
+                    gain_step=gain_step,
+                    settle_s=tune_settle_s,
+                )
+                if changed:
+                    continue
+
+                t_now = Time.now()
+                dt_s = float((t_now - t_ref).to_value(u.s))
+                az_c = _wrap_deg_360(az_hat + float(v_deg_s[0]) * dt_s)
+                alt_c = float(alt_hat + float(v_deg_s[1]) * dt_s)
+                alt_c = float(np.clip(alt_c, goto_cfg.alt_min_deg, goto_cfg.alt_max_deg))
+
+                jitter = jitter_seq[attempts % len(jitter_seq)]
+                target = {"az_deg": float(az_c + jitter[0]), "alt_deg": float(alt_c + jitter[1])}
+
+                if attempts == 0:
+                    log_info(
+                        self._out_log,
+                        "GoTo: AutoCal platesolve first target "
+                        f"az={float(target['az_deg']):.3f}deg "
+                        f"alt={float(target['alt_deg']):.3f}deg "
+                        f"radius={1.0:.3f}deg "
+                        f"jitter=({float(jitter[0]):.3f},{float(jitter[1]):.3f}) "
+                        f"dt={dt_s:.3f}s",
+                    )
+                platesolving_result = self._autocal_run_platesolve(
+                    fr.raw16,
+                    target=target,
+                    platesolving_cfg=platesolving_cfg,
+                    sep_cfg=sep_cfg,
+                    observer=observer,
+                    obstime=t_now,
+                )
+                attempts += 1
+                if bool(getattr(platesolving_result, "success", False)):
+                    break
 
         if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
             out["status"] = "ERR_PLATESOLVING"
