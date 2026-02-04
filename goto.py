@@ -1457,14 +1457,22 @@ class GoToWorker(BaseWorker):
         timeout_s: float,
         min_dt_s: float = 0.0,
         skip_frames: int = 0,
+        min_usable_frames: int = 0,
+        min_usable_sources: int = 1,
     ) -> List[_AutocalFrame]:
         frames: List[_AutocalFrame] = []
         deadline = _perf() + float(timeout_s)
         last_seq: Optional[int] = None
         last_capture_t: Optional[float] = None
+        usable = 0
         min_dt_s = max(0.0, float(min_dt_s))
         skip_remaining = max(0, int(skip_frames))
-        while len(frames) < int(n_frames) and _perf() < deadline:
+        min_usable_frames = max(0, int(min_usable_frames))
+        min_usable_sources = max(1, int(min_usable_sources))
+        while (
+            (len(frames) < int(n_frames) or (min_usable_frames > 0 and usable < min_usable_frames))
+            and _perf() < deadline
+        ):
             if self._op_cancel.is_set():
                 break
             fr = self._get_frame()
@@ -1499,6 +1507,8 @@ class GoToWorker(BaseWorker):
                 )
             )
             last_capture_t = t_capture
+            if obj_xy.shape[0] >= min_usable_sources:
+                usable += 1
         return frames
 
     def _autocal_adjust_exposure(
@@ -1594,9 +1604,10 @@ class GoToWorker(BaseWorker):
 
         per_frame: List[np.ndarray] = []
         t_list: List[float] = []
+        min_sources = max(1, int(min_sources))
         for fr in frames:
             n = int(fr.obj_xy.shape[0])
-            if n < int(min_sources):
+            if n < min_sources:
                 continue
             k = int(min(int(topk_sources), n))
             if k <= 0:
@@ -1905,7 +1916,7 @@ class GoToWorker(BaseWorker):
         drift_dt_min = float(params.get("drift_dt_min_s", 1.0))
         drift_capture_timeout_s = float(params.get("drift_capture_timeout_s", 12.0))
         drift_line_topk_sources = int(params.get("drift_line_topk_sources", 4))
-        drift_line_min_sources = int(params.get("drift_line_min_sources", 3))
+        drift_line_min_sources = int(params.get("drift_line_min_sources", 1))
         drift_line_min_frames = int(params.get("drift_line_min_frames", 10))
         drift_line_min_duration_s = float(params.get("drift_line_min_duration_s", 5.0))
         drift_line_deg_step = float(params.get("drift_line_deg_step", 0.1))
@@ -1914,6 +1925,9 @@ class GoToWorker(BaseWorker):
         drift_line_use_theil_sen = bool(params.get("drift_line_use_theil_sen", True))
         pointing_method = str(params.get("pointing_method", "horiz_drift")).strip().lower()
         drift_pointing_omega = float(params.get("drift_pointing_omega_deg_s", 15.041))
+        drift_capture_timeout_eff = float(drift_capture_timeout_s)
+        if drift_line_min_frames > 0 and drift_dt_min > 0.0:
+            drift_capture_timeout_eff += float(drift_dt_min) * 2.0
 
         jcal_rate_scale = float(params.get("jcal_rate_scale", 1.0))
         jcal_ramp_s = float(params.get("jcal_ramp_s", 0.6))
@@ -1958,7 +1972,7 @@ class GoToWorker(BaseWorker):
             f"stars=[{target_star_min},{target_star_max}] sat_max={target_sat_max:.3f} "
             f"exp_ms=[{exp_min_ms:.1f},{exp_max_ms:.1f}] gain=[{gain_min},{gain_max}] "
             f"drift_frames={drift_frames} drift_dt_min={drift_dt_min:.2f} "
-            f"drift_capture_timeout_s={drift_capture_timeout_s:.2f} "
+            f"drift_capture_timeout_s={drift_capture_timeout_eff:.2f} "
             f"drift_line_topk={drift_line_topk_sources} min_sources={drift_line_min_sources} "
             f"drift_line_min_frames={drift_line_min_frames} min_dt={drift_line_min_duration_s:.2f} "
             f"drift_line_deg_step={drift_line_deg_step:.2f} bin_width={drift_line_bin_width_px:.2f} "
@@ -2032,8 +2046,10 @@ class GoToWorker(BaseWorker):
         self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "DRIFT"}})
         drift_frames_list = self._autocal_capture_frames(
             n_frames=drift_frames,
-            timeout_s=drift_capture_timeout_s,
+            timeout_s=drift_capture_timeout_eff,
             min_dt_s=drift_dt_min,
+            min_usable_frames=drift_line_min_frames,
+            min_usable_sources=drift_line_min_sources,
         )
         if len(drift_frames_list) < 2:
             out["status"] = "ERR_DRIFT_FRAMES"
@@ -2088,153 +2104,6 @@ class GoToWorker(BaseWorker):
             }
         )
 
-        self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "JCAL"}})
-        drift_norm = float(np.linalg.norm(drift_pix))
-        if drift_norm <= 0.0:
-            out["status"] = "ERR_JCAL_RATE"
-            return out
-
-        steps_per_rad_az = float(self._goto.model.kin.steps_per_deg(Axis.AZ)) * (180.0 / math.pi)
-        steps_per_rad_alt = float(self._goto.model.kin.steps_per_deg(Axis.ALT)) * (180.0 / math.pi)
-        v_rad_mag = drift_norm * float(plate_scale_rad)
-        rate_az_mag = v_rad_mag * steps_per_rad_az * float(jcal_rate_scale)
-        rate_alt_mag = v_rad_mag * steps_per_rad_alt * float(jcal_rate_scale)
-
-        rate_max = float(getattr(mount_cfg, "rate_max", 0.0))
-        if rate_max > 0.0:
-            rate_az_mag = min(rate_az_mag, rate_max)
-            rate_alt_mag = min(rate_alt_mag, rate_max)
-
-        if rate_az_mag <= 0.0 or rate_alt_mag <= 0.0:
-            out["status"] = "ERR_JCAL_RATE"
-            return out
-
-        def _px_per_step(axis: Axis) -> float:
-            dps = abs(float(self._goto.model.kin.deg_per_step(axis)))
-            rad_per_step = dps * (math.pi / 180.0)
-            return float(rad_per_step / plate_scale_rad)
-
-        def _expected_shift(rate_steps_s: float, duration_s: float, axis: Axis) -> float:
-            return abs(float(rate_steps_s)) * float(duration_s) * _px_per_step(axis)
-
-        drift_dir = drift_pix / drift_norm
-
-        def _pick_rate_sign(axis: Axis, rate_mag: float, probe_s: float, probe_scale: float) -> float:
-            if probe_s <= 0.0 or probe_scale <= 0.0:
-                return 1.0
-            probe_rate = float(rate_mag) * float(probe_scale)
-            if probe_rate <= 0.0:
-                return 1.0
-            probe_frames = max(2, int(round(float(jcal_plateau_frames) * 0.5)))
-            probe_shift = max(
-                float(jcal_max_shift_px),
-                _expected_shift(probe_rate, probe_s, axis) * 1.2,
-            )
-            probe = self._autocal_axis_rate_scan(
-                axis=axis,
-                rate_steps_s=probe_rate,
-                ramp_s=jcal_ramp_s,
-                ramp_hz=jcal_ramp_hz,
-                plateau_s=probe_s,
-                plateau_frames=probe_frames,
-                plateau_min_dt_s=jcal_plateau_min_dt_s,
-                plateau_skip_frames=jcal_plateau_skip_frames,
-                drift_pix=drift_pix,
-                max_shift_px=probe_shift,
-                min_resp=jcal_min_resp,
-            )
-            if probe.col is None:
-                return 1.0
-            return 1.0 if float(np.dot(probe.col, drift_dir)) >= 0.0 else -1.0
-
-        max_shift_az = max(
-            float(jcal_max_shift_px),
-            _expected_shift(rate_az_mag, jcal_plateau_s, Axis.AZ) * 1.2,
-        )
-        max_shift_alt = max(
-            float(jcal_max_shift_px),
-            _expected_shift(rate_alt_mag, jcal_plateau_s, Axis.ALT) * 1.2,
-        )
-
-        sign_az = _pick_rate_sign(Axis.AZ, rate_az_mag, jcal_probe_s, jcal_probe_scale)
-        sign_alt = _pick_rate_sign(Axis.ALT, rate_alt_mag, jcal_probe_s, jcal_probe_scale)
-
-        col_az_res = self._autocal_axis_rate_scan(
-            axis=Axis.AZ,
-            rate_steps_s=sign_az * rate_az_mag,
-            ramp_s=jcal_ramp_s,
-            ramp_hz=jcal_ramp_hz,
-            plateau_s=jcal_plateau_s,
-            plateau_frames=jcal_plateau_frames,
-            plateau_min_dt_s=jcal_plateau_min_dt_s,
-            plateau_skip_frames=jcal_plateau_skip_frames,
-            drift_pix=drift_pix,
-            max_shift_px=max_shift_az,
-            min_resp=jcal_min_resp,
-        )
-        if col_az_res.col is None:
-            out["status"] = "ERR_JCAL_AZ"
-            return out
-
-        col_alt_res = self._autocal_axis_rate_scan(
-            axis=Axis.ALT,
-            rate_steps_s=sign_alt * rate_alt_mag,
-            ramp_s=jcal_ramp_s,
-            ramp_hz=jcal_ramp_hz,
-            plateau_s=jcal_plateau_s,
-            plateau_frames=jcal_plateau_frames,
-            plateau_min_dt_s=jcal_plateau_min_dt_s,
-            plateau_skip_frames=jcal_plateau_skip_frames,
-            drift_pix=drift_pix,
-            max_shift_px=max_shift_alt,
-            min_resp=jcal_min_resp,
-        )
-        if col_alt_res.col is None:
-            out["status"] = "ERR_JCAL_ALT"
-            return out
-
-        J_pix = np.column_stack([col_az_res.col, col_alt_res.col])
-        out["J_pix_per_step"] = J_pix
-        self._publish_state(
-            {
-                "goto": {
-                    "autocal_J_pix_per_step_00": float(J_pix[0, 0]),
-                    "autocal_J_pix_per_step_01": float(J_pix[0, 1]),
-                    "autocal_J_pix_per_step_10": float(J_pix[1, 0]),
-                    "autocal_J_pix_per_step_11": float(J_pix[1, 1]),
-                }
-            }
-        )
-
-        self._publish_state(
-            {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "POINTING_SOLVE"}}
-        )
-        e_az = J_pix[:, 0]
-        e_alt = J_pix[:, 1]
-        n_az = float(np.linalg.norm(e_az))
-        n_alt = float(np.linalg.norm(e_alt))
-        if n_az <= 0.0 or n_alt <= 0.0:
-            out["status"] = "ERR_JCAL_NORM"
-            return out
-
-        e_az_hat = e_az / n_az
-        e_alt_hat = e_alt / n_alt
-
-        v_az_pix = float(np.dot(drift_pix, e_az_hat))
-        v_alt_pix = float(np.dot(drift_pix, e_alt_hat))
-        v_obs = np.array([v_az_pix * plate_scale_rad, v_alt_pix * plate_scale_rad], dtype=np.float64)
-        log_info(
-            self._out_log,
-            "GoTo: AutoCal drift projection "
-            f"v_az_pix={v_az_pix:.3f}px/s v_alt_pix={v_alt_pix:.3f}px/s "
-            f"e_az_hat=[{float(e_az_hat[0]):.3f},{float(e_az_hat[1]):.3f}] "
-            f"e_alt_hat=[{float(e_alt_hat[0]):.3f},{float(e_alt_hat[1]):.3f}]",
-        )
-
-        platesolving_result = None
-        az_hat = None
-        alt_hat = None
-
         use_horizontal = pointing_method in (
             "horiz_drift",
             "horizontal",
@@ -2244,6 +2113,10 @@ class GoToWorker(BaseWorker):
             "horizontal_drift",
             "auto",
         )
+        platesolving_result = None
+        az_hat = None
+        alt_hat = None
+
         if use_horizontal and best_drift_frame is not None:
             deg_per_px = float(np.rad2deg(plate_scale_rad))
             scale_px_per_deg = 1.0 / deg_per_px if deg_per_px > 0.0 else 0.0
@@ -2311,6 +2184,156 @@ class GoToWorker(BaseWorker):
                                 }
                             )
                             break
+        if use_horizontal:
+            if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
+                out["status"] = "ERR_PLATESOLVING"
+                out["platesolving_result"] = platesolving_result
+                log_info(self._out_log, "GoTo: AutoCal platesolving failed (horizontal drift)")
+                return out
+
+        if not use_horizontal:
+            self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "JCAL"}})
+            drift_norm = float(np.linalg.norm(drift_pix))
+            if drift_norm <= 0.0:
+                out["status"] = "ERR_JCAL_RATE"
+                return out
+
+            steps_per_rad_az = float(self._goto.model.kin.steps_per_deg(Axis.AZ)) * (180.0 / math.pi)
+            steps_per_rad_alt = float(self._goto.model.kin.steps_per_deg(Axis.ALT)) * (180.0 / math.pi)
+            v_rad_mag = drift_norm * float(plate_scale_rad)
+            rate_az_mag = v_rad_mag * steps_per_rad_az * float(jcal_rate_scale)
+            rate_alt_mag = v_rad_mag * steps_per_rad_alt * float(jcal_rate_scale)
+
+            rate_max = float(getattr(mount_cfg, "rate_max", 0.0))
+            if rate_max > 0.0:
+                rate_az_mag = min(rate_az_mag, rate_max)
+                rate_alt_mag = min(rate_alt_mag, rate_max)
+
+            if rate_az_mag <= 0.0 or rate_alt_mag <= 0.0:
+                out["status"] = "ERR_JCAL_RATE"
+                return out
+
+            def _px_per_step(axis: Axis) -> float:
+                dps = abs(float(self._goto.model.kin.deg_per_step(axis)))
+                rad_per_step = dps * (math.pi / 180.0)
+                return float(rad_per_step / plate_scale_rad)
+
+            def _expected_shift(rate_steps_s: float, duration_s: float, axis: Axis) -> float:
+                return abs(float(rate_steps_s)) * float(duration_s) * _px_per_step(axis)
+
+            drift_dir = drift_pix / drift_norm
+
+            def _pick_rate_sign(axis: Axis, rate_mag: float, probe_s: float, probe_scale: float) -> float:
+                if probe_s <= 0.0 or probe_scale <= 0.0:
+                    return 1.0
+                probe_rate = float(rate_mag) * float(probe_scale)
+                if probe_rate <= 0.0:
+                    return 1.0
+                probe_frames = max(2, int(round(float(jcal_plateau_frames) * 0.5)))
+                probe_shift = max(
+                    float(jcal_max_shift_px),
+                    _expected_shift(probe_rate, probe_s, axis) * 1.2,
+                )
+                probe = self._autocal_axis_rate_scan(
+                    axis=axis,
+                    rate_steps_s=probe_rate,
+                    ramp_s=jcal_ramp_s,
+                    ramp_hz=jcal_ramp_hz,
+                    plateau_s=probe_s,
+                    plateau_frames=probe_frames,
+                    plateau_min_dt_s=jcal_plateau_min_dt_s,
+                    plateau_skip_frames=jcal_plateau_skip_frames,
+                    drift_pix=drift_pix,
+                    max_shift_px=probe_shift,
+                    min_resp=jcal_min_resp,
+                )
+                if probe.col is None:
+                    return 1.0
+                return 1.0 if float(np.dot(probe.col, drift_dir)) >= 0.0 else -1.0
+
+            max_shift_az = max(
+                float(jcal_max_shift_px),
+                _expected_shift(rate_az_mag, jcal_plateau_s, Axis.AZ) * 1.2,
+            )
+            max_shift_alt = max(
+                float(jcal_max_shift_px),
+                _expected_shift(rate_alt_mag, jcal_plateau_s, Axis.ALT) * 1.2,
+            )
+
+            sign_az = _pick_rate_sign(Axis.AZ, rate_az_mag, jcal_probe_s, jcal_probe_scale)
+            sign_alt = _pick_rate_sign(Axis.ALT, rate_alt_mag, jcal_probe_s, jcal_probe_scale)
+
+            col_az_res = self._autocal_axis_rate_scan(
+                axis=Axis.AZ,
+                rate_steps_s=sign_az * rate_az_mag,
+                ramp_s=jcal_ramp_s,
+                ramp_hz=jcal_ramp_hz,
+                plateau_s=jcal_plateau_s,
+                plateau_frames=jcal_plateau_frames,
+                plateau_min_dt_s=jcal_plateau_min_dt_s,
+                plateau_skip_frames=jcal_plateau_skip_frames,
+                drift_pix=drift_pix,
+                max_shift_px=max_shift_az,
+                min_resp=jcal_min_resp,
+            )
+            if col_az_res.col is None:
+                out["status"] = "ERR_JCAL_AZ"
+                return out
+
+            col_alt_res = self._autocal_axis_rate_scan(
+                axis=Axis.ALT,
+                rate_steps_s=sign_alt * rate_alt_mag,
+                ramp_s=jcal_ramp_s,
+                ramp_hz=jcal_ramp_hz,
+                plateau_s=jcal_plateau_s,
+                plateau_frames=jcal_plateau_frames,
+                plateau_min_dt_s=jcal_plateau_min_dt_s,
+                plateau_skip_frames=jcal_plateau_skip_frames,
+                drift_pix=drift_pix,
+                max_shift_px=max_shift_alt,
+                min_resp=jcal_min_resp,
+            )
+            if col_alt_res.col is None:
+                out["status"] = "ERR_JCAL_ALT"
+                return out
+
+            J_pix = np.column_stack([col_az_res.col, col_alt_res.col])
+            out["J_pix_per_step"] = J_pix
+            self._publish_state(
+                {
+                    "goto": {
+                        "autocal_J_pix_per_step_00": float(J_pix[0, 0]),
+                        "autocal_J_pix_per_step_01": float(J_pix[0, 1]),
+                        "autocal_J_pix_per_step_10": float(J_pix[1, 0]),
+                        "autocal_J_pix_per_step_11": float(J_pix[1, 1]),
+                    }
+                }
+            )
+
+            self._publish_state(
+                {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "POINTING_SOLVE"}}
+            )
+            e_az = J_pix[:, 0]
+            e_alt = J_pix[:, 1]
+            n_az = float(np.linalg.norm(e_az))
+            n_alt = float(np.linalg.norm(e_alt))
+            if n_az <= 0.0 or n_alt <= 0.0:
+                out["status"] = "ERR_JCAL_NORM"
+                return out
+
+            e_az_hat = e_az / n_az
+            e_alt_hat = e_alt / n_alt
+
+            v_az_pix = float(np.dot(drift_pix, e_az_hat))
+            v_alt_pix = float(np.dot(drift_pix, e_alt_hat))
+            v_obs = np.array([v_az_pix * plate_scale_rad, v_alt_pix * plate_scale_rad], dtype=np.float64)
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal drift projection "
+                f"v_az_pix={v_az_pix:.3f}px/s v_alt_pix={v_alt_pix:.3f}px/s "
+                f"e_az_hat=[{float(e_az_hat[0]):.3f},{float(e_az_hat[1]):.3f}] "
+                f"e_alt_hat=[{float(e_alt_hat[0]):.3f},{float(e_alt_hat[1]):.3f}]",
+            )
 
         if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
             def _wrap_deg_180(x: float) -> float:
