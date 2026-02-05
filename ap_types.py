@@ -184,6 +184,7 @@ class GotoState:
     busy: bool = False
     synced: bool = False
     last_error_arcsec: float = 0.0
+    manual_samples: int = 0
     J00: float = 0.0
     J01: float = 0.0
     J10: float = 0.0

@@ -57,6 +57,7 @@ class ActionType(str, Enum):
     # goto
     GOTO_CALIBRATE = "GOTO_CALIBRATE"
     GOTO_AUTOCALIBRATE = "GOTO_AUTOCALIBRATE"
+    GOTO_FIT_MODEL = "GOTO_FIT_MODEL"
     GOTO_CANCEL = "GOTO_CANCEL"
 
     # live overlay
@@ -251,6 +252,9 @@ def mount_goto(target: Any, **kwargs: Any) -> Action:
 
 def goto_calibrate(params: Dict[str, Any]) -> Action:
     return Action(ActionType.GOTO_CALIBRATE, {"params": dict(params)}, _now())
+
+def goto_fit_model(params: Dict[str, Any] | None = None) -> Action:
+    return Action(ActionType.GOTO_FIT_MODEL, {"params": params or {}}, _now())
 
 
 def goto_cancel() -> Action:

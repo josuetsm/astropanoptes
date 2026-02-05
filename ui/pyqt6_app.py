@@ -698,9 +698,17 @@ class AstroPanoptesWindow(QMainWindow):
         self.ds_ps_radius.setValue(self.cfg.platesolving.search_radius_deg or 1.0)
         self.ds_ps_radius.setSuffix(" deg")
 
+        self.ds_ps_radius_factor = QDoubleSpinBox()
+        self.ds_ps_radius_factor.setRange(0.5, 10.0)
+        self.ds_ps_radius_factor.setValue(self.cfg.platesolving.search_radius_factor)
+
         self.sb_ps_maxdet = QSpinBox()
         self.sb_ps_maxdet.setRange(3, 2000)
         self.sb_ps_maxdet.setValue(self.cfg.platesolving.max_det)
+
+        self.sb_ps_ndet = QSpinBox()
+        self.sb_ps_ndet.setRange(1, 2000)
+        self.sb_ps_ndet.setValue(self.cfg.platesolving.N_det)
 
         self.sb_ps_nseeds = QSpinBox()
         self.sb_ps_nseeds.setRange(0, 10)
@@ -710,14 +718,96 @@ class AstroPanoptesWindow(QMainWindow):
         self.sb_ps_mininl.setRange(1, 100)
         self.sb_ps_mininl.setValue(self.cfg.platesolving.min_inliers)
 
+        self.ds_ps_det_sigma = QDoubleSpinBox()
+        self.ds_ps_det_sigma.setRange(0.5, 50.0)
+        self.ds_ps_det_sigma.setValue(self.cfg.platesolving.det_thresh_sigma)
+
+        self.sb_ps_minarea = QSpinBox()
+        self.sb_ps_minarea.setRange(1, 200)
+        self.sb_ps_minarea.setValue(self.cfg.platesolving.det_minarea)
+
+        self.ds_ps_point_sigma = QDoubleSpinBox()
+        self.ds_ps_point_sigma.setRange(0.2, 10.0)
+        self.ds_ps_point_sigma.setValue(self.cfg.platesolving.point_sigma)
+
+        self.ds_ps_gmax = QDoubleSpinBox()
+        self.ds_ps_gmax.setRange(6.0, 20.0)
+        self.ds_ps_gmax.setValue(self.cfg.platesolving.gmax)
+
+        self.ds_ps_match_max = QDoubleSpinBox()
+        self.ds_ps_match_max.setRange(0.5, 20.0)
+        self.ds_ps_match_max.setValue(self.cfg.platesolving.match_max_px)
+
+        self.ds_ps_match_tol = QDoubleSpinBox()
+        self.ds_ps_match_tol.setRange(0.1, 60.0)
+        self.ds_ps_match_tol.setValue(self.cfg.platesolving.match_tol_arcsec)
+
+        self.ds_ps_pred_margin = QDoubleSpinBox()
+        self.ds_ps_pred_margin.setRange(0.0, 300.0)
+        self.ds_ps_pred_margin.setValue(self.cfg.platesolving.pred_margin_arcsec)
+
+        self.ds_ps_theta_step = QDoubleSpinBox()
+        self.ds_ps_theta_step.setRange(0.5, 60.0)
+        self.ds_ps_theta_step.setValue(self.cfg.platesolving.theta_step_deg)
+
+        self.ds_ps_theta_refine_span = QDoubleSpinBox()
+        self.ds_ps_theta_refine_span.setRange(0.5, 60.0)
+        self.ds_ps_theta_refine_span.setValue(self.cfg.platesolving.theta_refine_span_deg)
+
+        self.ds_ps_theta_refine_step = QDoubleSpinBox()
+        self.ds_ps_theta_refine_step.setRange(0.1, 10.0)
+        self.ds_ps_theta_refine_step.setValue(self.cfg.platesolving.theta_refine_step_deg)
+
+        self.ds_ps_triplet_tol = QDoubleSpinBox()
+        self.ds_ps_triplet_tol.setRange(0.1, 30.0)
+        self.ds_ps_triplet_tol.setValue(self.cfg.platesolving.triplet_tol_arcsec)
+
+        self.ds_ps_triplet_sigma = QDoubleSpinBox()
+        self.ds_ps_triplet_sigma.setRange(0.1, 10.0)
+        self.ds_ps_triplet_sigma.setValue(self.cfg.platesolving.triplet_sigma_arcsec)
+
+        self.sb_ps_triplet_trials = QSpinBox()
+        self.sb_ps_triplet_trials.setRange(10, 20000)
+        self.sb_ps_triplet_trials.setValue(self.cfg.platesolving.triplet_max_trials)
+
+        self.sb_ps_max_i_scan = QSpinBox()
+        self.sb_ps_max_i_scan.setRange(10, 20000)
+        self.sb_ps_max_i_scan.setValue(self.cfg.platesolving.max_i_scan)
+
+        self.sb_ps_guide_n = QSpinBox()
+        self.sb_ps_guide_n.setRange(0, 10)
+        self.sb_ps_guide_n.setValue(self.cfg.platesolving.guide_n)
+
+        self.ds_ps_simbad = QDoubleSpinBox()
+        self.ds_ps_simbad.setRange(0.2, 20.0)
+        self.ds_ps_simbad.setValue(self.cfg.platesolving.simbad_radius_arcsec)
+
         self.btn_ps_solve = QPushButton("Solve")
         self.btn_ps_solve.clicked.connect(self._platesolve_start)
 
         form.addRow("target:", self.ed_ps_target)
         form.addRow("search radius:", self.ds_ps_radius)
+        form.addRow("radius factor:", self.ds_ps_radius_factor)
         form.addRow("max detections:", self.sb_ps_maxdet)
+        form.addRow("N_det:", self.sb_ps_ndet)
         form.addRow("n_seeds:", self.sb_ps_nseeds)
         form.addRow("min inliers:", self.sb_ps_mininl)
+        form.addRow("det_sigma:", self.ds_ps_det_sigma)
+        form.addRow("minarea:", self.sb_ps_minarea)
+        form.addRow("point_sigma:", self.ds_ps_point_sigma)
+        form.addRow("gmax:", self.ds_ps_gmax)
+        form.addRow("match_max_px:", self.ds_ps_match_max)
+        form.addRow("match_tol_arcsec:", self.ds_ps_match_tol)
+        form.addRow("pred_margin_arcsec:", self.ds_ps_pred_margin)
+        form.addRow("theta_step_deg:", self.ds_ps_theta_step)
+        form.addRow("theta_refine_span_deg:", self.ds_ps_theta_refine_span)
+        form.addRow("theta_refine_step_deg:", self.ds_ps_theta_refine_step)
+        form.addRow("triplet_tol_arcsec:", self.ds_ps_triplet_tol)
+        form.addRow("triplet_sigma_arcsec:", self.ds_ps_triplet_sigma)
+        form.addRow("triplet_max_trials:", self.sb_ps_triplet_trials)
+        form.addRow("max_i_scan:", self.sb_ps_max_i_scan)
+        form.addRow("guide_n:", self.sb_ps_guide_n)
+        form.addRow("simbad_radius:", self.ds_ps_simbad)
         form.addRow(self.btn_ps_solve)
 
         out = QGroupBox("Outputs")
@@ -809,22 +899,27 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_goto = QPushButton("GoTo")
         self.btn_cancel = QPushButton("Cancel")
         self.btn_autocal = QPushButton("AutoCalibrate")
+        self.btn_fit_model = QPushButton("Fit GoTo Model")
         self.btn_home = QPushButton("Home")
 
         rowb = QHBoxLayout()
-        for button in [self.btn_goto, self.btn_cancel, self.btn_autocal, self.btn_home]:
+        for button in [self.btn_goto, self.btn_cancel, self.btn_autocal, self.btn_fit_model, self.btn_home]:
             rowb.addWidget(button)
         rowb.addStretch(1)
 
         self.btn_goto.clicked.connect(self._goto_start)
         self.btn_cancel.clicked.connect(self._goto_cancel)
         self.btn_autocal.clicked.connect(self._autocalibrate)
+        self.btn_fit_model.clicked.connect(self._goto_fit_model)
         self.btn_home.clicked.connect(self._home)
+
+        self.lbl_goto_samples = QLabel("0")
 
         form.addRow("mode:", self.dd_goto_mode)
         form.addRow("target:", self.tgt_frame)
         form.addRow(rowfb)
         form.addRow(rowb)
+        form.addRow("manual samples:", self.lbl_goto_samples)
 
         box.setLayout(form)
         layout.addWidget(box)
@@ -958,9 +1053,27 @@ class AstroPanoptesWindow(QMainWindow):
             return
         self.runner.request_platesolving_params(
             search_radius_deg=float(self.ds_ps_radius.value()),
+            search_radius_factor=float(self.ds_ps_radius_factor.value()),
             max_det=int(self.sb_ps_maxdet.value()),
+            N_det=int(self.sb_ps_ndet.value()),
             N_seed=int(self.sb_ps_nseeds.value()),
             min_inliers=int(self.sb_ps_mininl.value()),
+            det_thresh_sigma=float(self.ds_ps_det_sigma.value()),
+            det_minarea=int(self.sb_ps_minarea.value()),
+            point_sigma=float(self.ds_ps_point_sigma.value()),
+            gmax=float(self.ds_ps_gmax.value()),
+            match_max_px=float(self.ds_ps_match_max.value()),
+            match_tol_arcsec=float(self.ds_ps_match_tol.value()),
+            pred_margin_arcsec=float(self.ds_ps_pred_margin.value()),
+            theta_step_deg=float(self.ds_ps_theta_step.value()),
+            theta_refine_span_deg=float(self.ds_ps_theta_refine_span.value()),
+            theta_refine_step_deg=float(self.ds_ps_theta_refine_step.value()),
+            triplet_tol_arcsec=float(self.ds_ps_triplet_tol.value()),
+            triplet_sigma_arcsec=float(self.ds_ps_triplet_sigma.value()),
+            triplet_max_trials=int(self.sb_ps_triplet_trials.value()),
+            max_i_scan=int(self.sb_ps_max_i_scan.value()),
+            guide_n=int(self.sb_ps_guide_n.value()),
+            simbad_radius_arcsec=float(self.ds_ps_simbad.value()),
         )
         self.runner.request_platesolving_run(target=target)
         self._log(f"[plate solving] Solve target={target}")
@@ -984,6 +1097,10 @@ class AstroPanoptesWindow(QMainWindow):
     def _autocalibrate(self) -> None:
         self.runner.request_goto_autocalibrate()
         self._log("[goto] AutoCalibrate")
+
+    def _goto_fit_model(self) -> None:
+        self.runner.request_goto_fit_model()
+        self._log("[goto] Fit GoTo Model")
 
     def _home(self) -> None:
         target = {
@@ -1017,6 +1134,8 @@ class AstroPanoptesWindow(QMainWindow):
             f"{fps_max:.2f}"
         )
         self.lbl_drift.setText(f"drift vx/vy: {state.tracking.vx:.2f}/{state.tracking.vy:.2f} px/s")
+        if hasattr(self, "lbl_goto_samples"):
+            self.lbl_goto_samples.setText(str(getattr(state.goto, "manual_samples", 0)))
 
         if state.goto.synced or state.platesolving.last_ok:
             ra_str = self._format_ra_deg(state.platesolving.center_ra_deg)

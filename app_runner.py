@@ -39,6 +39,7 @@ from actions import (
     camera_set_param,
     goto_autocalibrate,
     goto_calibrate,
+    goto_fit_model,
     goto_cancel,
     live_sep_set_params,
     mount_connect,
@@ -467,6 +468,9 @@ class AppRunner:
 
     def request_goto_autocalibrate(self) -> None:
         self.enqueue(goto_autocalibrate())
+
+    def request_goto_fit_model(self, params: Dict[str, Any] | None = None) -> None:
+        self.enqueue(goto_fit_model(params))
 
     def request_goto_cancel(self) -> None:
         self.enqueue(goto_cancel())
@@ -1488,6 +1492,11 @@ class AppRunner:
         if t == ActionType.GOTO_AUTOCALIBRATE:
             params = p.get('params', {})
             self._goto_worker.request(kind='autocal', target=None, params=params)
+            return
+
+        if t == ActionType.GOTO_FIT_MODEL:
+            params = p.get('params', {})
+            self._goto_worker.request(kind='fit_model', target=None, params=params)
             return
 
         if t == ActionType.GOTO_CANCEL:

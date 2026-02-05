@@ -124,6 +124,9 @@ def bind_mount(
     def enqueue_goto_autocal() -> None:
         runner.request_goto_autocalibrate()
 
+    def enqueue_goto_fit_model() -> None:
+        runner.request_goto_fit_model()
+
     def enqueue_goto_cancel() -> None:
         runner.request_goto_cancel()
 
@@ -131,4 +134,5 @@ def bind_mount(
     goto_panel.btn_goto.on_click(lambda _btn: enqueue_goto_run())
     goto_panel.btn_calib.on_click(lambda _btn: enqueue_goto_calib())
     goto_panel.btn_autocal.on_click(lambda _btn: enqueue_goto_autocal())
+    goto_panel.btn_fit_model.on_click(lambda _btn: enqueue_goto_fit_model())
     goto_panel.btn_cancel.on_click(lambda _btn: enqueue_goto_cancel())

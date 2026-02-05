@@ -20,6 +20,8 @@ class PlatesolvingPanelHandles:
     pixel_um: W.BoundedFloatText
     binning: W.BoundedIntText
     max_det: W.BoundedIntText
+    n_det: W.BoundedIntText
+    n_seed: W.BoundedIntText
     det_sigma: W.BoundedFloatText
     minarea: W.BoundedIntText
     point_sigma: W.BoundedFloatText
@@ -31,6 +33,12 @@ class PlatesolvingPanelHandles:
     theta_refine_span: W.BoundedFloatText
     theta_refine_step: W.BoundedFloatText
     match_max: W.BoundedFloatText
+    match_tol_arcsec: W.BoundedFloatText
+    pred_margin_arcsec: W.BoundedFloatText
+    triplet_tol_arcsec: W.BoundedFloatText
+    triplet_sigma_arcsec: W.BoundedFloatText
+    triplet_max_trials: W.BoundedIntText
+    max_i_scan: W.BoundedIntText
     min_inliers: W.BoundedIntText
     guide_n: W.BoundedIntText
     simbad_radius: W.BoundedFloatText
@@ -71,6 +79,22 @@ def build_platesolving_panel(cfg: AppConfig) -> tuple[W.Widget, PlatesolvingPane
         min=20,
         max=2000,
         step=10,
+        layout=W.Layout(width="220px"),
+    )
+    n_det = W.BoundedIntText(
+        description="N_det",
+        value=int(platesolving_cfg.N_det),
+        min=1,
+        max=2000,
+        step=1,
+        layout=W.Layout(width="220px"),
+    )
+    n_seed = W.BoundedIntText(
+        description="N_seed",
+        value=int(platesolving_cfg.N_seed),
+        min=0,
+        max=50,
+        step=1,
         layout=W.Layout(width="220px"),
     )
     det_sigma = W.BoundedFloatText(
@@ -157,6 +181,54 @@ def build_platesolving_panel(cfg: AppConfig) -> tuple[W.Widget, PlatesolvingPane
         step=0.1,
         layout=W.Layout(width="260px"),
     )
+    match_tol_arcsec = W.BoundedFloatText(
+        description="match_tol_arcsec",
+        value=float(platesolving_cfg.match_tol_arcsec),
+        min=0.1,
+        max=60.0,
+        step=0.1,
+        layout=W.Layout(width="260px"),
+    )
+    pred_margin_arcsec = W.BoundedFloatText(
+        description="pred_margin_arcsec",
+        value=float(platesolving_cfg.pred_margin_arcsec),
+        min=0.0,
+        max=300.0,
+        step=1.0,
+        layout=W.Layout(width="260px"),
+    )
+    triplet_tol_arcsec = W.BoundedFloatText(
+        description="triplet_tol_arcsec",
+        value=float(platesolving_cfg.triplet_tol_arcsec),
+        min=0.1,
+        max=30.0,
+        step=0.1,
+        layout=W.Layout(width="260px"),
+    )
+    triplet_sigma_arcsec = W.BoundedFloatText(
+        description="triplet_sigma_arcsec",
+        value=float(platesolving_cfg.triplet_sigma_arcsec),
+        min=0.1,
+        max=10.0,
+        step=0.1,
+        layout=W.Layout(width="260px"),
+    )
+    triplet_max_trials = W.BoundedIntText(
+        description="triplet_max_trials",
+        value=int(platesolving_cfg.triplet_max_trials),
+        min=10,
+        max=20000,
+        step=10,
+        layout=W.Layout(width="260px"),
+    )
+    max_i_scan = W.BoundedIntText(
+        description="max_i_scan",
+        value=int(platesolving_cfg.max_i_scan),
+        min=10,
+        max=20000,
+        step=10,
+        layout=W.Layout(width="260px"),
+    )
     min_inliers = W.BoundedIntText(
         description="min_inliers",
         value=int(platesolving_cfg.min_inliers),
@@ -217,10 +289,12 @@ def build_platesolving_panel(cfg: AppConfig) -> tuple[W.Widget, PlatesolvingPane
             W.HTML("<b>Instrument</b>"),
             W.HBox([focal_mm, pixel_um, binning]),
             W.HTML("<b>Solver</b>"),
-            W.HBox([max_det, det_sigma, minarea, point_sigma]),
-            W.HBox([gmax, use_radius, search_radius_deg, search_radius_factor]),
-            W.HBox([theta_step, theta_refine_span, theta_refine_step]),
-            W.HBox([match_max, min_inliers, guide_n, simbad_radius]),
+            W.HBox([max_det, n_det, n_seed, det_sigma]),
+            W.HBox([minarea, point_sigma, gmax, use_radius]),
+            W.HBox([search_radius_deg, search_radius_factor, theta_step, theta_refine_span]),
+            W.HBox([theta_refine_step, match_max, match_tol_arcsec, pred_margin_arcsec]),
+            W.HBox([triplet_tol_arcsec, triplet_sigma_arcsec, triplet_max_trials, max_i_scan]),
+            W.HBox([min_inliers, guide_n, simbad_radius]),
             status,
             debug_html,
             image,
@@ -240,6 +314,8 @@ def build_platesolving_panel(cfg: AppConfig) -> tuple[W.Widget, PlatesolvingPane
         pixel_um=pixel_um,
         binning=binning,
         max_det=max_det,
+        n_det=n_det,
+        n_seed=n_seed,
         det_sigma=det_sigma,
         minarea=minarea,
         point_sigma=point_sigma,
@@ -251,6 +327,12 @@ def build_platesolving_panel(cfg: AppConfig) -> tuple[W.Widget, PlatesolvingPane
         theta_refine_span=theta_refine_span,
         theta_refine_step=theta_refine_step,
         match_max=match_max,
+        match_tol_arcsec=match_tol_arcsec,
+        pred_margin_arcsec=pred_margin_arcsec,
+        triplet_tol_arcsec=triplet_tol_arcsec,
+        triplet_sigma_arcsec=triplet_sigma_arcsec,
+        triplet_max_trials=triplet_max_trials,
+        max_i_scan=max_i_scan,
         min_inliers=min_inliers,
         guide_n=guide_n,
         simbad_radius=simbad_radius,

@@ -270,6 +270,7 @@ class UILoop:
         goto_busy = bool(state.goto.busy)
         goto_synced = bool(state.goto.synced)
         goto_err = float(state.goto.last_error_arcsec)
+        goto_samples = int(getattr(state.goto, "manual_samples", 0))
         j00 = float(state.goto.J00)
         j01 = float(state.goto.J01)
         j10 = float(state.goto.J10)
@@ -278,7 +279,8 @@ class UILoop:
             goto_panel.status,
             (
                 f"<b>GoTo</b>: {goto_status} | busy={goto_busy} | synced={goto_synced} | "
-                f"err={goto_err:.1f}\" | J=[[{j00:.6g},{j01:.6g}],[{j10:.6g},{j11:.6g}]]"
+                f"samples={goto_samples} | err={goto_err:.1f}\" | "
+                f"J=[[{j00:.6g},{j01:.6g}],[{j10:.6g},{j11:.6g}]]"
             ),
             self.guard,
         )

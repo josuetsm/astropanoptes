@@ -488,6 +488,13 @@ class GoToModel:
     _calib_steps: List[np.ndarray] = field(default_factory=list, repr=False)
     _calib_daltaz: List[np.ndarray] = field(default_factory=list, repr=False)
 
+    # Manual calibration samples (absolute measurements)
+    _manual_steps_abs: List[np.ndarray] = field(default_factory=list, repr=False)
+    _manual_az_alt_abs: List[np.ndarray] = field(default_factory=list, repr=False)
+
+    # History of commanded steps (AZ, ALT) during the session
+    steps_history: List[np.ndarray] = field(default_factory=list, repr=False)
+
     def init_from_mechanics(self) -> None:
         """Initialize J from the mechanical model (diagonal, no coupling)."""
         dps_az = self.kin.deg_per_step(Axis.AZ)
@@ -515,6 +522,9 @@ class GoToModel:
             self.steps_est[0] += s
         else:
             self.steps_est[1] += s
+        d_az = s if axis == Axis.AZ else 0.0
+        d_alt = s if axis == Axis.ALT else 0.0
+        self.steps_history.append(np.array([d_az, d_alt], dtype=np.float64))
 
     def predict_az_alt_deg(self, *, from_ref: bool = False) -> np.ndarray:
         """Predict current mount AZ/ALT from the model + steps.
@@ -602,6 +612,60 @@ class GoToModel:
         J_new = B.T
 
         # sanity: avoid singular / crazy values
+        if not np.all(np.isfinite(J_new)):
+            return False
+
+        self.J_deg_per_step = J_new.astype(np.float64)
+        return True
+
+    def add_manual_sample(self, az_alt_deg: np.ndarray) -> int:
+        """Store an absolute (steps, AltAz) sample from a manual plate-solve."""
+        az_alt = _as_array2(az_alt_deg)
+        self._manual_steps_abs.append(self.steps_est.copy())
+        self._manual_az_alt_abs.append(az_alt.copy())
+        self.last_solve_az_alt_deg = az_alt.copy()
+        self.last_solve_time = time.time()
+        return int(len(self._manual_steps_abs))
+
+    def fit_J_from_manual_samples(self, *, min_samples: int = 3, ridge: float = 1e-12) -> bool:
+        """Fit J from absolute manual samples (steps, AltAz).
+
+        Uses mean-centered data so an implicit offset is allowed.
+        """
+        if len(self._manual_steps_abs) < int(min_samples):
+            return False
+
+        S = np.stack(self._manual_steps_abs, axis=0)  # (N,2)
+        A = np.stack(self._manual_az_alt_abs, axis=0)  # (N,2) [az, alt] in deg
+
+        s_mean = np.mean(S, axis=0)
+        az_deg = A[:, 0].astype(np.float64)
+        alt_deg = A[:, 1].astype(np.float64)
+
+        # Circular mean for azimuth to avoid wrap issues
+        az_rad = np.deg2rad(az_deg)
+        az_mean = float(np.degrees(math.atan2(np.mean(np.sin(az_rad)), np.mean(np.cos(az_rad))))) % 360.0
+        alt_mean = float(np.mean(alt_deg))
+
+        dsteps = S - s_mean
+        daltaz = np.column_stack(
+            (
+                [_wrap_deg_180(float(az) - az_mean) for az in az_deg],
+                alt_deg - alt_mean,
+            )
+        ).astype(np.float64)
+
+        # Ridge-regularized least squares: minimize ||S B - D||^2 + ridge||B||^2
+        if ridge > 0:
+            lam = float(ridge)
+            S_aug = np.vstack([dsteps, math.sqrt(lam) * np.eye(2)])
+            D_aug = np.vstack([daltaz, np.zeros((2, 2), dtype=np.float64)])
+        else:
+            S_aug, D_aug = dsteps, daltaz
+
+        B, *_ = np.linalg.lstsq(S_aug, D_aug, rcond=None)
+        J_new = B.T
+
         if not np.all(np.isfinite(J_new)):
             return False
 
@@ -2506,6 +2570,33 @@ class GoToWorker(BaseWorker):
             return out
 
         out["platesolving_result"] = platesolving_result
+
+        manual_only = bool(params.get("manual_only", True))
+        if manual_only:
+            az_alt = platesolving_center_to_altaz_deg(
+                float(platesolving_result.center_ra_deg),
+                float(platesolving_result.center_dec_deg),
+                observer=observer,
+                obstime=Time.now(),
+            )
+            n_samples = int(self._goto.model.add_manual_sample(az_alt))
+            self._publish_state(
+                {
+                    "goto": {
+                        "status": GotoStatus.OK,
+                        "reason": None,
+                        "autocal_last_ok": True,
+                        "autocal_status": GotoAutocalStatus.OK,
+                        "autocal_reason": "MANUAL_SAMPLE",
+                        "manual_samples": n_samples,
+                    }
+                }
+            )
+            out["ok"] = True
+            out["status"] = "OK_MANUAL_SAMPLE"
+            out["manual_samples"] = n_samples
+            return out
+
         self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "SYNC"}})
         ok_sync = bool(self._goto.sync_from_platesolving(platesolving_result))
         self._publish_state(
@@ -2704,6 +2795,24 @@ class GoToWorker(BaseWorker):
                 log_info(
                     self._out_log,
                     f"GoTo: AUTOCAL status={autocal_out.get('status')} ok={autocal_ok}",
+                )
+
+            elif kind == "fit_model":
+                min_samples = int(params.get("min_samples", 3))
+                ridge = float(params.get("ridge", 1e-12))
+                ok = bool(self._goto.model.fit_J_from_manual_samples(min_samples=min_samples, ridge=ridge))
+                self._publish_j_matrix_state()
+                self._publish_state(
+                    {
+                        "goto": {
+                            "status": GotoStatus.OK if ok else GotoStatus.FAIL,
+                            "reason": None if ok else "ERR_INSUFFICIENT_SAMPLES",
+                        }
+                    }
+                )
+                log_info(
+                    self._out_log,
+                    f"GoTo: FIT_MODEL ok={ok} min_samples={min_samples}",
                 )
 
             else:
