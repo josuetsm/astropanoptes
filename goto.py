@@ -1663,6 +1663,7 @@ class GoToWorker(BaseWorker):
         use_theil_sen: bool,
         max_shift_px: float,
         min_resp: float,
+        fps: float,
     ) -> Optional[np.ndarray]:
         if len(frames) < int(min_frames):
             log_info(
@@ -1698,10 +1699,17 @@ class GoToWorker(BaseWorker):
         if t.size < 2:
             return None
         order = np.argsort(t)
-        t = t[order]
         per_frame = [per_frame[i] for i in order]
         per_frame_full = [per_frame_full[i] for i in order]
-        duration_s = float(t[-1] - t[0])
+
+        fps = float(fps)
+        use_fps = fps > 0.0 and np.isfinite(fps)
+        dt_frame = 1.0 / fps if use_fps else None
+        if use_fps:
+            duration_s = float((len(per_frame_full) - 1) * dt_frame)
+        else:
+            t = t[order]
+            duration_s = float(t[-1] - t[0])
         if not np.isfinite(duration_s) or duration_s < float(min_duration_s):
             log_info(
                 self._out_log,
@@ -1736,7 +1744,10 @@ class GoToWorker(BaseWorker):
         vels: List[np.ndarray] = []
         total_pairs = 0
         for i in range(1, len(per_frame_full)):
-            dt = float(t[i] - t[i - 1])
+            if use_fps:
+                dt = float(dt_frame)
+            else:
+                dt = float(t[i] - t[i - 1])
             if dt <= 0.0:
                 continue
             total_pairs += 1
@@ -1766,7 +1777,10 @@ class GoToWorker(BaseWorker):
                 return v
 
         # Fallback: project positions onto drift axis and fit slope.
-        t_rel = t - t[0]
+        if use_fps:
+            t_rel = np.arange(len(per_frame), dtype=np.float64) * float(dt_frame)
+        else:
+            t_rel = t - t[0]
         t_f = np.array([np.median(p @ u) for p in per_frame], dtype=np.float64)
         if not np.all(np.isfinite(t_f)):
             return None
@@ -2038,6 +2052,7 @@ class GoToWorker(BaseWorker):
         drift_line_use_theil_sen = bool(params.get("drift_line_use_theil_sen", True))
         drift_line_max_shift_px = float(params.get("drift_line_max_shift_px", 50.0))
         drift_line_min_resp = float(params.get("drift_line_min_resp", 0.1))
+        drift_line_fps = float(params.get("drift_line_fps", 0.0))
         pointing_method = str(params.get("pointing_method", "horiz_drift")).strip().lower()
         drift_pointing_omega = float(params.get("drift_pointing_omega_deg_s", 15.041))
         drift_capture_timeout_eff = float(drift_capture_timeout_s)
@@ -2081,6 +2096,20 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_DRIFT_PARAMS"
             return out
 
+        plate_scale_rad = float(platesolving_cfg.pixel_size_m) / float(platesolving_cfg.focal_m)
+        if not np.isfinite(plate_scale_rad) or plate_scale_rad <= 0.0:
+            out["status"] = "ERR_BAD_PLATE_SCALE"
+            return out
+
+        if drift_line_fps <= 0.0:
+            if float(getattr(st.camera, "fps_capture", 0.0)) > 0.0:
+                drift_line_fps = float(getattr(st.camera, "fps_capture", 0.0))
+            else:
+                cam_cfg = self._get_camera_cfg()
+                exp_ms = float(getattr(cam_cfg, "exp_ms", 0.0))
+                if exp_ms > 0.0:
+                    drift_line_fps = 1000.0 / exp_ms
+
         log_info(
             self._out_log,
             "GoTo: AutoCal config "
@@ -2093,6 +2122,7 @@ class GoToWorker(BaseWorker):
             f"drift_line_deg_step={drift_line_deg_step:.2f} bin_width={drift_line_bin_width_px:.2f} "
             f"drift_line_topk_bins={drift_line_topk_bins} "
             f"drift_line_max_shift_px={drift_line_max_shift_px:.1f} min_resp={drift_line_min_resp:.2f} "
+            f"drift_line_fps={drift_line_fps:.2f} "
             f"pointing_method={pointing_method} omega={drift_pointing_omega:.3f} "
             f"jcal_rate_scale={jcal_rate_scale:.2f} "
             f"jcal_ramp_s={jcal_ramp_s:.2f} ramp_hz={jcal_ramp_hz:.1f} "
@@ -2101,11 +2131,6 @@ class GoToWorker(BaseWorker):
             f"jcal_probe_s={jcal_probe_s:.2f} probe_scale={jcal_probe_scale:.2f} "
             f"jcal_min_resp={jcal_min_resp:.2f} jcal_max_shift_px={jcal_max_shift_px:.1f}",
         )
-
-        plate_scale_rad = float(platesolving_cfg.pixel_size_m) / float(platesolving_cfg.focal_m)
-        if not np.isfinite(plate_scale_rad) or plate_scale_rad <= 0.0:
-            out["status"] = "ERR_BAD_PLATE_SCALE"
-            return out
 
         self._publish_state(
             {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "EXPOSURE_TUNE"}}
@@ -2208,6 +2233,7 @@ class GoToWorker(BaseWorker):
             use_theil_sen=drift_line_use_theil_sen,
             max_shift_px=drift_line_max_shift_px,
             min_resp=drift_line_min_resp,
+            fps=drift_line_fps,
         )
         if drift_pix is None:
             out["status"] = "ERR_DRIFT"
