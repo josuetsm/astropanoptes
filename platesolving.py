@@ -72,12 +72,12 @@ class TargetParseError(PlatesolvingError):
 @dataclass(frozen=True)
 class ObserverConfig:
     """
-    Default observer: Santiago, Chile (approx).
+    Default observer: Algarrobo, Chile (approx).
     Used for AltAz -> ICRS conversion.
     """
-    lat_deg: float = -33.4489
-    lon_deg: float = -70.6693
-    height_m: float = 520.0
+    lat_deg: float = -33.3667
+    lon_deg: float = -71.6667
+    height_m: float = 28.0
 
     def location(self) -> EarthLocation:
         return EarthLocation(

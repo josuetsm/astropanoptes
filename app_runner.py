@@ -166,7 +166,7 @@ class AppRunner:
         self._platesolving_auto_target: str = ""
 
         # Config platesolving (runtime copy, actualizable desde UI por action)
-        self._platesolving_observer = ObserverConfig()  # Santiago por default en tu platesolving.py
+        self._platesolving_observer = ObserverConfig()  # Algarrobo por default en tu platesolving.py
         self._platesolving_worker = PlatesolvingWorker(
             get_frame=self._get_live_frame_for_platesolving,
             get_cfg=self._get_platesolving_cfg_snapshot,

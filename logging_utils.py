@@ -6,7 +6,7 @@ import sys
 import threading
 import time
 import traceback
-from typing import Optional, Dict
+from typing import Optional, Dict, Callable
 
 if importlib.util.find_spec("ipywidgets") is not None:
     import ipywidgets as W
@@ -15,6 +15,19 @@ else:
 
 
 _START_TIME = time.monotonic()
+
+_GLOBAL_LOG_SINK_LOCK = threading.Lock()
+_GLOBAL_LOG_SINK: Optional[Callable[[str], None]] = None
+
+
+def set_global_log_sink(sink: Optional[Callable[[str], None]]) -> None:
+    """
+    Register a global sink for log lines (used when out is None).
+    The sink must be a callable that accepts a single string line.
+    """
+    global _GLOBAL_LOG_SINK
+    with _GLOBAL_LOG_SINK_LOCK:
+        _GLOBAL_LOG_SINK = sink
 
 
 def _ts() -> str:
@@ -53,6 +66,12 @@ def append_to_output(out: "W.Output", msg: str) -> None:
     if out is None:
         return
     try:
+        if hasattr(out, "append") and callable(getattr(out, "append")):
+            out.append(msg)
+            return
+        if hasattr(out, "write") and callable(getattr(out, "write")):
+            out.write(msg + "\n")
+            return
         with out:
             print(msg)
     except Exception:
@@ -84,8 +103,19 @@ def log_info(
     line = _format_line("INFO", msg)
     if out is not None:
         append_to_output(out, line)
-    else:
-        _write_console(line)
+        return
+    sink = None
+    with _GLOBAL_LOG_SINK_LOCK:
+        sink = _GLOBAL_LOG_SINK
+    if sink is not None:
+        try:
+            sink(line)
+            return
+        except Exception:
+            sys.stderr.write(f"[{_ts()}][Logging][ERROR] Failed to write to global sink.\n")
+            sys.stderr.write(traceback.format_exc())
+            sys.stderr.flush()
+    _write_console(line)
 
 
 def log_error(
@@ -104,7 +134,20 @@ def log_error(
         append_to_output(out, line)
         if exc is not None:
             append_to_output(out, format_exc(exc))
-    else:
-        _write_console(line)
-        if exc is not None:
-            _write_console(format_exc(exc))
+        return
+    sink = None
+    with _GLOBAL_LOG_SINK_LOCK:
+        sink = _GLOBAL_LOG_SINK
+    if sink is not None:
+        try:
+            sink(line)
+            if exc is not None:
+                sink(format_exc(exc))
+            return
+        except Exception:
+            sys.stderr.write(f"[{_ts()}][Logging][ERROR] Failed to write to global sink.\n")
+            sys.stderr.write(traceback.format_exc())
+            sys.stderr.flush()
+    _write_console(line)
+    if exc is not None:
+        _write_console(format_exc(exc))

@@ -8,7 +8,7 @@ from dataclasses import dataclass
 from typing import Optional, Sequence
 
 import numpy as np
-from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer
+from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, QObject, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
     QApplication,
@@ -43,6 +43,18 @@ from actions import tracking_keyframe_reset
 from ap_types import Axis
 from app_runner import AppRunner
 from config import AppConfig
+from logging_utils import set_global_log_sink
+
+
+class QtLogSink(QObject):
+    message = pyqtSignal(str)
+
+    def __init__(self, append_cb) -> None:
+        super().__init__()
+        self.message.connect(append_cb)
+
+    def __call__(self, msg: str) -> None:
+        self.message.emit(msg)
 
 
 @dataclass
@@ -248,6 +260,8 @@ class AstroPanoptesWindow(QMainWindow):
         self._stars = self._init_star_catalog(n=120)
 
         self._build_central()
+        self._log_sink = QtLogSink(self._log)
+        set_global_log_sink(self._log_sink)
         self._build_top_toolbar()
         self._build_docks()
         self._build_menu()
@@ -266,6 +280,7 @@ class AstroPanoptesWindow(QMainWindow):
         self._log("PyQt6 UI ready.")
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        set_global_log_sink(None)
         self.runner.stop()
         super().closeEvent(event)
 
@@ -1308,9 +1323,10 @@ def build_ui(runner: Optional[AppRunner] = None, *, cfg: Optional[AppConfig] = N
     if runner is None:
         cfg = cfg or AppConfig()
         runner = AppRunner(cfg)
+        window = AstroPanoptesWindow(runner, cfg)
         runner.start()
-    else:
-        cfg = cfg or runner.cfg
+        return window
+    cfg = cfg or runner.cfg
     return AstroPanoptesWindow(runner, cfg)
 
 
@@ -1323,10 +1339,9 @@ def show_ui(*, start_app: bool = True, start_runner: bool = True) -> UI:
 
     cfg = AppConfig()
     runner = AppRunner(cfg)
+    window = AstroPanoptesWindow(runner, cfg)
     if start_runner:
         runner.start()
-
-    window = AstroPanoptesWindow(runner, cfg)
     window.showMaximized()
 
     if start_app and created:

@@ -2194,6 +2194,11 @@ class GoToWorker(BaseWorker):
                 scale_px_per_deg=scale_px_per_deg,
             )
             if sols:
+                sol_txt = ", ".join(f"az={az_deg:.3f} alt={alt_deg:.3f}" for az_deg, alt_deg in sols)
+                log_info(self._out_log, f"GoTo: AutoCal drift az/alt candidates: {sol_txt}")
+            else:
+                log_info(self._out_log, "GoTo: AutoCal drift az/alt candidates: none")
+            if sols:
                 t_wall = float(getattr(best_drift_frame, "t_wall", 0.0))
                 obstime = Time(t_wall, format="unix") if t_wall > 0.0 else Time.now()
                 candidates: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
