@@ -1379,6 +1379,7 @@ class _AutocalFrame:
     raw16: np.ndarray
     t_capture: float
     t_wall: float
+    t_mono: float
     obj_xy: np.ndarray
     star_count: int
     saturation_frac: float
@@ -1556,7 +1557,8 @@ class GoToWorker(BaseWorker):
             obj_xy, star_count, saturation_frac, top_sources = self._autocal_detect(raw16)
             t_capture = float(getattr(fr, "t_capture", _now_s()))
             t_wall = float(_now_s())
-            if last_capture_t is not None and (t_capture - last_capture_t) < min_dt_s:
+            t_mono = float(_perf())
+            if last_capture_t is not None and (t_mono - last_capture_t) < min_dt_s:
                 time.sleep(0.005)
                 continue
             frames.append(
@@ -1564,13 +1566,14 @@ class GoToWorker(BaseWorker):
                     raw16=raw16,
                     t_capture=t_capture,
                     t_wall=t_wall,
+                    t_mono=t_mono,
                     obj_xy=obj_xy,
                     star_count=star_count,
                     saturation_frac=saturation_frac,
                     top_sources=top_sources,
                 )
             )
-            last_capture_t = t_capture
+            last_capture_t = t_mono
             if obj_xy.shape[0] >= min_usable_sources:
                 usable += 1
         return frames
@@ -1681,7 +1684,7 @@ class GoToWorker(BaseWorker):
                 continue
             per_frame.append(fr.obj_xy[:k].astype(np.float64, copy=False))
             per_frame_full.append(fr.obj_xy.astype(np.float64, copy=False))
-            t_list.append(float(fr.t_capture))
+            t_list.append(float(getattr(fr, "t_mono", fr.t_wall)))
 
         if len(per_frame) < int(min_frames):
             log_info(
@@ -1694,6 +1697,10 @@ class GoToWorker(BaseWorker):
         t = np.asarray(t_list, dtype=np.float64)
         if t.size < 2:
             return None
+        order = np.argsort(t)
+        t = t[order]
+        per_frame = [per_frame[i] for i in order]
+        per_frame_full = [per_frame_full[i] for i in order]
         duration_s = float(t[-1] - t[0])
         if not np.isfinite(duration_s) or duration_s < float(min_duration_s):
             log_info(
@@ -1726,27 +1733,21 @@ class GoToWorker(BaseWorker):
         u = np.asarray(u, dtype=np.float64).reshape(2,)
 
         # Estimate drift speed using shifts relative to the first frame.
-        if per_frame:
-            ref_xy = per_frame[0]
-        else:
-            ref_xy = per_frame_full[0] if per_frame_full else None
-
         vels: List[np.ndarray] = []
         total_pairs = 0
-        if ref_xy is not None:
-            for i in range(1, len(per_frame_full)):
-                dt = float(t[i] - t[0])
-                if dt <= 0.0:
-                    continue
-                total_pairs += 1
-                dx, dy, resp, _n = estimate_shift_from_objects(
-                    per_frame_full[i],
-                    ref_xy,
-                    max_shift_px=float(max_shift_px),
-                )
-                if float(resp) < float(min_resp):
-                    continue
-                vels.append(np.array([dx / dt, dy / dt], dtype=np.float64))
+        for i in range(1, len(per_frame_full)):
+            dt = float(t[i] - t[i - 1])
+            if dt <= 0.0:
+                continue
+            total_pairs += 1
+            dx, dy, resp, _n = estimate_shift_from_objects(
+                per_frame_full[i - 1],
+                per_frame_full[i],
+                max_shift_px=float(max_shift_px),
+            )
+            if float(resp) < float(min_resp):
+                continue
+            vels.append(np.array([-dx / dt, -dy / dt], dtype=np.float64))
 
         if vels:
             v_arr = np.stack(vels, axis=0)
@@ -2177,9 +2178,10 @@ class GoToWorker(BaseWorker):
             f"sat=[{min(sat_fracs):.3f},{float(np.median(sat_fracs)):.3f},{max(sat_fracs):.3f}]",
         )
         if len(drift_frames_list) > 1:
-            ref_t = float(drift_frames_list[0].t_capture)
+            ref_t = float(getattr(drift_frames_list[0], "t_mono", drift_frames_list[0].t_wall))
             for idx, fr in enumerate(drift_frames_list):
-                dt = float(fr.t_capture - ref_t)
+                fr_t = float(getattr(fr, "t_mono", fr.t_wall))
+                dt = float(fr_t - ref_t)
                 log_info(
                     self._out_log,
                     "GoTo: AutoCal drift frame sources "
