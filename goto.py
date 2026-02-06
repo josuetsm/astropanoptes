@@ -1725,26 +1725,33 @@ class GoToWorker(BaseWorker):
             return None
         u = np.asarray(u, dtype=np.float64).reshape(2,)
 
-        # Estimate drift speed using pairwise shifts between consecutive frames.
+        # Estimate drift speed using shifts relative to the first frame.
+        if per_frame:
+            ref_xy = per_frame[0]
+        else:
+            ref_xy = per_frame_full[0] if per_frame_full else None
+
         vels: List[np.ndarray] = []
         total_pairs = 0
-        for i in range(1, len(per_frame_full)):
-            dt = float(t[i] - t[i - 1])
-            if dt <= 0.0:
-                continue
-            total_pairs += 1
-            dx, dy, resp, _n = estimate_shift_from_objects(
-                per_frame_full[i - 1],
-                per_frame_full[i],
-                max_shift_px=float(max_shift_px),
-            )
-            if float(resp) < float(min_resp):
-                continue
-            vels.append(np.array([-dx / dt, -dy / dt], dtype=np.float64))
+        if ref_xy is not None:
+            for i in range(1, len(per_frame_full)):
+                dt = float(t[i] - t[0])
+                if dt <= 0.0:
+                    continue
+                total_pairs += 1
+                dx, dy, resp, _n = estimate_shift_from_objects(
+                    per_frame_full[i],
+                    ref_xy,
+                    max_shift_px=float(max_shift_px),
+                )
+                if float(resp) < float(min_resp):
+                    continue
+                vels.append(np.array([dx / dt, dy / dt], dtype=np.float64))
 
         if vels:
-            v_med = np.median(np.stack(vels, axis=0), axis=0)
-            v = float(np.dot(v_med, u)) * u
+            v_arr = np.stack(vels, axis=0)
+            speed = float(np.median(v_arr @ u))
+            v = speed * u
             if np.all(np.isfinite(v)):
                 log_info(
                     self._out_log,
