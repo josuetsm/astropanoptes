@@ -259,6 +259,7 @@ class UILoop:
         safe_set(stacking_panel.btn_stop, "disabled", not stacking_running, self.guard)
         safe_set(stacking_panel.btn_reset, "disabled", not stacking_running, self.guard)
         safe_set(top_bar.save_stack, "disabled", not stacking_running, self.guard)
+        safe_set(top_bar.record_raw20, "disabled", not cam_connected, self.guard)
 
         safe_set(platesolving_panel.btn_solve, "disabled", ps_busy, self.guard)
         safe_set(platesolving_panel.search_radius_deg, "disabled", not bool(platesolving_panel.use_radius.value), self.guard)

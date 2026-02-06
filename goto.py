@@ -244,7 +244,7 @@ def _drift_to_az_alt(
     *,
     phi_deg: float,
     omega_deg_s: float,
-    scale_px_per_deg: float,
+    scale_deg_per_px: float,
     dedup_tol_deg: float = 1e-3,
     sort_by_forward_err: bool = True,
 ) -> List[Tuple[float, float]]:
@@ -254,7 +254,7 @@ def _drift_to_az_alt(
     Conventions:
       - +x right (east), +y up
       - omega in deg/s
-      - scale in px/deg
+      - scale in deg/px
     Returns 0, 1 or 2 solutions.
     """
     phi = math.radians(float(phi_deg))
@@ -264,7 +264,7 @@ def _drift_to_az_alt(
         return []
 
     omega = float(omega_deg_s)
-    scale = float(scale_px_per_deg)
+    scale = float(scale_deg_per_px)
     if omega <= 0.0 or scale <= 0.0:
         return []
 
@@ -1700,22 +1700,31 @@ class GoToWorker(BaseWorker):
         t = t[order]
         per_frame = [per_frame[i] for i in order]
 
-        fps = float(fps)
-        dt_frame: Optional[float] = None
-        if fps > 0.0 and np.isfinite(fps):
-            dt_frame = 1.0 / fps
-        else:
-            diffs = np.diff(t)
-            diffs = diffs[diffs > 0.0]
-            if diffs.size > 0:
-                dt_frame = float(np.median(diffs))
-                if not np.isfinite(dt_frame) or dt_frame <= 0.0:
-                    dt_frame = None
+        diffs = np.diff(t)
+        diffs = diffs[diffs > 0.0]
+        dt_med: Optional[float] = None
+        if diffs.size > 0:
+            dt_med = float(np.median(diffs))
+            if not np.isfinite(dt_med) or dt_med <= 0.0:
+                dt_med = None
 
-        if dt_frame is not None:
-            duration_s = float((len(per_frame) - 1) * dt_frame)
+        fps = float(fps)
+        dt_fps: Optional[float] = None
+        if fps > 0.0 and np.isfinite(fps):
+            dt_fps = 1.0 / fps
+
+        # Use the larger of (measured cadence, fps cadence) to avoid
+        # overestimating speed when frames are throttled (e.g., drift_dt_min_s).
+        dt_frame: Optional[float]
+        if dt_med is not None and dt_fps is not None:
+            dt_frame = max(float(dt_med), float(dt_fps))
         else:
-            duration_s = float(t[-1] - t[0])
+            dt_frame = dt_med if dt_med is not None else dt_fps
+
+        # Use actual monotonic span for duration gating (stable), even if we later use FPS for dt.
+        duration_s = float(t[-1] - t[0])
+        if (not np.isfinite(duration_s) or duration_s <= 0.0) and dt_frame is not None:
+            duration_s = float((len(per_frame) - 1) * dt_frame)
         if not np.isfinite(duration_s) or duration_s < float(min_duration_s):
             log_info(
                 self._out_log,
@@ -1785,7 +1794,8 @@ class GoToWorker(BaseWorker):
                     self._out_log,
                     "GoTo: AutoCal drift line sweep "
                     f"deg={float(best.get('deg', 0.0)):.2f} score={float(best.get('score', 0.0)):.3f} "
-                    f"v=[{float(v[0]):.3f},{float(v[1]):.3f}] pairs={len(vels)}/{total_pairs} "
+                    f"v=[{float(v[0]):.3f},{float(v[1]):.3f}] "
+                    f"dt={float(dt_frame or 0.0):.3f}s pairs={len(vels)}/{total_pairs} "
                     f"frames={len(per_frame)} pts={xy_all.shape[0]}",
                 )
                 return v
@@ -2278,7 +2288,6 @@ class GoToWorker(BaseWorker):
 
         if use_horizontal and best_drift_frame is not None:
             deg_per_px = float(np.rad2deg(plate_scale_rad))
-            scale_px_per_deg = 1.0 / deg_per_px if deg_per_px > 0.0 else 0.0
             vx = float(drift_pix[0])
             vy_up = float(drift_pix[1])
             sols = _drift_to_az_alt(
@@ -2286,7 +2295,7 @@ class GoToWorker(BaseWorker):
                 vy_up,
                 phi_deg=float(getattr(observer, "lat_deg", 0.0)),
                 omega_deg_s=float(drift_pointing_omega),
-                scale_px_per_deg=scale_px_per_deg,
+                scale_deg_per_px=deg_per_px,
             )
             if sols:
                 sol_txt = ", ".join(f"az={az_deg:.3f} alt={alt_deg:.3f}" for az_deg, alt_deg in sols)

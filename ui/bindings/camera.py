@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from typing import Dict
+import time
 
 from app_runner import AppRunner
 
@@ -26,6 +27,12 @@ def bind_camera(
 
     top_bar.connect_camera.on_click(on_connect_camera)
     top_bar.disconnect_camera.on_click(on_disconnect_camera)
+
+    def on_record_raw(_btn) -> None:
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        runner.request_camera_record_raw(duration_s=20.0, out_dir="raw_output", basename=f"raw_{ts}")
+
+    top_bar.record_raw20.on_click(on_record_raw)
 
     def on_camera_param(name: str, value) -> None:
         if guard.active:

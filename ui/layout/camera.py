@@ -23,6 +23,7 @@ class TopBarHandles:
     tracking_toggle: W.ToggleButton
     stacking_toggle: W.ToggleButton
     save_stack: W.Button
+    record_raw20: W.Button
 
 
 @dataclass
@@ -67,6 +68,7 @@ def build_top_bar() -> tuple[W.Widget, TopBarHandles]:
     tracking_toggle = W.ToggleButton(description="Tracking", value=False, disabled=False)
     stacking_toggle = W.ToggleButton(description="Stacking", value=False, disabled=False)
     save_stack = W.Button(description="Save Stack", disabled=True)
+    record_raw20 = W.Button(description="Record 20s RAW", button_style="warning")
 
     top_left = W.VBox([status_camera, status_mount, status_tracking, status_stacking])
     top_mid = W.VBox([fps_label, frame_ms_label])
@@ -80,6 +82,7 @@ def build_top_bar() -> tuple[W.Widget, TopBarHandles]:
             tracking_toggle,
             stacking_toggle,
             save_stack,
+            record_raw20,
         ],
         layout=W.Layout(flex_flow="row wrap", align_items="center"),
     )
@@ -99,6 +102,7 @@ def build_top_bar() -> tuple[W.Widget, TopBarHandles]:
         tracking_toggle=tracking_toggle,
         stacking_toggle=stacking_toggle,
         save_stack=save_stack,
+        record_raw20=record_raw20,
     )
     return widget, handles
 

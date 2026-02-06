@@ -36,6 +36,7 @@ from actions import (
     ActionType,
     camera_connect,
     camera_disconnect,
+    camera_record_raw,
     camera_set_param,
     goto_autocalibrate,
     goto_calibrate,
@@ -138,6 +139,9 @@ class AppRunner:
         self._actions: "queue.Queue[Action]" = queue.Queue()
         self._stop = threading.Event()
         self._thr: Optional[threading.Thread] = None
+        self._raw_record_lock = threading.Lock()
+        self._raw_record_active = False
+        self._raw_record_thread: Optional[threading.Thread] = None
 
         # Subsystems
         self._cam_dev: Optional[POACameraDevice] = None
@@ -441,6 +445,15 @@ class AppRunner:
 
     def request_camera_param(self, name: str, value: Any) -> None:
         self.enqueue(camera_set_param(name, value))
+
+    def request_camera_record_raw(
+        self,
+        *,
+        duration_s: float = 20.0,
+        out_dir: str = "raw_output",
+        basename: Optional[str] = None,
+    ) -> None:
+        self.enqueue(camera_record_raw(duration_s=duration_s, out_dir=out_dir, basename=basename))
 
     def request_mount_connect(self, port: str, baudrate: int) -> None:
         self.enqueue(mount_connect(port, baudrate))
@@ -1012,6 +1025,84 @@ class AppRunner:
         except Exception as exc:
             log_error(self.out_log, "Stacking: save failed", exc)
 
+    # -------------------------
+    # Raw recording helper
+    # -------------------------
+    def _start_raw_recording(
+        self,
+        *,
+        duration_s: float,
+        out_dir: str,
+        basename: Optional[str] = None,
+    ) -> None:
+        if self._cam_stream is None:
+            log_info(self.out_log, "Raw record: skipped (camera not connected)")
+            return
+
+        with self._raw_record_lock:
+            if self._raw_record_active:
+                log_info(self.out_log, "Raw record: already running")
+                return
+            self._raw_record_active = True
+
+        duration_s = max(0.1, float(duration_s))
+        if not basename:
+            basename = _dt.datetime.now().strftime("raw_%Y%m%d_%H%M%S")
+
+        def _worker() -> None:
+            frames: list[np.ndarray] = []
+            try:
+                stream = self._cam_stream
+                if stream is None:
+                    log_info(self.out_log, "Raw record: aborted (camera disconnected)")
+                    return
+
+                t0 = _perf()
+                last_token: Optional[float] = None
+
+                log_info(self.out_log, f"Raw record: start duration={duration_s:.1f}s")
+                while (_perf() - t0) < duration_s and not self._stop.is_set():
+                    fr = stream.latest()
+                    if fr is None:
+                        time.sleep(0.001)
+                        continue
+                    seq = self._frame_seq(fr)
+                    token = float(seq) if seq is not None else float(fr.t_capture)
+                    if last_token is not None and token == last_token:
+                        time.sleep(0.0005)
+                        continue
+                    last_token = token
+                    try:
+                        raw16 = ensure_raw16_bayer(fr.raw)
+                    except Exception:
+                        raw16 = np.asarray(fr.raw)
+                    frames.append(raw16.copy())
+
+                if not frames:
+                    log_info(self.out_log, "Raw record: no frames captured")
+                    return
+
+                try:
+                    Path(out_dir).mkdir(parents=True, exist_ok=True)
+                except Exception:
+                    pass
+                out_path = os.path.join(out_dir, f"{basename}.npy")
+                stack = np.stack(frames, axis=0)
+                np.save(out_path, stack)
+                log_info(
+                    self.out_log,
+                    f"Raw record: saved {stack.shape[0]} frames to {out_path} (shape={stack.shape}, dtype={stack.dtype})",
+                )
+            except Exception as exc:
+                log_error(self.out_log, "Raw record: failed", exc)
+            finally:
+                with self._raw_record_lock:
+                    self._raw_record_active = False
+                    self._raw_record_thread = None
+
+        self._raw_record_thread = threading.Thread(target=_worker, name="RawRecord", daemon=True)
+        self._raw_record_thread.start()
+
 
     # -------------------------
     # Main loop
@@ -1225,6 +1316,14 @@ class AppRunner:
             name = str(p.get("name", ""))
             value = p.get("value", None)
             self._apply_camera_param(name, value)
+            return
+
+        if t == ActionType.CAMERA_RECORD_RAW:
+            if isinstance(p, dict):
+                duration_s = float(p.get("duration_s", 20.0))
+                out_dir = str(p.get("out_dir", "raw_output"))
+                basename = p.get("basename", None)
+                self._start_raw_recording(duration_s=duration_s, out_dir=out_dir, basename=basename)
             return
 
         if t == ActionType.RESET_CAMERA_DEFAULTS:

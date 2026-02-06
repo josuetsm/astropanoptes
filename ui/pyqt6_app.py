@@ -3,6 +3,7 @@ from __future__ import annotations
 import math
 import random
 import sys
+import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Sequence
@@ -577,10 +578,13 @@ class AstroPanoptesWindow(QMainWindow):
 
         self.btn_apply_cam = QPushButton("Apply")
         self.btn_apply_cam.clicked.connect(self._camera_apply)
+        self.btn_record_raw = QPushButton("Record 20s RAW (.npy)")
+        self.btn_record_raw.clicked.connect(self._camera_record_raw)
 
         form.addRow("Exposure:", self.ds_exp_ms)
         form.addRow("Gain:", self.sb_gain)
         form.addRow(self.btn_apply_cam)
+        form.addRow(self.btn_record_raw)
         box.setLayout(form)
 
         layout.addWidget(box)
@@ -1005,6 +1009,15 @@ class AstroPanoptesWindow(QMainWindow):
         self.runner.request_camera_param("exp_ms", exp_ms)
         self.runner.request_camera_param("gain", gain)
         self._log(f"[camera] apply exposure={exp_ms:.1f} ms gain={gain}")
+
+    def _camera_record_raw(self) -> None:
+        if not bool(self.runner.get_state().camera.connected):
+            self._log("[camera] Record RAW skipped (camera not connected)")
+            return
+        ts = time.strftime("%Y%m%d_%H%M%S")
+        basename = f"raw_{ts}"
+        self.runner.request_camera_record_raw(duration_s=20.0, out_dir="raw_output", basename=basename)
+        self._log(f"[camera] Record 20s RAW -> raw_output/{basename}.npy")
 
     def _connect_all(self) -> None:
         self.runner.request_camera_connect(self.cfg.camera.camera_index)
