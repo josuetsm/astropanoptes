@@ -1673,7 +1673,6 @@ class GoToWorker(BaseWorker):
             return None
 
         per_frame: List[np.ndarray] = []
-        per_frame_full: List[np.ndarray] = []
         t_list: List[float] = []
         min_sources = max(1, int(min_sources))
         for fr in frames:
@@ -1684,7 +1683,6 @@ class GoToWorker(BaseWorker):
             if k <= 0:
                 continue
             per_frame.append(fr.obj_xy[:k].astype(np.float64, copy=False))
-            per_frame_full.append(fr.obj_xy.astype(np.float64, copy=False))
             t_list.append(float(getattr(fr, "t_mono", fr.t_wall)))
 
         if len(per_frame) < int(min_frames):
@@ -1699,16 +1697,24 @@ class GoToWorker(BaseWorker):
         if t.size < 2:
             return None
         order = np.argsort(t)
+        t = t[order]
         per_frame = [per_frame[i] for i in order]
-        per_frame_full = [per_frame_full[i] for i in order]
 
         fps = float(fps)
-        use_fps = fps > 0.0 and np.isfinite(fps)
-        dt_frame = 1.0 / fps if use_fps else None
-        if use_fps:
-            duration_s = float((len(per_frame_full) - 1) * dt_frame)
+        dt_frame: Optional[float] = None
+        if fps > 0.0 and np.isfinite(fps):
+            dt_frame = 1.0 / fps
         else:
-            t = t[order]
+            diffs = np.diff(t)
+            diffs = diffs[diffs > 0.0]
+            if diffs.size > 0:
+                dt_frame = float(np.median(diffs))
+                if not np.isfinite(dt_frame) or dt_frame <= 0.0:
+                    dt_frame = None
+
+        if dt_frame is not None:
+            duration_s = float((len(per_frame) - 1) * dt_frame)
+        else:
             duration_s = float(t[-1] - t[0])
         if not np.isfinite(duration_s) or duration_s < float(min_duration_s):
             log_info(
@@ -1740,22 +1746,30 @@ class GoToWorker(BaseWorker):
             return None
         u = np.asarray(u, dtype=np.float64).reshape(2,)
 
-        # Estimate drift speed using shifts relative to the first frame.
+        # Estimate drift speed using flux-order matching of top-k sources.
         vels: List[np.ndarray] = []
         total_pairs = 0
-        for i in range(1, len(per_frame_full)):
-            if use_fps:
-                dt = float(dt_frame)
-            else:
-                dt = float(t[i] - t[i - 1])
+        for i in range(1, len(per_frame)):
+            dt = float(dt_frame) if dt_frame is not None else float(t[i] - t[i - 1])
             if dt <= 0.0:
                 continue
             total_pairs += 1
-            dx, dy, resp, _n = estimate_shift_from_objects(
-                per_frame_full[i - 1],
-                per_frame_full[i],
-                max_shift_px=float(max_shift_px),
-            )
+            ref = per_frame[i - 1]
+            cur = per_frame[i]
+            n_ref = int(ref.shape[0])
+            n_cur = int(cur.shape[0])
+            n = min(n_ref, n_cur)
+            if n < int(min_sources):
+                continue
+            shifts = ref[:n] - cur[:n]
+            mags = np.hypot(shifts[:, 0], shifts[:, 1])
+            good = mags <= float(max_shift_px)
+            if not np.any(good):
+                continue
+            shifts = shifts[good]
+            dx = float(np.median(shifts[:, 0]))
+            dy = float(np.median(shifts[:, 1]))
+            resp = float(int(np.count_nonzero(good)) / n)
             if float(resp) < float(min_resp):
                 continue
             # vels in image coords (+x right, +y down)
@@ -1777,7 +1791,7 @@ class GoToWorker(BaseWorker):
                 return v
 
         # Fallback: project positions onto drift axis and fit slope.
-        if use_fps:
+        if dt_frame is not None:
             t_rel = np.arange(len(per_frame), dtype=np.float64) * float(dt_frame)
         else:
             t_rel = t - t[0]
@@ -2096,11 +2110,6 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_DRIFT_PARAMS"
             return out
 
-        plate_scale_rad = float(platesolving_cfg.pixel_size_m) / float(platesolving_cfg.focal_m)
-        if not np.isfinite(plate_scale_rad) or plate_scale_rad <= 0.0:
-            out["status"] = "ERR_BAD_PLATE_SCALE"
-            return out
-
         if drift_line_fps <= 0.0:
             if float(getattr(st.camera, "fps_capture", 0.0)) > 0.0:
                 drift_line_fps = float(getattr(st.camera, "fps_capture", 0.0))
@@ -2131,6 +2140,11 @@ class GoToWorker(BaseWorker):
             f"jcal_probe_s={jcal_probe_s:.2f} probe_scale={jcal_probe_scale:.2f} "
             f"jcal_min_resp={jcal_min_resp:.2f} jcal_max_shift_px={jcal_max_shift_px:.1f}",
         )
+
+        plate_scale_rad = float(platesolving_cfg.pixel_size_m) / float(platesolving_cfg.focal_m)
+        if not np.isfinite(plate_scale_rad) or plate_scale_rad <= 0.0:
+            out["status"] = "ERR_BAD_PLATE_SCALE"
+            return out
 
         self._publish_state(
             {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "EXPOSURE_TUNE"}}
