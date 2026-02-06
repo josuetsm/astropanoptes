@@ -1747,12 +1747,14 @@ class GoToWorker(BaseWorker):
             )
             if float(resp) < float(min_resp):
                 continue
+            # vels in image coords (+x right, +y down)
             vels.append(np.array([-dx / dt, -dy / dt], dtype=np.float64))
 
         if vels:
             v_arr = np.stack(vels, axis=0)
             speed = float(np.median(v_arr @ u))
-            v = speed * u
+            v_img = speed * u
+            v = np.array([float(v_img[0]), -float(v_img[1])], dtype=np.float64)  # to +y up
             if np.all(np.isfinite(v)):
                 log_info(
                     self._out_log,
@@ -1775,7 +1777,8 @@ class GoToWorker(BaseWorker):
             A = np.column_stack([t_rel, np.ones_like(t_rel)])
             slope, _b = np.linalg.lstsq(A, t_f, rcond=None)[0]
 
-        v = float(slope) * u
+        v_img = float(slope) * u
+        v = np.array([float(v_img[0]), -float(v_img[1])], dtype=np.float64)  # to +y up
         if not np.all(np.isfinite(v)):
             return None
 
@@ -1947,7 +1950,9 @@ class GoToWorker(BaseWorker):
         cols: List[np.ndarray] = []
         resp_low = 0
         for fr in frames[1:]:
-            dt = float(fr.t_capture - base.t_capture)
+            base_t = float(getattr(base, "t_mono", base.t_wall))
+            fr_t = float(getattr(fr, "t_mono", fr.t_wall))
+            dt = float(fr_t - base_t)
             if dt <= 0.0:
                 continue
             dx, dy, resp, _n = estimate_shift_from_objects(
@@ -1958,7 +1963,8 @@ class GoToWorker(BaseWorker):
             if float(resp) < float(min_resp):
                 resp_low += 1
                 continue
-            dp = np.array([-dx, -dy], dtype=np.float64) - drift_pix * dt
+            # Convert shifts to +y up to match drift_pix convention.
+            dp = np.array([-dx, dy], dtype=np.float64) - drift_pix * dt
             steps = float(rate_steps_s) * dt
             if steps == 0.0:
                 continue
@@ -2234,7 +2240,7 @@ class GoToWorker(BaseWorker):
             deg_per_px = float(np.rad2deg(plate_scale_rad))
             scale_px_per_deg = 1.0 / deg_per_px if deg_per_px > 0.0 else 0.0
             vx = float(drift_pix[0])
-            vy_up = -float(drift_pix[1])
+            vy_up = float(drift_pix[1])
             sols = _drift_to_az_alt(
                 vx,
                 vy_up,
