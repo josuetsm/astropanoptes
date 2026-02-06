@@ -1658,6 +1658,8 @@ class GoToWorker(BaseWorker):
         bin_width_px: float,
         topk_bins_for_score: int,
         use_theil_sen: bool,
+        max_shift_px: float,
+        min_resp: float,
     ) -> Optional[np.ndarray]:
         if len(frames) < int(min_frames):
             log_info(
@@ -1667,6 +1669,7 @@ class GoToWorker(BaseWorker):
             return None
 
         per_frame: List[np.ndarray] = []
+        per_frame_full: List[np.ndarray] = []
         t_list: List[float] = []
         min_sources = max(1, int(min_sources))
         for fr in frames:
@@ -1677,6 +1680,7 @@ class GoToWorker(BaseWorker):
             if k <= 0:
                 continue
             per_frame.append(fr.obj_xy[:k].astype(np.float64, copy=False))
+            per_frame_full.append(fr.obj_xy.astype(np.float64, copy=False))
             t_list.append(float(fr.t_capture))
 
         if len(per_frame) < int(min_frames):
@@ -1721,6 +1725,37 @@ class GoToWorker(BaseWorker):
             return None
         u = np.asarray(u, dtype=np.float64).reshape(2,)
 
+        # Estimate drift speed using pairwise shifts between consecutive frames.
+        vels: List[np.ndarray] = []
+        total_pairs = 0
+        for i in range(1, len(per_frame_full)):
+            dt = float(t[i] - t[i - 1])
+            if dt <= 0.0:
+                continue
+            total_pairs += 1
+            dx, dy, resp, _n = estimate_shift_from_objects(
+                per_frame_full[i - 1],
+                per_frame_full[i],
+                max_shift_px=float(max_shift_px),
+            )
+            if float(resp) < float(min_resp):
+                continue
+            vels.append(np.array([-dx / dt, -dy / dt], dtype=np.float64))
+
+        if vels:
+            v_med = np.median(np.stack(vels, axis=0), axis=0)
+            v = float(np.dot(v_med, u)) * u
+            if np.all(np.isfinite(v)):
+                log_info(
+                    self._out_log,
+                    "GoTo: AutoCal drift line sweep "
+                    f"deg={float(best.get('deg', 0.0)):.2f} score={float(best.get('score', 0.0)):.3f} "
+                    f"v=[{float(v[0]):.3f},{float(v[1]):.3f}] pairs={len(vels)}/{total_pairs} "
+                    f"frames={len(per_frame)} pts={xy_all.shape[0]}",
+                )
+                return v
+
+        # Fallback: project positions onto drift axis and fit slope.
         t_rel = t - t[0]
         t_f = np.array([np.median(p @ u) for p in per_frame], dtype=np.float64)
         if not np.all(np.isfinite(t_f)):
@@ -1738,7 +1773,7 @@ class GoToWorker(BaseWorker):
 
         log_info(
             self._out_log,
-            "GoTo: AutoCal drift line sweep "
+            "GoTo: AutoCal drift line sweep (proj) "
             f"deg={float(best.get('deg', 0.0)):.2f} score={float(best.get('score', 0.0)):.3f} "
             f"slope={float(slope):.6f} v=[{float(v[0]):.3f},{float(v[1]):.3f}] "
             f"frames={len(per_frame)} pts={xy_all.shape[0]}",
@@ -1987,6 +2022,8 @@ class GoToWorker(BaseWorker):
         drift_line_bin_width_px = float(params.get("drift_line_bin_width_px", 2.0))
         drift_line_topk_bins = int(params.get("drift_line_topk_bins", 4))
         drift_line_use_theil_sen = bool(params.get("drift_line_use_theil_sen", True))
+        drift_line_max_shift_px = float(params.get("drift_line_max_shift_px", 50.0))
+        drift_line_min_resp = float(params.get("drift_line_min_resp", 0.1))
         pointing_method = str(params.get("pointing_method", "horiz_drift")).strip().lower()
         drift_pointing_omega = float(params.get("drift_pointing_omega_deg_s", 15.041))
         drift_capture_timeout_eff = float(drift_capture_timeout_s)
@@ -2041,6 +2078,7 @@ class GoToWorker(BaseWorker):
             f"drift_line_min_frames={drift_line_min_frames} min_dt={drift_line_min_duration_s:.2f} "
             f"drift_line_deg_step={drift_line_deg_step:.2f} bin_width={drift_line_bin_width_px:.2f} "
             f"drift_line_topk_bins={drift_line_topk_bins} "
+            f"drift_line_max_shift_px={drift_line_max_shift_px:.1f} min_resp={drift_line_min_resp:.2f} "
             f"pointing_method={pointing_method} omega={drift_pointing_omega:.3f} "
             f"jcal_rate_scale={jcal_rate_scale:.2f} "
             f"jcal_ramp_s={jcal_ramp_s:.2f} ramp_hz={jcal_ramp_hz:.1f} "
@@ -2153,6 +2191,8 @@ class GoToWorker(BaseWorker):
             bin_width_px=drift_line_bin_width_px,
             topk_bins_for_score=drift_line_topk_bins,
             use_theil_sen=drift_line_use_theil_sen,
+            max_shift_px=drift_line_max_shift_px,
+            min_resp=drift_line_min_resp,
         )
         if drift_pix is None:
             out["status"] = "ERR_DRIFT"
