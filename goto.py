@@ -590,6 +590,25 @@ def _apply_roll_to_drift(v: np.ndarray, roll_deg: float) -> np.ndarray:
     return np.array([c * vx + s * vy, -s * vx + c * vy], dtype=np.float64)
 
 
+def _roll_deg_from_drift_delta(dv: np.ndarray, slew_rate_steps_s: float) -> float:
+    """
+    Convert drift delta from roll estimation into camera roll (deg).
+
+    roll is defined as the orientation of the +AZ axis in image coords (+x right, +y up).
+    If the induced AZ slew was negative, dv points to -AZ and must be rotated 180 deg.
+    """
+    d = np.asarray(dv, dtype=np.float64).reshape(2,)
+    if not np.all(np.isfinite(d)):
+        raise ValueError("drift delta must be finite")
+
+    roll_deg = float(math.degrees(math.atan2(float(d[1]), float(d[0]))))
+    if np.isfinite(slew_rate_steps_s) and float(slew_rate_steps_s) < 0.0:
+        roll_deg = _wrap_deg_180(roll_deg + 180.0)
+    else:
+        roll_deg = _wrap_deg_180(roll_deg)
+    return float(roll_deg)
+
+
 def _now_time() -> Time:
     # astropy Time uses UTC by default
     return Time.now()
@@ -2540,7 +2559,8 @@ class GoToWorker(BaseWorker):
             )
             return out
 
-        roll_deg = float(math.degrees(math.atan2(float(dv[1]), float(dv[0]))))
+        roll_raw_deg = float(math.degrees(math.atan2(float(dv[1]), float(dv[0]))))
+        roll_deg = _roll_deg_from_drift_delta(dv, used_slew_rate)
         out["ok"] = True
         out["status"] = "OK"
         out["roll_deg"] = roll_deg
@@ -2550,7 +2570,8 @@ class GoToWorker(BaseWorker):
             self._out_log,
             "GoTo: Roll estimate OK "
             f"slew_rate_steps_s={used_slew_rate:+.2f} "
-            f"roll={roll_deg:+.3f}deg v0=[{float(v0[0]):.3f},{float(v0[1]):.3f}] "
+            f"roll_raw={roll_raw_deg:+.3f}deg roll={roll_deg:+.3f}deg "
+            f"v0=[{float(v0[0]):.3f},{float(v0[1]):.3f}] "
             f"v1=[{float(v1[0]):.3f},{float(v1[1]):.3f}] "
             f"dv=[{float(dv[0]):.3f},{float(dv[1]):.3f}]",
         )
@@ -2800,6 +2821,21 @@ class GoToWorker(BaseWorker):
         platesolving_cfg = self._get_platesolving_cfg()
         sep_cfg = self._get_sep_cfg()
         observer = self._get_observer()
+
+        ps_overrides: Dict[str, Any] = {}
+        if "N_seed" in params:
+            ps_overrides["N_seed"] = int(params.get("N_seed"))
+        if "min_inliers" in params:
+            ps_overrides["min_inliers"] = int(params.get("min_inliers"))
+        if ps_overrides:
+            try:
+                platesolving_cfg = replace(platesolving_cfg, **ps_overrides)
+            except Exception as exc:
+                log_error(
+                    self._out_log,
+                    f"GoTo: invalid autocal platesolving overrides ({ps_overrides})",
+                    exc,
+                )
 
         target_star_min = int(params.get("target_star_min", 3))
         target_star_max = int(params.get("target_star_max", 200))
@@ -3712,6 +3748,20 @@ class GoToWorker(BaseWorker):
                 stages = int(params.get("stages", goto_cfg.stages))
                 platesolving_feedback = bool(params.get("platesolving_feedback", goto_cfg.platesolving_feedback))
                 gain = float(params.get("gain", goto_cfg.gain))
+                ps_overrides: Dict[str, Any] = {}
+                if "N_seed" in params:
+                    ps_overrides["N_seed"] = int(params.get("N_seed"))
+                if "min_inliers" in params:
+                    ps_overrides["min_inliers"] = int(params.get("min_inliers"))
+                if ps_overrides:
+                    try:
+                        platesolving_cfg = replace(platesolving_cfg, **ps_overrides)
+                    except Exception as exc:
+                        log_error(
+                            self._out_log,
+                            f"GoTo: invalid platesolving overrides for request ({ps_overrides})",
+                            exc,
+                        )
                 max_step_per_iter = int(goto_cfg.max_step_per_iter)
                 if "max_step_per_iter" in params:
                     max_step_per_iter = int(params.get("max_step_per_iter"))

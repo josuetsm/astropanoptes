@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from config import AppConfig
-from goto import GoToModel, MountKinematics
+from goto import GoToModel, MountKinematics, _roll_deg_from_drift_delta
 from platesolving import select_guide_star_indices
 from stacking import StackEngine
 from tracking import make_tracking_state, tracking_step, tracking_set_params
@@ -61,6 +61,22 @@ class CoreSmokeTests(unittest.TestCase):
         model = GoToModel(kin=kin)
         model.init_from_mechanics()
         self.assertEqual(model.J_deg_per_step.shape, (2, 2))
+
+    def test_roll_deg_from_drift_delta_respects_slew_sign(self) -> None:
+        # +30 deg with positive slew => +30
+        dv_pos = np.array([np.cos(np.deg2rad(30.0)), np.sin(np.deg2rad(30.0))], dtype=np.float64)
+        roll_pos = _roll_deg_from_drift_delta(dv_pos, 25.0)
+        self.assertAlmostEqual(roll_pos, 30.0, places=6)
+
+        # +30 deg with negative slew flips measured vector, should still return +30
+        dv_neg = -dv_pos
+        roll_neg = _roll_deg_from_drift_delta(dv_neg, -25.0)
+        self.assertAlmostEqual(roll_neg, 30.0, places=6)
+
+        # -30 deg with negative slew should recover -30 (not +150)
+        dv_left = np.array([np.cos(np.deg2rad(150.0)), np.sin(np.deg2rad(150.0))], dtype=np.float64)
+        roll_left = _roll_deg_from_drift_delta(dv_left, -20.0)
+        self.assertAlmostEqual(roll_left, -30.0, places=6)
 
 
 if __name__ == "__main__":

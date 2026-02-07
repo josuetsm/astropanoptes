@@ -908,6 +908,14 @@ class AstroPanoptesWindow(QMainWindow):
         self.cb_fb.setChecked(self.cfg.goto.platesolving_feedback)
         self.cb_fb.toggled.connect(self.sb_stages.setEnabled)
 
+        self.sb_goto_ps_nseeds = QSpinBox()
+        self.sb_goto_ps_nseeds.setRange(0, 10)
+        self.sb_goto_ps_nseeds.setValue(self.cfg.platesolving.N_seed)
+
+        self.sb_goto_ps_mininl = QSpinBox()
+        self.sb_goto_ps_mininl.setRange(1, 100)
+        self.sb_goto_ps_mininl.setValue(self.cfg.platesolving.min_inliers)
+
         self.ds_autocal_ps_radius = QDoubleSpinBox()
         self.ds_autocal_ps_radius.setRange(0.1, 30.0)
         self.ds_autocal_ps_radius.setDecimals(2)
@@ -933,6 +941,14 @@ class AstroPanoptesWindow(QMainWindow):
         rowfb.addWidget(QLabel("AutoCal gmax:"))
         rowfb.addWidget(self.ds_autocal_ps_gmax)
         rowfb.addStretch(1)
+
+        rowps = QHBoxLayout()
+        rowps.addWidget(QLabel("N seeds:"))
+        rowps.addWidget(self.sb_goto_ps_nseeds)
+        rowps.addSpacing(12)
+        rowps.addWidget(QLabel("Min inliers:"))
+        rowps.addWidget(self.sb_goto_ps_mininl)
+        rowps.addStretch(1)
 
         self.btn_goto = QPushButton("GoTo")
         self.btn_cancel = QPushButton("Cancel")
@@ -965,6 +981,7 @@ class AstroPanoptesWindow(QMainWindow):
         form.addRow("mode:", self.dd_goto_mode)
         form.addRow("target:", self.tgt_frame)
         form.addRow(rowfb)
+        form.addRow(rowps)
         form.addRow(rowb)
         form.addRow("manual samples:", self.lbl_goto_samples)
 
@@ -1142,9 +1159,14 @@ class AstroPanoptesWindow(QMainWindow):
         params = {
             "platesolving_feedback": bool(self.cb_fb.isChecked()),
             "stages": int(self.sb_stages.value()),
+            "N_seed": int(self.sb_goto_ps_nseeds.value()),
+            "min_inliers": int(self.sb_goto_ps_mininl.value()),
         }
         self.runner.request_mount_goto(target, **params)
-        self._log(f"[goto] GoTo target={target}")
+        self._log(
+            f"[goto] GoTo target={target} "
+            f"(N_seed={params['N_seed']} min_inliers={params['min_inliers']})"
+        )
 
     def _goto_cancel(self) -> None:
         self.runner.request_goto_cancel()
@@ -1154,11 +1176,14 @@ class AstroPanoptesWindow(QMainWindow):
         params = {
             "autocal_solve_radius_deg": float(self.ds_autocal_ps_radius.value()),
             "autocal_solve_gmax": float(self.ds_autocal_ps_gmax.value()),
+            "N_seed": int(self.sb_goto_ps_nseeds.value()),
+            "min_inliers": int(self.sb_goto_ps_mininl.value()),
         }
         self.runner.request_goto_autocalibrate(params)
         self._log(
             "[goto] AutoCalibrate "
-            f"(radius={params['autocal_solve_radius_deg']:.2f}deg, gmax={params['autocal_solve_gmax']:.2f})"
+            f"(radius={params['autocal_solve_radius_deg']:.2f}deg, gmax={params['autocal_solve_gmax']:.2f}, "
+            f"N_seed={params['N_seed']}, min_inliers={params['min_inliers']})"
         )
 
     def _goto_estimate_roll(self) -> None:
