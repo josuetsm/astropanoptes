@@ -869,6 +869,21 @@ class GoToModel:
         self.last_solve_time = time.time()
         return int(len(self._manual_steps_abs))
 
+    def sync_from_latest_manual_sample(self) -> bool:
+        """Set absolute reference from the latest manual (steps, AltAz) sample."""
+        if not self._manual_steps_abs or not self._manual_az_alt_abs:
+            return False
+
+        ref_steps = _as_array2(self._manual_steps_abs[-1])
+        ref_az_alt = _as_array2(self._manual_az_alt_abs[-1])
+
+        self.synced = True
+        self.ref_steps = ref_steps.copy()
+        self.ref_az_alt_deg = ref_az_alt.copy()
+        self.last_solve_az_alt_deg = ref_az_alt.copy()
+        self.last_solve_time = time.time()
+        return True
+
     def fit_J_from_manual_samples(self, *, min_samples: int = 3, ridge: float = 1e-12) -> bool:
         """Fit J from absolute manual samples (steps, AltAz).
 
@@ -3755,7 +3770,11 @@ class GoToWorker(BaseWorker):
                 self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "RUNNING"}})
                 autocal_out = self._goto_autocalibrate_blocking(params)
                 autocal_ok = bool(autocal_out.get("ok", False))
-                autocal_reason = "READY" if autocal_ok else str(autocal_out.get("status", "UNKNOWN"))
+                autocal_status = str(autocal_out.get("status", "UNKNOWN"))
+                if autocal_ok:
+                    autocal_reason = "MANUAL_SAMPLE" if autocal_status == "OK_MANUAL_SAMPLE" else "READY"
+                else:
+                    autocal_reason = autocal_status
                 self._publish_state(
                     {
                         "goto": {
@@ -3793,10 +3812,14 @@ class GoToWorker(BaseWorker):
                 min_samples = int(params.get("min_samples", 3))
                 ridge = float(params.get("ridge", 1e-12))
                 ok = bool(self._goto.model.fit_J_from_manual_samples(min_samples=min_samples, ridge=ridge))
+                synced_from_manual = False
+                if ok and not bool(getattr(self._goto.model, "synced", False)):
+                    synced_from_manual = bool(self._goto.model.sync_from_latest_manual_sample())
                 self._publish_j_matrix_state()
                 self._publish_state(
                     {
                         "goto": {
+                            "synced": bool(getattr(self._goto.model, "synced", False)),
                             "status": GotoStatus.OK if ok else GotoStatus.FAIL,
                             "reason": None if ok else "ERR_INSUFFICIENT_SAMPLES",
                         }
@@ -3804,7 +3827,9 @@ class GoToWorker(BaseWorker):
                 )
                 log_info(
                     self._out_log,
-                    f"GoTo: FIT_MODEL ok={ok} min_samples={min_samples}",
+                    f"GoTo: FIT_MODEL ok={ok} min_samples={min_samples} "
+                    f"synced={bool(getattr(self._goto.model, 'synced', False))} "
+                    f"synced_from_manual={synced_from_manual}",
                 )
 
             else:
