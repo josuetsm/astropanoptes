@@ -243,8 +243,8 @@ def _drift_to_az_alt(
     vy: float,
     *,
     phi_deg: float,
-    omega_deg_s: float,
-    scale_deg_per_px: float,
+    omega_arcsec_s: float,
+    scale_arcsec_per_px: float,
     dedup_tol_deg: float = 1e-3,
     sort_by_forward_err: bool = True,
 ) -> List[Tuple[float, float]]:
@@ -253,8 +253,8 @@ def _drift_to_az_alt(
 
     Conventions:
       - +x right (east), +y up
-      - omega in deg/s
-      - scale in deg/px
+      - omega in arcsec/s
+      - scale in arcsec/px
     Returns 0, 1 or 2 solutions.
     """
     phi = math.radians(float(phi_deg))
@@ -264,8 +264,8 @@ def _drift_to_az_alt(
         log_error(None, "GoTo: drift_to_az_alt degenerate (cos(phi) ~ 0)")
         return []
 
-    omega = float(omega_deg_s)
-    scale = float(scale_deg_per_px)
+    omega = float(omega_arcsec_s)
+    scale = float(scale_arcsec_per_px)
     if omega <= 0.0 or scale <= 0.0:
         log_error(None, "GoTo: drift_to_az_alt invalid omega/scale")
         return []
@@ -398,8 +398,8 @@ def _drift_to_az_alt_refracted(
     vy: float,
     *,
     phi_deg: float,
-    omega_deg_s: float,
-    scale_deg_per_px: float,
+    omega_arcsec_s: float,
+    scale_arcsec_per_px: float,
     P_hPa: float = 1013.25,
     T_C: float = 15.0,
     max_iter: int = 12,
@@ -419,8 +419,8 @@ def _drift_to_az_alt_refracted(
         log_error(None, "GoTo: drift_to_az_alt_refracted degenerate (cos(phi) ~ 0)")
         return []
 
-    omega = float(omega_deg_s)
-    scale = float(scale_deg_per_px)
+    omega = float(omega_arcsec_s)
+    scale = float(scale_arcsec_per_px)
     if omega <= 0.0 or scale <= 0.0:
         log_error(None, "GoTo: drift_to_az_alt_refracted invalid omega/scale")
         return []
@@ -518,8 +518,8 @@ def _drift_to_az_alt_refracted(
         float(vx),
         float(vy),
         phi_deg=float(phi_deg),
-        omega_deg_s=float(omega_deg_s),
-        scale_deg_per_px=float(scale_deg_per_px),
+        omega_arcsec_s=float(omega_arcsec_s),
+        scale_arcsec_per_px=float(scale_arcsec_per_px),
         dedup_tol_deg=float(dedup_tol_deg),
         sort_by_forward_err=False,
     )
@@ -2642,7 +2642,12 @@ class GoToWorker(BaseWorker):
         drift_refract_max_iter = int(params.get("drift_refract_max_iter", 12))
         drift_refract_lm_lambda = float(params.get("drift_refract_lm_lambda", 1e-2))
         pointing_method = str(params.get("pointing_method", "horiz_drift")).strip().lower()
-        drift_pointing_omega = float(params.get("drift_pointing_omega_deg_s", 15.041))
+        drift_pointing_omega = float(
+            params.get(
+                "drift_pointing_omega_arcsec_s",
+                params.get("drift_pointing_omega_deg_s", 15.041),
+            )
+        )
         drift_capture_timeout_eff = float(drift_capture_timeout_s)
         if drift_line_min_frames > 0 and drift_dt_min > 0.0:
             drift_capture_timeout_eff += float(drift_dt_min) * 2.0
@@ -2730,7 +2735,7 @@ class GoToWorker(BaseWorker):
             f"vmax={drift_stack_vmax_px_s:.1f} fps={drift_stack_fps:.2f} "
             f"drift_refract_enable={int(bool(drift_refract_enable))} "
             f"P_hPa={drift_refract_P_hPa:.1f} T_C={drift_refract_T_C:.1f} "
-            f"pointing_method={pointing_method} omega={drift_pointing_omega:.3f} "
+            f"pointing_method={pointing_method} omega_arcsec_s={drift_pointing_omega:.3f} "
             f"jcal_rate_scale={jcal_rate_scale:.2f} "
             f"jcal_ramp_s={jcal_ramp_s:.2f} ramp_hz={jcal_ramp_hz:.1f} "
             f"jcal_plateau_s={jcal_plateau_s:.2f} frames={jcal_plateau_frames} "
@@ -2908,7 +2913,7 @@ class GoToWorker(BaseWorker):
         alt_hat = None
 
         if use_horizontal and best_drift_frame is not None:
-            deg_per_px = float(np.rad2deg(plate_scale_rad))
+            arcsec_per_px = float(np.rad2deg(plate_scale_rad) * 3600.0)
             vx = float(drift_pix_corr[0])
             vy_up = float(drift_pix_corr[1])
             if drift_refract_enable:
@@ -2916,8 +2921,8 @@ class GoToWorker(BaseWorker):
                     vx,
                     vy_up,
                     phi_deg=float(getattr(observer, "lat_deg", 0.0)),
-                    omega_deg_s=float(drift_pointing_omega),
-                    scale_deg_per_px=deg_per_px,
+                    omega_arcsec_s=float(drift_pointing_omega),
+                    scale_arcsec_per_px=arcsec_per_px,
                     P_hPa=float(drift_refract_P_hPa),
                     T_C=float(drift_refract_T_C),
                     max_iter=int(drift_refract_max_iter),
@@ -2928,8 +2933,8 @@ class GoToWorker(BaseWorker):
                     vx,
                     vy_up,
                     phi_deg=float(getattr(observer, "lat_deg", 0.0)),
-                    omega_deg_s=float(drift_pointing_omega),
-                    scale_deg_per_px=deg_per_px,
+                    omega_arcsec_s=float(drift_pointing_omega),
+                    scale_arcsec_per_px=arcsec_per_px,
                 )
             if not sols:
                 log_error(
