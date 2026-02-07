@@ -40,6 +40,12 @@ ROOT_DIR = Path(__file__).resolve().parents[1]
 if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
+OBSERVER_PRESETS = (
+    ("Algarrobo", {"lat_deg": -33.3667, "lon_deg": -71.6667, "height_m": 28.0}),
+    ("Estación Central (Santiago)", {"lat_deg": -33.4569, "lon_deg": -70.6990, "height_m": 520.0}),
+)
+BARLOW_FACTORS = (1, 2, 3, 4, 5)
+
 from actions import tracking_keyframe_reset
 from ap_types import Axis
 from app_runner import AppRunner
@@ -542,6 +548,7 @@ class AstroPanoptesWindow(QMainWindow):
 
     def _build_modules_tabs(self) -> QWidget:
         tabs = QTabWidget()
+        tabs.addTab(self._tab_observer(), "Observador")
         tabs.addTab(self._tab_camera(), "Camera")
         tabs.addTab(self._tab_tracking(), "Tracking")
         tabs.addTab(self._tab_stacking(), "Stacking")
@@ -557,6 +564,150 @@ class AstroPanoptesWindow(QMainWindow):
 
         self.modules_tabs = tabs
         return wrap
+
+    def _tab_observer(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
+
+        box = QGroupBox("Configuración del observador")
+        form = QFormLayout()
+
+        self.dd_obs_site = QComboBox()
+        for site_name, site_data in OBSERVER_PRESETS:
+            self.dd_obs_site.addItem(site_name, site_data)
+        self.dd_obs_site.currentIndexChanged.connect(self._observer_site_changed)
+
+        self.lbl_obs_site_coords = QLabel("--")
+
+        self.ds_obs_focal_mm = QDoubleSpinBox()
+        self.ds_obs_focal_mm.setRange(50.0, 10_000.0)
+        self.ds_obs_focal_mm.setDecimals(1)
+        self.ds_obs_focal_mm.setValue(float(self.cfg.platesolving.focal_m) * 1_000.0)
+        self.ds_obs_focal_mm.setSuffix(" mm")
+        self.ds_obs_focal_mm.valueChanged.connect(self._observer_refresh_effective_focal)
+
+        self.ds_obs_pixel_um = QDoubleSpinBox()
+        self.ds_obs_pixel_um.setRange(0.1, 20.0)
+        self.ds_obs_pixel_um.setDecimals(1)
+        self.ds_obs_pixel_um.setSingleStep(0.1)
+        self.ds_obs_pixel_um.setValue(round(float(self.cfg.platesolving.pixel_size_m) * 1e6, 1))
+        self.ds_obs_pixel_um.setSuffix(" µm")
+
+        self.dd_obs_barlow = QComboBox()
+        for factor in BARLOW_FACTORS:
+            label = "x1 (sin barlow)" if factor == 1 else f"x{factor}"
+            self.dd_obs_barlow.addItem(label, factor)
+        self.dd_obs_barlow.currentIndexChanged.connect(self._observer_refresh_effective_focal)
+
+        self.lbl_obs_effective_focal = QLabel("--")
+
+        self.cb_obs_rot_prior = QCheckBox("Prior de rotación (plate solving)")
+        self.cb_obs_rot_prior.setChecked(
+            bool(getattr(self.cfg.platesolving, "rotation_prior_enable", True))
+        )
+
+        self.ds_obs_rot_tol = QDoubleSpinBox()
+        self.ds_obs_rot_tol.setRange(1.0, 180.0)
+        self.ds_obs_rot_tol.setDecimals(1)
+        self.ds_obs_rot_tol.setValue(
+            float(getattr(self.cfg.platesolving, "rotation_prior_tol_deg", 45.0))
+        )
+        self.ds_obs_rot_tol.setSuffix(" deg")
+
+        self.btn_obs_apply = QPushButton("Apply")
+        self.btn_obs_apply.clicked.connect(self._observer_apply)
+
+        form.addRow("Ubicación:", self.dd_obs_site)
+        form.addRow("Lat/Lon/Alt:", self.lbl_obs_site_coords)
+        form.addRow("Focal:", self.ds_obs_focal_mm)
+        form.addRow("Tamaño píxel:", self.ds_obs_pixel_um)
+        form.addRow("Barlow:", self.dd_obs_barlow)
+        form.addRow("Focal efectiva:", self.lbl_obs_effective_focal)
+        form.addRow(self.cb_obs_rot_prior)
+        form.addRow("Tolerancia rotación:", self.ds_obs_rot_tol)
+        form.addRow(self.btn_obs_apply)
+
+        box.setLayout(form)
+        layout.addWidget(box)
+        layout.addStretch(1)
+
+        self._observer_site_changed()
+        self._observer_refresh_effective_focal()
+        return widget
+
+    def _observer_site_data(self) -> dict[str, float]:
+        data = self.dd_obs_site.currentData()
+        if isinstance(data, dict):
+            try:
+                return {
+                    "lat_deg": float(data["lat_deg"]),
+                    "lon_deg": float(data["lon_deg"]),
+                    "height_m": float(data["height_m"]),
+                }
+            except (KeyError, TypeError, ValueError):
+                pass
+        fallback = OBSERVER_PRESETS[0][1]
+        return {
+            "lat_deg": float(fallback["lat_deg"]),
+            "lon_deg": float(fallback["lon_deg"]),
+            "height_m": float(fallback["height_m"]),
+        }
+
+    def _observer_barlow_factor(self) -> int:
+        try:
+            factor = int(self.dd_obs_barlow.currentData())
+        except (TypeError, ValueError):
+            factor = 1
+        return max(1, min(5, factor))
+
+    def _observer_site_changed(self, *_args) -> None:
+        site = self._observer_site_data()
+        self.lbl_obs_site_coords.setText(
+            f"{site['lat_deg']:.4f}°, {site['lon_deg']:.4f}°, {site['height_m']:.0f} m"
+        )
+
+    def _observer_refresh_effective_focal(self, *_args) -> None:
+        base_focal_mm = float(self.ds_obs_focal_mm.value())
+        factor = self._observer_barlow_factor()
+        effective_focal_mm = base_focal_mm * factor
+        self.lbl_obs_effective_focal.setText(f"{effective_focal_mm:.1f} mm")
+
+    def _observer_apply(self) -> None:
+        site = self._observer_site_data()
+        base_focal_mm = float(self.ds_obs_focal_mm.value())
+        barlow_factor = self._observer_barlow_factor()
+        effective_focal_mm = base_focal_mm * barlow_factor
+        effective_focal_m = effective_focal_mm / 1_000.0
+        pixel_um = round(float(self.ds_obs_pixel_um.value()), 1)
+        pixel_size_m = pixel_um * 1e-6
+        rotation_prior_enable = bool(self.cb_obs_rot_prior.isChecked())
+        rotation_prior_tol_deg = float(self.ds_obs_rot_tol.value())
+        roll_offset_deg = float(self.runner.get_state().camera.roll_deg)
+
+        self.runner.request_platesolving_params(
+            focal_m=effective_focal_m,
+            pixel_size_m=pixel_size_m,
+            observer_lat_deg=float(site["lat_deg"]),
+            observer_lon_deg=float(site["lon_deg"]),
+            observer_height_m=float(site["height_m"]),
+            rotation_prior_enable=rotation_prior_enable,
+            rotation_prior_tol_deg=rotation_prior_tol_deg,
+            rotation_prior_roll_offset_deg=roll_offset_deg,
+        )
+        self.cfg.platesolving.focal_m = effective_focal_m
+        self.cfg.platesolving.pixel_size_m = pixel_size_m
+        self.cfg.platesolving.rotation_prior_enable = rotation_prior_enable
+        self.cfg.platesolving.rotation_prior_tol_deg = rotation_prior_tol_deg
+        self.cfg.platesolving.rotation_prior_roll_offset_deg = roll_offset_deg
+
+        self._log(
+            "[observer] apply "
+            f"site={self.dd_obs_site.currentText()} lat={site['lat_deg']:.4f} lon={site['lon_deg']:.4f} "
+            f"alt={site['height_m']:.0f}m focal={base_focal_mm:.1f}mm barlow=x{barlow_factor} "
+            f"effective={effective_focal_mm:.1f}mm pixel={pixel_um:.1f}um "
+            f"rot_prior={int(rotation_prior_enable)} tol={rotation_prior_tol_deg:.1f}deg roll={roll_offset_deg:+.2f}deg"
+        )
 
     def _tab_camera(self) -> QWidget:
         widget = QWidget()
@@ -916,6 +1067,26 @@ class AstroPanoptesWindow(QMainWindow):
         self.sb_goto_ps_mininl.setRange(1, 100)
         self.sb_goto_ps_mininl.setValue(self.cfg.platesolving.min_inliers)
 
+        self.sb_rightcal_steps = QSpinBox()
+        self.sb_rightcal_steps.setRange(1, 500)
+        self.sb_rightcal_steps.setValue(10)
+
+        self.sb_rightcal_step_microsteps = QSpinBox()
+        self.sb_rightcal_step_microsteps.setRange(1, 2_000_000)
+        self.sb_rightcal_step_microsteps.setValue(300)
+
+        self.ds_rightcal_radius = QDoubleSpinBox()
+        self.ds_rightcal_radius.setRange(0.1, 5.0)
+        self.ds_rightcal_radius.setDecimals(2)
+        self.ds_rightcal_radius.setValue(0.5)
+        self.ds_rightcal_radius.setSuffix(" deg")
+
+        self.ds_rightcal_theta_tol = QDoubleSpinBox()
+        self.ds_rightcal_theta_tol.setRange(1.0, 90.0)
+        self.ds_rightcal_theta_tol.setDecimals(1)
+        self.ds_rightcal_theta_tol.setValue(20.0)
+        self.ds_rightcal_theta_tol.setSuffix(" deg")
+
         self.ds_autocal_ps_radius = QDoubleSpinBox()
         self.ds_autocal_ps_radius.setRange(0.1, 30.0)
         self.ds_autocal_ps_radius.setDecimals(2)
@@ -928,6 +1099,29 @@ class AstroPanoptesWindow(QMainWindow):
         self.ds_autocal_ps_gmax.setRange(6.0, 20.0)
         self.ds_autocal_ps_gmax.setDecimals(2)
         self.ds_autocal_ps_gmax.setValue(float(self.cfg.platesolving.gmax))
+
+        self.dd_autocal_ps_mode = QComboBox()
+        self.dd_autocal_ps_mode.addItems(
+            ["deriva (actual)", "alt/az manual", "alt/az actual (registrado)"]
+        )
+
+        self.ds_autocal_ps_manual_az = QDoubleSpinBox()
+        self.ds_autocal_ps_manual_az.setRange(0.0, 360.0)
+        self.ds_autocal_ps_manual_az.setDecimals(6)
+
+        self.ds_autocal_ps_manual_alt = QDoubleSpinBox()
+        self.ds_autocal_ps_manual_alt.setRange(0.0, 90.0)
+        self.ds_autocal_ps_manual_alt.setDecimals(6)
+
+        self.autocal_manual_frame = QFrame()
+        row_manual = QHBoxLayout(self.autocal_manual_frame)
+        row_manual.setContentsMargins(0, 0, 0, 0)
+        row_manual.addWidget(QLabel("Az°"))
+        row_manual.addWidget(self.ds_autocal_ps_manual_az)
+        row_manual.addSpacing(10)
+        row_manual.addWidget(QLabel("Alt°"))
+        row_manual.addWidget(self.ds_autocal_ps_manual_alt)
+        row_manual.addStretch(1)
 
         rowfb = QHBoxLayout()
         rowfb.addWidget(self.cb_fb)
@@ -950,9 +1144,70 @@ class AstroPanoptesWindow(QMainWindow):
         rowps.addWidget(self.sb_goto_ps_mininl)
         rowps.addStretch(1)
 
+        rowcal = QHBoxLayout()
+        rowcal.addWidget(QLabel("Calib derecha pasos:"))
+        rowcal.addWidget(self.sb_rightcal_steps)
+        rowcal.addSpacing(10)
+        rowcal.addWidget(QLabel("µsteps/paso:"))
+        rowcal.addWidget(self.sb_rightcal_step_microsteps)
+        rowcal.addSpacing(10)
+        rowcal.addWidget(QLabel("PS radius:"))
+        rowcal.addWidget(self.ds_rightcal_radius)
+        rowcal.addSpacing(10)
+        rowcal.addWidget(QLabel("θ tol:"))
+        rowcal.addWidget(self.ds_rightcal_theta_tol)
+        rowcal.addStretch(1)
+
+        self.sb_calib_dpad_steps = QSpinBox()
+        self.sb_calib_dpad_steps.setRange(1, 2_000_000)
+        self.sb_calib_dpad_steps.setValue(300)
+
+        self.sb_calib_dpad_delay = QSpinBox()
+        self.sb_calib_dpad_delay.setRange(50, 200_000)
+        self.sb_calib_dpad_delay.setValue(int(self.cfg.goto.slew_delay_us))
+        self.sb_calib_dpad_delay.setSuffix(" µs")
+
+        def _mk_cal_btn(text: str) -> QToolButton:
+            button = QToolButton()
+            button.setText(text)
+            button.setFixedSize(QSize(28, 28))
+            button.setStyleSheet(
+                "QToolButton { border-radius:8px; background:#1f1f1f; border:1px solid #3a3a3a; "
+                "color:#e8e8e8; font-size:11px; }"
+                "QToolButton:hover { background:#262626; border:1px solid #5a5a5a; }"
+            )
+            return button
+
+        self.b_cal_up = _mk_cal_btn("▲")
+        self.b_cal_down = _mk_cal_btn("▼")
+        self.b_cal_left = _mk_cal_btn("◀")
+        self.b_cal_right = _mk_cal_btn("▶")
+
+        grid_cal = QGridLayout()
+        grid_cal.setHorizontalSpacing(4)
+        grid_cal.setVerticalSpacing(4)
+        grid_cal.setContentsMargins(0, 0, 0, 0)
+        grid_cal.addWidget(self.b_cal_up, 0, 1)
+        grid_cal.addWidget(self.b_cal_left, 1, 0)
+        grid_cal.addWidget(self.b_cal_right, 1, 2)
+        grid_cal.addWidget(self.b_cal_down, 2, 1)
+
+        self.calib_dpad_frame = QFrame()
+        rowd = QHBoxLayout(self.calib_dpad_frame)
+        rowd.setContentsMargins(0, 0, 0, 0)
+        rowd.addWidget(QLabel("steps:"))
+        rowd.addWidget(self.sb_calib_dpad_steps)
+        rowd.addSpacing(10)
+        rowd.addWidget(QLabel("delay_us:"))
+        rowd.addWidget(self.sb_calib_dpad_delay)
+        rowd.addSpacing(14)
+        rowd.addLayout(grid_cal)
+        rowd.addStretch(1)
+
         self.btn_goto = QPushButton("GoTo")
         self.btn_cancel = QPushButton("Cancel")
         self.btn_autocal = QPushButton("AutoCalibrate")
+        self.btn_rightcal = QPushButton("Calibrar Derecha Auto")
         self.btn_roll = QPushButton("Estimar Roll")
         self.btn_fit_model = QPushButton("Fit GoTo Model")
         self.btn_home = QPushButton("Home")
@@ -962,6 +1217,7 @@ class AstroPanoptesWindow(QMainWindow):
             self.btn_goto,
             self.btn_cancel,
             self.btn_autocal,
+            self.btn_rightcal,
             self.btn_roll,
             self.btn_fit_model,
             self.btn_home,
@@ -972,16 +1228,25 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_goto.clicked.connect(self._goto_start)
         self.btn_cancel.clicked.connect(self._goto_cancel)
         self.btn_autocal.clicked.connect(self._autocalibrate)
+        self.btn_rightcal.clicked.connect(self._goto_calibrate_right_scan)
         self.btn_roll.clicked.connect(self._goto_estimate_roll)
         self.btn_fit_model.clicked.connect(self._goto_fit_model)
         self.btn_home.clicked.connect(self._home)
+        self.b_cal_right.clicked.connect(lambda: self._goto_calibrate_dpad("right"))
+        self.b_cal_left.clicked.connect(lambda: self._goto_calibrate_dpad("left"))
+        self.b_cal_up.clicked.connect(lambda: self._goto_calibrate_dpad("up"))
+        self.b_cal_down.clicked.connect(lambda: self._goto_calibrate_dpad("down"))
 
         self.lbl_goto_samples = QLabel("0")
 
         form.addRow("mode:", self.dd_goto_mode)
         form.addRow("target:", self.tgt_frame)
         form.addRow(rowfb)
+        form.addRow("AutoCal PS mode:", self.dd_autocal_ps_mode)
+        form.addRow("AutoCal manual:", self.autocal_manual_frame)
         form.addRow(rowps)
+        form.addRow(rowcal)
+        form.addRow("Calib D-pad:", self.calib_dpad_frame)
         form.addRow(rowb)
         form.addRow("manual samples:", self.lbl_goto_samples)
 
@@ -991,7 +1256,9 @@ class AstroPanoptesWindow(QMainWindow):
 
         self.dd_goto_mode.currentIndexChanged.connect(self._goto_mode_switch)
         self.dd_radec_fmt.currentIndexChanged.connect(self._goto_mode_switch)
+        self.dd_autocal_ps_mode.currentIndexChanged.connect(self._autocal_ps_mode_switch)
         self._goto_mode_switch()
+        self._autocal_ps_mode_switch()
         return widget
 
     def _goto_mode_switch(self) -> None:
@@ -1047,6 +1314,20 @@ class AstroPanoptesWindow(QMainWindow):
             wrap_layout.setContentsMargins(0, 0, 0, 0)
             wrap_layout.addLayout(row)
             self.tgt_v.addWidget(wrap)
+
+    def _autocal_ps_mode_value(self) -> str:
+        mode = self.dd_autocal_ps_mode.currentText()
+        if mode.startswith("alt/az manual"):
+            return "manual_altaz"
+        if mode.startswith("alt/az actual"):
+            return "current_altaz"
+        return "drift"
+
+    def _autocal_ps_mode_switch(self) -> None:
+        manual = self._autocal_ps_mode_value() == "manual_altaz"
+        self.autocal_manual_frame.setVisible(manual)
+        self.ds_autocal_ps_manual_az.setEnabled(manual)
+        self.ds_autocal_ps_manual_alt.setEnabled(manual)
 
     def _camera_apply(self) -> None:
         exp_ms = float(self.ds_exp_ms.value())
@@ -1147,6 +1428,7 @@ class AstroPanoptesWindow(QMainWindow):
             max_i_scan=int(self.sb_ps_max_i_scan.value()),
             guide_n=int(self.sb_ps_guide_n.value()),
             simbad_radius_arcsec=float(self.ds_ps_simbad.value()),
+            rotation_prior_roll_offset_deg=float(self.runner.get_state().camera.roll_deg),
         )
         self.runner.request_platesolving_run(target=target)
         self._log(f"[plate solving] Solve target={target}")
@@ -1173,22 +1455,70 @@ class AstroPanoptesWindow(QMainWindow):
         self._log("[goto] Cancel")
 
     def _autocalibrate(self) -> None:
+        ps_mode = self._autocal_ps_mode_value()
         params = {
             "autocal_solve_radius_deg": float(self.ds_autocal_ps_radius.value()),
             "autocal_solve_gmax": float(self.ds_autocal_ps_gmax.value()),
             "N_seed": int(self.sb_goto_ps_nseeds.value()),
             "min_inliers": int(self.sb_goto_ps_mininl.value()),
+            "autocal_ps_mode": ps_mode,
         }
+        if ps_mode == "manual_altaz":
+            params["autocal_ps_target"] = {
+                "az_deg": float(self.ds_autocal_ps_manual_az.value()),
+                "alt_deg": float(self.ds_autocal_ps_manual_alt.value()),
+            }
         self.runner.request_goto_autocalibrate(params)
+        target_txt = ""
+        if "autocal_ps_target" in params:
+            target_txt = f", target={params['autocal_ps_target']}"
         self._log(
             "[goto] AutoCalibrate "
             f"(radius={params['autocal_solve_radius_deg']:.2f}deg, gmax={params['autocal_solve_gmax']:.2f}, "
-            f"N_seed={params['N_seed']}, min_inliers={params['min_inliers']})"
+            f"N_seed={params['N_seed']}, min_inliers={params['min_inliers']}, "
+            f"ps_mode={params['autocal_ps_mode']}{target_txt})"
         )
 
     def _goto_estimate_roll(self) -> None:
         self.runner.request_goto_estimate_roll()
         self._log("[goto] Estimar Roll")
+
+    def _goto_calibrate_right_scan(self) -> None:
+        params = {
+            "strategy": "direction_scan",
+            "scan_steps": int(self.sb_rightcal_steps.value()),
+            "scan_step_microsteps": int(self.sb_rightcal_step_microsteps.value()),
+            "scan_ps_radius_deg": float(self.ds_rightcal_radius.value()),
+            "scan_theta_tol_deg": float(self.ds_rightcal_theta_tol.value()),
+            "scan_direction": "right",
+            "N_seed": int(self.sb_goto_ps_nseeds.value()),
+            "min_inliers": int(self.sb_goto_ps_mininl.value()),
+        }
+        self.runner.request_goto_calibrate(params)
+        self._log(
+            "[goto] Calibrar derecha auto "
+            f"(pasos={params['scan_steps']}, microsteps={params['scan_step_microsteps']}, "
+            f"radius={params['scan_ps_radius_deg']:.2f}deg, theta_tol={params['scan_theta_tol_deg']:.1f}deg)"
+        )
+
+    def _goto_calibrate_dpad(self, direction: str) -> None:
+        params = {
+            "strategy": "direction_scan",
+            "scan_steps": 1,
+            "scan_step_microsteps": int(self.sb_calib_dpad_steps.value()),
+            "delay_us": int(self.sb_calib_dpad_delay.value()),
+            "scan_ps_radius_deg": float(self.ds_rightcal_radius.value()),
+            "scan_theta_tol_deg": float(self.ds_rightcal_theta_tol.value()),
+            "scan_direction": str(direction).strip().lower(),
+            "N_seed": int(self.sb_goto_ps_nseeds.value()),
+            "min_inliers": int(self.sb_goto_ps_mininl.value()),
+        }
+        self.runner.request_goto_calibrate(params)
+        self._log(
+            "[goto] Calib D-pad "
+            f"(dir={params['scan_direction']}, microsteps={params['scan_step_microsteps']}, "
+            f"delay_us={params['delay_us']}, radius={params['scan_ps_radius_deg']:.2f}deg)"
+        )
 
     def _goto_fit_model(self) -> None:
         self.runner.request_goto_fit_model()

@@ -116,6 +116,10 @@ class PlatesolvingConfig:
     # Instrument (SI)
     pixel_size_m: float = 2.9e-6
     focal_m: float = 0.9
+    rotation_prior_enable: bool = True
+    rotation_prior_tol_deg: float = 45.0
+    rotation_prior_roll_offset_deg: float = 0.0
+    rotation_prior_az_step_deg: float = 0.05
 
     # App-level control
     auto_solve: bool = False

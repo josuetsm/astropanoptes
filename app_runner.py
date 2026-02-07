@@ -825,6 +825,8 @@ class AppRunner:
     def _reset_platesolving_defaults(self) -> None:
         with self._platesolving_cfg_lock:
             self.cfg.platesolving = replace(self.default_cfg.platesolving)
+            self._platesolving_observer = ObserverConfig()
+            self._goto.cfg.observer = self._platesolving_observer
         self._live_sep_params = {
             "sep_bw": int(self.cfg.sep.bw),
             "sep_bh": int(self.cfg.sep.bh),
@@ -1560,6 +1562,19 @@ class AppRunner:
                 if "auto_target" in payload:
                     self._platesolving_auto_target = str(payload.pop("auto_target") or "")
 
+                observer_payload = {}
+                observer_keymap = {
+                    "observer_lat_deg": "lat_deg",
+                    "observer_lon_deg": "lon_deg",
+                    "observer_height_m": "height_m",
+                    "observer_refraction_enable": "refraction_enable",
+                    "observer_refraction_P_hPa": "refraction_P_hPa",
+                    "observer_refraction_T_C": "refraction_T_C",
+                }
+                for key, observer_field in observer_keymap.items():
+                    if key in payload:
+                        observer_payload[observer_field] = payload.pop(key)
+
                 # Rebuild dataclass con campos existentes
                 with self._platesolving_cfg_lock:
                     d = dict(self.cfg.platesolving.__dict__)
@@ -1567,8 +1582,29 @@ class AppRunner:
                         if k in d:
                             d[k] = v
                     self.cfg.platesolving = PlatesolvingConfig(**d)
+                    if observer_payload:
+                        obs = dict(self._platesolving_observer.__dict__)
+                        try:
+                            if "lat_deg" in observer_payload:
+                                obs["lat_deg"] = float(observer_payload["lat_deg"])
+                            if "lon_deg" in observer_payload:
+                                obs["lon_deg"] = float(observer_payload["lon_deg"])
+                            if "height_m" in observer_payload:
+                                obs["height_m"] = float(observer_payload["height_m"])
+                            if "refraction_enable" in observer_payload:
+                                obs["refraction_enable"] = bool(observer_payload["refraction_enable"])
+                            if "refraction_P_hPa" in observer_payload:
+                                obs["refraction_P_hPa"] = float(observer_payload["refraction_P_hPa"])
+                            if "refraction_T_C" in observer_payload:
+                                obs["refraction_T_C"] = float(observer_payload["refraction_T_C"])
+                            self._platesolving_observer = ObserverConfig(**obs)
+                            self._goto.cfg.observer = self._platesolving_observer
+                        except Exception as exc:
+                            log_error(self.out_log, "Platesolving: observer params rejected", exc)
                 if payload:
                     log_info(self.out_log, "Platesolving: params updated")
+                if observer_payload:
+                    log_info(self.out_log, "Platesolving: observer updated")
             return
 
         if t == ActionType.RESET_PLATESOLVING_DEFAULTS:

@@ -2798,6 +2798,364 @@ class GoToWorker(BaseWorker):
         )
         return _AutocalJResult(col=col, ok_count=len(cols), resp_low=resp_low, missing_frames=0)
 
+    def _goto_calibrate_right_scan_blocking(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "ok": False,
+            "status": "RUNNING",
+            "steps_done": 0,
+            "solves_ok": 0,
+            "fit_updates": 0,
+            "n_samples": 0,
+        }
+
+        st = self._get_state()
+        if not bool(st.camera.connected):
+            out["status"] = "ERR_NO_CAMERA"
+            return out
+        if not bool(st.mount.connected):
+            out["status"] = "ERR_NO_MOUNT"
+            return out
+
+        goto_cfg = self._get_goto_cfg()
+        mount_cfg = self._get_mount_cfg()
+        platesolving_cfg = self._get_platesolving_cfg()
+        sep_cfg = self._get_sep_cfg()
+        observer = self._get_observer()
+
+        ps_overrides: Dict[str, Any] = {}
+        if "N_seed" in params:
+            ps_overrides["N_seed"] = int(params.get("N_seed"))
+        if "min_inliers" in params:
+            ps_overrides["min_inliers"] = int(params.get("min_inliers"))
+        if ps_overrides:
+            try:
+                platesolving_cfg = replace(platesolving_cfg, **ps_overrides)
+            except Exception as exc:
+                log_error(
+                    self._out_log,
+                    f"GoTo: invalid right-scan platesolving overrides ({ps_overrides})",
+                    exc,
+                )
+
+        scan_steps = int(params.get("scan_steps", 10))
+        scan_step_microsteps = int(params.get("scan_step_microsteps", 300))
+        scan_ps_radius_deg = float(params.get("scan_ps_radius_deg", 0.5))
+        scan_ps_gmax = float(params.get("scan_ps_gmax", getattr(platesolving_cfg, "gmax", 15.0)))
+        scan_theta_tol_deg = float(params.get("scan_theta_tol_deg", 20.0))
+        scan_fit_min_samples = int(params.get("scan_fit_min_samples", 3))
+        scan_fit_ridge = float(params.get("scan_fit_ridge", 1e-12))
+        scan_sync_latest = bool(params.get("scan_sync_latest", True))
+        scan_direction = str(params.get("scan_direction", "right")).strip().lower()
+        delay_us = int(
+            params.get(
+                "delay_us",
+                getattr(goto_cfg, "slew_delay_us", getattr(goto_cfg, "slew_delay_us_az", 1200)),
+            )
+        )
+        settle_s = float(params.get("settle_s", goto_cfg.settle_s))
+
+        if scan_steps < 1:
+            out["status"] = "ERR_SCAN_STEPS"
+            return out
+        if scan_step_microsteps < 1:
+            out["status"] = "ERR_SCAN_STEP_SIZE"
+            return out
+        if not np.isfinite(scan_ps_radius_deg) or scan_ps_radius_deg <= 0.0:
+            out["status"] = "ERR_SCAN_PS_RADIUS"
+            return out
+        if not np.isfinite(scan_ps_gmax) or scan_ps_gmax <= 0.0:
+            out["status"] = "ERR_SCAN_PS_GMAX"
+            return out
+        if not np.isfinite(scan_theta_tol_deg) or scan_theta_tol_deg <= 0.0:
+            out["status"] = "ERR_SCAN_THETA_TOL"
+            return out
+        if scan_fit_min_samples < 2:
+            scan_fit_min_samples = 2
+        if not np.isfinite(scan_fit_ridge) or scan_fit_ridge < 0.0:
+            scan_fit_ridge = 1e-12
+        if delay_us < 50:
+            delay_us = 50
+        if settle_s < 0.0:
+            settle_s = 0.0
+
+        scan_axis: Optional[Axis] = None
+        move_dir = 0
+        if scan_direction in ("right", "+", "az+"):
+            scan_axis = Axis.AZ
+            move_dir = +1
+        elif scan_direction in ("left", "-", "az-"):
+            scan_axis = Axis.AZ
+            move_dir = -1
+        elif scan_direction in ("up", "alt+"):
+            scan_axis = Axis.ALT
+            move_dir = +1
+        elif scan_direction in ("down", "alt-"):
+            scan_axis = Axis.ALT
+            move_dir = -1
+        else:
+            out["status"] = "ERR_SCAN_DIRECTION"
+            return out
+
+        if scan_axis == Axis.AZ and bool(getattr(mount_cfg, "invert_az", False)):
+            move_dir *= -1
+        if scan_axis == Axis.ALT and bool(getattr(mount_cfg, "invert_alt", False)):
+            move_dir *= -1
+        signed_step = float(move_dir * scan_step_microsteps)
+
+        def _coerce_altaz(raw_target: Any) -> Optional[Tuple[float, float]]:
+            try:
+                if isinstance(raw_target, dict):
+                    if "az_deg" in raw_target and "alt_deg" in raw_target:
+                        az = float(raw_target.get("az_deg"))
+                        alt = float(raw_target.get("alt_deg"))
+                    elif "az" in raw_target and "alt" in raw_target:
+                        az = float(raw_target.get("az"))
+                        alt = float(raw_target.get("alt"))
+                    else:
+                        return None
+                else:
+                    arr = np.asarray(raw_target, dtype=np.float64).reshape(-1)
+                    if arr.size < 2:
+                        return None
+                    az = float(arr[0])
+                    alt = float(arr[1])
+            except Exception:
+                return None
+            if not np.isfinite(az) or not np.isfinite(alt):
+                return None
+            az = _wrap_deg_360(az)
+            alt = float(np.clip(alt, goto_cfg.alt_min_deg, goto_cfg.alt_max_deg))
+            return (az, alt)
+
+        def _current_altaz() -> Optional[Tuple[float, float]]:
+            model_altaz = self._goto.model.current_az_alt_deg()
+            if model_altaz is not None:
+                parsed = _coerce_altaz(model_altaz)
+                if parsed is not None:
+                    return parsed
+            st_now = self._get_state()
+            if bool(getattr(st_now.goto, "pointing_valid", False)):
+                parsed = _coerce_altaz(
+                    {
+                        "az_deg": float(getattr(st_now.goto, "pointing_az_deg", 0.0)),
+                        "alt_deg": float(getattr(st_now.goto, "pointing_alt_deg", 0.0)),
+                    }
+                )
+                if parsed is not None:
+                    return parsed
+            if bool(getattr(st_now.platesolving, "last_ok", False)):
+                try:
+                    az_alt = platesolving_center_to_altaz_deg(
+                        float(getattr(st_now.platesolving, "center_ra_deg", 0.0)),
+                        float(getattr(st_now.platesolving, "center_dec_deg", 0.0)),
+                        observer=observer,
+                        obstime=Time.now(),
+                    )
+                    parsed = _coerce_altaz(az_alt)
+                    if parsed is not None:
+                        return parsed
+                except Exception as exc:
+                    log_error(self._out_log, "GoTo: right-scan failed to decode last platesolve center", exc)
+            if bool(getattr(self._goto.model, "synced", False)):
+                try:
+                    parsed = _coerce_altaz(self._goto.model.predict_az_alt_deg())
+                    if parsed is not None:
+                        return parsed
+                except Exception:
+                    pass
+            return None
+
+        def _theta_dist_mod180(a_deg: float, b_deg: float) -> float:
+            d = abs((float(a_deg) - float(b_deg)) % 180.0)
+            return float(min(d, 180.0 - d))
+
+        theta_ref: Optional[float] = None
+
+        def _solve_near_altaz(az_deg: float, alt_deg: float, *, label: str, step_idx: int) -> Optional[PlatesolvingResult]:
+            if self._op_cancel.is_set():
+                out["status"] = "CANCELLED"
+                return None
+            obstime = Time.now()
+            try:
+                target_icrs = parse_target_to_icrs(
+                    {"az_deg": float(az_deg), "alt_deg": float(alt_deg)},
+                    observer=observer,
+                    obstime=obstime,
+                ).icrs
+                target = (float(target_icrs.ra.deg), float(target_icrs.dec.deg))
+            except Exception as exc:
+                out["status"] = f"ERR_SCAN_TARGET_STEP_{step_idx}"
+                log_error(self._out_log, "GoTo: right-scan failed to transform AltAz -> ICRS", exc)
+                return None
+
+            raw16 = self._get_live_raw16()
+            if raw16 is None:
+                frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
+                if not frames:
+                    out["status"] = f"ERR_SCAN_NO_FRAME_STEP_{step_idx}"
+                    return None
+                raw16 = frames[0].raw16
+
+            log_info(
+                self._out_log,
+                "GoTo: right-scan platesolve "
+                f"{label} step={step_idx} target_az={float(az_deg):.3f} target_alt={float(alt_deg):.3f} "
+                f"target_ra={float(target[0]):.6f} target_dec={float(target[1]):.6f} "
+                f"radius={scan_ps_radius_deg:.2f}",
+            )
+            result = self._autocal_run_platesolve(
+                raw16,
+                target=target,
+                platesolving_cfg=platesolving_cfg,
+                sep_cfg=sep_cfg,
+                observer=observer,
+                obstime=obstime,
+                solve_radius_deg=scan_ps_radius_deg,
+                solve_gmax=scan_ps_gmax,
+            )
+            if not bool(getattr(result, "success", False)):
+                out["status"] = f"ERR_SCAN_PLATESOLVING_STEP_{step_idx}"
+                return None
+            return result
+
+        def _consume_solution(
+            result: PlatesolvingResult,
+            *,
+            step_idx: int,
+            update_model: bool = True,
+        ) -> bool:
+            nonlocal theta_ref
+            theta = float(getattr(result, "theta_deg", float("nan")))
+            if not np.isfinite(theta):
+                out["status"] = f"ERR_SCAN_THETA_STEP_{step_idx}"
+                return False
+            if theta_ref is None:
+                theta_ref = theta
+            else:
+                dtheta = _theta_dist_mod180(theta, float(theta_ref))
+                if dtheta > float(scan_theta_tol_deg):
+                    out["status"] = f"ERR_SCAN_THETA_INCONSISTENT_STEP_{step_idx}"
+                    log_error(
+                        self._out_log,
+                        "GoTo: right-scan theta inconsistent "
+                        f"step={step_idx} theta={theta:.3f} theta_ref={float(theta_ref):.3f} dtheta={dtheta:.3f}",
+                    )
+                    return False
+
+            if not update_model:
+                return True
+
+            az_alt = platesolving_center_to_altaz_deg(
+                float(result.center_ra_deg),
+                float(result.center_dec_deg),
+                observer=observer,
+                obstime=Time.now(),
+            )
+            n_samples = int(self._goto.model.add_manual_sample(az_alt))
+            out["n_samples"] = n_samples
+            out["solves_ok"] = int(out["solves_ok"]) + 1
+            self._publish_state(
+                {
+                    "goto": {
+                        "manual_samples": n_samples,
+                        "autocal_az_deg": float(az_alt[0]),
+                        "autocal_alt_deg": float(az_alt[1]),
+                        "autocal_radius_deg": float(scan_ps_radius_deg),
+                    }
+                }
+            )
+
+            fit_ok = bool(
+                self._goto.model.fit_J_from_manual_samples(
+                    min_samples=int(max(2, scan_fit_min_samples)),
+                    ridge=float(scan_fit_ridge),
+                )
+            )
+            if fit_ok:
+                out["fit_updates"] = int(out["fit_updates"]) + 1
+                if scan_sync_latest:
+                    _ = bool(self._goto.model.sync_from_latest_manual_sample())
+                self._publish_j_matrix_state()
+                self._publish_state({"goto": {"synced": bool(getattr(self._goto.model, "synced", False))}})
+            return True
+
+        log_info(
+            self._out_log,
+            "GoTo: right-scan calibration start "
+            f"steps={scan_steps} microsteps={scan_step_microsteps} axis={scan_axis.value} dir={scan_direction} "
+            f"cmd_dir={move_dir:+d} ps_radius={scan_ps_radius_deg:.2f} theta_tol={scan_theta_tol_deg:.1f}",
+        )
+
+        altaz0 = _current_altaz()
+        if altaz0 is None:
+            out["status"] = "ERR_SCAN_NO_CURRENT"
+            return out
+
+        self._publish_state({"goto": {"status": GotoStatus.RUNNING, "reason": "CALIBRATE_RIGHT_SCAN_BASE"}})
+        base_result = _solve_near_altaz(float(altaz0[0]), float(altaz0[1]), label="base", step_idx=0)
+        if base_result is None:
+            return out
+        if not _consume_solution(base_result, step_idx=0, update_model=False):
+            return out
+
+        for step_idx in range(1, int(scan_steps) + 1):
+            if self._op_cancel.is_set():
+                out["status"] = "CANCELLED"
+                return out
+
+            self._publish_state(
+                {"goto": {"status": GotoStatus.RUNNING, "reason": f"CALIBRATE_RIGHT_SCAN_MOVE_{step_idx}"}}
+            )
+            self._exec_steps(
+                self._move_steps,
+                scan_axis,
+                signed_steps=signed_step,
+                delay_us=int(delay_us),
+            )
+            try:
+                self._stop_mount()
+            except Exception:
+                pass
+            if settle_s > 0.0:
+                time.sleep(float(settle_s))
+
+            altaz_est = _current_altaz()
+            if altaz_est is None:
+                out["status"] = f"ERR_SCAN_NO_CURRENT_STEP_{step_idx}"
+                return out
+
+            self._publish_state(
+                {"goto": {"status": GotoStatus.RUNNING, "reason": f"CALIBRATE_RIGHT_SCAN_SOLVE_{step_idx}"}}
+            )
+            result = _solve_near_altaz(float(altaz_est[0]), float(altaz_est[1]), label="scan", step_idx=step_idx)
+            if result is None:
+                return out
+            if not _consume_solution(result, step_idx=step_idx):
+                return out
+            out["steps_done"] = int(step_idx)
+
+        out["ok"] = True
+        out["status"] = "OK"
+        self._publish_state(
+            {
+                "goto": {
+                    "status": GotoStatus.OK,
+                    "reason": None,
+                    "autocal_last_ok": True,
+                    "autocal_status": GotoAutocalStatus.OK,
+                    "autocal_reason": "RIGHT_SCAN_READY",
+                    "synced": bool(getattr(self._goto.model, "synced", False)),
+                }
+            }
+        )
+        log_info(
+            self._out_log,
+            "GoTo: right-scan calibration OK "
+            f"steps_done={out['steps_done']} solves_ok={out['solves_ok']} "
+            f"fit_updates={out['fit_updates']} samples={out['n_samples']}",
+        )
+        return out
+
     def _goto_autocalibrate_blocking(self, params: Dict[str, Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "ok": False,
@@ -2906,6 +3264,14 @@ class GoToWorker(BaseWorker):
             params.get("autocal_solve_radius_deg", getattr(platesolving_cfg, "search_radius_deg", 1.0) or 1.0)
         )
         autocal_solve_gmax = float(params.get("autocal_solve_gmax", getattr(platesolving_cfg, "gmax", 15.0)))
+        autocal_ps_mode_raw = str(params.get("autocal_ps_mode", "drift")).strip().lower()
+        if autocal_ps_mode_raw in ("manual", "manual_altaz", "manual-altaz"):
+            autocal_ps_mode = "manual_altaz"
+        elif autocal_ps_mode_raw in ("current", "current_altaz", "current-altaz", "live", "registered"):
+            autocal_ps_mode = "current_altaz"
+        else:
+            autocal_ps_mode = "drift"
+        autocal_ps_target_raw = params.get("autocal_ps_target", None)
 
         if self._rate_mount is None:
             out["status"] = "ERR_NO_RATE"
@@ -2971,6 +3337,7 @@ class GoToWorker(BaseWorker):
             f"drift_refract_enable={int(bool(drift_refract_enable))} "
             f"P_hPa={drift_refract_P_hPa:.1f} T_C={drift_refract_T_C:.1f} "
             f"autocal_ps_radius_deg={autocal_solve_radius_deg:.2f} autocal_ps_gmax={autocal_solve_gmax:.2f} "
+            f"autocal_ps_mode={autocal_ps_mode} "
             f"pointing_method={pointing_method} omega_arcsec_s={drift_pointing_omega:.3f} "
             f"jcal_rate_scale={jcal_rate_scale:.2f} "
             f"jcal_ramp_s={jcal_ramp_s:.2f} ramp_hz={jcal_ramp_hz:.1f} "
@@ -3042,6 +3409,218 @@ class GoToWorker(BaseWorker):
             f"exp_ms={float(getattr(cam_cfg, 'exp_ms', 0.0)):.2f} "
             f"gain={int(getattr(cam_cfg, 'gain', 0))}",
         )
+
+        def _coerce_altaz_target(raw_target: Any) -> Optional[Tuple[float, float]]:
+            az: Optional[float] = None
+            alt: Optional[float] = None
+            if isinstance(raw_target, dict):
+                if "az_deg" in raw_target and "alt_deg" in raw_target:
+                    az = float(raw_target.get("az_deg"))
+                    alt = float(raw_target.get("alt_deg"))
+                elif "az" in raw_target and "alt" in raw_target:
+                    az = float(raw_target.get("az"))
+                    alt = float(raw_target.get("alt"))
+            elif isinstance(raw_target, (tuple, list)) and len(raw_target) >= 2:
+                az = float(raw_target[0])
+                alt = float(raw_target[1])
+            if az is None or alt is None:
+                return None
+            if not np.isfinite(az) or not np.isfinite(alt):
+                return None
+            az = _wrap_deg_360(float(az))
+            alt = float(np.clip(float(alt), goto_cfg.alt_min_deg, goto_cfg.alt_max_deg))
+            return (az, alt)
+
+        def _resolve_current_altaz_target() -> Optional[Tuple[float, float]]:
+            try:
+                model_altaz = self._goto.model.current_az_alt_deg()
+            except Exception:
+                model_altaz = None
+            if model_altaz is not None:
+                coerced = _coerce_altaz_target(model_altaz)
+                if coerced is not None:
+                    return coerced
+            st_now = self._get_state()
+            if bool(getattr(st_now.goto, "pointing_valid", False)):
+                return _coerce_altaz_target(
+                    {
+                        "az_deg": float(getattr(st_now.goto, "pointing_az_deg", 0.0)),
+                        "alt_deg": float(getattr(st_now.goto, "pointing_alt_deg", 0.0)),
+                    }
+                )
+            return None
+
+        if autocal_ps_mode != "drift":
+            if autocal_ps_mode == "manual_altaz":
+                target_base = _coerce_altaz_target(autocal_ps_target_raw)
+            else:
+                target_base = _resolve_current_altaz_target()
+            if target_base is None:
+                out["status"] = "ERR_AUTOCAL_PS_TARGET"
+                log_error(
+                    self._out_log,
+                    f"GoTo: AutoCal invalid target for mode={autocal_ps_mode}",
+                )
+                return out
+
+            az_hat = float(target_base[0])
+            alt_hat = float(target_base[1])
+            out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
+            self._publish_state(
+                {
+                    "goto": {
+                        "autocal_az_deg": az_hat,
+                        "autocal_alt_deg": alt_hat,
+                        "autocal_radius_deg": 1.0,
+                        "autocal_status": GotoAutocalStatus.RUNNING,
+                        "autocal_reason": "PLATESOLVING_LOOP",
+                    }
+                }
+            )
+
+            jitter_seq = [
+                (0.0, 0.0),
+                (jitter_deg, 0.0),
+                (-jitter_deg, 0.0),
+                (0.0, jitter_deg),
+                (0.0, -jitter_deg),
+            ]
+            platesolving_result: Optional[PlatesolvingResult] = None
+            attempts = 0
+            while attempts < int(solve_attempts):
+                if self._op_cancel.is_set():
+                    out["status"] = "CANCELLED"
+                    return out
+                frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
+                if not frames:
+                    attempts += 1
+                    continue
+                fr = frames[0]
+                changed = self._autocal_adjust_exposure(
+                    star_count=fr.star_count,
+                    saturation_frac=fr.saturation_frac,
+                    target_min=target_star_min,
+                    target_max=target_star_max,
+                    sat_max=target_sat_max,
+                    exp_min_ms=exp_min_ms,
+                    exp_max_ms=exp_max_ms,
+                    exp_step=exp_step,
+                    gain_min=gain_min,
+                    gain_max=gain_max,
+                    gain_step=gain_step,
+                    settle_s=tune_settle_s,
+                )
+                if changed:
+                    continue
+
+                jitter = jitter_seq[attempts % len(jitter_seq)]
+                target = {
+                    "az_deg": _wrap_deg_360(az_hat + float(jitter[0])),
+                    "alt_deg": float(np.clip(alt_hat + float(jitter[1]), goto_cfg.alt_min_deg, goto_cfg.alt_max_deg)),
+                }
+                if attempts == 0:
+                    log_info(
+                        self._out_log,
+                        "GoTo: AutoCal platesolve first target "
+                        f"mode={autocal_ps_mode} "
+                        f"az={float(target['az_deg']):.3f}deg "
+                        f"alt={float(target['alt_deg']):.3f}deg "
+                        f"radius={1.0:.3f}deg "
+                        f"jitter=({float(jitter[0]):.3f},{float(jitter[1]):.3f})",
+                    )
+                platesolving_result = self._autocal_run_platesolve(
+                    fr.raw16,
+                    target=target,
+                    platesolving_cfg=platesolving_cfg,
+                    sep_cfg=sep_cfg,
+                    observer=observer,
+                    obstime=Time.now(),
+                    solve_radius_deg=autocal_solve_radius_deg,
+                    solve_gmax=autocal_solve_gmax,
+                )
+                attempts += 1
+                if bool(getattr(platesolving_result, "success", False)):
+                    break
+
+            if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
+                out["status"] = "ERR_PLATESOLVING"
+                out["platesolving_result"] = platesolving_result
+                return out
+
+            out["platesolving_result"] = platesolving_result
+
+            manual_only = bool(params.get("manual_only", True))
+            if manual_only:
+                az_alt = platesolving_center_to_altaz_deg(
+                    float(platesolving_result.center_ra_deg),
+                    float(platesolving_result.center_dec_deg),
+                    observer=observer,
+                    obstime=Time.now(),
+                )
+                n_samples = int(self._goto.model.add_manual_sample(az_alt))
+                self._publish_state(
+                    {
+                        "goto": {
+                            "status": GotoStatus.OK,
+                            "reason": None,
+                            "autocal_last_ok": True,
+                            "autocal_status": GotoAutocalStatus.OK,
+                            "autocal_reason": "MANUAL_SAMPLE",
+                            "manual_samples": n_samples,
+                        }
+                    }
+                )
+                out["ok"] = True
+                out["status"] = "OK_MANUAL_SAMPLE"
+                out["manual_samples"] = n_samples
+                return out
+
+            self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "SYNC"}})
+            ok_sync = bool(self._goto.sync_from_platesolving(platesolving_result))
+            self._publish_state(
+                {
+                    "goto": {
+                        "synced": ok_sync,
+                        "status": GotoStatus.OK if ok_sync else GotoStatus.FAIL,
+                        "reason": None if ok_sync else "SYNC_FAILED",
+                    }
+                }
+            )
+            if not ok_sync:
+                out["status"] = "ERR_SYNC"
+                return out
+
+            self._publish_state(
+                {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "CALIBRATE_J"}}
+            )
+
+            def _get_live_frame_for_calib() -> Optional[np.ndarray]:
+                return self._get_live_raw16()
+
+            calib_out = self._goto.calibrate_blocking(
+                get_live_frame=_get_live_frame_for_calib,
+                move_steps=self._move_steps,
+                stop=self._stop_mount,
+                platesolving_cfg=platesolving_cfg,
+                n_samples=int(params.get("calib_samples", goto_cfg.calib_samples)),
+                max_radius_deg=float(params.get("calib_max_radius_deg", goto_cfg.calib_max_radius_deg)),
+            )
+            if not bool(calib_out.get("ok", False)):
+                out["status"] = "ERR_CALIBRATE_J"
+                return out
+
+            out["ok"] = True
+            out["status"] = "OK"
+            self._publish_state(
+                {
+                    "goto": {
+                        "autocal_last_ok": True,
+                        "autocal_status": GotoAutocalStatus.OK,
+                        "autocal_reason": "READY",
+                    }
+                }
+            )
+            return out
 
         self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "DRIFT"}})
         drift_frames_list = self._autocal_capture_frames(
@@ -3815,6 +4394,32 @@ class GoToWorker(BaseWorker):
                     )
 
             elif kind == "calibrate":
+                strategy = str(params.get("strategy", "default")).strip().lower()
+
+                if strategy in ("right_scan", "scan_right", "right", "direction_scan", "dir_scan"):
+                    calib_out = self._goto_calibrate_right_scan_blocking(params)
+                    calib_ok = bool(calib_out.get("ok", False))
+                    calib_status = str(calib_out.get("status", "UNKNOWN"))
+                    calib_samples = int(calib_out.get("n_samples", 0))
+                    self._publish_state(
+                        {
+                            "goto": {
+                                "status": GotoStatus.OK if calib_ok else GotoStatus.FAIL,
+                                "reason": f"CALIBRATE_RIGHT_SCAN_{calib_status}",
+                            }
+                        }
+                    )
+                    log_info(
+                        self._out_log,
+                        "GoTo: CALIBRATE_RIGHT_SCAN "
+                        f"status={calib_status} ok={calib_ok} "
+                        f"steps_done={int(calib_out.get('steps_done', 0))} "
+                        f"solves_ok={int(calib_out.get('solves_ok', 0))} "
+                        f"samples={calib_samples}",
+                    )
+                    self._publish_j_matrix_state()
+                    return
+
                 if "n_samples" not in params and "samples" in params:
                     params["n_samples"] = params.get("samples")
                 if "max_radius_deg" not in params and "radius_deg" in params:

@@ -43,6 +43,7 @@ __all__ = [
     "GuideStar",
     "PlatesolvingResult",
     "TargetParseError",
+    "expected_field_rotation_deg",
     "solve_plate",
     "PlatesolvingWorker",
     "pixel_to_radec",
@@ -295,6 +296,70 @@ def _icrs_to_altaz_app_deg(
             T_C=float(getattr(observer, "refraction_T_C", 15.0)),
         )
     return float(az), float(alt)
+
+
+def _wrap_deg_180(angle_deg: float) -> float:
+    return float(((float(angle_deg) + 180.0) % 360.0) - 180.0)
+
+
+def _angle_distance_deg(a_deg: float, b_deg: float) -> float:
+    return float(abs(_wrap_deg_180(float(a_deg) - float(b_deg))))
+
+
+def expected_field_rotation_deg(
+    ra_deg: float,
+    dec_deg: float,
+    *,
+    observer: ObserverConfig,
+    obstime: Optional[Time] = None,
+    roll_offset_deg: float = 0.0,
+    az_step_deg: float = 0.05,
+) -> Optional[float]:
+    """
+    Estimate expected image theta (deg) for a given ICRS center and observer.
+
+    theta convention matches solve_plate:
+      theta = atan2(R[1,0], R[0,0]) where R maps image xy -> tangent (east, north).
+
+    We compute local +Az direction in the tangent plane and subtract roll_offset_deg,
+    where roll_offset_deg is the orientation of +Az in image coordinates.
+    """
+    if obstime is None:
+        obstime = Time.now()
+
+    center_icrs = SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg, frame="icrs")
+    az_deg, alt_deg = _icrs_to_altaz_app_deg(
+        float(ra_deg),
+        float(dec_deg),
+        observer=observer,
+        obstime=obstime,
+    )
+
+    step = abs(float(az_step_deg))
+    if not np.isfinite(step) or step < 1e-5:
+        step = 0.05
+
+    try:
+        az_next = (float(az_deg) + step) % 360.0
+        next_icrs = parse_target_to_icrs(
+            {"az_deg": float(az_next), "alt_deg": float(alt_deg)},
+            observer=observer,
+            obstime=obstime,
+        ).icrs
+        d_lon, d_lat = center_icrs.spherical_offsets_to(next_icrs)
+        du = float(d_lon.to_value(u.arcsec))
+        dv = float(d_lat.to_value(u.arcsec))
+    except (RuntimeError, ValueError, TypeError):
+        return None
+
+    if (not np.isfinite(du)) or (not np.isfinite(dv)):
+        return None
+    if math.hypot(du, dv) < 1e-6:
+        return None
+
+    az_axis_theta = float(np.degrees(np.arctan2(dv, du)))
+    theta_expected = _wrap_deg_180(az_axis_theta - float(roll_offset_deg))
+    return float(theta_expected)
 
 
 # ============================================================
@@ -698,6 +763,22 @@ def solve_plate(
         )
     center_icrs = _ensure_icrs(center_icrs, label="center")
 
+    rotation_prior_enable = bool(getattr(cfg, "rotation_prior_enable", False))
+    rotation_prior_tol_deg = float(getattr(cfg, "rotation_prior_tol_deg", 45.0))
+    rotation_prior_roll_offset_deg = float(getattr(cfg, "rotation_prior_roll_offset_deg", 0.0))
+    rotation_prior_az_step_deg = float(getattr(cfg, "rotation_prior_az_step_deg", 0.05))
+
+    expected_theta_deg: Optional[float] = None
+    if rotation_prior_enable and np.isfinite(rotation_prior_tol_deg) and rotation_prior_tol_deg > 0.0:
+        expected_theta_deg = expected_field_rotation_deg(
+            float(center_icrs.ra.deg),
+            float(center_icrs.dec.deg),
+            observer=observer,
+            obstime=obstime,
+            roll_offset_deg=rotation_prior_roll_offset_deg,
+            az_step_deg=rotation_prior_az_step_deg,
+        )
+
     # 2) Prepare frame (RAW16)
     raw16 = ensure_raw16_bayer(frame)
     h, w = raw16.shape[:2]
@@ -1038,6 +1119,14 @@ def solve_plate(
 
         num_inliers = int(len(inliers))
         rms_inliers = float(np.sqrt(np.mean([d * d for (_, _, d) in inliers]))) if num_inliers > 0 else float("inf")
+        R_fit = np.asarray(fit["R"], dtype=np.float64)
+        theta_fit_deg = float(np.degrees(np.arctan2(R_fit[1, 0], R_fit[0, 0])))
+
+        rotation_err_deg: Optional[float] = None
+        rotation_ok = True
+        if expected_theta_deg is not None:
+            rotation_err_deg = _angle_distance_deg(theta_fit_deg, expected_theta_deg)
+            rotation_ok = bool(rotation_err_deg <= float(rotation_prior_tol_deg))
 
         return {
             "num_inliers": num_inliers,
@@ -1046,16 +1135,30 @@ def solve_plate(
             "center": center0,
             "candidate": cand,
             "inliers": inliers,
+            "theta_deg": theta_fit_deg,
+            "rotation_err_deg": rotation_err_deg,
+            "rotation_ok": rotation_ok,
         }
 
     to_eval = candidates[: min(len(candidates), int(max_trials))]
 
     best = None
+    rotation_rejected = 0
+    best_rotation_err_deg: Optional[float] = None
     if progress_cb:
         progress_cb("platesolving:validate:start", {"n_eval": int(len(to_eval))})
 
     for cand in to_eval:
         ev = evaluate_candidate(cand)
+        if expected_theta_deg is not None:
+            err = ev.get("rotation_err_deg", None)
+            if isinstance(err, (float, int)) and np.isfinite(float(err)):
+                err_f = float(err)
+                if best_rotation_err_deg is None or err_f < best_rotation_err_deg:
+                    best_rotation_err_deg = err_f
+            if not bool(ev.get("rotation_ok", False)):
+                rotation_rejected += 1
+                continue
         if best is None:
             best = ev
             continue
@@ -1065,6 +1168,34 @@ def solve_plate(
             best = ev
 
     if best is None:
+        if expected_theta_deg is not None and rotation_rejected > 0:
+            metrics = {
+                "n_eval": float(len(to_eval)),
+                "rotation_expected_deg": float(expected_theta_deg),
+                "rotation_tol_deg": float(rotation_prior_tol_deg),
+                "rotation_rejected": float(rotation_rejected),
+            }
+            if best_rotation_err_deg is not None:
+                metrics["rotation_best_err_deg"] = float(best_rotation_err_deg)
+            return PlatesolvingResult(
+                success=False,
+                status="NO_ROTATION_MATCH",
+                theta_deg=0.0,
+                dx_px=0.0,
+                dy_px=0.0,
+                response=0.0,
+                scale_arcsec_per_px=float(arcsec_per_px),
+                R_2x2=((1.0, 0.0), (0.0, 1.0)),
+                t_arcsec=(0.0, 0.0),
+                n_inliers=0,
+                rms_arcsec=float("inf"),
+                rms_px=float("inf"),
+                center_ra_deg=float(center_icrs.ra.deg),
+                center_dec_deg=float(center_icrs.dec.deg),
+                overlay=overlay,
+                guides=[],
+                metrics=metrics,
+            )
         return PlatesolvingResult(
             success=False,
             status="VALIDATION_FAILED",
@@ -1131,7 +1262,7 @@ def solve_plate(
 
     # 14) Success criterion
     min_inliers = int(getattr(cfg, "min_inliers", 3))
-    success = bool(best["num_inliers"] >= min_inliers)
+    success_inliers = bool(best["num_inliers"] >= min_inliers)
 
     offset_lon, offset_lat = best_center_icrs.spherical_offsets_to(center_icrs_ref)
     offset_arcsec = np.array([offset_lon.to_value(u.arcsec), offset_lat.to_value(u.arcsec)], dtype=np.float64)
@@ -1139,6 +1270,17 @@ def solve_plate(
     theta_deg = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
     rms_px = float(best["rms_inliers"] / max(1e-9, float(s)))
     response = float(best["num_inliers"]) / max(1.0, rms_px)
+    rotation_err_deg: Optional[float] = None
+    rotation_ok = True
+    if expected_theta_deg is not None:
+        rotation_err_deg = _angle_distance_deg(theta_deg, expected_theta_deg)
+        rotation_ok = bool(rotation_err_deg <= float(rotation_prior_tol_deg))
+    success = bool(success_inliers and rotation_ok)
+    status = "OK"
+    if not success_inliers:
+        status = "LOW_INLIERS"
+    elif not rotation_ok:
+        status = "ROTATION_MISMATCH"
 
     metrics = {
         "n_det": float(img_xy_all.shape[0]),
@@ -1153,10 +1295,18 @@ def solve_plate(
         "rms_inliers_arcsec": float(best["rms_inliers"]),
         "scale_arcsec_per_px": float(s),
     }
+    if expected_theta_deg is not None:
+        metrics["rotation_expected_deg"] = float(expected_theta_deg)
+        metrics["rotation_tol_deg"] = float(rotation_prior_tol_deg)
+        metrics["rotation_rejected"] = float(rotation_rejected)
+        if rotation_err_deg is not None:
+            metrics["rotation_err_deg"] = float(rotation_err_deg)
+        if best_rotation_err_deg is not None:
+            metrics["rotation_best_err_deg"] = float(best_rotation_err_deg)
 
     return PlatesolvingResult(
         success=success,
-        status="OK" if success else "LOW_INLIERS",
+        status=status,
         theta_deg=theta_deg,
         dx_px=float(offset_px[0]),
         dy_px=float(offset_px[1]),
@@ -1252,6 +1402,10 @@ def _build_platesolving_debug_info(result: Any) -> Dict[str, Any]:
         "dy_px": float(getattr(result, "dy_px", 0.0)),
         "radius_deg": metrics.get("radius_deg"),
         "scale_arcsec_per_px": float(getattr(result, "scale_arcsec_per_px", metrics.get("scale_arcsec_per_px", 0.0))),
+        "rotation_expected_deg": metrics.get("rotation_expected_deg"),
+        "rotation_err_deg": metrics.get("rotation_err_deg"),
+        "rotation_tol_deg": metrics.get("rotation_tol_deg"),
+        "rotation_rejected": metrics.get("rotation_rejected"),
     }
     return info
 
