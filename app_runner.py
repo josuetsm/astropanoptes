@@ -39,6 +39,7 @@ from actions import (
     camera_record_raw,
     camera_set_param,
     goto_autocalibrate,
+    goto_estimate_roll,
     goto_calibrate,
     goto_fit_model,
     goto_cancel,
@@ -482,6 +483,9 @@ class AppRunner:
     def request_goto_autocalibrate(self) -> None:
         self.enqueue(goto_autocalibrate())
 
+    def request_goto_estimate_roll(self, params: Dict[str, Any] | None = None) -> None:
+        self.enqueue(goto_estimate_roll(params))
+
     def request_goto_fit_model(self, params: Dict[str, Any] | None = None) -> None:
         self.enqueue(goto_fit_model(params))
 
@@ -704,6 +708,7 @@ class AppRunner:
 
     def _reset_camera_defaults(self) -> None:
         self.cfg.camera = replace(self.default_cfg.camera)
+        self._update_state({"camera": {"roll_deg": float(self.cfg.camera.roll_deg)}})
         self._restart_camera_stream_if_active(reason="camera defaults reset")
 
     def _reset_preview_defaults(self) -> None:
@@ -1591,6 +1596,11 @@ class AppRunner:
         if t == ActionType.GOTO_AUTOCALIBRATE:
             params = p.get('params', {})
             self._goto_worker.request(kind='autocal', target=None, params=params)
+            return
+
+        if t == ActionType.GOTO_ESTIMATE_ROLL:
+            params = p.get('params', {})
+            self._goto_worker.request(kind='roll', target=None, params=params)
             return
 
         if t == ActionType.GOTO_FIT_MODEL:

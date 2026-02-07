@@ -28,6 +28,9 @@ class CameraConfig:
     # camera gamma (si aplica en SDK)
     gamma: float = 1.0
 
+    # camera roll (deg). 0 => +x aligned with az-axis (east)
+    roll_deg: float = 0.0
+
     # debayer (solo para preview/stacking si lo usas)
     debayer: str = "SDK default"  # Off (Mono) | RGGB | BGGR | GRBG | GBRG | SDK default
 

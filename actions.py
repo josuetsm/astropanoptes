@@ -59,6 +59,7 @@ class ActionType(str, Enum):
     GOTO_CALIBRATE = "GOTO_CALIBRATE"
     GOTO_AUTOCALIBRATE = "GOTO_AUTOCALIBRATE"
     GOTO_FIT_MODEL = "GOTO_FIT_MODEL"
+    GOTO_ESTIMATE_ROLL = "GOTO_ESTIMATE_ROLL"
     GOTO_CANCEL = "GOTO_CANCEL"
 
     # live overlay
@@ -196,6 +197,10 @@ def tracking_bootstrap() -> Action:
 
 def goto_autocalibrate(params: Dict[str, Any] | None = None) -> Action:
     return Action(ActionType.GOTO_AUTOCALIBRATE, {"params": params or {}}, _now())
+
+
+def goto_estimate_roll(params: Dict[str, Any] | None = None) -> Action:
+    return Action(ActionType.GOTO_ESTIMATE_ROLL, {"params": params or {}}, _now())
 
 
 # -------------------------

@@ -72,7 +72,7 @@ from platesolving import (
 )
 from logging_utils import log_error, log_info
 from workers import BaseWorker
-from imaging import ensure_raw16_bayer
+from imaging import ensure_raw16_bayer, estimate_sensor_drift_from_stack
 from sep_utils import sep_detect_from_raw16, estimate_shift_from_objects
 
 import astropy.units as u
@@ -261,17 +261,20 @@ def _drift_to_az_alt(
     C = math.cos(phi)
     S = math.sin(phi)
     if abs(C) < 1e-12:
+        log_error(None, "GoTo: drift_to_az_alt degenerate (cos(phi) ~ 0)")
         return []
 
     omega = float(omega_deg_s)
     scale = float(scale_deg_per_px)
     if omega <= 0.0 or scale <= 0.0:
+        log_error(None, "GoTo: drift_to_az_alt invalid omega/scale")
         return []
 
     u = (float(vy) * scale) / (omega * C)
     q = (float(vx) * scale) / omega
 
     if abs(u) > 1.0 + 1e-9:
+        log_error(None, "GoTo: drift_to_az_alt no physical solution (|sin(az)| > 1)")
         return []
     u = float(max(-1.0, min(1.0, u)))
 
@@ -304,6 +307,7 @@ def _drift_to_az_alt(
                 sols.append((az_deg, alt_deg))
 
     if not sols:
+        log_error(None, "GoTo: drift_to_az_alt no physical solution")
         return []
 
     def _circ_dist_deg(a: float, b: float) -> float:
@@ -332,6 +336,245 @@ def _drift_to_az_alt(
     if sort_by_forward_err and len(uniq) > 1:
         uniq.sort(key=lambda p: (_forward_err(p[0], p[1]), p[0], p[1]))
     return uniq
+
+
+def _R_true_to_app_deg(h_true_deg: float, *, P_hPa: float, T_C: float) -> float:
+    """
+    Refraction R(h_true) in degrees, where: h_app = h_true + R(h_true).
+
+    Bennett-style approximation (reasonable for h_true >= ~5°; avoid near horizon).
+    """
+    if h_true_deg <= -1.0:
+        return 0.0
+
+    x = math.radians(h_true_deg + 10.3 / (h_true_deg + 5.11))
+    R_arcmin = 1.02 / math.tan(x)
+
+    T_K = T_C + 273.15
+    R_arcmin *= (P_hPa / 1010.0) * (283.0 / T_K)
+    return R_arcmin / 60.0
+
+
+def _unrefract_app_to_true(
+    h_app_deg: float,
+    *,
+    P_hPa: float = 1013.25,
+    T_C: float = 15.0,
+    iters: int = 8,
+) -> float:
+    """Solve h_app = h_true + R(h_true) for h_true."""
+    h = min(89.9, max(-1.0, float(h_app_deg)))
+    for _ in range(int(iters)):
+        R = _R_true_to_app_deg(h, P_hPa=P_hPa, T_C=T_C)
+        f = (h + R) - float(h_app_deg)
+
+        eps = 1e-3
+        R2 = _R_true_to_app_deg(h + eps, P_hPa=P_hPa, T_C=T_C)
+        df = 1.0 + (R2 - R) / eps
+        if abs(df) < 1e-12:
+            break
+
+        step = f / df
+        h -= step
+        if h > 89.9:
+            h = 89.9
+        if h < -1.0:
+            h = -1.0
+        if abs(step) < 1e-7:
+            break
+    return float(h)
+
+
+def _dRdh_true(h_true_deg: float, *, P_hPa: float, T_C: float) -> float:
+    """Derivative dR/dh (deg/deg) by finite difference."""
+    eps = 1e-3
+    R1 = _R_true_to_app_deg(h_true_deg, P_hPa=P_hPa, T_C=T_C)
+    R2 = _R_true_to_app_deg(h_true_deg + eps, P_hPa=P_hPa, T_C=T_C)
+    return float((R2 - R1) / eps)
+
+
+def _drift_to_az_alt_refracted(
+    vx: float,
+    vy: float,
+    *,
+    phi_deg: float,
+    omega_deg_s: float,
+    scale_deg_per_px: float,
+    P_hPa: float = 1013.25,
+    T_C: float = 15.0,
+    max_iter: int = 12,
+    lm_lambda: float = 1e-2,
+    dedup_tol_deg: float = 1e-3,
+    sort_by_forward_err: bool = True,
+) -> List[Tuple[float, float]]:
+    """
+    Refraction-aware inversion from drift (vx, vy) to (az, alt_true).
+
+    Returns 0, 1 or 2 solutions; altitude is *true* (non-refracted) to match AltAz->ICRS.
+    """
+    phi = math.radians(float(phi_deg))
+    C = math.cos(phi)
+    S = math.sin(phi)
+    if abs(C) < 1e-12:
+        log_error(None, "GoTo: drift_to_az_alt_refracted degenerate (cos(phi) ~ 0)")
+        return []
+
+    omega = float(omega_deg_s)
+    scale = float(scale_deg_per_px)
+    if omega <= 0.0 or scale <= 0.0:
+        log_error(None, "GoTo: drift_to_az_alt_refracted invalid omega/scale")
+        return []
+
+    def _wrap360(a_deg: float) -> float:
+        return float(a_deg) % 360.0
+
+    def _circ_dist_deg(a: float, b: float) -> float:
+        d = (a - b) % 360.0
+        return min(d, 360.0 - d)
+
+    def _forward_refracted(az_deg: float, alt_true_deg: float) -> Tuple[float, float]:
+        az = math.radians(float(az_deg))
+        h_true = float(alt_true_deg)
+
+        d_alt_true = omega * C * math.sin(az)
+        d_x_true = omega * (S * math.cos(math.radians(h_true)) - C * math.sin(math.radians(h_true)) * math.cos(az))
+
+        R = _R_true_to_app_deg(h_true, P_hPa=float(P_hPa), T_C=float(T_C))
+        dR = _dRdh_true(h_true, P_hPa=float(P_hPa), T_C=float(T_C))
+        h_app = h_true + R
+
+        d_alt_app = (1.0 + dR) * d_alt_true
+
+        ch_true = math.cos(math.radians(h_true))
+        ch_app = math.cos(math.radians(h_app))
+        if ch_true < 1e-8:
+            scale_x = 1.0
+        else:
+            scale_x = ch_app / ch_true
+        d_x_app = scale_x * d_x_true
+
+        vx_pred = d_x_app / scale
+        vy_pred = d_alt_app / scale
+        return vx_pred, vy_pred
+
+    def _sse(az_deg: float, alt_true_deg: float) -> float:
+        vx2, vy2 = _forward_refracted(az_deg, alt_true_deg)
+        return (vx2 - float(vx)) ** 2 + (vy2 - float(vy)) ** 2
+
+    def _gauss_newton_lm(az0: float, alt0: float) -> Tuple[float, float, float]:
+        az = _wrap360(float(az0))
+        alt = float(alt0)
+        lam = float(lm_lambda)
+
+        for _ in range(int(max_iter)):
+            if alt > 89.9:
+                alt = 89.9
+            if alt < -0.5:
+                alt = -0.5
+
+            vx0, vy0 = _forward_refracted(az, alt)
+            r0x = vx0 - float(vx)
+            r0y = vy0 - float(vy)
+
+            da = 1e-3
+            dh = 1e-3
+            vx_a, vy_a = _forward_refracted(_wrap360(az + da), alt)
+            vx_h, vy_h = _forward_refracted(az, alt + dh)
+
+            j00 = (vx_a - vx0) / da
+            j10 = (vy_a - vy0) / da
+            j01 = (vx_h - vx0) / dh
+            j11 = (vy_h - vy0) / dh
+
+            a00 = j00 * j00 + j10 * j10 + lam
+            a01 = j00 * j01 + j10 * j11
+            a11 = j01 * j01 + j11 * j11 + lam
+            b0 = -(j00 * r0x + j10 * r0y)
+            b1 = -(j01 * r0x + j11 * r0y)
+
+            det = a00 * a11 - a01 * a01
+            if abs(det) < 1e-18:
+                break
+
+            dp0 = (b0 * a11 - b1 * a01) / det
+            dp1 = (-b0 * a01 + b1 * a00) / det
+
+            az_try = _wrap360(az + dp0)
+            alt_try = alt + dp1
+
+            s0 = r0x * r0x + r0y * r0y
+            s1 = _sse(az_try, alt_try)
+            if s1 < s0:
+                az, alt = az_try, alt_try
+                lam *= 0.5
+                if abs(dp0) < 1e-6 and abs(dp1) < 1e-6:
+                    break
+            else:
+                lam *= 5.0
+
+        return az, alt, _sse(az, alt)
+
+    base = _drift_to_az_alt(
+        float(vx),
+        float(vy),
+        phi_deg=float(phi_deg),
+        omega_deg_s=float(omega_deg_s),
+        scale_deg_per_px=float(scale_deg_per_px),
+        dedup_tol_deg=float(dedup_tol_deg),
+        sort_by_forward_err=False,
+    )
+    if not base:
+        log_error(None, "GoTo: drift_to_az_alt_refracted no base solutions")
+        return []
+
+    seeds_true: List[Tuple[float, float]] = []
+    for az_seed, alt_app_seed in base:
+        alt_true_seed = _unrefract_app_to_true(alt_app_seed, P_hPa=float(P_hPa), T_C=float(T_C))
+        seeds_true.append((az_seed, alt_true_seed))
+
+    refined: List[Tuple[float, float, float]] = []
+    for az0, alt0 in seeds_true:
+        refined.append(_gauss_newton_lm(az0, alt0))
+
+    sols: List[Tuple[float, float]] = []
+    for az_deg, alt_true_deg, _ in refined:
+        if -0.5 <= alt_true_deg <= 90.0:
+            sols.append((_wrap360(az_deg), float(alt_true_deg)))
+
+    if not sols:
+        log_error(None, "GoTo: drift_to_az_alt_refracted no solutions after refinement")
+        return []
+
+    uniq: List[Tuple[float, float]] = []
+    for az_deg, alt_deg in sols:
+        is_new = True
+        for az2, alt2 in uniq:
+            if _circ_dist_deg(az_deg, az2) <= float(dedup_tol_deg) and abs(alt_deg - alt2) <= float(dedup_tol_deg):
+                is_new = False
+                break
+        if is_new:
+            uniq.append((az_deg, alt_deg))
+
+    if sort_by_forward_err and len(uniq) > 1:
+        uniq.sort(key=lambda p: (_sse(p[0], p[1]), p[0], p[1]))
+    return uniq
+
+
+def _apply_roll_to_drift(v: np.ndarray, roll_deg: float) -> np.ndarray:
+    """
+    Rotate drift vector by -roll so +x aligns with az-axis.
+    roll_deg is defined from induced az drift: atan2(dvy, dvx).
+    """
+    if not np.isfinite(roll_deg):
+        return v
+    r = math.radians(float(roll_deg))
+    if abs(r) < 1e-12:
+        return v
+    c = math.cos(r)
+    s = math.sin(r)
+    vx = float(v[0])
+    vy = float(v[1])
+    return np.array([c * vx + s * vy, -s * vx + c * vy], dtype=np.float64)
 
 
 def _now_time() -> Time:
@@ -367,7 +610,6 @@ def pick_bright_start_star(
     if obstime is None:
         obstime = _now_time()
 
-    altaz_frame = AltAz(obstime=obstime, location=observer.location())
     candidates: List[Dict[str, float | str]] = []
     fallback: List[Dict[str, float | str]] = []
 
@@ -377,9 +619,9 @@ def pick_bright_start_star(
             dec=float(star["dec_deg"]) * u.deg,
             frame="icrs",
         )
-        altaz = coord.transform_to(altaz_frame)
-        alt_deg = float(altaz.alt.deg)
-        az_deg = float(altaz.az.deg)
+        altaz = icrs_to_altaz_deg(coord, observer=observer, obstime=obstime)
+        az_deg = float(altaz[0])
+        alt_deg = float(altaz[1])
         payload: Dict[str, float | str] = {
             "name": str(star["name"]),
             "ra_deg": float(star["ra_deg"]),
@@ -800,7 +1042,14 @@ def icrs_to_altaz_deg(
     loc = observer.location()
     altaz = coord_icrs.transform_to(AltAz(obstime=obstime, location=loc))
     az = _wrap_deg_360(float(altaz.az.deg))
-    alt = float(altaz.alt.deg)
+    alt_true = float(altaz.alt.deg)
+    alt = alt_true
+    if bool(getattr(observer, "refraction_enable", False)):
+        alt = alt_true + _R_true_to_app_deg(
+            alt_true,
+            P_hPa=float(getattr(observer, "refraction_P_hPa", 1013.25)),
+            T_C=float(getattr(observer, "refraction_T_C", 15.0)),
+        )
     return np.array([az, alt], dtype=np.float64)
 
 
@@ -1649,6 +1898,93 @@ class GoToWorker(BaseWorker):
             return False
         return True
 
+    def _autocal_estimate_drift_stack(
+        self,
+        frames: List[_AutocalFrame],
+        *,
+        window: int,
+        fps_hint: float,
+        median_k: int,
+        smooth_k: int,
+        vmax_px_s: float,
+        margin_px: float,
+        max_shift_cap: int,
+        profile_q: Optional[float],
+        use_subpixel: bool,
+    ) -> Optional[np.ndarray]:
+        n = int(len(frames))
+        if n <= int(window):
+            log_error(
+                self._out_log,
+                f"GoTo: AutoCal drift stack needs > window frames (n={n} window={int(window)})",
+            )
+            return None
+
+        t = np.asarray([float(fr.t_mono) for fr in frames], dtype=np.float64)
+        order = np.argsort(t)
+        t = t[order]
+        frames = [frames[i] for i in order]
+
+        dt = np.diff(t)
+        dt = dt[dt > 0.0]
+        fps_eff: Optional[float] = None
+        dt_med: Optional[float] = None
+        if dt.size > 0:
+            dt_med = float(np.median(dt))
+            if np.isfinite(dt_med) and dt_med > 0.0:
+                fps_eff = 1.0 / dt_med
+
+        if fps_eff is None:
+            fps_hint = float(fps_hint)
+            if fps_hint > 0.0 and np.isfinite(fps_hint):
+                fps_eff = fps_hint
+            else:
+                log_error(self._out_log, "GoTo: AutoCal drift stack missing valid fps")
+                return None
+
+        try:
+            stack = np.stack([fr.raw16 for fr in frames], axis=0)
+        except Exception as exc:
+            log_error(self._out_log, "GoTo: AutoCal drift stack build failed", exc)
+            return None
+
+        try:
+            out = estimate_sensor_drift_from_stack(
+                stack,
+                fps=float(fps_eff),
+                window=int(window),
+                median_k=int(median_k),
+                smooth_k=int(smooth_k),
+                vmax_px_s=float(vmax_px_s),
+                margin_px=float(margin_px),
+                max_shift_cap=int(max_shift_cap),
+                profile_q=profile_q,
+                use_subpixel=bool(use_subpixel),
+                return_per_window=False,
+            )
+        except Exception as exc:
+            log_error(self._out_log, "GoTo: AutoCal drift stack failed", exc)
+            return None
+
+        vx = float(out.get("vx_mean", 0.0))
+        vy = float(out.get("vy_mean", 0.0))
+        if not np.isfinite(vx) or not np.isfinite(vy):
+            log_error(self._out_log, "GoTo: AutoCal drift stack produced non-finite velocity")
+            return None
+
+        # estimator uses +y down; autocal uses +y up
+        v = np.array([vx, -vy], dtype=np.float64)
+
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal drift stack "
+            f"v=[{float(v[0]):.3f},{float(v[1]):.3f}] "
+            f"fps={float(fps_eff):.3f} dt_med={float(dt_med or 0.0):.3f}s "
+            f"window={int(window)} n={n} "
+            f"vx_std={float(out.get('vx_std', 0.0)):.3f} vy_std={float(out.get('vy_std', 0.0)):.3f}",
+        )
+        return v
+
     def _autocal_estimate_drift_line_sweep(
         self,
         frames: List[_AutocalFrame],
@@ -1666,7 +2002,7 @@ class GoToWorker(BaseWorker):
         fps: float,
     ) -> Optional[np.ndarray]:
         if len(frames) < int(min_frames):
-            log_info(
+            log_error(
                 self._out_log,
                 f"GoTo: AutoCal drift line sweep needs >= {int(min_frames)} frames, got {len(frames)}",
             )
@@ -1686,7 +2022,7 @@ class GoToWorker(BaseWorker):
             t_list.append(float(getattr(fr, "t_mono", fr.t_wall)))
 
         if len(per_frame) < int(min_frames):
-            log_info(
+            log_error(
                 self._out_log,
                 f"GoTo: AutoCal drift line sweep insufficient usable frames "
                 f"usable={len(per_frame)} min={int(min_frames)}",
@@ -1695,6 +2031,7 @@ class GoToWorker(BaseWorker):
 
         t = np.asarray(t_list, dtype=np.float64)
         if t.size < 2:
+            log_error(self._out_log, "GoTo: AutoCal drift line sweep needs >=2 timestamps")
             return None
         order = np.argsort(t)
         t = t[order]
@@ -1726,7 +2063,7 @@ class GoToWorker(BaseWorker):
         if (not np.isfinite(duration_s) or duration_s <= 0.0) and dt_frame is not None:
             duration_s = float((len(per_frame) - 1) * dt_frame)
         if not np.isfinite(duration_s) or duration_s < float(min_duration_s):
-            log_info(
+            log_error(
                 self._out_log,
                 "GoTo: AutoCal drift line sweep duration too short "
                 f"dt={duration_s:.3f}s min={float(min_duration_s):.3f}s",
@@ -1744,14 +2081,16 @@ class GoToWorker(BaseWorker):
                 topk_bins_for_score=int(topk_bins_for_score),
             )
         except Exception as exc:
-            log_info(
+            log_error(
                 self._out_log,
-                f"GoTo: AutoCal drift line sweep failed: {exc}",
+                "GoTo: AutoCal drift line sweep failed",
+                exc,
             )
             return None
 
         u = best.get("u", None)
         if u is None:
+            log_error(self._out_log, "GoTo: AutoCal drift line sweep missing direction vector")
             return None
         u = np.asarray(u, dtype=np.float64).reshape(2,)
 
@@ -1807,6 +2146,7 @@ class GoToWorker(BaseWorker):
             t_rel = t - t[0]
         t_f = np.array([np.median(p @ u) for p in per_frame], dtype=np.float64)
         if not np.all(np.isfinite(t_f)):
+            log_error(self._out_log, "GoTo: AutoCal drift line sweep invalid projection values")
             return None
 
         if bool(use_theil_sen):
@@ -1818,6 +2158,7 @@ class GoToWorker(BaseWorker):
         v_img = float(slope) * u
         v = np.array([float(v_img[0]), -float(v_img[1])], dtype=np.float64)  # to +y up
         if not np.all(np.isfinite(v)):
+            log_error(self._out_log, "GoTo: AutoCal drift line sweep produced non-finite velocity")
             return None
 
         log_info(
@@ -1828,6 +2169,214 @@ class GoToWorker(BaseWorker):
             f"frames={len(per_frame)} pts={xy_all.shape[0]}",
         )
         return v
+
+    def _goto_estimate_roll_blocking(self, params: Dict[str, Any]) -> Dict[str, Any]:
+        out: Dict[str, Any] = {
+            "ok": False,
+            "status": "RUNNING",
+            "roll_deg": None,
+        }
+
+        st = self._get_state()
+        if not bool(st.camera.connected):
+            out["status"] = "ERR_NO_CAMERA"
+            log_error(self._out_log, "GoTo: Roll estimate failed (no camera)")
+            return out
+        if not bool(st.mount.connected):
+            out["status"] = "ERR_NO_MOUNT"
+            log_error(self._out_log, "GoTo: Roll estimate failed (no mount)")
+            return out
+        if self._rate_mount is None:
+            out["status"] = "ERR_NO_RATE"
+            log_error(self._out_log, "GoTo: Roll estimate failed (rate unavailable)")
+            return out
+
+        try:
+            self._rate_mount(0.0, 0.0)
+        except Exception as exc:
+            log_error(self._out_log, "GoTo: Roll estimate failed to stop mount", exc)
+
+        mount_cfg = self._get_mount_cfg()
+        cam_cfg = self._get_camera_cfg()
+
+        roll_window = int(params.get("roll_window", 60))
+        roll_frames = int(params.get("roll_frames", max(roll_window + 5, 80)))
+        roll_dt_min = float(params.get("roll_dt_min_s", 0.0))
+        roll_timeout_s = float(params.get("roll_capture_timeout_s", 12.0))
+        roll_min_sources = int(params.get("roll_min_sources", 1))
+
+        roll_rate_steps_s = float(params.get("roll_rate_steps_s", getattr(mount_cfg, "default_rate", 80.0)))
+        roll_rate_steps_s = abs(float(roll_rate_steps_s))
+        roll_ramp_s = float(params.get("roll_ramp_s", 0.6))
+        roll_ramp_hz = float(params.get("roll_ramp_hz", 25.0))
+        roll_settle_s = float(params.get("roll_settle_s", 0.2))
+
+        roll_fps = float(params.get("roll_fps", 0.0))
+        if roll_fps <= 0.0:
+            if float(getattr(st.camera, "fps_capture", 0.0)) > 0.0:
+                roll_fps = float(getattr(st.camera, "fps_capture", 0.0))
+            else:
+                exp_ms = float(getattr(cam_cfg, "exp_ms", 0.0))
+                if exp_ms > 0.0:
+                    roll_fps = 1000.0 / exp_ms
+
+        roll_stack_median_k = int(params.get("roll_stack_median_k", 3))
+        roll_stack_smooth_k = int(params.get("roll_stack_smooth_k", 20))
+        roll_stack_vmax_px_s = float(params.get("roll_stack_vmax_px_s", 30.0))
+        roll_stack_margin_px = float(params.get("roll_stack_margin_px", 10.0))
+        roll_stack_max_shift_cap = int(params.get("roll_stack_max_shift_cap", 200))
+        roll_stack_profile_q = params.get("roll_stack_profile_q", None)
+        roll_stack_use_subpixel = bool(params.get("roll_stack_use_subpixel", False))
+        roll_use_stack = bool(params.get("roll_use_stack", True))
+        roll_use_line = bool(params.get("roll_use_line", True))
+
+        if roll_window < 1:
+            roll_window = 1
+        if roll_stack_profile_q is not None:
+            try:
+                roll_stack_profile_q = float(roll_stack_profile_q)
+                if not np.isfinite(roll_stack_profile_q):
+                    roll_stack_profile_q = None
+            except (TypeError, ValueError):
+                roll_stack_profile_q = None
+        if roll_rate_steps_s <= 0.0:
+            out["status"] = "ERR_BAD_RATE"
+            log_error(self._out_log, "GoTo: Roll estimate failed (rate <= 0)")
+            return out
+
+        def _estimate_drift(frames: List[_AutocalFrame]) -> Optional[np.ndarray]:
+            v = None
+            if roll_use_stack:
+                v = self._autocal_estimate_drift_stack(
+                    frames,
+                    window=roll_window,
+                    fps_hint=roll_fps,
+                    median_k=roll_stack_median_k,
+                    smooth_k=roll_stack_smooth_k,
+                    vmax_px_s=roll_stack_vmax_px_s,
+                    margin_px=roll_stack_margin_px,
+                    max_shift_cap=roll_stack_max_shift_cap,
+                    profile_q=roll_stack_profile_q,
+                    use_subpixel=roll_stack_use_subpixel,
+                )
+            if v is None and roll_use_line:
+                v = self._autocal_estimate_drift_line_sweep(
+                    frames,
+                    min_frames=max(2, int(min(roll_frames, 10))),
+                    min_duration_s=0.0,
+                    min_sources=max(1, int(roll_min_sources)),
+                    topk_sources=4,
+                    deg_step=0.1,
+                    bin_width_px=2.0,
+                    topk_bins_for_score=4,
+                    use_theil_sen=True,
+                    max_shift_px=50.0,
+                    min_resp=0.1,
+                    fps=roll_fps,
+                )
+            return v
+
+        log_info(
+            self._out_log,
+            "GoTo: Roll estimate config "
+            f"frames={roll_frames} window={roll_window} fps={roll_fps:.2f} "
+            f"rate_steps_s={roll_rate_steps_s:.1f} ramp_s={roll_ramp_s:.2f}",
+        )
+
+        frames0 = self._autocal_capture_frames(
+            n_frames=int(roll_frames),
+            timeout_s=float(roll_timeout_s),
+            min_dt_s=float(roll_dt_min),
+            min_usable_frames=max(0, int(roll_frames)),
+            min_usable_sources=max(1, int(roll_min_sources)),
+        )
+        if len(frames0) < max(2, int(roll_frames)):
+            out["status"] = "ERR_DRIFT0_FRAMES"
+            log_error(
+                self._out_log,
+                f"GoTo: Roll estimate insufficient baseline frames ({len(frames0)}/{roll_frames})",
+            )
+            return out
+
+        v0 = _estimate_drift(frames0)
+        if v0 is None:
+            out["status"] = "ERR_DRIFT0"
+            log_error(self._out_log, "GoTo: Roll estimate failed (baseline drift)")
+            return out
+
+        frames1: List[_AutocalFrame] = []
+        try:
+            self._autocal_rate_ramp(
+                axis=Axis.AZ,
+                start_rate=0.0,
+                end_rate=float(roll_rate_steps_s),
+                ramp_s=roll_ramp_s,
+                ramp_hz=roll_ramp_hz,
+            )
+            if roll_settle_s > 0.0:
+                time.sleep(float(roll_settle_s))
+            frames1 = self._autocal_capture_frames(
+                n_frames=int(roll_frames),
+                timeout_s=float(roll_timeout_s),
+                min_dt_s=float(roll_dt_min),
+                min_usable_frames=max(0, int(roll_frames)),
+                min_usable_sources=max(1, int(roll_min_sources)),
+            )
+        finally:
+            self._autocal_rate_ramp(
+                axis=Axis.AZ,
+                start_rate=float(roll_rate_steps_s),
+                end_rate=0.0,
+                ramp_s=roll_ramp_s,
+                ramp_hz=roll_ramp_hz,
+            )
+            if self._rate_mount is not None:
+                self._rate_mount(0.0, 0.0)
+
+        if len(frames1) < max(2, int(roll_frames)):
+            out["status"] = "ERR_DRIFT1_FRAMES"
+            log_error(
+                self._out_log,
+                f"GoTo: Roll estimate insufficient slew frames ({len(frames1)}/{roll_frames})",
+            )
+            return out
+
+        v1 = _estimate_drift(frames1)
+        if v1 is None:
+            out["status"] = "ERR_DRIFT1"
+            log_error(self._out_log, "GoTo: Roll estimate failed (slew drift)")
+            return out
+
+        dv = np.array([float(v1[0]) - float(v0[0]), float(v1[1]) - float(v0[1])], dtype=np.float64)
+        if not np.all(np.isfinite(dv)):
+            out["status"] = "ERR_DRIFT_DELTA"
+            log_error(self._out_log, "GoTo: Roll estimate failed (non-finite delta)")
+            return out
+
+        dv_mag = float(np.hypot(dv[0], dv[1]))
+        min_dv = float(params.get("roll_min_delta_px_s", 0.05))
+        if dv_mag < min_dv:
+            out["status"] = "ERR_DRIFT_DELTA_SMALL"
+            log_error(
+                self._out_log,
+                f"GoTo: Roll estimate failed (delta too small: {dv_mag:.3f} < {min_dv:.3f})",
+            )
+            return out
+
+        roll_deg = float(math.degrees(math.atan2(float(dv[1]), float(dv[0]))))
+        out["ok"] = True
+        out["status"] = "OK"
+        out["roll_deg"] = roll_deg
+
+        self._publish_state({"camera": {"roll_deg": float(roll_deg)}})
+        log_info(
+            self._out_log,
+            "GoTo: Roll estimate OK "
+            f"roll={roll_deg:+.3f}deg v0=[{float(v0[0]):.3f},{float(v0[1]):.3f}] "
+            f"v1=[{float(v1[0]):.3f},{float(v1[1]):.3f}] "
+            f"dv=[{float(dv[0]):.3f},{float(dv[1]):.3f}]",
+        )
+        return out
 
     def _autocal_pick_best_frame(
         self,
@@ -2077,6 +2626,21 @@ class GoToWorker(BaseWorker):
         drift_line_max_shift_px = float(params.get("drift_line_max_shift_px", 50.0))
         drift_line_min_resp = float(params.get("drift_line_min_resp", 0.1))
         drift_line_fps = float(params.get("drift_line_fps", 0.0))
+        drift_stack_enable = bool(params.get("drift_stack_enable", True))
+        drift_stack_window = int(params.get("drift_stack_window", 60))
+        drift_stack_median_k = int(params.get("drift_stack_median_k", 3))
+        drift_stack_smooth_k = int(params.get("drift_stack_smooth_k", 20))
+        drift_stack_vmax_px_s = float(params.get("drift_stack_vmax_px_s", 30.0))
+        drift_stack_margin_px = float(params.get("drift_stack_margin_px", 10.0))
+        drift_stack_max_shift_cap = int(params.get("drift_stack_max_shift_cap", 200))
+        drift_stack_profile_q = params.get("drift_stack_profile_q", None)
+        drift_stack_use_subpixel = bool(params.get("drift_stack_use_subpixel", False))
+        drift_stack_fps = float(params.get("drift_stack_fps", 0.0))
+        drift_refract_enable = bool(params.get("drift_refract_enable", True))
+        drift_refract_P_hPa = float(params.get("drift_refract_P_hPa", 1013.25))
+        drift_refract_T_C = float(params.get("drift_refract_T_C", 15.0))
+        drift_refract_max_iter = int(params.get("drift_refract_max_iter", 12))
+        drift_refract_lm_lambda = float(params.get("drift_refract_lm_lambda", 1e-2))
         pointing_method = str(params.get("pointing_method", "horiz_drift")).strip().lower()
         drift_pointing_omega = float(params.get("drift_pointing_omega_deg_s", 15.041))
         drift_capture_timeout_eff = float(drift_capture_timeout_s)
@@ -2128,6 +2692,26 @@ class GoToWorker(BaseWorker):
                 exp_ms = float(getattr(cam_cfg, "exp_ms", 0.0))
                 if exp_ms > 0.0:
                     drift_line_fps = 1000.0 / exp_ms
+        if drift_stack_fps <= 0.0:
+            drift_stack_fps = float(drift_line_fps)
+
+        if drift_stack_window < 1:
+            drift_stack_window = 1
+        if drift_stack_profile_q is not None:
+            try:
+                drift_stack_profile_q = float(drift_stack_profile_q)
+                if not np.isfinite(drift_stack_profile_q):
+                    drift_stack_profile_q = None
+            except (TypeError, ValueError):
+                drift_stack_profile_q = None
+        if not np.isfinite(drift_refract_P_hPa) or drift_refract_P_hPa <= 0.0:
+            drift_refract_P_hPa = 1013.25
+        if not np.isfinite(drift_refract_T_C):
+            drift_refract_T_C = 15.0
+        if drift_refract_max_iter < 1:
+            drift_refract_max_iter = 1
+        if drift_refract_lm_lambda <= 0.0 or not np.isfinite(drift_refract_lm_lambda):
+            drift_refract_lm_lambda = 1e-2
 
         log_info(
             self._out_log,
@@ -2142,6 +2726,10 @@ class GoToWorker(BaseWorker):
             f"drift_line_topk_bins={drift_line_topk_bins} "
             f"drift_line_max_shift_px={drift_line_max_shift_px:.1f} min_resp={drift_line_min_resp:.2f} "
             f"drift_line_fps={drift_line_fps:.2f} "
+            f"drift_stack_enable={int(bool(drift_stack_enable))} window={int(drift_stack_window)} "
+            f"vmax={drift_stack_vmax_px_s:.1f} fps={drift_stack_fps:.2f} "
+            f"drift_refract_enable={int(bool(drift_refract_enable))} "
+            f"P_hPa={drift_refract_P_hPa:.1f} T_C={drift_refract_T_C:.1f} "
             f"pointing_method={pointing_method} omega={drift_pointing_omega:.3f} "
             f"jcal_rate_scale={jcal_rate_scale:.2f} "
             f"jcal_ramp_s={jcal_ramp_s:.2f} ramp_hz={jcal_ramp_hz:.1f} "
@@ -2150,6 +2738,12 @@ class GoToWorker(BaseWorker):
             f"jcal_probe_s={jcal_probe_s:.2f} probe_scale={jcal_probe_scale:.2f} "
             f"jcal_min_resp={jcal_min_resp:.2f} jcal_max_shift_px={jcal_max_shift_px:.1f}",
         )
+        if drift_stack_enable and drift_frames <= drift_stack_window:
+            log_info(
+                self._out_log,
+                "GoTo: AutoCal drift stack will be skipped "
+                f"(drift_frames={drift_frames} window={drift_stack_window})",
+            )
 
         plate_scale_rad = float(platesolving_cfg.pixel_size_m) / float(platesolving_cfg.focal_m)
         if not np.isfinite(plate_scale_rad) or plate_scale_rad <= 0.0:
@@ -2245,30 +2839,57 @@ class GoToWorker(BaseWorker):
                 )
         best_drift_frame = self._autocal_pick_best_frame(drift_frames_list)
 
-        drift_pix = self._autocal_estimate_drift_line_sweep(
-            drift_frames_list,
-            min_frames=drift_line_min_frames,
-            min_duration_s=drift_line_min_duration_s,
-            min_sources=drift_line_min_sources,
-            topk_sources=drift_line_topk_sources,
-            deg_step=drift_line_deg_step,
-            bin_width_px=drift_line_bin_width_px,
-            topk_bins_for_score=drift_line_topk_bins,
-            use_theil_sen=drift_line_use_theil_sen,
-            max_shift_px=drift_line_max_shift_px,
-            min_resp=drift_line_min_resp,
-            fps=drift_line_fps,
-        )
+        drift_pix: Optional[np.ndarray] = None
+        drift_method = "line_sweep"
+        if drift_stack_enable:
+            drift_pix = self._autocal_estimate_drift_stack(
+                drift_frames_list,
+                window=drift_stack_window,
+                fps_hint=drift_stack_fps,
+                median_k=drift_stack_median_k,
+                smooth_k=drift_stack_smooth_k,
+                vmax_px_s=drift_stack_vmax_px_s,
+                margin_px=drift_stack_margin_px,
+                max_shift_cap=drift_stack_max_shift_cap,
+                profile_q=drift_stack_profile_q,
+                use_subpixel=drift_stack_use_subpixel,
+            )
+            if drift_pix is not None:
+                drift_method = "stack"
+        if drift_pix is None:
+            drift_pix = self._autocal_estimate_drift_line_sweep(
+                drift_frames_list,
+                min_frames=drift_line_min_frames,
+                min_duration_s=drift_line_min_duration_s,
+                min_sources=drift_line_min_sources,
+                topk_sources=drift_line_topk_sources,
+                deg_step=drift_line_deg_step,
+                bin_width_px=drift_line_bin_width_px,
+                topk_bins_for_score=drift_line_topk_bins,
+                use_theil_sen=drift_line_use_theil_sen,
+                max_shift_px=drift_line_max_shift_px,
+                min_resp=drift_line_min_resp,
+                fps=drift_line_fps,
+            )
         if drift_pix is None:
             out["status"] = "ERR_DRIFT"
-            log_info(self._out_log, "GoTo: AutoCal drift estimate failed")
+            log_error(self._out_log, "GoTo: AutoCal drift estimate failed")
             return out
-        out["drift_pix"] = drift_pix
+        drift_pix_raw = drift_pix
+        roll_deg = 0.0
+        try:
+            roll_deg = float(getattr(self._get_state().camera, "roll_deg", 0.0))
+        except Exception:
+            roll_deg = 0.0
+        drift_pix_corr = _apply_roll_to_drift(drift_pix_raw, roll_deg)
+
+        out["drift_pix"] = drift_pix_corr
+        out["drift_method"] = drift_method
         self._publish_state(
             {
                 "goto": {
-                    "autocal_drift_px_s_x": float(drift_pix[0]),
-                    "autocal_drift_px_s_y": float(drift_pix[1]),
+                    "autocal_drift_px_s_x": float(drift_pix_corr[0]),
+                    "autocal_drift_px_s_y": float(drift_pix_corr[1]),
                 }
             }
         )
@@ -2288,20 +2909,36 @@ class GoToWorker(BaseWorker):
 
         if use_horizontal and best_drift_frame is not None:
             deg_per_px = float(np.rad2deg(plate_scale_rad))
-            vx = float(drift_pix[0])
-            vy_up = float(drift_pix[1])
-            sols = _drift_to_az_alt(
-                vx,
-                vy_up,
-                phi_deg=float(getattr(observer, "lat_deg", 0.0)),
-                omega_deg_s=float(drift_pointing_omega),
-                scale_deg_per_px=deg_per_px,
-            )
+            vx = float(drift_pix_corr[0])
+            vy_up = float(drift_pix_corr[1])
+            if drift_refract_enable:
+                sols = _drift_to_az_alt_refracted(
+                    vx,
+                    vy_up,
+                    phi_deg=float(getattr(observer, "lat_deg", 0.0)),
+                    omega_deg_s=float(drift_pointing_omega),
+                    scale_deg_per_px=deg_per_px,
+                    P_hPa=float(drift_refract_P_hPa),
+                    T_C=float(drift_refract_T_C),
+                    max_iter=int(drift_refract_max_iter),
+                    lm_lambda=float(drift_refract_lm_lambda),
+                )
+            else:
+                sols = _drift_to_az_alt(
+                    vx,
+                    vy_up,
+                    phi_deg=float(getattr(observer, "lat_deg", 0.0)),
+                    omega_deg_s=float(drift_pointing_omega),
+                    scale_deg_per_px=deg_per_px,
+                )
+            if not sols:
+                log_error(
+                    self._out_log,
+                    "GoTo: AutoCal drift az/alt candidates: none",
+                )
             if sols:
                 sol_txt = ", ".join(f"az={az_deg:.3f} alt={alt_deg:.3f}" for az_deg, alt_deg in sols)
                 log_info(self._out_log, f"GoTo: AutoCal drift az/alt candidates: {sol_txt}")
-            else:
-                log_info(self._out_log, "GoTo: AutoCal drift az/alt candidates: none")
             if sols:
                 t_wall = float(getattr(best_drift_frame, "t_wall", 0.0))
                 obstime = Time(t_wall, format="unix") if t_wall > 0.0 else Time.now()
@@ -2523,11 +3160,29 @@ class GoToWorker(BaseWorker):
 
             def _predict_rate(az_deg: float, alt_deg: float, t0: Time, dt_s: float = 1.0) -> np.ndarray:
                 loc = observer.location()
-                altaz0 = AltAz(az=float(az_deg) * u.deg, alt=float(alt_deg) * u.deg, obstime=t0, location=loc)
+                az0 = float(az_deg)
+                alt0 = float(alt_deg)
+                alt_true0 = alt0
+                if bool(getattr(observer, "refraction_enable", False)):
+                    alt_true0 = _unrefract_app_to_true(
+                        alt0,
+                        P_hPa=float(getattr(observer, "refraction_P_hPa", 1013.25)),
+                        T_C=float(getattr(observer, "refraction_T_C", 15.0)),
+                    )
+                altaz0 = AltAz(az=az0 * u.deg, alt=alt_true0 * u.deg, obstime=t0, location=loc)
                 coord = SkyCoord(altaz0)
                 altaz1 = coord.transform_to(AltAz(obstime=t0 + float(dt_s) * u.s, location=loc))
-                daz = _wrap_deg_180(float(altaz1.az.deg) - float(az_deg))
-                dalt = float(altaz1.alt.deg) - float(alt_deg)
+                az1 = float(altaz1.az.deg)
+                alt_true1 = float(altaz1.alt.deg)
+                alt1 = alt_true1
+                if bool(getattr(observer, "refraction_enable", False)):
+                    alt1 = alt_true1 + _R_true_to_app_deg(
+                        alt_true1,
+                        P_hPa=float(getattr(observer, "refraction_P_hPa", 1013.25)),
+                        T_C=float(getattr(observer, "refraction_T_C", 15.0)),
+                    )
+                daz = _wrap_deg_180(float(az1) - az0)
+                dalt = float(alt1) - alt0
                 return np.array(
                     [
                         np.deg2rad(daz) / float(dt_s),
@@ -2906,6 +3561,23 @@ class GoToWorker(BaseWorker):
                     f"GoTo: AUTOCAL status={autocal_out.get('status')} ok={autocal_ok}",
                 )
 
+            elif kind == "roll":
+                roll_out = self._goto_estimate_roll_blocking(params)
+                roll_ok = bool(roll_out.get("ok", False))
+                roll_status = str(roll_out.get("status", "UNKNOWN"))
+                self._publish_state(
+                    {
+                        "goto": {
+                            "status": GotoStatus.OK if roll_ok else GotoStatus.FAIL,
+                            "reason": f"ROLL_{roll_status}",
+                        }
+                    }
+                )
+                log_info(
+                    self._out_log,
+                    f"GoTo: ROLL_ESTIMATE status={roll_status} ok={roll_ok}",
+                )
+
             elif kind == "fit_model":
                 min_samples = int(params.get("min_samples", 3))
                 ridge = float(params.get("ridge", 1e-12))
@@ -2967,5 +3639,5 @@ def make_default_goto_controller_for_your_mount() -> GoToController:
     )
     model = GoToModel(kin=kin)
     model.init_from_mechanics()
-    cfg = GoToConfig(observer=ObserverConfig(lat_deg=-33.4489, lon_deg=-70.6693, height_m=520.0))
+    cfg = GoToConfig(observer=ObserverConfig())
     return GoToController(cfg=cfg, model=model)

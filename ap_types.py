@@ -100,6 +100,7 @@ class CameraState:
     fps_view: float = 0.0
     fps_control_loop: float = 0.0
     frame_ms: float = 0.0
+    roll_deg: float = 0.0
     last_error: Optional[str] = None
 
 

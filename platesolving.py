@@ -2,6 +2,7 @@
 # -*- coding: utf-8 -*-
 from __future__ import annotations
 
+import math
 import time
 from dataclasses import dataclass
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
@@ -78,6 +79,9 @@ class ObserverConfig:
     lat_deg: float = -33.3667
     lon_deg: float = -71.6667
     height_m: float = 28.0
+    refraction_enable: bool = True
+    refraction_P_hPa: float = 1013.25
+    refraction_T_C: float = 15.0
 
     def location(self) -> EarthLocation:
         return EarthLocation(
@@ -85,6 +89,52 @@ class ObserverConfig:
             lon=self.lon_deg * u.deg,
             height=self.height_m * u.m,
         )
+
+
+def _R_true_to_app_deg(h_true_deg: float, *, P_hPa: float, T_C: float) -> float:
+    """
+    Refraction R(h_true) in degrees, where: h_app = h_true + R(h_true).
+    Bennett-style approximation; avoid near/below horizon for pointing model.
+    """
+    if h_true_deg <= -1.0:
+        return 0.0
+
+    x = math.radians(h_true_deg + 10.3 / (h_true_deg + 5.11))
+    R_arcmin = 1.02 / math.tan(x)
+
+    T_K = T_C + 273.15
+    R_arcmin *= (P_hPa / 1010.0) * (283.0 / T_K)
+    return R_arcmin / 60.0
+
+
+def _unrefract_app_to_true(
+    h_app_deg: float,
+    *,
+    P_hPa: float = 1013.25,
+    T_C: float = 15.0,
+    iters: int = 8,
+) -> float:
+    """Solve h_app = h_true + R(h_true) for h_true."""
+    h = min(89.9, max(-1.0, float(h_app_deg)))
+    for _ in range(int(iters)):
+        R = _R_true_to_app_deg(h, P_hPa=P_hPa, T_C=T_C)
+        f = (h + R) - float(h_app_deg)
+
+        eps = 1e-3
+        R2 = _R_true_to_app_deg(h + eps, P_hPa=P_hPa, T_C=T_C)
+        df = 1.0 + (R2 - R) / eps
+        if abs(df) < 1e-12:
+            break
+
+        step = f / df
+        h -= step
+        if h > 89.9:
+            h = 89.9
+        if h < -1.0:
+            h = -1.0
+        if abs(step) < 1e-7:
+            break
+    return float(h)
 
 
 @dataclass(frozen=True)
@@ -172,6 +222,12 @@ def parse_target_to_icrs(
             if target.get("obstime"):
                 t = Time(str(target["obstime"]))
             loc = observer.location()
+            if bool(getattr(observer, "refraction_enable", False)):
+                alt = _unrefract_app_to_true(
+                    alt,
+                    P_hPa=float(getattr(observer, "refraction_P_hPa", 1013.25)),
+                    T_C=float(getattr(observer, "refraction_T_C", 15.0)),
+                )
             altaz = AltAz(alt=alt * u.deg, az=az * u.deg, obstime=t, location=loc)
             return SkyCoord(altaz).icrs
 

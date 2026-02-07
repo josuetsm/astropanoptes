@@ -52,6 +52,7 @@ class GotoPanelHandles:
     btn_goto: W.Button
     btn_calib: W.Button
     btn_autocal: W.Button
+    btn_roll: W.Button
     btn_fit_model: W.Button
     btn_cancel: W.Button
     target_box: W.VBox
@@ -326,6 +327,7 @@ def build_goto_panel(cfg: AppConfig) -> tuple[W.Widget, GotoPanelHandles]:
     btn_goto = W.Button(description="GoTo", button_style="success", layout=W.Layout(width="100px"))
     btn_calib = W.Button(description="Calibrate", button_style="warning", layout=W.Layout(width="120px"))
     btn_autocal = W.Button(description="AutoCalibrate", button_style="warning", layout=W.Layout(width="140px"))
+    btn_roll = W.Button(description="Estimar Roll", button_style="info", layout=W.Layout(width="130px"))
     btn_fit_model = W.Button(description="Fit GoTo Model", button_style="warning", layout=W.Layout(width="160px"))
     btn_cancel = W.Button(description="Cancel", button_style="danger", layout=W.Layout(width="110px"))
 
@@ -335,7 +337,7 @@ def build_goto_panel(cfg: AppConfig) -> tuple[W.Widget, GotoPanelHandles]:
     box_altaz = W.HBox([az, alt])
     target_box = W.VBox([box_name])
 
-    box_buttons = W.HBox([btn_sync, btn_goto, btn_calib, btn_autocal, btn_fit_model, btn_cancel])
+    box_buttons = W.HBox([btn_sync, btn_goto, btn_calib, btn_autocal, btn_roll, btn_fit_model, btn_cancel])
     box_params = W.HBox([tol_arcsec, stages, gain, settle_s, feedback])
     box_calib = W.HBox([calib_samples, calib_radius])
     box_delay = W.HBox([delay_us])
@@ -375,6 +377,7 @@ def build_goto_panel(cfg: AppConfig) -> tuple[W.Widget, GotoPanelHandles]:
         btn_goto=btn_goto,
         btn_calib=btn_calib,
         btn_autocal=btn_autocal,
+        btn_roll=btn_roll,
         btn_fit_model=btn_fit_model,
         btn_cancel=btn_cancel,
         target_box=target_box,
