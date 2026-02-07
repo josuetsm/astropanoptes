@@ -724,6 +724,7 @@ class GoToModel:
 
     # Last successful plate-solve (used as the best estimate of mount AZ/ALT)
     last_solve_az_alt_deg: Optional[np.ndarray] = None
+    last_solve_steps_est: Optional[np.ndarray] = None
     last_solve_time: float = 0.0
 
     # Calibration samples (for updating J)
@@ -787,6 +788,12 @@ class GoToModel:
         Prefers last successful plate-solve, otherwise the model prediction.
         """
         if self.last_solve_az_alt_deg is not None:
+            if self.last_solve_steps_est is not None:
+                dsteps = self.steps_est - self.last_solve_steps_est
+                daltaz = self.J_deg_per_step @ dsteps
+                az = _wrap_deg_360(float(self.last_solve_az_alt_deg[0]) + float(daltaz[0]))
+                alt = float(self.last_solve_az_alt_deg[1]) + float(daltaz[1])
+                return np.array([az, alt], dtype=np.float64)
             return self.last_solve_az_alt_deg.copy()
         if not self.synced:
             return None
@@ -798,32 +805,34 @@ class GoToModel:
         Returns True if steps_est was updated from the solve.
         """
         az_alt_deg = _as_array2(az_alt_deg)
+        updated_steps = False
+
+        if self.synced:
+            daltaz = np.array(
+                [
+                    _wrap_deg_180(float(az_alt_deg[0]) - float(self.ref_az_alt_deg[0])),
+                    float(az_alt_deg[1]) - float(self.ref_az_alt_deg[1]),
+                ],
+                dtype=np.float64,
+            )
+
+            try:
+                dsteps, *_ = np.linalg.lstsq(self.J_deg_per_step, daltaz, rcond=None)
+            except np.linalg.LinAlgError as exc:
+                log_error(None, "GoTo: failed to reconcile steps from plate-solve", exc, throttle_s=5.0, throttle_key="goto_steps_reconcile")
+                dsteps = None
+
+            if dsteps is not None:
+                if not np.all(np.isfinite(dsteps)):
+                    log_error(None, "GoTo: non-finite steps from plate-solve reconciliation", None, throttle_s=5.0, throttle_key="goto_steps_reconcile_nan")
+                else:
+                    self.steps_est = self.ref_steps + dsteps
+                    updated_steps = True
+
         self.last_solve_az_alt_deg = az_alt_deg.copy()
+        self.last_solve_steps_est = self.steps_est.copy()
         self.last_solve_time = time.time()
-
-        if not self.synced:
-            return False
-
-        daltaz = np.array(
-            [
-                _wrap_deg_180(float(az_alt_deg[0]) - float(self.ref_az_alt_deg[0])),
-                float(az_alt_deg[1]) - float(self.ref_az_alt_deg[1]),
-            ],
-            dtype=np.float64,
-        )
-
-        try:
-            dsteps, *_ = np.linalg.lstsq(self.J_deg_per_step, daltaz, rcond=None)
-        except np.linalg.LinAlgError as exc:
-            log_error(None, "GoTo: failed to reconcile steps from plate-solve", exc, throttle_s=5.0, throttle_key="goto_steps_reconcile")
-            return False
-
-        if not np.all(np.isfinite(dsteps)):
-            log_error(None, "GoTo: non-finite steps from plate-solve reconciliation", None, throttle_s=5.0, throttle_key="goto_steps_reconcile_nan")
-            return False
-
-        self.steps_est = self.ref_steps + dsteps
-        return True
+        return bool(updated_steps)
 
     def add_calibration_sample(self, dsteps: np.ndarray, daltaz_deg: np.ndarray) -> None:
         self._calib_steps.append(_as_array2(dsteps))
@@ -866,6 +875,7 @@ class GoToModel:
         self._manual_steps_abs.append(self.steps_est.copy())
         self._manual_az_alt_abs.append(az_alt.copy())
         self.last_solve_az_alt_deg = az_alt.copy()
+        self.last_solve_steps_est = self.steps_est.copy()
         self.last_solve_time = time.time()
         return int(len(self._manual_steps_abs))
 
@@ -881,6 +891,7 @@ class GoToModel:
         self.ref_steps = ref_steps.copy()
         self.ref_az_alt_deg = ref_az_alt.copy()
         self.last_solve_az_alt_deg = ref_az_alt.copy()
+        self.last_solve_steps_est = ref_steps.copy()
         self.last_solve_time = time.time()
         return True
 
@@ -1121,6 +1132,7 @@ class GoToController:
         self.model.ref_steps = self.model.steps_est.copy()
         self.model.ref_az_alt_deg = az_alt.copy()
         self.model.last_solve_az_alt_deg = az_alt.copy()
+        self.model.last_solve_steps_est = self.model.steps_est.copy()
         self.model.last_solve_time = time.time()
         return True
 
@@ -1258,10 +1270,10 @@ class GoToController:
             # Iterate corrections
             for it in range(stages):
                 st.iters = it + 1
-                obstime = _now_time()
+                iter_time = _now_time()
 
                 # target altaz at current time
-                altaz_tgt = icrs_to_altaz_deg(target_icrs, observer=self.cfg.observer, obstime=obstime)
+                altaz_tgt = icrs_to_altaz_deg(target_icrs, observer=self.cfg.observer, obstime=iter_time)
 
                 # current mount altaz best estimate
                 if use_platesolving_feedback:
@@ -1360,27 +1372,66 @@ class GoToController:
                     target_for_solver = target
 
                 if use_platesolving_feedback:
+                    solve_time = _now_time()
                     sol = self._platesolving_live(
                         get_live_frame=get_live_frame,
                         target_for_solver=target_for_solver,
                         platesolving_cfg=platesolving_cfg,
-                        obstime=obstime,
+                        obstime=solve_time,
                     )
                     st.last_solution = sol
+
+                    if (not bool(getattr(sol, "success", False))) and bool(self.cfg.solve_near_predicted):
+                        # Recovery attempt: if prediction is off, re-acquire around the target itself.
+                        target_retry: TargetType = {"az_deg": float(altaz_tgt[0]), "alt_deg": float(altaz_tgt[1])}
+                        log_info(
+                            None,
+                            f"GoTo: platesolve retry near target (iter={it + 1}, status={getattr(sol, 'status', 'UNKNOWN')})",
+                            throttle_s=0.2,
+                            throttle_key="goto_ps_retry_target",
+                        )
+                        sol_retry = self._platesolving_live(
+                            get_live_frame=get_live_frame,
+                            target_for_solver=target_retry,
+                            platesolving_cfg=platesolving_cfg,
+                            radius_deg_seq=(5.0, 10.0, 20.0),
+                            obstime=solve_time,
+                        )
+                        if bool(getattr(sol_retry, "success", False)):
+                            sol = sol_retry
+                            st.last_solution = sol_retry
 
                     if bool(getattr(sol, "success", False)):
                         az_alt_new = platesolving_center_to_altaz_deg(
                             float(sol.center_ra_deg),
                             float(sol.center_dec_deg),
                             observer=self.cfg.observer,
-                            obstime=obstime,
+                            obstime=solve_time,
                         )
                         self.model.apply_plate_solve(az_alt_new)
                     else:
-                        # If solve fails, fall back to model prediction but keep iterating.
-                        # You can also choose to abort here.
-                        self.model.last_solve_az_alt_deg = self.model.predict_az_alt_deg()
-                        self.model.last_solve_time = time.time()
+                        # Do not continue blindly when feedback is enabled and solve cannot re-acquire.
+                        st.status = "ERR_PLATESOLVING_FEEDBACK"
+                        return st
+
+            # Final check after the last correction stage.
+            final_time = _now_time()
+            final_tgt = icrs_to_altaz_deg(target_icrs, observer=self.cfg.observer, obstime=final_time)
+            if use_platesolving_feedback:
+                final_cur = self.model.current_az_alt_deg()
+            else:
+                final_cur = self.model.predict_az_alt_deg()
+            if final_cur is not None:
+                daz_f = _wrap_deg_180(float(final_tgt[0]) - float(final_cur[0]))
+                dalt_f = float(final_tgt[1]) - float(final_cur[1])
+                st.err_az_arcsec = float(daz_f * 3600.0)
+                st.err_alt_arcsec = float(dalt_f * 3600.0)
+                if (abs(st.err_az_arcsec) <= float(self.cfg.tol_arcsec)) and (
+                    abs(st.err_alt_arcsec) <= float(self.cfg.tol_arcsec)
+                ):
+                    st.ok = True
+                    st.status = "OK"
+                    return st
 
             st.status = "ERR_MAX_ITERS"
             return st
