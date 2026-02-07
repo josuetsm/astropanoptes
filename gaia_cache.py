@@ -35,7 +35,7 @@ import re
 from pathlib import Path
 from typing import Optional, Sequence, Tuple, Union, List, Dict
 
-from logging_utils import log_error
+from logging_utils import log_error, log_info
 from astroquery.gaia import Gaia
 from astropy.coordinates import SkyCoord, Angle
 import astropy.units as u
@@ -283,7 +283,7 @@ def gaia_cone_with_mag(
     path = _path_for(hexkey, prefer_parquet)
     if path.exists():
         if verbose:
-            print(f"[gaia_cache] HIT {path}")
+            log_info(None, f"[gaia_cache] HIT {path}")
         return _load_table(path)
 
     Gaia.ROW_LIMIT = row_limit
@@ -302,7 +302,7 @@ def gaia_cone_with_mag(
     try:
         if auth:
             if verbose:
-                print("[gaia_cache] Login al Gaia Archive…")
+                log_info(None, "[gaia_cache] Login al Gaia Archive...")
             Gaia.login(user=auth[0], password=auth[1])
             did_login = True
 
@@ -315,14 +315,14 @@ def gaia_cone_with_mag(
                 if attempt == retries:
                     raise
                 if verbose:
-                    print(f"[gaia_cache] retry {attempt}: {type(e).__name__} -> {e}")
+                    log_info(None, f"[gaia_cache] retry {attempt}: {type(e).__name__} -> {e}")
                 log_error(None, f"Gaia cache: query retry {attempt} failed", e)
                 time.sleep(backoff_s * attempt)
 
     finally:
         if did_login:
             if verbose:
-                print("[gaia_cache] Logout del Gaia Archive.")
+                log_info(None, "[gaia_cache] Logout del Gaia Archive.")
             try:
                 Gaia.logout()
             except Exception as exc:
@@ -346,7 +346,7 @@ def gaia_cone_with_mag(
 
     _save_table(tab, path)
     if verbose:
-        print(f"[gaia_cache] MISS -> saved {len(tab)} rows to {path}")
+        log_info(None, f"[gaia_cache] MISS -> saved {len(tab)} rows to {path}")
     return tab
 
 
@@ -399,7 +399,7 @@ def _query_healpix_tile_async(
             if attempt == retries:
                 raise
             if verbose:
-                print(f"[gaia_healpix] retry {attempt}: {type(e).__name__} -> {e}")
+                log_info(None, f"[gaia_healpix] retry {attempt}: {type(e).__name__} -> {e}")
             log_error(None, f"Gaia healpix: query retry {attempt} failed", e)
             time.sleep(backoff_s * attempt)
 
@@ -491,7 +491,7 @@ def gaia_healpix_cone_with_mag(
         raise GaiaCacheMissError(missing_paths, missing_tiles=missing)
 
     if verbose and need_download:
-        print(f"[gaia_healpix] nside={nside}, tiles={len(pix_indices)}")
+        log_info(None, f"[gaia_healpix] nside={nside}, tiles={len(pix_indices)}")
         if progress_cb:
             progress_cb("gaia:healpix:start", {"tiles": float(len(pix_indices)), "missing": float(len(missing))})
 
@@ -500,7 +500,7 @@ def gaia_healpix_cone_with_mag(
         # Login SOLO si hay algo que descargar (y auth provisto)
         if auth and need_download:
             if verbose:
-                print(f"[gaia_healpix] Login único al Gaia Archive… (missing tiles={len(missing)})")
+                log_info(None, f"[gaia_healpix] Login único al Gaia Archive... (missing tiles={len(missing)})")
             Gaia.login(user=auth[0], password=auth[1])
             did_login = True
         elif need_download and auth is None and getattr(Gaia, "login", None) is not None:
@@ -515,12 +515,12 @@ def gaia_healpix_cone_with_mag(
             if path.exists():
                 # Si hay descargas, puede ser útil indicar el directorio base una vez
                 if verbose and need_download and i == 1:
-                    print(f"[gaia_healpix] HIT first tile -> {path.parent}")
+                    log_info(None, f"[gaia_healpix] HIT first tile -> {path.parent}")
                 tab = _load_table(path)
             else:
                 if verbose:
                     # Ojo: este bloque solo corre si need_download=True (por definición)
-                    print(f"[gaia_healpix] Query tile {i}/{len(pix_indices)} (pix={pix_i})")
+                    log_info(None, f"[gaia_healpix] Query tile {i}/{len(pix_indices)} (pix={pix_i})")
                 if progress_cb:
                     progress_cb("gaia:healpix:tile", {"tile": float(i), "tiles": float(len(pix_indices)), "pix": float(pix_i)})
                 poly = hp.boundaries_skycoord(pix, step=1)
@@ -541,7 +541,7 @@ def gaia_healpix_cone_with_mag(
     finally:
         if did_login:
             if verbose:
-                print("[gaia_healpix] Logout del Gaia Archive.")
+                log_info(None, "[gaia_healpix] Logout del Gaia Archive.")
             try:
                 Gaia.logout()
             except Exception as exc:
@@ -574,6 +574,6 @@ def gaia_healpix_cone_with_mag(
     full = full[sep <= radius_deg]
 
     if verbose and need_download:
-        print(f"[gaia_healpix] Final rows (G<={gmax}): {len(full)}")
+        log_info(None, f"[gaia_healpix] Final rows (G<={gmax}): {len(full)}")
 
     return full

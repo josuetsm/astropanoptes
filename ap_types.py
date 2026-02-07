@@ -184,6 +184,11 @@ class GotoState:
     reason: Optional[str] = None
     busy: bool = False
     synced: bool = False
+    pointing_valid: bool = False
+    pointing_az_deg: float = 0.0
+    pointing_alt_deg: float = 0.0
+    pointing_ra_deg: float = 0.0
+    pointing_dec_deg: float = 0.0
     last_error_arcsec: float = 0.0
     manual_samples: int = 0
     J00: float = 0.0

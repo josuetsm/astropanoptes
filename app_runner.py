@@ -81,6 +81,7 @@ from sep_utils import sep_detect_from_raw16
 from platesolving import (
     ObserverConfig,
     PlatesolvingWorker,
+    parse_target_to_icrs,
     save_gaia_auth,
     load_gaia_auth,
 )
@@ -311,6 +312,11 @@ class AppRunner:
                     "busy": False,
                     "status": GotoStatus.IDLE,
                     "synced": False,
+                    "pointing_valid": False,
+                    "pointing_az_deg": 0.0,
+                    "pointing_alt_deg": 0.0,
+                    "pointing_ra_deg": 0.0,
+                    "pointing_dec_deg": 0.0,
                     "last_error_arcsec": 0.0,
                     "J00": float(self._goto.model.J_deg_per_step[0, 0]),
                     "J01": float(self._goto.model.J_deg_per_step[0, 1]),
@@ -381,6 +387,62 @@ class AppRunner:
         self._update_state(patch)
         if result is not None and bool(getattr(result, "success", False)):
             self._last_platesolving_result = result
+
+    def _goto_pointing_snapshot(self) -> Optional[Dict[str, float]]:
+        az_alt = self._goto.model.current_az_alt_deg()
+        if az_alt is None:
+            return None
+
+        az = float(az_alt[0]) % 360.0
+        alt = float(np.clip(float(az_alt[1]), -90.0, 90.0))
+        if not np.isfinite(az) or not np.isfinite(alt):
+            return None
+
+        coord_icrs = parse_target_to_icrs(
+            {"az_deg": az, "alt_deg": alt},
+            observer=self._platesolving_observer,
+            obstime=Time.now(),
+        ).icrs
+        ra = float(coord_icrs.ra.deg) % 360.0
+        dec = float(coord_icrs.dec.deg)
+        if not np.isfinite(ra) or not np.isfinite(dec):
+            return None
+
+        return {
+            "az_deg": az,
+            "alt_deg": alt,
+            "ra_deg": ra,
+            "dec_deg": dec,
+        }
+
+    def _update_goto_pointing_state(self) -> None:
+        try:
+            p = self._goto_pointing_snapshot()
+        except Exception as exc:
+            log_error(
+                self.out_log,
+                "GoTo: live pointing update failed",
+                exc,
+                throttle_s=2.0,
+                throttle_key="goto_pointing_update",
+            )
+            p = None
+
+        if p is None:
+            self._update_state({"goto": {"pointing_valid": False}})
+            return
+
+        self._update_state(
+            {
+                "goto": {
+                    "pointing_valid": True,
+                    "pointing_az_deg": float(p["az_deg"]),
+                    "pointing_alt_deg": float(p["alt_deg"]),
+                    "pointing_ra_deg": float(p["ra_deg"]),
+                    "pointing_dec_deg": float(p["dec_deg"]),
+                }
+            }
+        )
 
     # -------------------------
     # Lifecycle
@@ -1225,6 +1287,9 @@ class AppRunner:
 
             # 2e) platesolving autosolve scheduling (if enabled)
             self._maybe_autosolve()
+
+            # 2f) live pointing readout (Az/Alt + RA/Dec updated with current time)
+            self._update_goto_pointing_state()
 
             # 3) preview
             self._maybe_update_preview()

@@ -4,7 +4,7 @@ Astropanoptes es un prototipo de control para astrofotografía que integra:
 - Captura desde cámaras Player One (SDK vía `pyPOACamera`).
 - Control de montura con firmware Arduino (comandos de microsteps, rate y move).
 - Tracking por correlación de fase (OpenCV) en un loop de control en tiempo real.
-- Una UI en Jupyter/ipywidgets para operación básica.
+- Una UI en PyQt6 para operación básica.
 
 Este README describe **toda la estructura del repositorio** y explica cada módulo, incluyendo los aún pendientes de implementar.
 
@@ -16,7 +16,8 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 - `LICENSE`: licencia del proyecto.
 - `app.ipynb`: notebook de ejemplo para levantar UI y ejecutar el runner.
 - `app_runner.py`: orquestador principal de runtime; loop de control, captura, preview y tracking.
-- `ui.py`: UI en ipywidgets (estado, preview, control manual de montura, parámetros de cámara).
+- `ui.py`: wrapper para construir/mostrar la UI PyQt6.
+- `ui/pyqt6_app.py`: implementación principal de la UI de escritorio.
 - `actions.py`: definición de acciones y factories (connect, set params, tracking, stacking, platesolving, goto).
 - `ap_types.py`: tipos compartidos (ejes, modos, `Frame`, `AppState`).
 - `config.py`: configuración de cámara, preview, montura, tracking, stacking, platesolving y app.
@@ -28,7 +29,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 - `tracking.py`: pipeline de tracking (preprocesado, correlación de fase, control PI, auto-calibración, rate limiter).
 - `mount_arduino.py`: driver de montura vía serial (protocolo Arduino, comandos RATE/MOVE/MS/STOP).
 - `mount_firmware.ino`: firmware Arduino para la montura (lado microcontrolador).
-- `logging_utils.py`: logging liviano a stdout o `ipywidgets.Output`.
+- `logging_utils.py`: logging liviano a stdout o sink global de la UI.
 
 ## Módulos actuales (qué hacen)
 
@@ -38,8 +39,8 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
   - Ejecuta el loop de control a `control_hz`, genera previews y aplica tracking.
   - Mantiene el estado global (`AppState`) para la UI.
 
-- **`ui.py`**
-  - Construye la UI en Jupyter (botones de conexión, estados, live view).
+- **`ui.py` + `ui/pyqt6_app.py`**
+  - Construye la UI en PyQt6 (botones de conexión, estados, live view).
   - Incluye controles manuales de montura (microsteps, move, stop).
   - Refleja métricas de tracking cuando está activo.
 
@@ -84,7 +85,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 
 ### 5) Logging
 - **`logging_utils.py`**
-  - Abstracción simple de logs para consola o widgets.
+  - Abstracción simple de logs para consola o sink de UI.
 
 ## Módulos pendientes (por implementar)
 
@@ -108,7 +109,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 
 ## Requisitos (implícitos)
 
-- Python con `numpy`, `opencv-python`, `ipywidgets`, `pyserial`.
+- Python con `numpy`, `opencv-python`, `PyQt6`, `pyserial`.
 - SDK de Player One Camera disponible en la plataforma (binarios `.dll/.so/.dylib`).
 - Arduino con firmware de `mount_firmware.ino` cargado.
 

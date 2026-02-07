@@ -2640,7 +2640,24 @@ class GoToWorker(BaseWorker):
             }
         )
         if ps_ok:
+            az_match, alt_match = platesolving_center_to_altaz_deg(
+                float(getattr(result, "center_ra_deg", 0.0)),
+                float(getattr(result, "center_dec_deg", 0.0)),
+                observer=observer,
+                obstime=obstime,
+            )
+            log_info(
+                self._out_log,
+                "Platesolving: OK "
+                f"status={ps_reason} match_az={float(az_match):.4f}deg "
+                f"match_alt={float(alt_match):.4f}deg",
+            )
             self._publish_state({"platesolving_result": result})
+        else:
+            log_info(
+                self._out_log,
+                f"Platesolving: ERR status={ps_reason}",
+            )
         return result
 
     def _autocal_axis_rates(self, axis: Axis, rate: float) -> Tuple[float, float]:

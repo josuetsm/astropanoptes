@@ -1,17 +1,11 @@
 # logging_utils.py
 from __future__ import annotations
 
-import importlib.util
 import sys
 import threading
 import time
 import traceback
-from typing import Optional, Dict, Callable
-
-if importlib.util.find_spec("ipywidgets") is not None:
-    import ipywidgets as W
-else:
-    W = None  # type: ignore
+from typing import Optional, Dict, Callable, Any
 
 
 _START_TIME = time.monotonic()
@@ -59,9 +53,9 @@ def format_exc(exc: BaseException) -> str:
     return "".join(traceback.format_exception(type(exc), exc, exc.__traceback__))
 
 
-def append_to_output(out: "W.Output", msg: str) -> None:
+def append_to_output(out: Any, msg: str) -> None:
     """
-    Escribe en un ipywidgets.Output sin romper el notebook si falla.
+    Escribe en un output sink sin romper la app si falla.
     """
     if out is None:
         return
@@ -91,7 +85,7 @@ def _write_console(line: str) -> None:
 
 
 def log_info(
-    out: Optional["W.Output"],
+    out: Optional[Any],
     msg: str,
     *,
     throttle_s: Optional[float] = None,
@@ -119,7 +113,7 @@ def log_info(
 
 
 def log_error(
-    out: Optional["W.Output"],
+    out: Optional[Any],
     msg: str,
     exc: Optional[BaseException] = None,
     *,

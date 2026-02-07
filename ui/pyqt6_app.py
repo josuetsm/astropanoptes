@@ -362,7 +362,7 @@ class AstroPanoptesWindow(QMainWindow):
 
         self.lbl_fps = QLabel("FPS cap/max: --/--/--")
         self.lbl_drift = QLabel("drift vx/vy: --/-- px/s")
-        self.lbl_coords = QLabel("RA/Dec: -- -- | Alt/Az: -- --")
+        self.lbl_coords = QLabel("RA/Dec: -- -- | Az/Alt: -- --")
         self.lbl_errors = QLabel("Errors: none")
         self.lbl_errors.setStyleSheet(
             "QLabel { padding:4px 10px; border:1px solid #5a2a2a; border-radius:10px; "
@@ -1204,12 +1204,18 @@ class AstroPanoptesWindow(QMainWindow):
         if hasattr(self, "lbl_goto_samples"):
             self.lbl_goto_samples.setText(str(getattr(state.goto, "manual_samples", 0)))
 
-        if state.goto.synced or state.platesolving.last_ok:
+        if state.goto.pointing_valid:
+            ra_str = self._format_ra_deg(state.goto.pointing_ra_deg)
+            dec_str = self._format_dec_deg(state.goto.pointing_dec_deg)
+            az_str = self._format_az_deg(state.goto.pointing_az_deg)
+            alt_str = self._format_alt_deg(state.goto.pointing_alt_deg)
+            self.lbl_coords.setText(f"RA/Dec: {ra_str} {dec_str} | Az/Alt: {az_str} {alt_str}")
+        elif state.goto.synced or state.platesolving.last_ok:
             ra_str = self._format_ra_deg(state.platesolving.center_ra_deg)
             dec_str = self._format_dec_deg(state.platesolving.center_dec_deg)
-            self.lbl_coords.setText(f"RA/Dec: {ra_str} {dec_str} | Alt/Az: -- --")
+            self.lbl_coords.setText(f"RA/Dec: {ra_str} {dec_str} | Az/Alt: -- --")
         else:
-            self.lbl_coords.setText("RA/Dec: -- -- | Alt/Az: -- --")
+            self.lbl_coords.setText("RA/Dec: -- -- | Az/Alt: -- --")
 
         self._update_chips_from_state(state)
         self._update_ps_outputs(state)
@@ -1332,6 +1338,12 @@ class AstroPanoptesWindow(QMainWindow):
         minutes = int((dec_abs - degrees) * 60)
         seconds = (dec_abs - degrees - minutes / 60) * 3600
         return f"{sign}{degrees:02d}:{minutes:02d}:{seconds:05.2f}"
+
+    def _format_az_deg(self, az_deg: float) -> str:
+        return f"{(float(az_deg) % 360.0):06.2f}°"
+
+    def _format_alt_deg(self, alt_deg: float) -> str:
+        return f"{float(alt_deg):+06.2f}°"
 
     def _build_goto_target(self) -> Optional[object]:
         mode = self.dd_goto_mode.currentText()

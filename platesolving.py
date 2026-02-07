@@ -267,6 +267,29 @@ def _ensure_icrs(coord: SkyCoord, *, label: str) -> SkyCoord:
     return coord.icrs
 
 
+def _icrs_to_altaz_app_deg(
+    ra_deg: float,
+    dec_deg: float,
+    *,
+    observer: ObserverConfig,
+    obstime: Optional[Time] = None,
+) -> Tuple[float, float]:
+    if obstime is None:
+        obstime = Time.now()
+    c = SkyCoord(ra=float(ra_deg) * u.deg, dec=float(dec_deg) * u.deg, frame="icrs")
+    altaz = c.transform_to(AltAz(obstime=obstime, location=observer.location()))
+    az = float(altaz.az.deg) % 360.0
+    alt_true = float(altaz.alt.deg)
+    alt = alt_true
+    if bool(getattr(observer, "refraction_enable", False)):
+        alt = alt_true + _R_true_to_app_deg(
+            alt_true,
+            P_hPa=float(getattr(observer, "refraction_P_hPa", 1013.25)),
+            T_C=float(getattr(observer, "refraction_T_C", 15.0)),
+        )
+    return float(az), float(alt)
+
+
 # ============================================================
 # Image: SEP detection (closer to your notebook logic)
 # ============================================================
@@ -1334,6 +1357,7 @@ class PlatesolvingWorker(BaseWorker):
         cfg = self._get_cfg()
         sep_cfg = self._get_sep_cfg()
         observer = self._get_observer()
+        obstime = Time.now()
         debug_stats = bool(getattr(cfg, "debug_input_stats", False))
 
         self._log_input_stats(raw16, "frame(raw16)", debug_stats)
@@ -1345,6 +1369,7 @@ class PlatesolvingWorker(BaseWorker):
                 cfg=cfg,
                 sep_cfg=sep_cfg,
                 observer=observer,
+                obstime=obstime,
                 progress_cb=None,
             )
         except (RuntimeError, ValueError, TypeError) as exc:
@@ -1399,9 +1424,17 @@ class PlatesolvingWorker(BaseWorker):
         n_inliers = int(getattr(result, "n_inliers", 0))
         rms_px = float(getattr(result, "rms_px", 0.0))
         if success:
+            az_match, alt_match = _icrs_to_altaz_app_deg(
+                float(getattr(result, "center_ra_deg", 0.0)),
+                float(getattr(result, "center_dec_deg", 0.0)),
+                observer=observer,
+                obstime=obstime,
+            )
             log_info(
                 self._out_log,
-                f"Platesolving: OK status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+                "Platesolving: OK "
+                f"status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g} "
+                f"match_az={az_match:.4f}deg match_alt={alt_match:.4f}deg",
             )
         else:
             log_info(

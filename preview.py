@@ -94,7 +94,7 @@ def stretch_fast_u8(
 
 def encode_jpeg(u8: np.ndarray, quality: int = 75) -> bytes:
     """
-    Encode JPEG rápido para ipywidgets.Image.
+    Encode JPEG rápido para preview UI.
 
     - u8: HxW o HxWx3 uint8.
     - quality: 1..100 (típico 60-85)
