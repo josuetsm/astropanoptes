@@ -918,17 +918,26 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_goto = QPushButton("GoTo")
         self.btn_cancel = QPushButton("Cancel")
         self.btn_autocal = QPushButton("AutoCalibrate")
+        self.btn_roll = QPushButton("Estimar Roll")
         self.btn_fit_model = QPushButton("Fit GoTo Model")
         self.btn_home = QPushButton("Home")
 
         rowb = QHBoxLayout()
-        for button in [self.btn_goto, self.btn_cancel, self.btn_autocal, self.btn_fit_model, self.btn_home]:
+        for button in [
+            self.btn_goto,
+            self.btn_cancel,
+            self.btn_autocal,
+            self.btn_roll,
+            self.btn_fit_model,
+            self.btn_home,
+        ]:
             rowb.addWidget(button)
         rowb.addStretch(1)
 
         self.btn_goto.clicked.connect(self._goto_start)
         self.btn_cancel.clicked.connect(self._goto_cancel)
         self.btn_autocal.clicked.connect(self._autocalibrate)
+        self.btn_roll.clicked.connect(self._goto_estimate_roll)
         self.btn_fit_model.clicked.connect(self._goto_fit_model)
         self.btn_home.clicked.connect(self._home)
 
@@ -1125,6 +1134,10 @@ class AstroPanoptesWindow(QMainWindow):
     def _autocalibrate(self) -> None:
         self.runner.request_goto_autocalibrate()
         self._log("[goto] AutoCalibrate")
+
+    def _goto_estimate_roll(self) -> None:
+        self.runner.request_goto_estimate_roll()
+        self._log("[goto] Estimar Roll")
 
     def _goto_fit_model(self) -> None:
         self.runner.request_goto_fit_model()
