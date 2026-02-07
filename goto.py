@@ -2205,8 +2205,15 @@ class GoToWorker(BaseWorker):
         roll_timeout_s = float(params.get("roll_capture_timeout_s", 12.0))
         roll_min_sources = int(params.get("roll_min_sources", 1))
 
-        roll_rate_steps_s = float(params.get("roll_rate_steps_s", getattr(mount_cfg, "default_rate", 80.0)))
+        roll_rate_steps_s = float(
+            params.get("roll_rate_steps_s", min(40.0, float(getattr(mount_cfg, "default_rate", 80.0))))
+        )
         roll_rate_steps_s = abs(float(roll_rate_steps_s))
+        roll_rate_max_steps_s = float(params.get("roll_rate_max_steps_s", 50.0))
+        roll_rate_min_steps_s = float(params.get("roll_rate_min_steps_s", 10.0))
+        roll_rate_backoff = float(params.get("roll_rate_backoff", 0.65))
+        roll_rate_attempts = int(params.get("roll_rate_attempts", 3))
+        roll_follow_vx = bool(params.get("roll_follow_vx", True))
         roll_ramp_s = float(params.get("roll_ramp_s", 0.6))
         roll_ramp_hz = float(params.get("roll_ramp_hz", 25.0))
         roll_settle_s = float(params.get("roll_settle_s", 0.2))
@@ -2222,13 +2229,17 @@ class GoToWorker(BaseWorker):
 
         roll_stack_median_k = int(params.get("roll_stack_median_k", 3))
         roll_stack_smooth_k = int(params.get("roll_stack_smooth_k", 20))
-        roll_stack_vmax_px_s = float(params.get("roll_stack_vmax_px_s", 30.0))
+        # Roll estimation runs while slewing; allow significantly larger drift than "sensor quiet" defaults.
+        roll_stack_vmax_px_s = float(params.get("roll_stack_vmax_px_s", 120.0))
         roll_stack_margin_px = float(params.get("roll_stack_margin_px", 10.0))
-        roll_stack_max_shift_cap = int(params.get("roll_stack_max_shift_cap", 200))
+        roll_stack_max_shift_cap = int(params.get("roll_stack_max_shift_cap", 600))
         roll_stack_profile_q = params.get("roll_stack_profile_q", None)
         roll_stack_use_subpixel = bool(params.get("roll_stack_use_subpixel", False))
         roll_use_stack = bool(params.get("roll_use_stack", True))
-        roll_use_line = bool(params.get("roll_use_line", True))
+        roll_use_line = bool(params.get("roll_use_line", False))
+        roll_line_max_shift_px = float(params.get("roll_line_max_shift_px", 120.0))
+        roll_max_rel_std = float(params.get("roll_max_rel_std", 0.35))
+        roll_max_speed_px_s = float(params.get("roll_max_speed_px_s", max(120.0, roll_stack_vmax_px_s)))
 
         if roll_window < 1:
             roll_window = 1
@@ -2243,22 +2254,71 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_BAD_RATE"
             log_error(self._out_log, "GoTo: Roll estimate failed (rate <= 0)")
             return out
+        if np.isfinite(roll_rate_max_steps_s) and roll_rate_max_steps_s > 0.0:
+            roll_rate_steps_s = min(float(roll_rate_steps_s), float(roll_rate_max_steps_s))
+        if not np.isfinite(roll_rate_min_steps_s) or roll_rate_min_steps_s <= 0.0:
+            roll_rate_min_steps_s = 1.0
+        if roll_rate_steps_s < roll_rate_min_steps_s:
+            roll_rate_steps_s = float(roll_rate_min_steps_s)
+        if not np.isfinite(roll_rate_backoff) or not (0.0 < roll_rate_backoff < 1.0):
+            roll_rate_backoff = 0.65
+        if roll_rate_attempts < 1:
+            roll_rate_attempts = 1
+        if not np.isfinite(roll_max_speed_px_s) or roll_max_speed_px_s <= 0.0:
+            out["status"] = "ERR_BAD_SPEED_LIMIT"
+            log_error(self._out_log, "GoTo: Roll estimate failed (invalid roll_max_speed_px_s)")
+            return out
+        if (not roll_use_stack) and (not roll_use_line):
+            out["status"] = "ERR_ROLL_METHOD"
+            log_error(self._out_log, "GoTo: Roll estimate failed (all methods disabled)")
+            return out
 
-        def _estimate_drift(frames: List[_AutocalFrame]) -> Optional[np.ndarray]:
+        def _estimate_drift(frames: List[_AutocalFrame], label: str) -> Optional[np.ndarray]:
             v = None
+            source = "none"
             if roll_use_stack:
-                v = self._autocal_estimate_drift_stack(
-                    frames,
-                    window=roll_window,
-                    fps_hint=roll_fps,
-                    median_k=roll_stack_median_k,
-                    smooth_k=roll_stack_smooth_k,
-                    vmax_px_s=roll_stack_vmax_px_s,
-                    margin_px=roll_stack_margin_px,
-                    max_shift_cap=roll_stack_max_shift_cap,
-                    profile_q=roll_stack_profile_q,
-                    use_subpixel=roll_stack_use_subpixel,
-                )
+                try:
+                    t = np.asarray([float(fr.t_mono) for fr in frames], dtype=np.float64)
+                    dt = np.diff(np.sort(t))
+                    dt = dt[dt > 0.0]
+                    fps_eff = float(1.0 / np.median(dt)) if dt.size > 0 else float(roll_fps)
+                    stack = np.stack([fr.raw16 for fr in frames], axis=0)
+                    drift_out = estimate_sensor_drift_from_stack(
+                        stack,
+                        fps=float(fps_eff),
+                        window=int(roll_window),
+                        median_k=int(roll_stack_median_k),
+                        smooth_k=int(roll_stack_smooth_k),
+                        vmax_px_s=float(roll_stack_vmax_px_s),
+                        margin_px=float(roll_stack_margin_px),
+                        max_shift_cap=int(roll_stack_max_shift_cap),
+                        profile_q=roll_stack_profile_q,
+                        use_subpixel=bool(roll_stack_use_subpixel),
+                        return_per_window=False,
+                    )
+                    vx = float(drift_out.get("vx_mean", 0.0))
+                    vy = float(drift_out.get("vy_mean", 0.0))
+                    vx_std = float(drift_out.get("vx_std", 0.0))
+                    vy_std = float(drift_out.get("vy_std", 0.0))
+                    v = np.array([vx, -vy], dtype=np.float64)
+                    speed = float(np.hypot(v[0], v[1]))
+                    rel_std = float(max(vx_std, vy_std) / max(speed, 1e-6))
+                    if not np.all(np.isfinite(v)):
+                        log_error(self._out_log, f"GoTo: Roll {label} stack drift non-finite")
+                        v = None
+                    elif rel_std > float(roll_max_rel_std):
+                        log_error(
+                            self._out_log,
+                            "GoTo: Roll stack drift unstable "
+                            f"label={label} rel_std={rel_std:.3f} "
+                            f"vx_std={vx_std:.3f} vy_std={vy_std:.3f} speed={speed:.3f}",
+                        )
+                        v = None
+                    else:
+                        source = "stack"
+                except Exception as exc:
+                    log_error(self._out_log, f"GoTo: Roll {label} stack drift failed", exc)
+                    v = None
             if v is None and roll_use_line:
                 v = self._autocal_estimate_drift_line_sweep(
                     frames,
@@ -2270,17 +2330,32 @@ class GoToWorker(BaseWorker):
                     bin_width_px=2.0,
                     topk_bins_for_score=4,
                     use_theil_sen=True,
-                    max_shift_px=50.0,
+                    max_shift_px=float(roll_line_max_shift_px),
                     min_resp=0.1,
                     fps=roll_fps,
                 )
+                if v is not None:
+                    source = "line"
+            if v is not None:
+                speed = float(np.hypot(float(v[0]), float(v[1])))
+                if speed > float(roll_max_speed_px_s):
+                    log_error(
+                        self._out_log,
+                        "GoTo: Roll drift speed too high "
+                        f"label={label} source={source} speed={speed:.3f} "
+                        f"limit={float(roll_max_speed_px_s):.3f}",
+                    )
+                    v = None
             return v
 
         log_info(
             self._out_log,
             "GoTo: Roll estimate config "
             f"frames={roll_frames} window={roll_window} fps={roll_fps:.2f} "
-            f"rate_steps_s={roll_rate_steps_s:.1f} ramp_s={roll_ramp_s:.2f}",
+            f"rate_steps_s={roll_rate_steps_s:.1f} ramp_s={roll_ramp_s:.2f} "
+            f"use_stack={int(roll_use_stack)} use_line={int(roll_use_line)} "
+            f"max_rel_std={roll_max_rel_std:.3f} max_speed={roll_max_speed_px_s:.1f} "
+            f"follow_vx={int(roll_follow_vx)} attempts={roll_rate_attempts} backoff={roll_rate_backoff:.2f}",
         )
 
         frames0 = self._autocal_capture_frames(
@@ -2298,53 +2373,104 @@ class GoToWorker(BaseWorker):
             )
             return out
 
-        v0 = _estimate_drift(frames0)
+        v0 = _estimate_drift(frames0, "baseline")
         if v0 is None:
             out["status"] = "ERR_DRIFT0"
             log_error(self._out_log, "GoTo: Roll estimate failed (baseline drift)")
             return out
 
-        frames1: List[_AutocalFrame] = []
-        try:
-            self._autocal_rate_ramp(
-                axis=Axis.AZ,
-                start_rate=0.0,
-                end_rate=float(roll_rate_steps_s),
-                ramp_s=roll_ramp_s,
-                ramp_hz=roll_ramp_hz,
-            )
-            if roll_settle_s > 0.0:
-                time.sleep(float(roll_settle_s))
-            frames1 = self._autocal_capture_frames(
-                n_frames=int(roll_frames),
-                timeout_s=float(roll_timeout_s),
-                min_dt_s=float(roll_dt_min),
-                min_usable_frames=max(0, int(roll_frames)),
-                min_usable_sources=max(1, int(roll_min_sources)),
-            )
-        finally:
-            self._autocal_rate_ramp(
-                axis=Axis.AZ,
-                start_rate=float(roll_rate_steps_s),
-                end_rate=0.0,
-                ramp_s=roll_ramp_s,
-                ramp_hz=roll_ramp_hz,
-            )
-            if self._rate_mount is not None:
-                self._rate_mount(0.0, 0.0)
+        slew_sign = 1.0
+        if roll_follow_vx and abs(float(v0[0])) > 1e-6:
+            slew_sign = 1.0 if float(v0[0]) >= 0.0 else -1.0
+        log_info(
+            self._out_log,
+            "GoTo: Roll slew direction "
+            f"v0x={float(v0[0]):+.3f} sign={int(slew_sign):+d}",
+        )
 
-        if len(frames1) < max(2, int(roll_frames)):
-            out["status"] = "ERR_DRIFT1_FRAMES"
+        v1: Optional[np.ndarray] = None
+        frames1: List[_AutocalFrame] = []
+        last_frames_count = 0
+        used_slew_rate = 0.0
+        rate_try = float(roll_rate_steps_s)
+        for attempt_idx in range(int(roll_rate_attempts)):
+            rate_signed = float(slew_sign * rate_try)
+            log_info(
+                self._out_log,
+                "GoTo: Roll slew attempt "
+                f"{attempt_idx + 1}/{int(roll_rate_attempts)} rate_steps_s={rate_signed:+.2f}",
+            )
+
+            frames_try: List[_AutocalFrame] = []
+            try:
+                self._autocal_rate_ramp(
+                    axis=Axis.AZ,
+                    start_rate=0.0,
+                    end_rate=rate_signed,
+                    ramp_s=roll_ramp_s,
+                    ramp_hz=roll_ramp_hz,
+                )
+                if roll_settle_s > 0.0:
+                    time.sleep(float(roll_settle_s))
+                frames_try = self._autocal_capture_frames(
+                    n_frames=int(roll_frames),
+                    timeout_s=float(roll_timeout_s),
+                    min_dt_s=float(roll_dt_min),
+                    min_usable_frames=max(0, int(roll_frames)),
+                    min_usable_sources=max(1, int(roll_min_sources)),
+                )
+            finally:
+                self._autocal_rate_ramp(
+                    axis=Axis.AZ,
+                    start_rate=rate_signed,
+                    end_rate=0.0,
+                    ramp_s=roll_ramp_s,
+                    ramp_hz=roll_ramp_hz,
+                )
+                if self._rate_mount is not None:
+                    self._rate_mount(0.0, 0.0)
+
+            last_frames_count = len(frames_try)
+            if len(frames_try) < max(2, int(roll_frames)):
+                log_error(
+                    self._out_log,
+                    "GoTo: Roll slew attempt insufficient frames "
+                    f"attempt={attempt_idx + 1} frames={len(frames_try)}/{roll_frames}",
+                )
+            else:
+                v_try = _estimate_drift(frames_try, f"slew#{attempt_idx + 1}")
+                if v_try is not None:
+                    v1 = v_try
+                    frames1 = frames_try
+                    used_slew_rate = rate_signed
+                    break
+
+            if attempt_idx + 1 < int(roll_rate_attempts):
+                next_rate = float(rate_try) * float(roll_rate_backoff)
+                if next_rate < float(roll_rate_min_steps_s):
+                    log_error(
+                        self._out_log,
+                        "GoTo: Roll slew retry aborted (rate would be below min) "
+                        f"next={next_rate:.2f} min={float(roll_rate_min_steps_s):.2f}",
+                    )
+                    break
+                log_info(
+                    self._out_log,
+                    "GoTo: Roll slew retry with lower rate "
+                    f"{rate_try:.2f} -> {next_rate:.2f}",
+                )
+                rate_try = next_rate
+
+        if v1 is None:
+            if last_frames_count < max(2, int(roll_frames)):
+                out["status"] = "ERR_DRIFT1_FRAMES"
+            else:
+                out["status"] = "ERR_DRIFT1"
             log_error(
                 self._out_log,
-                f"GoTo: Roll estimate insufficient slew frames ({len(frames1)}/{roll_frames})",
+                "GoTo: Roll estimate failed (slew drift) "
+                f"attempts={int(roll_rate_attempts)}",
             )
-            return out
-
-        v1 = _estimate_drift(frames1)
-        if v1 is None:
-            out["status"] = "ERR_DRIFT1"
-            log_error(self._out_log, "GoTo: Roll estimate failed (slew drift)")
             return out
 
         dv = np.array([float(v1[0]) - float(v0[0]), float(v1[1]) - float(v0[1])], dtype=np.float64)
@@ -2372,6 +2498,7 @@ class GoToWorker(BaseWorker):
         log_info(
             self._out_log,
             "GoTo: Roll estimate OK "
+            f"slew_rate_steps_s={used_slew_rate:+.2f} "
             f"roll={roll_deg:+.3f}deg v0=[{float(v0[0]):.3f},{float(v0[1]):.3f}] "
             f"v1=[{float(v1[0]):.3f},{float(v1[1]):.3f}] "
             f"dv=[{float(dv[0]):.3f},{float(dv[1]):.3f}]",
@@ -2898,24 +3025,13 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_DRIFT"
             log_error(self._out_log, "GoTo: AutoCal drift estimate failed")
             return out
-        drift_pix_raw = drift_pix
+        drift_pix_raw = np.asarray(drift_pix, dtype=np.float64)
         roll_deg = 0.0
         try:
             roll_deg = float(getattr(self._get_state().camera, "roll_deg", 0.0))
         except Exception:
             roll_deg = 0.0
         drift_pix_corr = _apply_roll_to_drift(drift_pix_raw, roll_deg)
-
-        out["drift_pix"] = drift_pix_corr
-        out["drift_method"] = drift_method
-        self._publish_state(
-            {
-                "goto": {
-                    "autocal_drift_px_s_x": float(drift_pix_corr[0]),
-                    "autocal_drift_px_s_y": float(drift_pix_corr[1]),
-                }
-            }
-        )
 
         use_horizontal = pointing_method in (
             "horiz_drift",
@@ -2926,45 +3042,93 @@ class GoToWorker(BaseWorker):
             "horizontal_drift",
             "auto",
         )
+        use_roll_corr = bool(use_horizontal and np.isfinite(roll_deg) and abs(roll_deg) > 1e-9)
+        drift_pix_use = drift_pix_corr if use_roll_corr else drift_pix_raw
+        drift_pix = np.asarray(drift_pix_use, dtype=np.float64)
+
+        log_info(
+            self._out_log,
+            "GoTo: AutoCal drift vectors "
+            f"raw=[{float(drift_pix_raw[0]):.3f},{float(drift_pix_raw[1]):.3f}] "
+            f"corr=[{float(drift_pix_corr[0]):.3f},{float(drift_pix_corr[1]):.3f}] "
+            f"roll_deg={float(roll_deg):+.3f} use_roll={int(use_roll_corr)}",
+        )
+
+        out["drift_pix"] = drift_pix
+        out["drift_pix_raw"] = drift_pix_raw
+        out["drift_method"] = drift_method
+        self._publish_state(
+            {
+                "goto": {
+                    "autocal_drift_px_s_x": float(drift_pix[0]),
+                    "autocal_drift_px_s_y": float(drift_pix[1]),
+                }
+            }
+        )
         platesolving_result = None
         az_hat = None
         alt_hat = None
 
         if use_horizontal and best_drift_frame is not None:
             arcsec_per_px = float(np.rad2deg(plate_scale_rad) * 3600.0)
-            vx = float(drift_pix_corr[0])
-            vy_up = float(drift_pix_corr[1])
-            if drift_refract_enable:
-                sols = _drift_to_az_alt_refracted(
+
+            def _solve_drift_to_azalt(v_xy: np.ndarray) -> List[Tuple[float, float]]:
+                vx = float(v_xy[0])
+                vy_up = float(v_xy[1])
+                if drift_refract_enable:
+                    return _drift_to_az_alt_refracted(
+                        vx,
+                        vy_up,
+                        phi_deg=float(getattr(observer, "lat_deg", 0.0)),
+                        omega_arcsec_s=float(drift_pointing_omega),
+                        scale_arcsec_per_px=arcsec_per_px,
+                        P_hPa=float(drift_refract_P_hPa),
+                        T_C=float(drift_refract_T_C),
+                        max_iter=int(drift_refract_max_iter),
+                        lm_lambda=float(drift_refract_lm_lambda),
+                    )
+                return _drift_to_az_alt(
                     vx,
                     vy_up,
                     phi_deg=float(getattr(observer, "lat_deg", 0.0)),
                     omega_arcsec_s=float(drift_pointing_omega),
                     scale_arcsec_per_px=arcsec_per_px,
-                    P_hPa=float(drift_refract_P_hPa),
-                    T_C=float(drift_refract_T_C),
-                    max_iter=int(drift_refract_max_iter),
-                    lm_lambda=float(drift_refract_lm_lambda),
                 )
-            else:
-                sols = _drift_to_az_alt(
-                    vx,
-                    vy_up,
-                    phi_deg=float(getattr(observer, "lat_deg", 0.0)),
-                    omega_arcsec_s=float(drift_pointing_omega),
-                    scale_arcsec_per_px=arcsec_per_px,
-                )
-            if not sols:
-                log_error(
-                    self._out_log,
-                    "GoTo: AutoCal drift az/alt candidates: none",
-                )
-            if sols:
+
+            t_wall = float(getattr(best_drift_frame, "t_wall", 0.0))
+            obstime = Time(t_wall, format="unix") if t_wall > 0.0 else Time.now()
+
+            drift_trials: List[Tuple[str, np.ndarray]] = []
+            if use_roll_corr:
+                drift_trials.append(("roll", np.asarray(drift_pix_corr, dtype=np.float64)))
+            drift_trials.append(("raw", np.asarray(drift_pix_raw, dtype=np.float64)))
+
+            prev_trial_vec: Optional[np.ndarray] = None
+            for trial_label, trial_vec in drift_trials:
+                if prev_trial_vec is not None and np.allclose(trial_vec, prev_trial_vec, atol=1e-9, rtol=0.0):
+                    continue
+                prev_trial_vec = trial_vec
+
+                if trial_label == "raw" and use_roll_corr:
+                    log_error(
+                        self._out_log,
+                        "GoTo: AutoCal drift az/alt candidates none/failed with roll-corrected drift; retrying raw drift",
+                    )
+
+                sols = _solve_drift_to_azalt(trial_vec)
+                if not sols:
+                    log_error(
+                        self._out_log,
+                        f"GoTo: AutoCal drift az/alt candidates: none (mode={trial_label})",
+                    )
+                    continue
+
                 sol_txt = ", ".join(f"az={az_deg:.3f} alt={alt_deg:.3f}" for az_deg, alt_deg in sols)
-                log_info(self._out_log, f"GoTo: AutoCal drift az/alt candidates: {sol_txt}")
-            if sols:
-                t_wall = float(getattr(best_drift_frame, "t_wall", 0.0))
-                obstime = Time(t_wall, format="unix") if t_wall > 0.0 else Time.now()
+                log_info(
+                    self._out_log,
+                    f"GoTo: AutoCal drift az/alt candidates (mode={trial_label}): {sol_txt}",
+                )
+
                 candidates: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
                 for az_deg, alt_deg in sols:
                     try:
@@ -2978,47 +3142,67 @@ class GoToWorker(BaseWorker):
                     except Exception as exc:
                         log_info(self._out_log, f"GoTo: AutoCal drift target parse failed: {exc}")
 
-                if candidates:
-                    self._publish_state(
-                        {
-                            "goto": {
-                                "autocal_status": GotoAutocalStatus.RUNNING,
-                                "autocal_reason": "PLATESOLVING_LOOP",
-                            }
-                        }
+                if not candidates:
+                    log_error(
+                        self._out_log,
+                        f"GoTo: AutoCal drift target parse produced no candidates (mode={trial_label})",
                     )
-                    for idx, (azalt, target) in enumerate(candidates):
-                        if self._op_cancel.is_set():
-                            out["status"] = "CANCELLED"
-                            return out
-                        log_info(
-                            self._out_log,
-                            "GoTo: AutoCal platesolve (drift) "
-                            f"cand={idx} az={azalt[0]:.3f} alt={azalt[1]:.3f}",
-                        )
-                        platesolving_result = self._autocal_run_platesolve(
-                            best_drift_frame.raw16,
-                            target=target,
-                            platesolving_cfg=platesolving_cfg,
-                            sep_cfg=sep_cfg,
-                            observer=observer,
-                            obstime=obstime,
-                            solve_radius_deg=autocal_solve_radius_deg,
-                            solve_gmax=autocal_solve_gmax,
-                        )
-                        if bool(getattr(platesolving_result, "success", False)):
-                            az_hat, alt_hat = float(azalt[0]), float(azalt[1])
-                            out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
-                            self._publish_state(
-                                {
-                                    "goto": {
-                                        "autocal_az_deg": float(az_hat),
-                                        "autocal_alt_deg": float(alt_hat),
-                                        "autocal_radius_deg": 1.0,
-                                    }
+                    continue
+
+                drift_pix = np.asarray(trial_vec, dtype=np.float64)
+                out["drift_pix"] = drift_pix
+                self._publish_state(
+                    {
+                        "goto": {
+                            "autocal_drift_px_s_x": float(drift_pix[0]),
+                            "autocal_drift_px_s_y": float(drift_pix[1]),
+                        }
+                    }
+                )
+
+                self._publish_state(
+                    {
+                        "goto": {
+                            "autocal_status": GotoAutocalStatus.RUNNING,
+                            "autocal_reason": "PLATESOLVING_LOOP",
+                        }
+                    }
+                )
+
+                for idx, (azalt, target) in enumerate(candidates):
+                    if self._op_cancel.is_set():
+                        out["status"] = "CANCELLED"
+                        return out
+                    log_info(
+                        self._out_log,
+                        "GoTo: AutoCal platesolve (drift) "
+                        f"mode={trial_label} cand={idx} az={azalt[0]:.3f} alt={azalt[1]:.3f}",
+                    )
+                    platesolving_result = self._autocal_run_platesolve(
+                        best_drift_frame.raw16,
+                        target=target,
+                        platesolving_cfg=platesolving_cfg,
+                        sep_cfg=sep_cfg,
+                        observer=observer,
+                        obstime=obstime,
+                        solve_radius_deg=autocal_solve_radius_deg,
+                        solve_gmax=autocal_solve_gmax,
+                    )
+                    if bool(getattr(platesolving_result, "success", False)):
+                        az_hat, alt_hat = float(azalt[0]), float(azalt[1])
+                        out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
+                        self._publish_state(
+                            {
+                                "goto": {
+                                    "autocal_az_deg": float(az_hat),
+                                    "autocal_alt_deg": float(alt_hat),
+                                    "autocal_radius_deg": 1.0,
                                 }
-                            )
-                            break
+                            }
+                        )
+                        break
+                if platesolving_result is not None and bool(getattr(platesolving_result, "success", False)):
+                    break
         if use_horizontal:
             if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
                 out["status"] = "ERR_PLATESOLVING"
