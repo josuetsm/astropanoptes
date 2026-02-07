@@ -62,6 +62,53 @@ class CoreSmokeTests(unittest.TestCase):
         model.init_from_mechanics()
         self.assertEqual(model.J_deg_per_step.shape, (2, 2))
 
+    def test_goto_model_manual_fit_reports_params_and_errors(self) -> None:
+        model = GoToModel()
+        j_true = np.array([[0.0120, 0.0018], [0.0007, 0.0085]], dtype=np.float64)
+        yaw_true = 121.5
+        pitch_true = 38.25
+        theta_true = 17.0
+        rng = np.random.default_rng(7)
+
+        samples = np.array(
+            [
+                [-1200.0, -800.0],
+                [-800.0, 600.0],
+                [-200.0, -300.0],
+                [300.0, 400.0],
+                [900.0, -500.0],
+                [1400.0, 900.0],
+            ],
+            dtype=np.float64,
+        )
+        for s_az, s_alt in samples:
+            model.steps_est = np.array([s_az, s_alt], dtype=np.float64)
+            az = yaw_true + j_true[0, 0] * s_az + j_true[0, 1] * s_alt
+            alt = pitch_true + j_true[1, 0] * s_az + j_true[1, 1] * s_alt
+            theta = theta_true + float(rng.normal(0.0, 0.15))
+            model.add_manual_sample(np.array([az % 360.0, alt], dtype=np.float64), theta_deg=theta)
+
+        ok = model.fit_J_from_manual_samples(min_samples=6, ridge=1e-12)
+        self.assertTrue(ok)
+        self.assertEqual(model.model_fit_samples, 6)
+        self.assertEqual(model.model_roll_samples, 6)
+        self.assertTrue(np.all(np.isfinite(model.J_deg_per_step)))
+        self.assertAlmostEqual(model.J_deg_per_step[0, 0], j_true[0, 0], places=5)
+        self.assertAlmostEqual(model.J_deg_per_step[0, 1], j_true[0, 1], places=5)
+        self.assertAlmostEqual(model.J_deg_per_step[1, 0], j_true[1, 0], places=5)
+        self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_true[1, 1], places=5)
+        self.assertTrue(np.isfinite(model.model_non_orthogonality_deg))
+        self.assertTrue(np.isfinite(model.model_non_orthogonality_err_deg))
+        self.assertTrue(np.isfinite(model.model_roll_deg))
+        self.assertTrue(np.isfinite(model.model_roll_err_deg))
+        self.assertTrue(np.isfinite(model.model_yaw_deg))
+        self.assertTrue(np.isfinite(model.model_yaw_err_deg))
+        self.assertTrue(np.isfinite(model.model_pitch_deg))
+        self.assertTrue(np.isfinite(model.model_pitch_err_deg))
+        self.assertTrue(np.isfinite(model.model_fit_rms_arcsec))
+        self.assertTrue(np.isfinite(model.J00_err))
+        self.assertTrue(np.isfinite(model.J11_err))
+
     def test_roll_deg_from_drift_delta_respects_slew_sign(self) -> None:
         # +30 deg with positive slew => +30
         dv_pos = np.array([np.cos(np.deg2rad(30.0)), np.sin(np.deg2rad(30.0))], dtype=np.float64)

@@ -956,29 +956,45 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_ps_solve.clicked.connect(self._platesolve_start)
 
         form.addRow("target:", self.ed_ps_target)
-        form.addRow("search radius:", self.ds_ps_radius)
-        form.addRow("radius factor:", self.ds_ps_radius_factor)
-        form.addRow("max detections:", self.sb_ps_maxdet)
-        form.addRow("N_det:", self.sb_ps_ndet)
-        form.addRow("n_seeds:", self.sb_ps_nseeds)
-        form.addRow("min inliers:", self.sb_ps_mininl)
-        form.addRow("det_sigma:", self.ds_ps_det_sigma)
-        form.addRow("minarea:", self.sb_ps_minarea)
-        form.addRow("point_sigma:", self.ds_ps_point_sigma)
-        form.addRow("gmax:", self.ds_ps_gmax)
-        form.addRow("match_max_px:", self.ds_ps_match_max)
-        form.addRow("match_tol_arcsec:", self.ds_ps_match_tol)
-        form.addRow("pred_margin_arcsec:", self.ds_ps_pred_margin)
-        form.addRow("theta_step_deg:", self.ds_ps_theta_step)
-        form.addRow("theta_refine_span_deg:", self.ds_ps_theta_refine_span)
-        form.addRow("theta_refine_step_deg:", self.ds_ps_theta_refine_step)
-        form.addRow("triplet_tol_arcsec:", self.ds_ps_triplet_tol)
-        form.addRow("triplet_sigma_arcsec:", self.ds_ps_triplet_sigma)
-        form.addRow("triplet_max_trials:", self.sb_ps_triplet_trials)
-        form.addRow("max_i_scan:", self.sb_ps_max_i_scan)
-        form.addRow("guide_n:", self.sb_ps_guide_n)
-        form.addRow("simbad_radius:", self.ds_ps_simbad)
-        form.addRow(self.btn_ps_solve)
+        ps_params_frame = QFrame()
+        ps_params_row = QHBoxLayout(ps_params_frame)
+        ps_params_row.setContentsMargins(0, 0, 0, 0)
+        ps_params_row.setSpacing(16)
+
+        ps_form_left = QFormLayout()
+        ps_form_left.addRow("search radius:", self.ds_ps_radius)
+        ps_form_left.addRow("radius factor:", self.ds_ps_radius_factor)
+        ps_form_left.addRow("max detections:", self.sb_ps_maxdet)
+        ps_form_left.addRow("N_det:", self.sb_ps_ndet)
+        ps_form_left.addRow("n_seeds:", self.sb_ps_nseeds)
+        ps_form_left.addRow("min inliers:", self.sb_ps_mininl)
+        ps_form_left.addRow("det_sigma:", self.ds_ps_det_sigma)
+        ps_form_left.addRow("minarea:", self.sb_ps_minarea)
+        ps_form_left.addRow("point_sigma:", self.ds_ps_point_sigma)
+        ps_form_left.addRow("gmax:", self.ds_ps_gmax)
+        ps_form_left.addRow("guide_n:", self.sb_ps_guide_n)
+
+        ps_form_right = QFormLayout()
+        ps_form_right.addRow("match_max_px:", self.ds_ps_match_max)
+        ps_form_right.addRow("match_tol_arcsec:", self.ds_ps_match_tol)
+        ps_form_right.addRow("pred_margin_arcsec:", self.ds_ps_pred_margin)
+        ps_form_right.addRow("theta_step_deg:", self.ds_ps_theta_step)
+        ps_form_right.addRow("theta_refine_span_deg:", self.ds_ps_theta_refine_span)
+        ps_form_right.addRow("theta_refine_step_deg:", self.ds_ps_theta_refine_step)
+        ps_form_right.addRow("triplet_tol_arcsec:", self.ds_ps_triplet_tol)
+        ps_form_right.addRow("triplet_sigma_arcsec:", self.ds_ps_triplet_sigma)
+        ps_form_right.addRow("triplet_max_trials:", self.sb_ps_triplet_trials)
+        ps_form_right.addRow("max_i_scan:", self.sb_ps_max_i_scan)
+        ps_form_right.addRow("simbad_radius:", self.ds_ps_simbad)
+
+        ps_params_row.addLayout(ps_form_left, 1)
+        ps_params_row.addLayout(ps_form_right, 1)
+        form.addRow(ps_params_frame)
+
+        row_ps_btn = QHBoxLayout()
+        row_ps_btn.addWidget(self.btn_ps_solve)
+        row_ps_btn.addStretch(1)
+        form.addRow(row_ps_btn)
 
         out = QGroupBox("Outputs")
         out_form = QFormLayout()
@@ -1067,14 +1083,6 @@ class AstroPanoptesWindow(QMainWindow):
         self.sb_goto_ps_mininl.setRange(1, 100)
         self.sb_goto_ps_mininl.setValue(self.cfg.platesolving.min_inliers)
 
-        self.sb_rightcal_steps = QSpinBox()
-        self.sb_rightcal_steps.setRange(1, 500)
-        self.sb_rightcal_steps.setValue(10)
-
-        self.sb_rightcal_step_microsteps = QSpinBox()
-        self.sb_rightcal_step_microsteps.setRange(1, 2_000_000)
-        self.sb_rightcal_step_microsteps.setValue(300)
-
         self.ds_rightcal_radius = QDoubleSpinBox()
         self.ds_rightcal_radius.setRange(0.1, 5.0)
         self.ds_rightcal_radius.setDecimals(2)
@@ -1144,20 +1152,6 @@ class AstroPanoptesWindow(QMainWindow):
         rowps.addWidget(self.sb_goto_ps_mininl)
         rowps.addStretch(1)
 
-        rowcal = QHBoxLayout()
-        rowcal.addWidget(QLabel("Calib derecha pasos:"))
-        rowcal.addWidget(self.sb_rightcal_steps)
-        rowcal.addSpacing(10)
-        rowcal.addWidget(QLabel("µsteps/paso:"))
-        rowcal.addWidget(self.sb_rightcal_step_microsteps)
-        rowcal.addSpacing(10)
-        rowcal.addWidget(QLabel("PS radius:"))
-        rowcal.addWidget(self.ds_rightcal_radius)
-        rowcal.addSpacing(10)
-        rowcal.addWidget(QLabel("θ tol:"))
-        rowcal.addWidget(self.ds_rightcal_theta_tol)
-        rowcal.addStretch(1)
-
         self.sb_calib_dpad_steps = QSpinBox()
         self.sb_calib_dpad_steps.setRange(1, 2_000_000)
         self.sb_calib_dpad_steps.setValue(300)
@@ -1193,21 +1187,36 @@ class AstroPanoptesWindow(QMainWindow):
         grid_cal.addWidget(self.b_cal_down, 2, 1)
 
         self.calib_dpad_frame = QFrame()
-        rowd = QHBoxLayout(self.calib_dpad_frame)
-        rowd.setContentsMargins(0, 0, 0, 0)
-        rowd.addWidget(QLabel("steps:"))
-        rowd.addWidget(self.sb_calib_dpad_steps)
-        rowd.addSpacing(10)
-        rowd.addWidget(QLabel("delay_us:"))
-        rowd.addWidget(self.sb_calib_dpad_delay)
-        rowd.addSpacing(14)
-        rowd.addLayout(grid_cal)
-        rowd.addStretch(1)
+        col_dpad = QVBoxLayout(self.calib_dpad_frame)
+        col_dpad.setContentsMargins(0, 0, 0, 0)
+        col_dpad.setSpacing(6)
+
+        rowd_params = QHBoxLayout()
+        rowd_params.setContentsMargins(0, 0, 0, 0)
+        rowd_params.addWidget(QLabel("steps:"))
+        rowd_params.addWidget(self.sb_calib_dpad_steps)
+        rowd_params.addSpacing(10)
+        rowd_params.addWidget(QLabel("delay_us:"))
+        rowd_params.addWidget(self.sb_calib_dpad_delay)
+        rowd_params.addSpacing(14)
+        rowd_params.addWidget(QLabel("PS radius:"))
+        rowd_params.addWidget(self.ds_rightcal_radius)
+        rowd_params.addSpacing(8)
+        rowd_params.addWidget(QLabel("θ tol:"))
+        rowd_params.addWidget(self.ds_rightcal_theta_tol)
+        rowd_params.addStretch(1)
+        col_dpad.addLayout(rowd_params)
+
+        rowd_pad = QHBoxLayout()
+        rowd_pad.setContentsMargins(0, 0, 0, 0)
+        rowd_pad.addStretch(1)
+        rowd_pad.addLayout(grid_cal)
+        rowd_pad.addStretch(1)
+        col_dpad.addLayout(rowd_pad)
 
         self.btn_goto = QPushButton("GoTo")
         self.btn_cancel = QPushButton("Cancel")
         self.btn_autocal = QPushButton("AutoCalibrate")
-        self.btn_rightcal = QPushButton("Calibrar Derecha Auto")
         self.btn_roll = QPushButton("Estimar Roll")
         self.btn_fit_model = QPushButton("Fit GoTo Model")
         self.btn_home = QPushButton("Home")
@@ -1217,7 +1226,6 @@ class AstroPanoptesWindow(QMainWindow):
             self.btn_goto,
             self.btn_cancel,
             self.btn_autocal,
-            self.btn_rightcal,
             self.btn_roll,
             self.btn_fit_model,
             self.btn_home,
@@ -1228,7 +1236,6 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_goto.clicked.connect(self._goto_start)
         self.btn_cancel.clicked.connect(self._goto_cancel)
         self.btn_autocal.clicked.connect(self._autocalibrate)
-        self.btn_rightcal.clicked.connect(self._goto_calibrate_right_scan)
         self.btn_roll.clicked.connect(self._goto_estimate_roll)
         self.btn_fit_model.clicked.connect(self._goto_fit_model)
         self.btn_home.clicked.connect(self._home)
@@ -1245,7 +1252,6 @@ class AstroPanoptesWindow(QMainWindow):
         form.addRow("AutoCal PS mode:", self.dd_autocal_ps_mode)
         form.addRow("AutoCal manual:", self.autocal_manual_frame)
         form.addRow(rowps)
-        form.addRow(rowcal)
         form.addRow("Calib D-pad:", self.calib_dpad_frame)
         form.addRow(rowb)
         form.addRow("manual samples:", self.lbl_goto_samples)
@@ -1482,24 +1488,6 @@ class AstroPanoptesWindow(QMainWindow):
     def _goto_estimate_roll(self) -> None:
         self.runner.request_goto_estimate_roll()
         self._log("[goto] Estimar Roll")
-
-    def _goto_calibrate_right_scan(self) -> None:
-        params = {
-            "strategy": "direction_scan",
-            "scan_steps": int(self.sb_rightcal_steps.value()),
-            "scan_step_microsteps": int(self.sb_rightcal_step_microsteps.value()),
-            "scan_ps_radius_deg": float(self.ds_rightcal_radius.value()),
-            "scan_theta_tol_deg": float(self.ds_rightcal_theta_tol.value()),
-            "scan_direction": "right",
-            "N_seed": int(self.sb_goto_ps_nseeds.value()),
-            "min_inliers": int(self.sb_goto_ps_mininl.value()),
-        }
-        self.runner.request_goto_calibrate(params)
-        self._log(
-            "[goto] Calibrar derecha auto "
-            f"(pasos={params['scan_steps']}, microsteps={params['scan_step_microsteps']}, "
-            f"radius={params['scan_ps_radius_deg']:.2f}deg, theta_tol={params['scan_theta_tol_deg']:.1f}deg)"
-        )
 
     def _goto_calibrate_dpad(self, direction: str) -> None:
         params = {

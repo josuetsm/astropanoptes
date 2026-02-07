@@ -65,6 +65,7 @@ from config import SepConfig, PlatesolvingConfig, MountConfig, CameraConfig
 from platesolving import (
     ObserverConfig,
     PlatesolvingResult,
+    expected_field_rotation_deg,
     parse_target_to_icrs,
     solve_plate,
     _build_platesolving_debug_info,
@@ -127,6 +128,49 @@ def _as_array2(x: Sequence[float]) -> np.ndarray:
     if a.size != 2:
         raise ValueError("expected a 2-vector")
     return a
+
+
+def _circular_mean_deg(values: Sequence[float]) -> float:
+    v = np.asarray(values, dtype=np.float64).reshape(-1)
+    if v.size == 0:
+        raise ValueError("expected at least one angle")
+    r = np.deg2rad(v)
+    s = float(np.mean(np.sin(r)))
+    c = float(np.mean(np.cos(r)))
+    if abs(s) < 1e-15 and abs(c) < 1e-15:
+        return 0.0
+    return _wrap_deg_360(math.degrees(math.atan2(s, c)))
+
+
+def _circular_std_deg(values: Sequence[float]) -> float:
+    v = np.asarray(values, dtype=np.float64).reshape(-1)
+    if v.size == 0:
+        return 0.0
+    r = np.deg2rad(v)
+    s = float(np.mean(np.sin(r)))
+    c = float(np.mean(np.cos(r)))
+    R = float(math.hypot(s, c))
+    R = min(max(R, 1e-12), 1.0)
+    return float(np.degrees(math.sqrt(max(0.0, -2.0 * math.log(R)))))
+
+
+def _non_orthogonality_deg_from_params(j00: float, j01: float, j10: float, j11: float) -> float:
+    c0 = np.array([float(j00), float(j10)], dtype=np.float64)
+    c1 = np.array([float(j01), float(j11)], dtype=np.float64)
+    n0 = float(np.linalg.norm(c0))
+    n1 = float(np.linalg.norm(c1))
+    if n0 <= 1e-18 or n1 <= 1e-18:
+        return 0.0
+    cosang = float(np.clip(float(np.dot(c0, c1)) / (n0 * n1), -1.0, 1.0))
+    ang = float(np.degrees(math.acos(cosang)))
+    return float(ang - 90.0)
+
+
+def _non_orthogonality_deg_from_J(J: np.ndarray) -> float:
+    A = np.asarray(J, dtype=np.float64)
+    if A.shape != (2, 2):
+        return 0.0
+    return _non_orthogonality_deg_from_params(A[0, 0], A[0, 1], A[1, 0], A[1, 1])
 
 
 def _flatten_points(xy: np.ndarray) -> np.ndarray:
@@ -766,9 +810,29 @@ class GoToModel:
     # Manual calibration samples (absolute measurements)
     _manual_steps_abs: List[np.ndarray] = field(default_factory=list, repr=False)
     _manual_az_alt_abs: List[np.ndarray] = field(default_factory=list, repr=False)
+    _manual_roll_deg_abs: List[float] = field(default_factory=list, repr=False)
 
     # History of commanded steps (AZ, ALT) during the session
     steps_history: List[np.ndarray] = field(default_factory=list, repr=False)
+
+    # Model-fit report fields (published to state).
+    J00_err: float = 0.0
+    J01_err: float = 0.0
+    J10_err: float = 0.0
+    J11_err: float = 0.0
+    model_non_orthogonality_deg: float = 0.0
+    model_non_orthogonality_err_deg: float = 0.0
+    model_roll_deg: float = 0.0
+    model_roll_err_deg: float = 0.0
+    model_roll_samples: int = 0
+    model_pitch_deg: float = 0.0
+    model_pitch_err_deg: float = 0.0
+    model_yaw_deg: float = 0.0
+    model_yaw_err_deg: float = 0.0
+    model_fit_samples: int = 0
+    model_fit_rms_az_deg: float = 0.0
+    model_fit_rms_alt_deg: float = 0.0
+    model_fit_rms_arcsec: float = 0.0
 
     def init_from_mechanics(self) -> None:
         """Initialize J from the mechanical model (diagonal, no coupling)."""
@@ -778,6 +842,20 @@ class GoToModel:
             [[dps_az, 0.0], [0.0, dps_alt]],
             dtype=np.float64,
         )
+        self.J00_err = 0.0
+        self.J01_err = 0.0
+        self.J10_err = 0.0
+        self.J11_err = 0.0
+        self.model_non_orthogonality_deg = _non_orthogonality_deg_from_J(self.J_deg_per_step)
+        self.model_non_orthogonality_err_deg = 0.0
+        self.model_pitch_deg = 0.0
+        self.model_pitch_err_deg = 0.0
+        self.model_yaw_deg = 0.0
+        self.model_yaw_err_deg = 0.0
+        self.model_fit_samples = 0
+        self.model_fit_rms_az_deg = 0.0
+        self.model_fit_rms_alt_deg = 0.0
+        self.model_fit_rms_arcsec = 0.0
 
     def set_microsteps(self, az_div: int, alt_div: int) -> None:
         self.kin.microsteps_az = int(az_div)
@@ -788,6 +866,7 @@ class GoToModel:
         self.init_from_mechanics()
         self.J_deg_per_step[0, 1] = float(base[0, 1])
         self.J_deg_per_step[1, 0] = float(base[1, 0])
+        self.model_non_orthogonality_deg = _non_orthogonality_deg_from_J(self.J_deg_per_step)
 
     def note_manual_move(self, axis: Axis, direction: int, steps: int) -> None:
         """Update step counter when the app executes a MOVE."""
@@ -899,13 +978,39 @@ class GoToModel:
             return False
 
         self.J_deg_per_step = J_new.astype(np.float64)
+        self.J00_err = 0.0
+        self.J01_err = 0.0
+        self.J10_err = 0.0
+        self.J11_err = 0.0
+        self.model_non_orthogonality_deg = _non_orthogonality_deg_from_J(self.J_deg_per_step)
+        self.model_non_orthogonality_err_deg = 0.0
+        self.model_fit_samples = int(S.shape[0])
+        res = D - (S @ B)
+        self.model_fit_rms_az_deg = float(np.sqrt(np.mean(np.square(res[:, 0]))))
+        self.model_fit_rms_alt_deg = float(np.sqrt(np.mean(np.square(res[:, 1]))))
+        self.model_fit_rms_arcsec = float(
+            np.sqrt(np.mean(np.square(res[:, 0]) + np.square(res[:, 1]))) * 3600.0
+        )
         return True
 
-    def add_manual_sample(self, az_alt_deg: np.ndarray) -> int:
+    def add_manual_sample(
+        self,
+        az_alt_deg: np.ndarray,
+        *,
+        theta_deg: Optional[float] = None,
+        roll_deg: Optional[float] = None,
+    ) -> int:
         """Store an absolute (steps, AltAz) sample from a manual plate-solve."""
         az_alt = _as_array2(az_alt_deg)
         self._manual_steps_abs.append(self.steps_est.copy())
         self._manual_az_alt_abs.append(az_alt.copy())
+        # Backward-compatible argument: theta_deg. For the extended model this is
+        # interpreted as a roll estimate sample (deg).
+        roll_sample = roll_deg if roll_deg is not None else theta_deg
+        if roll_sample is not None:
+            roll = float(roll_sample)
+            if np.isfinite(roll):
+                self._manual_roll_deg_abs.append(_wrap_deg_180(roll))
         self.last_solve_az_alt_deg = az_alt.copy()
         self.last_solve_steps_est = self.steps_est.copy()
         self.last_solve_time = time.time()
@@ -930,47 +1035,166 @@ class GoToModel:
     def fit_J_from_manual_samples(self, *, min_samples: int = 3, ridge: float = 1e-12) -> bool:
         """Fit J from absolute manual samples (steps, AltAz).
 
-        Uses mean-centered data so an implicit offset is allowed.
+        Solves a linear model with intercept:
+          az  ~= yaw   + J00*s_az + J01*s_alt
+          alt ~= pitch + J10*s_az + J11*s_alt
+
+        This exposes:
+          - axis non-orthogonality (from J columns)
+          - telescope yaw/pitch offsets (intercepts)
+          - camera roll (from stored plate-solve theta samples)
+          - uncertainty estimates (standard errors)
         """
         if len(self._manual_steps_abs) < int(min_samples):
             return False
 
         S = np.stack(self._manual_steps_abs, axis=0)  # (N,2)
         A = np.stack(self._manual_az_alt_abs, axis=0)  # (N,2) [az, alt] in deg
+        n = int(S.shape[0])
+        if n < int(min_samples):
+            return False
 
-        s_mean = np.mean(S, axis=0)
         az_deg = A[:, 0].astype(np.float64)
         alt_deg = A[:, 1].astype(np.float64)
 
-        # Circular mean for azimuth to avoid wrap issues
-        az_rad = np.deg2rad(az_deg)
-        az_mean = float(np.degrees(math.atan2(np.mean(np.sin(az_rad)), np.mean(np.cos(az_rad))))) % 360.0
-        alt_mean = float(np.mean(alt_deg))
+        az_center = _circular_mean_deg(az_deg)
+        az_unwrapped = np.array(
+            [float(az_center + _wrap_deg_180(float(az) - float(az_center))) for az in az_deg],
+            dtype=np.float64,
+        )
 
-        dsteps = S - s_mean
-        daltaz = np.column_stack(
-            (
-                [_wrap_deg_180(float(az) - az_mean) for az in az_deg],
-                alt_deg - alt_mean,
-            )
-        ).astype(np.float64)
+        Y = np.column_stack((az_unwrapped, alt_deg)).astype(np.float64)  # (N,2)
+        X = np.column_stack((np.ones(n, dtype=np.float64), S)).astype(np.float64)  # (N,3)
 
-        # Ridge-regularized least squares: minimize ||S B - D||^2 + ridge||B||^2
-        if ridge > 0:
-            lam = float(ridge)
-            S_aug = np.vstack([dsteps, math.sqrt(lam) * np.eye(2)])
-            D_aug = np.vstack([daltaz, np.zeros((2, 2), dtype=np.float64)])
+        reg = np.diag([0.0, 1.0, 1.0]).astype(np.float64)
+        lam = max(0.0, float(ridge))
+        if lam > 0.0:
+            X_aug = np.vstack((X, math.sqrt(lam) * reg))
+            Y_aug = np.vstack((Y, np.zeros((3, 2), dtype=np.float64)))
         else:
-            S_aug, D_aug = dsteps, daltaz
+            X_aug = X
+            Y_aug = Y
 
-        B, *_ = np.linalg.lstsq(S_aug, D_aug, rcond=None)
-        J_new = B.T
+        B, *_ = np.linalg.lstsq(X_aug, Y_aug, rcond=None)  # (3,2)
+        J_new = np.array(
+            [[float(B[1, 0]), float(B[2, 0])], [float(B[1, 1]), float(B[2, 1])]],
+            dtype=np.float64,
+        )
 
         if not np.all(np.isfinite(J_new)):
             return False
 
         self.J_deg_per_step = J_new.astype(np.float64)
+
+        pred = X @ B
+        res_az = np.array(
+            [_wrap_deg_180(float(Y[i, 0]) - float(pred[i, 0])) for i in range(n)],
+            dtype=np.float64,
+        )
+        res_alt = (Y[:, 1] - pred[:, 1]).astype(np.float64)
+        sse_az = float(np.dot(res_az, res_az))
+        sse_alt = float(np.dot(res_alt, res_alt))
+        dof = max(1, n - 3)
+
+        XtX = (X.T @ X) + (lam * (reg.T @ reg))
+        try:
+            XtX_inv = np.linalg.inv(XtX)
+        except np.linalg.LinAlgError:
+            XtX_inv = np.linalg.pinv(XtX)
+
+        sigma2_az = sse_az / float(dof)
+        sigma2_alt = sse_alt / float(dof)
+        var_beta_az = np.maximum(np.diag(XtX_inv) * sigma2_az, 0.0)
+        var_beta_alt = np.maximum(np.diag(XtX_inv) * sigma2_alt, 0.0)
+        std_beta_az = np.sqrt(var_beta_az)
+        std_beta_alt = np.sqrt(var_beta_alt)
+
+        self.model_fit_samples = int(n)
+        self.model_fit_rms_az_deg = float(np.sqrt(np.mean(np.square(res_az))))
+        self.model_fit_rms_alt_deg = float(np.sqrt(np.mean(np.square(res_alt))))
+        self.model_fit_rms_arcsec = float(
+            np.sqrt(np.mean(np.square(res_az) + np.square(res_alt))) * 3600.0
+        )
+
+        self.model_yaw_deg = _wrap_deg_360(float(B[0, 0]))
+        self.model_pitch_deg = float(B[0, 1])
+        self.model_yaw_err_deg = float(std_beta_az[0])
+        self.model_pitch_err_deg = float(std_beta_alt[0])
+
+        self.J00_err = float(std_beta_az[1])
+        self.J01_err = float(std_beta_az[2])
+        self.J10_err = float(std_beta_alt[1])
+        self.J11_err = float(std_beta_alt[2])
+
+        self.model_non_orthogonality_deg = _non_orthogonality_deg_from_J(self.J_deg_per_step)
+        self.model_non_orthogonality_err_deg = 0.0
+        j_params = np.array(
+            [
+                float(self.J_deg_per_step[0, 0]),
+                float(self.J_deg_per_step[0, 1]),
+                float(self.J_deg_per_step[1, 0]),
+                float(self.J_deg_per_step[1, 1]),
+            ],
+            dtype=np.float64,
+        )
+        j_vars = np.array(
+            [
+                float(self.J00_err * self.J00_err),
+                float(self.J01_err * self.J01_err),
+                float(self.J10_err * self.J10_err),
+                float(self.J11_err * self.J11_err),
+            ],
+            dtype=np.float64,
+        )
+        if np.all(np.isfinite(j_params)) and np.all(np.isfinite(j_vars)):
+            grad = np.zeros(4, dtype=np.float64)
+            for i in range(4):
+                eps = max(1e-12, 1e-6 * abs(float(j_params[i])))
+                p_hi = j_params.copy()
+                p_lo = j_params.copy()
+                p_hi[i] += eps
+                p_lo[i] -= eps
+                f_hi = _non_orthogonality_deg_from_params(*p_hi.tolist())
+                f_lo = _non_orthogonality_deg_from_params(*p_lo.tolist())
+                if np.isfinite(f_hi) and np.isfinite(f_lo):
+                    grad[i] = float((f_hi - f_lo) / (2.0 * eps))
+            v_nonorth = float(np.sum(np.square(grad) * j_vars))
+            if np.isfinite(v_nonorth) and v_nonorth >= 0.0:
+                self.model_non_orthogonality_err_deg = float(math.sqrt(v_nonorth))
+
+        th = np.asarray(self._manual_roll_deg_abs, dtype=np.float64).reshape(-1)
+        th = th[np.isfinite(th)]
+        self.model_roll_samples = int(th.size)
+        if th.size >= 1:
+            self.model_roll_deg = _wrap_deg_180(_circular_mean_deg(th))
+            if th.size >= 2:
+                roll_std = _circular_std_deg(th)
+                self.model_roll_err_deg = float(roll_std / math.sqrt(float(th.size)))
+            else:
+                self.model_roll_err_deg = 0.0
+
         return True
+
+    def model_fit_report(self) -> Dict[str, float]:
+        return {
+            "J00_err": float(self.J00_err),
+            "J01_err": float(self.J01_err),
+            "J10_err": float(self.J10_err),
+            "J11_err": float(self.J11_err),
+            "model_non_orthogonality_deg": float(self.model_non_orthogonality_deg),
+            "model_non_orthogonality_err_deg": float(self.model_non_orthogonality_err_deg),
+            "model_roll_deg": float(self.model_roll_deg),
+            "model_roll_err_deg": float(self.model_roll_err_deg),
+            "model_roll_samples": int(self.model_roll_samples),
+            "model_pitch_deg": float(self.model_pitch_deg),
+            "model_pitch_err_deg": float(self.model_pitch_err_deg),
+            "model_yaw_deg": float(self.model_yaw_deg),
+            "model_yaw_err_deg": float(self.model_yaw_err_deg),
+            "model_fit_samples": int(self.model_fit_samples),
+            "model_fit_rms_az_deg": float(self.model_fit_rms_az_deg),
+            "model_fit_rms_alt_deg": float(self.model_fit_rms_alt_deg),
+            "model_fit_rms_arcsec": float(self.model_fit_rms_arcsec),
+        }
 
 
 # ============================================================
@@ -3051,7 +3275,12 @@ class GoToWorker(BaseWorker):
                 observer=observer,
                 obstime=Time.now(),
             )
-            n_samples = int(self._goto.model.add_manual_sample(az_alt))
+            n_samples = int(
+                self._goto.model.add_manual_sample(
+                    az_alt,
+                    roll_deg=self._roll_sample_from_solution(result, observer=observer, obstime=Time.now()),
+                )
+            )
             out["n_samples"] = n_samples
             out["solves_ok"] = int(out["solves_ok"]) + 1
             self._publish_state(
@@ -3077,6 +3306,7 @@ class GoToWorker(BaseWorker):
                     _ = bool(self._goto.model.sync_from_latest_manual_sample())
                 self._publish_j_matrix_state()
                 self._publish_state({"goto": {"synced": bool(getattr(self._goto.model, "synced", False))}})
+                self._log_model_fit_state(prefix="GoTo: right-scan fit update")
             return True
 
         log_info(
@@ -3557,7 +3787,16 @@ class GoToWorker(BaseWorker):
                     observer=observer,
                     obstime=Time.now(),
                 )
-                n_samples = int(self._goto.model.add_manual_sample(az_alt))
+                n_samples = int(
+                    self._goto.model.add_manual_sample(
+                        az_alt,
+                        roll_deg=self._roll_sample_from_solution(
+                            platesolving_result,
+                            observer=observer,
+                            obstime=Time.now(),
+                        ),
+                    )
+                )
                 self._publish_state(
                     {
                         "goto": {
@@ -4222,7 +4461,16 @@ class GoToWorker(BaseWorker):
                 observer=observer,
                 obstime=Time.now(),
             )
-            n_samples = int(self._goto.model.add_manual_sample(az_alt))
+            n_samples = int(
+                self._goto.model.add_manual_sample(
+                    az_alt,
+                    roll_deg=self._roll_sample_from_solution(
+                        platesolving_result,
+                        observer=observer,
+                        obstime=Time.now(),
+                    ),
+                )
+            )
             self._publish_state(
                 {
                     "goto": {
@@ -4287,11 +4535,37 @@ class GoToWorker(BaseWorker):
         )
         return out
 
+    def _roll_sample_from_solution(
+        self,
+        result: PlatesolvingResult,
+        *,
+        observer: ObserverConfig,
+        obstime: Optional[Time] = None,
+    ) -> float:
+        theta = float(getattr(result, "theta_deg", float("nan")))
+        ra = float(getattr(result, "center_ra_deg", float("nan")))
+        dec = float(getattr(result, "center_dec_deg", float("nan")))
+        if (not np.isfinite(theta)) or (not np.isfinite(ra)) or (not np.isfinite(dec)):
+            return float("nan")
+        t_eval = obstime if obstime is not None else Time.now()
+        az_axis_theta = expected_field_rotation_deg(
+            ra,
+            dec,
+            observer=observer,
+            obstime=t_eval,
+            roll_offset_deg=0.0,
+        )
+        if az_axis_theta is None or (not np.isfinite(az_axis_theta)):
+            return float("nan")
+        return _wrap_deg_180(float(az_axis_theta) - float(theta))
+
     def _publish_j_matrix_state(self) -> None:
-        J = getattr(self._goto.model, "J_deg_per_step", None)
+        model = self._goto.model
+        J = getattr(model, "J_deg_per_step", None)
         if J is None or getattr(J, "shape", None) != (2, 2):
             log_error(self._out_log, "GoTo: J matrix unavailable or invalid", ValueError("invalid J matrix"))
             return
+        fit_report = model.model_fit_report()
         self._publish_state(
             {
                 "goto": {
@@ -4299,9 +4573,46 @@ class GoToWorker(BaseWorker):
                     "J01": float(J[0, 1]),
                     "J10": float(J[1, 0]),
                     "J11": float(J[1, 1]),
-                    "synced": bool(getattr(self._goto.model, "synced", False)),
+                    "J00_err": float(fit_report["J00_err"]),
+                    "J01_err": float(fit_report["J01_err"]),
+                    "J10_err": float(fit_report["J10_err"]),
+                    "J11_err": float(fit_report["J11_err"]),
+                    "model_non_orthogonality_deg": float(fit_report["model_non_orthogonality_deg"]),
+                    "model_non_orthogonality_err_deg": float(fit_report["model_non_orthogonality_err_deg"]),
+                    "model_camera_roll_deg": float(fit_report["model_roll_deg"]),
+                    "model_camera_roll_err_deg": float(fit_report["model_roll_err_deg"]),
+                    "model_camera_roll_samples": int(fit_report["model_roll_samples"]),
+                    "model_pitch_deg": float(fit_report["model_pitch_deg"]),
+                    "model_pitch_err_deg": float(fit_report["model_pitch_err_deg"]),
+                    "model_yaw_deg": float(fit_report["model_yaw_deg"]),
+                    "model_yaw_err_deg": float(fit_report["model_yaw_err_deg"]),
+                    "model_fit_samples": int(fit_report["model_fit_samples"]),
+                    "model_fit_rms_az_deg": float(fit_report["model_fit_rms_az_deg"]),
+                    "model_fit_rms_alt_deg": float(fit_report["model_fit_rms_alt_deg"]),
+                    "model_fit_rms_arcsec": float(fit_report["model_fit_rms_arcsec"]),
+                    "synced": bool(getattr(model, "synced", False)),
                 }
             }
+        )
+
+    def _log_model_fit_state(self, *, prefix: str) -> None:
+        rep = self._goto.model.model_fit_report()
+        J = getattr(self._goto.model, "J_deg_per_step", np.zeros((2, 2), dtype=np.float64))
+        log_info(
+            self._out_log,
+            f"{prefix} "
+            f"samples={int(rep['model_fit_samples'])} "
+            f"J=[[{float(J[0, 0]):+.6e},{float(J[0, 1]):+.6e}],"
+            f"[{float(J[1, 0]):+.6e},{float(J[1, 1]):+.6e}]] "
+            f"dJ=[[{float(rep['J00_err']):.3e},{float(rep['J01_err']):.3e}],"
+            f"[{float(rep['J10_err']):.3e},{float(rep['J11_err']):.3e}]] "
+            f"nonorth={float(rep['model_non_orthogonality_deg']):+.4f}±{float(rep['model_non_orthogonality_err_deg']):.4f}deg "
+            f"roll={float(rep['model_roll_deg']):+.3f}±{float(rep['model_roll_err_deg']):.3f}deg "
+            f"yaw={float(rep['model_yaw_deg']):+.4f}±{float(rep['model_yaw_err_deg']):.4f}deg "
+            f"pitch={float(rep['model_pitch_deg']):+.4f}±{float(rep['model_pitch_err_deg']):.4f}deg "
+            f"rms=[az={float(rep['model_fit_rms_az_deg']):.4f}deg "
+            f"alt={float(rep['model_fit_rms_alt_deg']):.4f}deg "
+            f"tot={float(rep['model_fit_rms_arcsec']):.2f}arcsec]",
         )
 
     def _handle_request(self, request: Dict[str, Any]) -> None:
@@ -4524,6 +4835,8 @@ class GoToWorker(BaseWorker):
                     f"synced={bool(getattr(self._goto.model, 'synced', False))} "
                     f"synced_from_manual={synced_from_manual}",
                 )
+                if ok:
+                    self._log_model_fit_state(prefix="GoTo: FIT_MODEL report")
 
             else:
                 self._publish_state(

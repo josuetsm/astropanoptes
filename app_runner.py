@@ -794,6 +794,7 @@ class AppRunner:
         self._goto.model.kin.axis_sign_az = +1
         self._goto.model.kin.axis_sign_alt = _axis_sign_from_invert(self.cfg.mount.invert_alt)
         self._goto.model.init_from_mechanics()
+        fit_report = self._goto.model.model_fit_report()
         self._update_state(
             {
                 "goto": {
@@ -801,6 +802,23 @@ class AppRunner:
                     "J01": float(self._goto.model.J_deg_per_step[0, 1]),
                     "J10": float(self._goto.model.J_deg_per_step[1, 0]),
                     "J11": float(self._goto.model.J_deg_per_step[1, 1]),
+                    "J00_err": float(fit_report["J00_err"]),
+                    "J01_err": float(fit_report["J01_err"]),
+                    "J10_err": float(fit_report["J10_err"]),
+                    "J11_err": float(fit_report["J11_err"]),
+                    "model_non_orthogonality_deg": float(fit_report["model_non_orthogonality_deg"]),
+                    "model_non_orthogonality_err_deg": float(fit_report["model_non_orthogonality_err_deg"]),
+                    "model_camera_roll_deg": float(fit_report["model_roll_deg"]),
+                    "model_camera_roll_err_deg": float(fit_report["model_roll_err_deg"]),
+                    "model_camera_roll_samples": int(fit_report["model_roll_samples"]),
+                    "model_pitch_deg": float(fit_report["model_pitch_deg"]),
+                    "model_pitch_err_deg": float(fit_report["model_pitch_err_deg"]),
+                    "model_yaw_deg": float(fit_report["model_yaw_deg"]),
+                    "model_yaw_err_deg": float(fit_report["model_yaw_err_deg"]),
+                    "model_fit_samples": int(fit_report["model_fit_samples"]),
+                    "model_fit_rms_az_deg": float(fit_report["model_fit_rms_az_deg"]),
+                    "model_fit_rms_alt_deg": float(fit_report["model_fit_rms_alt_deg"]),
+                    "model_fit_rms_arcsec": float(fit_report["model_fit_rms_arcsec"]),
                 }
             }
         )
