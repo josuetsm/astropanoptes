@@ -363,10 +363,17 @@ def _unrefract_app_to_true(
     iters: int = 8,
 ) -> float:
     """Solve h_app = h_true + R(h_true) for h_true."""
-    h = min(89.9, max(-1.0, float(h_app_deg)))
+    h_app = float(np.clip(float(h_app_deg), -90.0, 90.0))
+    # In our Bennett branch model, refraction is 0 for h_true <= -1 deg.
+    # Keep sub-horizon apparent altitudes invertible in that regime.
+    if h_app <= -1.0:
+        return float(h_app)
+
+    h_hi = 89.999999
+    h = min(h_hi, max(-1.0, h_app))
     for _ in range(int(iters)):
         R = _R_true_to_app_deg(h, P_hPa=P_hPa, T_C=T_C)
-        f = (h + R) - float(h_app_deg)
+        f = (h + R) - h_app
 
         eps = 1e-3
         R2 = _R_true_to_app_deg(h + eps, P_hPa=P_hPa, T_C=T_C)
@@ -376,8 +383,8 @@ def _unrefract_app_to_true(
 
         step = f / df
         h -= step
-        if h > 89.9:
-            h = 89.9
+        if h > h_hi:
+            h = h_hi
         if h < -1.0:
             h = -1.0
         if abs(step) < 1e-7:
@@ -408,9 +415,10 @@ def _drift_to_az_alt_refracted(
     sort_by_forward_err: bool = True,
 ) -> List[Tuple[float, float]]:
     """
-    Refraction-aware inversion from drift (vx, vy) to (az, alt_true).
+    Refraction-aware inversion from drift (vx, vy) to (az, alt_app).
 
-    Returns 0, 1 or 2 solutions; altitude is *true* (non-refracted) to match AltAz->ICRS.
+    Returns 0, 1 or 2 solutions; altitude is apparent (refracted) to match
+    parse_target_to_icrs and the GoTo model's AltAz convention.
     """
     phi = math.radians(float(phi_deg))
     C = math.cos(phi)
@@ -538,8 +546,13 @@ def _drift_to_az_alt_refracted(
 
     sols: List[Tuple[float, float]] = []
     for az_deg, alt_true_deg, _ in refined:
-        if -0.5 <= alt_true_deg <= 90.0:
-            sols.append((_wrap360(az_deg), float(alt_true_deg)))
+        alt_app_deg = alt_true_deg + _R_true_to_app_deg(
+            alt_true_deg,
+            P_hPa=float(P_hPa),
+            T_C=float(T_C),
+        )
+        if np.isfinite(alt_app_deg) and -0.5 <= alt_app_deg <= 90.0:
+            sols.append((_wrap360(az_deg), float(alt_app_deg)))
 
     if not sols:
         log_error(None, "GoTo: drift_to_az_alt_refracted no solutions after refinement")
@@ -1794,6 +1807,15 @@ class GoToWorker(BaseWorker):
             return None
         return int(seq)
 
+    def _autocal_frame_time_s(self, fr: _AutocalFrame) -> float:
+        t_capture = float(getattr(fr, "t_capture", float("nan")))
+        if np.isfinite(t_capture):
+            return t_capture
+        t_mono = float(getattr(fr, "t_mono", float("nan")))
+        if np.isfinite(t_mono):
+            return t_mono
+        return float(getattr(fr, "t_wall", _now_s()))
+
     def _autocal_detect(
         self, raw16: np.ndarray
     ) -> Tuple[np.ndarray, int, float, Tuple[Tuple[float, float, float], ...]]:
@@ -1873,7 +1895,8 @@ class GoToWorker(BaseWorker):
             t_capture = float(getattr(fr, "t_capture", _now_s()))
             t_wall = float(_now_s())
             t_mono = float(_perf())
-            if last_capture_t is not None and (t_mono - last_capture_t) < min_dt_s:
+            frame_t = t_capture if np.isfinite(t_capture) else t_mono
+            if last_capture_t is not None and (frame_t - last_capture_t) < min_dt_s:
                 time.sleep(0.005)
                 continue
             frames.append(
@@ -1888,7 +1911,7 @@ class GoToWorker(BaseWorker):
                     top_sources=top_sources,
                 )
             )
-            last_capture_t = t_mono
+            last_capture_t = frame_t
             if obj_xy.shape[0] >= min_usable_sources:
                 usable += 1
         return frames
@@ -1969,7 +1992,6 @@ class GoToWorker(BaseWorker):
         frames: List[_AutocalFrame],
         *,
         window: int,
-        fps_hint: float,
         median_k: int,
         smooth_k: int,
         vmax_px_s: float,
@@ -1986,27 +2008,21 @@ class GoToWorker(BaseWorker):
             )
             return None
 
-        t = np.asarray([float(fr.t_mono) for fr in frames], dtype=np.float64)
+        t = np.asarray([self._autocal_frame_time_s(fr) for fr in frames], dtype=np.float64)
         order = np.argsort(t)
         t = t[order]
         frames = [frames[i] for i in order]
 
         dt = np.diff(t)
         dt = dt[dt > 0.0]
-        fps_eff: Optional[float] = None
         dt_med: Optional[float] = None
         if dt.size > 0:
             dt_med = float(np.median(dt))
-            if np.isfinite(dt_med) and dt_med > 0.0:
-                fps_eff = 1.0 / dt_med
-
-        if fps_eff is None:
-            fps_hint = float(fps_hint)
-            if fps_hint > 0.0 and np.isfinite(fps_hint):
-                fps_eff = fps_hint
-            else:
-                log_error(self._out_log, "GoTo: AutoCal drift stack missing valid fps")
-                return None
+            if not np.isfinite(dt_med) or dt_med <= 0.0:
+                dt_med = None
+        if dt_med is None:
+            log_error(self._out_log, "GoTo: AutoCal drift stack missing valid frame capture timestamps")
+            return None
 
         try:
             stack = np.stack([fr.raw16 for fr in frames], axis=0)
@@ -2017,7 +2033,7 @@ class GoToWorker(BaseWorker):
         try:
             out = estimate_sensor_drift_from_stack(
                 stack,
-                fps=float(fps_eff),
+                frame_times_s=t,
                 window=int(window),
                 median_k=int(median_k),
                 smooth_k=int(smooth_k),
@@ -2045,7 +2061,7 @@ class GoToWorker(BaseWorker):
             self._out_log,
             "GoTo: AutoCal drift stack "
             f"v=[{float(v[0]):.3f},{float(v[1]):.3f}] "
-            f"fps={float(fps_eff):.3f} dt_med={float(dt_med or 0.0):.3f}s "
+            f"dt_med={float(dt_med or 0.0):.3f}s dt_span={float(t[-1] - t[0]):.3f}s "
             f"window={int(window)} n={n} "
             f"vx_std={float(out.get('vx_std', 0.0)):.3f} vy_std={float(out.get('vy_std', 0.0)):.3f}",
         )
@@ -2065,7 +2081,6 @@ class GoToWorker(BaseWorker):
         use_theil_sen: bool,
         max_shift_px: float,
         min_resp: float,
-        fps: float,
     ) -> Optional[np.ndarray]:
         if len(frames) < int(min_frames):
             log_error(
@@ -2085,7 +2100,7 @@ class GoToWorker(BaseWorker):
             if k <= 0:
                 continue
             per_frame.append(fr.obj_xy[:k].astype(np.float64, copy=False))
-            t_list.append(float(getattr(fr, "t_mono", fr.t_wall)))
+            t_list.append(self._autocal_frame_time_s(fr))
 
         if len(per_frame) < int(min_frames):
             log_error(
@@ -2111,23 +2126,7 @@ class GoToWorker(BaseWorker):
             if not np.isfinite(dt_med) or dt_med <= 0.0:
                 dt_med = None
 
-        fps = float(fps)
-        dt_fps: Optional[float] = None
-        if fps > 0.0 and np.isfinite(fps):
-            dt_fps = 1.0 / fps
-
-        # Use the larger of (measured cadence, fps cadence) to avoid
-        # overestimating speed when frames are throttled (e.g., drift_dt_min_s).
-        dt_frame: Optional[float]
-        if dt_med is not None and dt_fps is not None:
-            dt_frame = max(float(dt_med), float(dt_fps))
-        else:
-            dt_frame = dt_med if dt_med is not None else dt_fps
-
-        # Use actual monotonic span for duration gating (stable), even if we later use FPS for dt.
         duration_s = float(t[-1] - t[0])
-        if (not np.isfinite(duration_s) or duration_s <= 0.0) and dt_frame is not None:
-            duration_s = float((len(per_frame) - 1) * dt_frame)
         if not np.isfinite(duration_s) or duration_s < float(min_duration_s):
             log_error(
                 self._out_log,
@@ -2164,7 +2163,7 @@ class GoToWorker(BaseWorker):
         vels: List[np.ndarray] = []
         total_pairs = 0
         for i in range(1, len(per_frame)):
-            dt = float(dt_frame) if dt_frame is not None else float(t[i] - t[i - 1])
+            dt = float(t[i] - t[i - 1])
             if dt <= 0.0:
                 continue
             total_pairs += 1
@@ -2200,16 +2199,13 @@ class GoToWorker(BaseWorker):
                     "GoTo: AutoCal drift line sweep "
                     f"deg={float(best.get('deg', 0.0)):.2f} score={float(best.get('score', 0.0)):.3f} "
                     f"v=[{float(v[0]):.3f},{float(v[1]):.3f}] "
-                    f"dt={float(dt_frame or 0.0):.3f}s pairs={len(vels)}/{total_pairs} "
+                    f"dt_med={float(dt_med or 0.0):.3f}s pairs={len(vels)}/{total_pairs} "
                     f"frames={len(per_frame)} pts={xy_all.shape[0]}",
                 )
                 return v
 
         # Fallback: project positions onto drift axis and fit slope.
-        if dt_frame is not None:
-            t_rel = np.arange(len(per_frame), dtype=np.float64) * float(dt_frame)
-        else:
-            t_rel = t - t[0]
+        t_rel = t - t[0]
         t_f = np.array([np.median(p @ u) for p in per_frame], dtype=np.float64)
         if not np.all(np.isfinite(t_f)):
             log_error(self._out_log, "GoTo: AutoCal drift line sweep invalid projection values")
@@ -2263,7 +2259,6 @@ class GoToWorker(BaseWorker):
             log_error(self._out_log, "GoTo: Roll estimate failed to stop mount", exc)
 
         mount_cfg = self._get_mount_cfg()
-        cam_cfg = self._get_camera_cfg()
 
         roll_window = int(params.get("roll_window", 60))
         roll_frames = int(params.get("roll_frames", max(roll_window + 5, 80)))
@@ -2283,15 +2278,6 @@ class GoToWorker(BaseWorker):
         roll_ramp_s = float(params.get("roll_ramp_s", 0.6))
         roll_ramp_hz = float(params.get("roll_ramp_hz", 25.0))
         roll_settle_s = float(params.get("roll_settle_s", 0.2))
-
-        roll_fps = float(params.get("roll_fps", 0.0))
-        if roll_fps <= 0.0:
-            if float(getattr(st.camera, "fps_capture", 0.0)) > 0.0:
-                roll_fps = float(getattr(st.camera, "fps_capture", 0.0))
-            else:
-                exp_ms = float(getattr(cam_cfg, "exp_ms", 0.0))
-                if exp_ms > 0.0:
-                    roll_fps = 1000.0 / exp_ms
 
         roll_stack_median_k = int(params.get("roll_stack_median_k", 3))
         roll_stack_smooth_k = int(params.get("roll_stack_smooth_k", 20))
@@ -2344,14 +2330,14 @@ class GoToWorker(BaseWorker):
             source = "none"
             if roll_use_stack:
                 try:
-                    t = np.asarray([float(fr.t_mono) for fr in frames], dtype=np.float64)
-                    dt = np.diff(np.sort(t))
-                    dt = dt[dt > 0.0]
-                    fps_eff = float(1.0 / np.median(dt)) if dt.size > 0 else float(roll_fps)
-                    stack = np.stack([fr.raw16 for fr in frames], axis=0)
+                    t = np.asarray([self._autocal_frame_time_s(fr) for fr in frames], dtype=np.float64)
+                    order = np.argsort(t)
+                    t = t[order]
+                    frames_sorted = [frames[i] for i in order]
+                    stack = np.stack([fr.raw16 for fr in frames_sorted], axis=0)
                     drift_out = estimate_sensor_drift_from_stack(
                         stack,
-                        fps=float(fps_eff),
+                        frame_times_s=t,
                         window=int(roll_window),
                         median_k=int(roll_stack_median_k),
                         smooth_k=int(roll_stack_smooth_k),
@@ -2398,7 +2384,6 @@ class GoToWorker(BaseWorker):
                     use_theil_sen=True,
                     max_shift_px=float(roll_line_max_shift_px),
                     min_resp=0.1,
-                    fps=roll_fps,
                 )
                 if v is not None:
                     source = "line"
@@ -2417,7 +2402,7 @@ class GoToWorker(BaseWorker):
         log_info(
             self._out_log,
             "GoTo: Roll estimate config "
-            f"frames={roll_frames} window={roll_window} fps={roll_fps:.2f} "
+            f"frames={roll_frames} window={roll_window} "
             f"rate_steps_s={roll_rate_steps_s:.1f} ramp_s={roll_ramp_s:.2f} "
             f"use_stack={int(roll_use_stack)} use_line={int(roll_use_line)} "
             f"max_rel_std={roll_max_rel_std:.3f} max_speed={roll_max_speed_px_s:.1f} "
@@ -2754,8 +2739,8 @@ class GoToWorker(BaseWorker):
         cols: List[np.ndarray] = []
         resp_low = 0
         for fr in frames[1:]:
-            base_t = float(getattr(base, "t_mono", base.t_wall))
-            fr_t = float(getattr(fr, "t_mono", fr.t_wall))
+            base_t = self._autocal_frame_time_s(base)
+            fr_t = self._autocal_frame_time_s(fr)
             dt = float(fr_t - base_t)
             if dt <= 0.0:
                 continue
@@ -2842,7 +2827,6 @@ class GoToWorker(BaseWorker):
         drift_line_use_theil_sen = bool(params.get("drift_line_use_theil_sen", True))
         drift_line_max_shift_px = float(params.get("drift_line_max_shift_px", 50.0))
         drift_line_min_resp = float(params.get("drift_line_min_resp", 0.1))
-        drift_line_fps = float(params.get("drift_line_fps", 0.0))
         drift_stack_enable = bool(params.get("drift_stack_enable", True))
         drift_stack_window = int(params.get("drift_stack_window", 60))
         drift_stack_median_k = int(params.get("drift_stack_median_k", 3))
@@ -2852,7 +2836,6 @@ class GoToWorker(BaseWorker):
         drift_stack_max_shift_cap = int(params.get("drift_stack_max_shift_cap", 200))
         drift_stack_profile_q = params.get("drift_stack_profile_q", None)
         drift_stack_use_subpixel = bool(params.get("drift_stack_use_subpixel", False))
-        drift_stack_fps = float(params.get("drift_stack_fps", 0.0))
         drift_refract_enable = bool(params.get("drift_refract_enable", True))
         drift_refract_P_hPa = float(params.get("drift_refract_P_hPa", 1013.25))
         drift_refract_T_C = float(params.get("drift_refract_T_C", 15.0))
@@ -2916,17 +2899,6 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_AUTOCAL_PS_PARAMS"
             return out
 
-        if drift_line_fps <= 0.0:
-            if float(getattr(st.camera, "fps_capture", 0.0)) > 0.0:
-                drift_line_fps = float(getattr(st.camera, "fps_capture", 0.0))
-            else:
-                cam_cfg = self._get_camera_cfg()
-                exp_ms = float(getattr(cam_cfg, "exp_ms", 0.0))
-                if exp_ms > 0.0:
-                    drift_line_fps = 1000.0 / exp_ms
-        if drift_stack_fps <= 0.0:
-            drift_stack_fps = float(drift_line_fps)
-
         if drift_stack_window < 1:
             drift_stack_window = 1
         if drift_stack_profile_q is not None:
@@ -2957,9 +2929,9 @@ class GoToWorker(BaseWorker):
             f"drift_line_deg_step={drift_line_deg_step:.2f} bin_width={drift_line_bin_width_px:.2f} "
             f"drift_line_topk_bins={drift_line_topk_bins} "
             f"drift_line_max_shift_px={drift_line_max_shift_px:.1f} min_resp={drift_line_min_resp:.2f} "
-            f"drift_line_fps={drift_line_fps:.2f} "
+            "drift_timebase=capture_ts "
             f"drift_stack_enable={int(bool(drift_stack_enable))} window={int(drift_stack_window)} "
-            f"vmax={drift_stack_vmax_px_s:.1f} fps={drift_stack_fps:.2f} "
+            f"vmax={drift_stack_vmax_px_s:.1f} "
             f"drift_refract_enable={int(bool(drift_refract_enable))} "
             f"P_hPa={drift_refract_P_hPa:.1f} T_C={drift_refract_T_C:.1f} "
             f"autocal_ps_radius_deg={autocal_solve_radius_deg:.2f} autocal_ps_gmax={autocal_solve_gmax:.2f} "
@@ -3060,9 +3032,9 @@ class GoToWorker(BaseWorker):
             f"sat=[{min(sat_fracs):.3f},{float(np.median(sat_fracs)):.3f},{max(sat_fracs):.3f}]",
         )
         if len(drift_frames_list) > 1:
-            ref_t = float(getattr(drift_frames_list[0], "t_mono", drift_frames_list[0].t_wall))
+            ref_t = self._autocal_frame_time_s(drift_frames_list[0])
             for idx, fr in enumerate(drift_frames_list):
-                fr_t = float(getattr(fr, "t_mono", fr.t_wall))
+                fr_t = self._autocal_frame_time_s(fr)
                 dt = float(fr_t - ref_t)
                 log_info(
                     self._out_log,
@@ -3078,7 +3050,6 @@ class GoToWorker(BaseWorker):
             drift_pix = self._autocal_estimate_drift_stack(
                 drift_frames_list,
                 window=drift_stack_window,
-                fps_hint=drift_stack_fps,
                 median_k=drift_stack_median_k,
                 smooth_k=drift_stack_smooth_k,
                 vmax_px_s=drift_stack_vmax_px_s,
@@ -3102,7 +3073,6 @@ class GoToWorker(BaseWorker):
                 use_theil_sen=drift_line_use_theil_sen,
                 max_shift_px=drift_line_max_shift_px,
                 min_resp=drift_line_min_resp,
-                fps=drift_line_fps,
             )
         if drift_pix is None:
             out["status"] = "ERR_DRIFT"

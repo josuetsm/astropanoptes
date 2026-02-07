@@ -115,10 +115,17 @@ def _unrefract_app_to_true(
     iters: int = 8,
 ) -> float:
     """Solve h_app = h_true + R(h_true) for h_true."""
-    h = min(89.9, max(-1.0, float(h_app_deg)))
+    h_app = float(np.clip(float(h_app_deg), -90.0, 90.0))
+    # In our Bennett branch model, refraction is 0 for h_true <= -1 deg.
+    # Keep sub-horizon apparent altitudes invertible in that regime.
+    if h_app <= -1.0:
+        return float(h_app)
+
+    h_hi = 89.999999
+    h = min(h_hi, max(-1.0, h_app))
     for _ in range(int(iters)):
         R = _R_true_to_app_deg(h, P_hPa=P_hPa, T_C=T_C)
-        f = (h + R) - float(h_app_deg)
+        f = (h + R) - h_app
 
         eps = 1e-3
         R2 = _R_true_to_app_deg(h + eps, P_hPa=P_hPa, T_C=T_C)
@@ -128,8 +135,8 @@ def _unrefract_app_to_true(
 
         step = f / df
         h -= step
-        if h > 89.9:
-            h = 89.9
+        if h > h_hi:
+            h = h_hi
         if h < -1.0:
             h = -1.0
         if abs(step) < 1e-7:

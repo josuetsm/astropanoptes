@@ -108,6 +108,12 @@ def _format_params(params: Dict[str, Any]) -> str:
     return ", ".join(parts)
 
 
+def _axis_sign_from_invert(invert_flag: bool) -> int:
+    # invert=True means user-facing +direction maps to opposite physical motion.
+    # Use the same sign in kinematics so model Alt/Az evolves in physical direction.
+    return -1 if bool(invert_flag) else +1
+
+
 class AppRunner:
     """
     Orquestador principal (runtime).
@@ -190,6 +196,8 @@ class AppRunner:
             motor_pulley_teeth=20,
             ring_radius_m_az=0.24,
             ring_radius_m_alt=0.235,
+            axis_sign_az=+1,
+            axis_sign_alt=_axis_sign_from_invert(self.cfg.mount.invert_alt),
         )
         goto_cfg = GoToRuntimeConfig(
             observer=self._platesolving_observer,
@@ -783,6 +791,8 @@ class AppRunner:
             self._mount_set_microsteps(self.cfg.mount.ms_az, self.cfg.mount.ms_alt)
         self._goto.model.kin.microsteps_az = int(self.cfg.mount.ms_az)
         self._goto.model.kin.microsteps_alt = int(self.cfg.mount.ms_alt)
+        self._goto.model.kin.axis_sign_az = +1
+        self._goto.model.kin.axis_sign_alt = _axis_sign_from_invert(self.cfg.mount.invert_alt)
         self._goto.model.init_from_mechanics()
         self._update_state(
             {

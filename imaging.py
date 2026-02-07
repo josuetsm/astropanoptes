@@ -1,7 +1,7 @@
 # imaging.py
 from __future__ import annotations
 
-from typing import Tuple
+from typing import Sequence, Tuple
 
 import math
 import numpy as np
@@ -53,6 +53,7 @@ def estimate_sensor_drift_from_stack(
     stack: np.ndarray,
     *,
     fps: float = 10.0,
+    frame_times_s: Sequence[float] | None = None,
     window: int = 60,
     median_k: int = 3,
     smooth_k: int = 20,
@@ -81,6 +82,8 @@ def estimate_sensor_drift_from_stack(
     Notas:
       - window=60 es el baseline principal de robustez.
       - vmax_px_s=30.0 asume sensor quieto (gating agresivo).
+      - Si se entrega frame_times_s, la velocidad se calcula con el dt real
+        de cada ventana (no con fps fijo).
     """
     arr = np.asarray(stack)
     if arr.ndim != 3:
@@ -91,16 +94,33 @@ def estimate_sensor_drift_from_stack(
     n, h, w = arr.shape
     if n <= int(window):
         raise ValueError(f"need n > window, got n={n} window={window}")
-    if float(fps) <= 0.0:
-        raise ValueError(f"fps must be > 0, got {fps}")
-
-    dt = 1.0 / float(fps)
     smooth_k = int(max(1, smooth_k))
     kernel = np.ones(smooth_k, dtype=np.float64) / float(smooth_k)
 
-    # max shift derivado (funcion de window)
-    max_shift = int(math.ceil(vmax_px_s * (float(window) / float(fps)) + margin_px))
-    max_shift = int(min(max_shift, max_shift_cap))
+    t_arr: np.ndarray
+    fps_meta = 0.0
+    if frame_times_s is not None:
+        t_arr = np.asarray(frame_times_s, dtype=np.float64).reshape(-1)
+        if t_arr.size != n:
+            raise ValueError(f"frame_times_s must have {n} elements, got {t_arr.size}")
+        if not np.all(np.isfinite(t_arr)):
+            raise ValueError("frame_times_s contains non-finite values")
+        dt_samples = np.diff(t_arr)
+        dt_samples = dt_samples[dt_samples > 0.0]
+        if dt_samples.size > 0:
+            fps_meta = float(1.0 / np.median(dt_samples))
+    else:
+        if float(fps) <= 0.0:
+            raise ValueError(f"fps must be > 0, got {fps}")
+        dt = 1.0 / float(fps)
+        t_arr = np.arange(n, dtype=np.float64) * float(dt)
+        fps_meta = float(fps)
+
+    def _max_shift_for_dt(dt_s: float) -> int:
+        if not np.isfinite(dt_s) or dt_s <= 0.0:
+            return 0
+        max_shift = int(math.ceil(vmax_px_s * float(dt_s) + margin_px))
+        return int(min(max_shift, int(max_shift_cap)))
 
     def profile_1d(img_u16: np.ndarray, which: str) -> np.ndarray:
         img = median_prefilter_raw16(img_u16, ksize=int(median_k))
@@ -126,7 +146,7 @@ def estimate_sensor_drift_from_stack(
             return 0.0
         return 0.5 * (y_m1 - y_p1) / denom
 
-    def shift_1d_gated(p0: np.ndarray, p1: np.ndarray) -> float:
+    def shift_1d_gated(p0: np.ndarray, p1: np.ndarray, *, max_shift: int) -> float:
         a = p1 - p1.mean()
         b = p0 - p0.mean()
 
@@ -134,7 +154,10 @@ def estimate_sensor_drift_from_stack(
         L = len(p1)
         shifts = np.arange(-(L - 1), (L - 1) + 1)
 
+        max_shift = int(max(0, max_shift))
         mask = (shifts >= -max_shift) & (shifts <= max_shift)
+        if not np.any(mask):
+            return 0.0
         corr_m = corr.copy()
         corr_m[~mask] = -np.inf
 
@@ -157,21 +180,36 @@ def estimate_sensor_drift_from_stack(
 
     vx_list = []
     vy_list = []
+    dt_window_list = []
+    max_shift_list = []
 
     for i in range(0, n - int(window)):
         j = i + int(window)
+        dt_window = float(t_arr[j] - t_arr[i])
+        if not np.isfinite(dt_window) or dt_window <= 0.0:
+            continue
+        max_shift_ij = _max_shift_for_dt(dt_window)
+        if max_shift_ij <= 0:
+            continue
 
-        dy = shift_1d_gated(pdy_all[i], pdy_all[j])
-        dx = shift_1d_gated(pdx_all[i], pdx_all[j])
+        dy = shift_1d_gated(pdy_all[i], pdy_all[j], max_shift=max_shift_ij)
+        dx = shift_1d_gated(pdx_all[i], pdx_all[j], max_shift=max_shift_ij)
 
-        vx = dx / (float(window) * dt)
-        vy = dy / (float(window) * dt)
+        vx = dx / float(dt_window)
+        vy = dy / float(dt_window)
 
         vx_list.append(vx)
         vy_list.append(vy)
+        dt_window_list.append(float(dt_window))
+        max_shift_list.append(int(max_shift_ij))
 
     vx_arr = np.asarray(vx_list, dtype=np.float64)
     vy_arr = np.asarray(vy_list, dtype=np.float64)
+    if vx_arr.size == 0 or vy_arr.size == 0:
+        raise ValueError("no valid windows for drift estimation (non-positive frame dt)")
+
+    dt_window_arr = np.asarray(dt_window_list, dtype=np.float64)
+    max_shift_arr = np.asarray(max_shift_list, dtype=np.int32)
 
     out = {
         "vx_mean": float(vx_arr.mean()),
@@ -181,22 +219,25 @@ def estimate_sensor_drift_from_stack(
         "n_frames": int(n),
         "n_windows": int(vx_arr.size),
         "params": {
-            "fps": float(fps),
+            "fps": float(fps_meta),
             "window": int(window),
             "median_k": int(median_k),
             "smooth_k": int(smooth_k),
             "vmax_px_s": float(vmax_px_s),
             "margin_px": float(margin_px),
             "max_shift_cap": int(max_shift_cap),
-            "max_shift_used": int(max_shift),
+            "max_shift_used": int(np.median(max_shift_arr)) if max_shift_arr.size > 0 else 0,
             "profile_q": profile_q,
             "use_subpixel": bool(use_subpixel),
+            "time_mode": "frame_times_s" if frame_times_s is not None else "fps",
+            "window_dt_s_median": float(np.median(dt_window_arr)),
         },
     }
 
     if return_per_window:
         out["vx_per_window"] = vx_arr
         out["vy_per_window"] = vy_arr
+        out["dt_per_window_s"] = dt_window_arr
 
     return out
 
