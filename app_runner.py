@@ -480,8 +480,8 @@ class AppRunner:
     def request_goto_calibrate(self, params: Dict[str, Any]) -> None:
         self.enqueue(goto_calibrate(params))
 
-    def request_goto_autocalibrate(self) -> None:
-        self.enqueue(goto_autocalibrate())
+    def request_goto_autocalibrate(self, params: Dict[str, Any] | None = None) -> None:
+        self.enqueue(goto_autocalibrate(params))
 
     def request_goto_estimate_roll(self, params: Dict[str, Any] | None = None) -> None:
         self.enqueue(goto_estimate_roll(params))

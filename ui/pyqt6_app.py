@@ -908,11 +908,30 @@ class AstroPanoptesWindow(QMainWindow):
         self.cb_fb.setChecked(self.cfg.goto.platesolving_feedback)
         self.cb_fb.toggled.connect(self.sb_stages.setEnabled)
 
+        self.ds_autocal_ps_radius = QDoubleSpinBox()
+        self.ds_autocal_ps_radius.setRange(0.1, 30.0)
+        self.ds_autocal_ps_radius.setDecimals(2)
+        self.ds_autocal_ps_radius.setValue(
+            float(self.cfg.platesolving.search_radius_deg or 1.0)
+        )
+        self.ds_autocal_ps_radius.setSuffix(" deg")
+
+        self.ds_autocal_ps_gmax = QDoubleSpinBox()
+        self.ds_autocal_ps_gmax.setRange(6.0, 20.0)
+        self.ds_autocal_ps_gmax.setDecimals(2)
+        self.ds_autocal_ps_gmax.setValue(float(self.cfg.platesolving.gmax))
+
         rowfb = QHBoxLayout()
         rowfb.addWidget(self.cb_fb)
         rowfb.addSpacing(10)
         rowfb.addWidget(QLabel("Stages:"))
         rowfb.addWidget(self.sb_stages)
+        rowfb.addSpacing(12)
+        rowfb.addWidget(QLabel("AutoCal radius:"))
+        rowfb.addWidget(self.ds_autocal_ps_radius)
+        rowfb.addSpacing(8)
+        rowfb.addWidget(QLabel("AutoCal gmax:"))
+        rowfb.addWidget(self.ds_autocal_ps_gmax)
         rowfb.addStretch(1)
 
         self.btn_goto = QPushButton("GoTo")
@@ -1132,8 +1151,15 @@ class AstroPanoptesWindow(QMainWindow):
         self._log("[goto] Cancel")
 
     def _autocalibrate(self) -> None:
-        self.runner.request_goto_autocalibrate()
-        self._log("[goto] AutoCalibrate")
+        params = {
+            "autocal_solve_radius_deg": float(self.ds_autocal_ps_radius.value()),
+            "autocal_solve_gmax": float(self.ds_autocal_ps_gmax.value()),
+        }
+        self.runner.request_goto_autocalibrate(params)
+        self._log(
+            "[goto] AutoCalibrate "
+            f"(radius={params['autocal_solve_radius_deg']:.2f}deg, gmax={params['autocal_solve_gmax']:.2f})"
+        )
 
     def _goto_estimate_roll(self) -> None:
         self.runner.request_goto_estimate_roll()

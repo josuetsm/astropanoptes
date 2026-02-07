@@ -2398,8 +2398,15 @@ class GoToWorker(BaseWorker):
         sep_cfg: SepConfig,
         observer: ObserverConfig,
         obstime: Time,
+        solve_radius_deg: Optional[float] = None,
+        solve_gmax: Optional[float] = None,
     ) -> PlatesolvingResult:
-        ps_cfg = replace(platesolving_cfg, search_radius_deg=1.0)
+        ps_kwargs: Dict[str, Any] = {}
+        if solve_radius_deg is not None:
+            ps_kwargs["search_radius_deg"] = float(solve_radius_deg)
+        if solve_gmax is not None:
+            ps_kwargs["gmax"] = float(solve_gmax)
+        ps_cfg = replace(platesolving_cfg, **ps_kwargs) if ps_kwargs else platesolving_cfg
         result = solve_plate(
             raw16,
             target=target,
@@ -2666,6 +2673,10 @@ class GoToWorker(BaseWorker):
 
         solve_attempts = int(params.get("solve_attempts", 5))
         jitter_deg = float(params.get("solve_jitter_deg", 0.2))
+        autocal_solve_radius_deg = float(
+            params.get("autocal_solve_radius_deg", getattr(platesolving_cfg, "search_radius_deg", 1.0) or 1.0)
+        )
+        autocal_solve_gmax = float(params.get("autocal_solve_gmax", getattr(platesolving_cfg, "gmax", 15.0)))
 
         if self._rate_mount is None:
             out["status"] = "ERR_NO_RATE"
@@ -2687,6 +2698,12 @@ class GoToWorker(BaseWorker):
             return out
         if drift_capture_timeout_s <= 0.0:
             out["status"] = "ERR_DRIFT_PARAMS"
+            return out
+        if autocal_solve_radius_deg <= 0.0 or not np.isfinite(autocal_solve_radius_deg):
+            out["status"] = "ERR_AUTOCAL_PS_PARAMS"
+            return out
+        if autocal_solve_gmax <= 0.0 or not np.isfinite(autocal_solve_gmax):
+            out["status"] = "ERR_AUTOCAL_PS_PARAMS"
             return out
 
         if drift_line_fps <= 0.0:
@@ -2735,6 +2752,7 @@ class GoToWorker(BaseWorker):
             f"vmax={drift_stack_vmax_px_s:.1f} fps={drift_stack_fps:.2f} "
             f"drift_refract_enable={int(bool(drift_refract_enable))} "
             f"P_hPa={drift_refract_P_hPa:.1f} T_C={drift_refract_T_C:.1f} "
+            f"autocal_ps_radius_deg={autocal_solve_radius_deg:.2f} autocal_ps_gmax={autocal_solve_gmax:.2f} "
             f"pointing_method={pointing_method} omega_arcsec_s={drift_pointing_omega:.3f} "
             f"jcal_rate_scale={jcal_rate_scale:.2f} "
             f"jcal_ramp_s={jcal_ramp_s:.2f} ramp_hz={jcal_ramp_hz:.1f} "
@@ -2985,6 +3003,8 @@ class GoToWorker(BaseWorker):
                             sep_cfg=sep_cfg,
                             observer=observer,
                             obstime=obstime,
+                            solve_radius_deg=autocal_solve_radius_deg,
+                            solve_gmax=autocal_solve_gmax,
                         )
                         if bool(getattr(platesolving_result, "success", False)):
                             az_hat, alt_hat = float(azalt[0]), float(azalt[1])
@@ -3328,6 +3348,8 @@ class GoToWorker(BaseWorker):
                     sep_cfg=sep_cfg,
                     observer=observer,
                     obstime=t_now,
+                    solve_radius_deg=autocal_solve_radius_deg,
+                    solve_gmax=autocal_solve_gmax,
                 )
                 attempts += 1
                 if bool(getattr(platesolving_result, "success", False)):
