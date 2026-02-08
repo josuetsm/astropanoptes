@@ -127,6 +127,100 @@ class CoreSmokeTests(unittest.TestCase):
         roll_left = _roll_deg_from_drift_delta(dv_left, -20.0)
         self.assertAlmostEqual(roll_left, -30.0, places=6)
 
+    def test_goto_model_manual_fit_keeps_unexcited_axis_column(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        j_before = model.J_deg_per_step.copy()
+
+        base_steps = np.array([1000.0, 500.0], dtype=np.float64)
+        base_az_alt = np.array([220.0, 58.0], dtype=np.float64)
+        j_true_az_col = np.array([0.0012, -0.00005], dtype=np.float64)
+
+        for d_az in np.array([-600.0, -300.0, 0.0, 350.0, 700.0], dtype=np.float64):
+            d_steps = np.array([d_az, 0.0], dtype=np.float64)  # no ALT excitation
+            model.steps_est = base_steps + d_steps
+            d_altaz = j_true_az_col * d_az
+            az = float(base_az_alt[0] + d_altaz[0])
+            alt = float(base_az_alt[1] + d_altaz[1])
+            model.add_manual_sample(np.array([az % 360.0, alt], dtype=np.float64), theta_deg=0.0)
+
+        ok = model.fit_J_from_manual_samples(min_samples=3, ridge=1e-9)
+        self.assertTrue(ok)
+        self.assertGreater(abs(float(np.linalg.det(model.J_deg_per_step))), 1e-12)
+        self.assertAlmostEqual(model.J_deg_per_step[0, 1], j_before[0, 1], places=12)
+        self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_before[1, 1], places=12)
+
+    def test_goto_model_manual_fit_rejects_outlier_sample(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        j_true = np.array([[0.0013, 0.0004], [-0.0002, 0.0011]], dtype=np.float64)
+        base_steps = np.array([4200.0, -1700.0], dtype=np.float64)
+        base_az_alt = np.array([223.0, 58.5], dtype=np.float64)
+        deltas = np.array(
+            [
+                [-1200.0, -700.0],
+                [-700.0, 500.0],
+                [-250.0, -300.0],
+                [300.0, 250.0],
+                [650.0, -450.0],
+                [900.0, 700.0],
+                [1200.0, 900.0],  # outlier injected here
+            ],
+            dtype=np.float64,
+        )
+
+        for i, (d_az, d_alt) in enumerate(deltas):
+            d_steps = np.array([d_az, d_alt], dtype=np.float64)
+            model.steps_est = base_steps + d_steps
+            d_altaz = j_true @ d_steps
+            az = float(base_az_alt[0] + d_altaz[0])
+            alt = float(base_az_alt[1] + d_altaz[1])
+            if i == len(deltas) - 1:
+                az += 8.0
+                alt -= 5.0
+            model.add_manual_sample(np.array([az % 360.0, alt], dtype=np.float64), theta_deg=0.0)
+
+        ok = model.fit_J_from_manual_samples(min_samples=5, ridge=1e-9)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(model.model_fit_samples, 5)
+        self.assertLess(model.model_fit_samples, len(deltas))
+        self.assertAlmostEqual(model.J_deg_per_step[0, 0], j_true[0, 0], places=4)
+        self.assertAlmostEqual(model.J_deg_per_step[0, 1], j_true[0, 1], places=4)
+        self.assertAlmostEqual(model.J_deg_per_step[1, 0], j_true[1, 0], places=4)
+        self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_true[1, 1], places=4)
+
+    def test_goto_model_calibration_fit_rejects_outlier_sample(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        j_true = np.array([[0.0011, 0.0003], [-0.0001, 0.0010]], dtype=np.float64)
+        steps = np.array(
+            [
+                [-900.0, -500.0],
+                [-600.0, 400.0],
+                [-200.0, -300.0],
+                [250.0, 300.0],
+                [700.0, -450.0],
+                [1100.0, 800.0],
+                [1300.0, 900.0],  # outlier injected here
+            ],
+            dtype=np.float64,
+        )
+
+        for i, s in enumerate(steps):
+            d_altaz = j_true @ s
+            if i == len(steps) - 1:
+                d_altaz = d_altaz + np.array([6.0, -4.0], dtype=np.float64)
+            model.add_calibration_sample(s, d_altaz)
+
+        ok = model.fit_J_from_samples(min_samples=4, ridge=1e-9)
+        self.assertTrue(ok)
+        self.assertGreaterEqual(model.model_fit_samples, 4)
+        self.assertLess(model.model_fit_samples, len(steps))
+        self.assertAlmostEqual(model.J_deg_per_step[0, 0], j_true[0, 0], places=4)
+        self.assertAlmostEqual(model.J_deg_per_step[0, 1], j_true[0, 1], places=4)
+        self.assertAlmostEqual(model.J_deg_per_step[1, 0], j_true[1, 0], places=4)
+        self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_true[1, 1], places=4)
+
 
 if __name__ == "__main__":
     unittest.main()

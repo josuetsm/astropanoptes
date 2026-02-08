@@ -6,6 +6,7 @@ This module is intentionally *self-contained*: it does not import AppRunner.
 AppRunner (or any orchestrator) should provide callbacks for:
   - get_live_frame(): -> np.ndarray (uint16 RAW16 Bayer; platesolving will use SEP)
   - move_steps(axis: Axis, direction: int, steps: int, delay_us: int) -> None/str
+  - rate_mount(az_rate_steps_s: float, alt_rate_steps_s: float) -> None/str (optional)
   - stop() -> None/str
   - (optional) set_tracking_enabled(bool) + tracking_keyframe_reset()
 
@@ -24,7 +25,7 @@ A GoTo is done as a closed-loop:
   1) estimate current mount AltAz (from last solve, otherwise from model)
   2) compute desired target AltAz (at current time/location)
   3) convert error (deg) -> correction steps via inv(J)
-  4) move (MOVE blocking, per axis)
+  4) move both axes simultaneously via RATE (fallback: MOVE per axis)
   5) plate-solve near the predicted center to measure the new AltAz
   6) iterate until tolerance (default 10 arcsec) or max iters
 
@@ -620,11 +621,15 @@ def _drift_to_az_alt_refracted(
 def _apply_roll_to_drift(v: np.ndarray, roll_deg: float) -> np.ndarray:
     """
     Rotate drift vector by -roll so +x aligns with az-axis.
-    roll_deg is defined from induced az drift: atan2(dvy, dvx).
+
+    For drift-axis alignment we only need orientation modulo 180 deg, so we
+    first map roll to [-90, +90). This avoids accidental full-vector flips when
+    roll is reported in the opposite 180-deg branch.
     """
     if not np.isfinite(roll_deg):
         return v
-    r = math.radians(float(roll_deg))
+    roll_axis_deg = _roll_axis_equivalent_deg(float(roll_deg))
+    r = math.radians(float(roll_axis_deg))
     if abs(r) < 1e-12:
         return v
     c = math.cos(r)
@@ -651,6 +656,18 @@ def _roll_deg_from_drift_delta(dv: np.ndarray, slew_rate_steps_s: float) -> floa
     else:
         roll_deg = _wrap_deg_180(roll_deg)
     return float(roll_deg)
+
+
+def _roll_axis_equivalent_deg(roll_deg: float) -> float:
+    """
+    Canonical roll branch for axis alignment only (direction-agnostic).
+
+    Returns angle in [-90, +90), equivalent to roll modulo 180 deg.
+    """
+    r = _wrap_deg_180(float(roll_deg))
+    if r >= 90.0:
+        r -= 180.0
+    return float(r)
 
 
 def _now_time() -> Time:
@@ -958,39 +975,115 @@ class GoToModel:
         """
         if len(self._calib_steps) < int(min_samples):
             return False
-        S = np.stack(self._calib_steps, axis=0)  # (N,2)
-        D = np.stack(self._calib_daltaz, axis=0)  # (N,2)
+        S_all = np.stack(self._calib_steps, axis=0).astype(np.float64)  # (N,2)
+        D_all = np.stack(self._calib_daltaz, axis=0).astype(np.float64)  # (N,2)
+        n_all = int(S_all.shape[0])
 
-        # Ridge-regularized least squares: minimize ||S B - D||^2 + ridge||B||^2
-        # Implemented by augmenting S and D.
-        if ridge > 0:
-            lam = float(ridge)
-            S_aug = np.vstack([S, math.sqrt(lam) * np.eye(2)])
-            D_aug = np.vstack([D, np.zeros((2, 2), dtype=np.float64)])
-        else:
-            S_aug, D_aug = S, D
+        def _solve_with_mask(mask: np.ndarray) -> Optional[Dict[str, Any]]:
+            idx = np.flatnonzero(mask)
+            n_use = int(idx.size)
+            if n_use < int(min_samples):
+                return None
 
-        B, *_ = np.linalg.lstsq(S_aug, D_aug, rcond=None)
-        J_new = B.T
+            S = S_all[idx, :]
+            D = D_all[idx, :]
 
-        # sanity: avoid singular / crazy values
-        if not np.all(np.isfinite(J_new)):
+            # Ridge-regularized least squares: minimize ||S B - D||^2 + ridge||B||^2
+            # Implemented by augmenting S and D.
+            if ridge > 0:
+                lam = float(ridge)
+                S_aug = np.vstack([S, math.sqrt(lam) * np.eye(2)])
+                D_aug = np.vstack([D, np.zeros((2, 2), dtype=np.float64)])
+            else:
+                S_aug, D_aug = S, D
+
+            B, *_ = np.linalg.lstsq(S_aug, D_aug, rcond=None)
+            J_new = B.T
+
+            if not np.all(np.isfinite(J_new)):
+                return None
+            det_J = float(np.linalg.det(J_new))
+            if (not np.isfinite(det_J)) or abs(det_J) < 1e-12:
+                return None
+            try:
+                cond_J = float(np.linalg.cond(J_new))
+            except np.linalg.LinAlgError:
+                return None
+            if (not np.isfinite(cond_J)) or cond_J > 1e10:
+                return None
+
+            pred_use = S @ B
+            res_use = D - pred_use
+            pred_all = S_all @ B
+            res_all = D_all - pred_all
+            return {
+                "mask": mask.copy(),
+                "n_use": n_use,
+                "J_new": J_new,
+                "res_use": res_use,
+                "res_all": res_all,
+            }
+
+        mask = np.ones(n_all, dtype=bool)
+        fit = _solve_with_mask(mask)
+        if fit is None:
             return False
 
-        self.J_deg_per_step = J_new.astype(np.float64)
+        # Robust outlier rejection on total residual norm using MAD scale.
+        min_keep = max(int(min_samples), 3)
+        if n_all >= max(min_keep + 2, 5):
+            for _ in range(3):
+                res_all = np.asarray(fit["res_all"], dtype=np.float64)
+                res_norm = np.hypot(res_all[:, 0], res_all[:, 1])
+                finite = np.isfinite(res_norm)
+                if int(np.sum(finite)) < min_keep:
+                    break
+
+                med = float(np.median(res_norm[finite]))
+                mad = float(np.median(np.abs(res_norm[finite] - med)))
+                sigma = float(1.4826 * mad)
+                thr = med + 4.5 * sigma
+                thr = max(float(20.0 / 3600.0), float(thr if np.isfinite(thr) else 0.0))
+
+                new_mask = finite & (res_norm <= thr)
+                if int(np.sum(new_mask)) < min_keep:
+                    idx_f = np.flatnonzero(finite)
+                    order = idx_f[np.argsort(res_norm[idx_f])]
+                    keep = order[:min_keep]
+                    new_mask = np.zeros_like(mask, dtype=bool)
+                    new_mask[keep] = True
+
+                if np.array_equal(new_mask, mask):
+                    break
+
+                fit_new = _solve_with_mask(new_mask)
+                if fit_new is None:
+                    break
+                mask = new_mask
+                fit = fit_new
+
+        self.J_deg_per_step = np.asarray(fit["J_new"], dtype=np.float64)
         self.J00_err = 0.0
         self.J01_err = 0.0
         self.J10_err = 0.0
         self.J11_err = 0.0
         self.model_non_orthogonality_deg = _non_orthogonality_deg_from_J(self.J_deg_per_step)
         self.model_non_orthogonality_err_deg = 0.0
-        self.model_fit_samples = int(S.shape[0])
-        res = D - (S @ B)
+        self.model_fit_samples = int(fit["n_use"])
+        res = np.asarray(fit["res_use"], dtype=np.float64)
         self.model_fit_rms_az_deg = float(np.sqrt(np.mean(np.square(res[:, 0]))))
         self.model_fit_rms_alt_deg = float(np.sqrt(np.mean(np.square(res[:, 1]))))
         self.model_fit_rms_arcsec = float(
             np.sqrt(np.mean(np.square(res[:, 0]) + np.square(res[:, 1]))) * 3600.0
         )
+        n_out = int(n_all - int(fit["n_use"]))
+        if n_out > 0:
+            log_info(
+                None,
+                f"GoTo: calibration fit rejected outliers={n_out}/{n_all}",
+                throttle_s=0.2,
+                throttle_key="goto_fit_calib_outliers",
+            )
         return True
 
     def add_manual_sample(
@@ -1060,62 +1153,198 @@ class GoToModel:
         d_alt = (A_abs[:, 1] - float(a_ref[1])).astype(np.float64)
         D = np.column_stack((d_az, d_alt)).astype(np.float64)  # (N,2)
 
-        reg = np.eye(2, dtype=np.float64)
-        lam = max(0.0, float(ridge))
-        if lam > 0.0:
-            S_aug = np.vstack((S, math.sqrt(lam) * reg))
-            D_aug = np.vstack((D, np.zeros((2, 2), dtype=np.float64)))
-        else:
-            S_aug = S
-            D_aug = D
+        J_prev = np.asarray(self.J_deg_per_step, dtype=np.float64)
+        if J_prev.shape != (2, 2) or not np.all(np.isfinite(J_prev)):
+            J_prev = np.array(
+                [
+                    [float(self.kin.deg_per_step(Axis.AZ)), 0.0],
+                    [0.0, float(self.kin.deg_per_step(Axis.ALT))],
+                ],
+                dtype=np.float64,
+            )
 
-        B, *_ = np.linalg.lstsq(S_aug, D_aug, rcond=None)  # (2,2)
-        J_new = B.T.astype(np.float64)
+        def _solve_with_mask(mask: np.ndarray) -> Optional[Dict[str, Any]]:
+            idx = np.flatnonzero(mask)
+            n_use = int(idx.size)
+            if n_use < int(min_samples):
+                return None
 
-        if not np.all(np.isfinite(J_new)):
+            S_use = S[idx, :]
+            D_use = D[idx, :]
+
+            # Solve only for excited columns to avoid collapsing unobserved axes.
+            col_energy = np.linalg.norm(S_use, axis=0)
+            active_cols = [j for j in range(2) if float(col_energy[j]) > 1e-9]
+            if not active_cols:
+                return None
+            S_active = S_use[:, active_cols]
+            p = int(S_active.shape[1])
+            if n_use < max(int(min_samples), p + 1):
+                return None
+
+            reg = np.eye(p, dtype=np.float64)
+            lam = max(0.0, float(ridge))
+            if lam > 0.0:
+                S_aug = np.vstack((S_active, math.sqrt(lam) * reg))
+                D_aug = np.vstack((D_use, np.zeros((p, 2), dtype=np.float64)))
+            else:
+                S_aug = S_active
+                D_aug = D_use
+
+            B_active, *_ = np.linalg.lstsq(S_aug, D_aug, rcond=None)  # (p,2)
+            if not np.all(np.isfinite(B_active)):
+                return None
+
+            J_new = J_prev.copy()
+            for ridx, cidx in enumerate(active_cols):
+                J_new[0, cidx] = float(B_active[ridx, 0])
+                J_new[1, cidx] = float(B_active[ridx, 1])
+
+            # If a non-excited column was already invalid/near-zero, restore mechanical baseline.
+            if 0 not in active_cols and float(np.linalg.norm(J_new[:, 0])) < 1e-12:
+                J_new[:, 0] = np.array([float(self.kin.deg_per_step(Axis.AZ)), 0.0], dtype=np.float64)
+            if 1 not in active_cols and float(np.linalg.norm(J_new[:, 1])) < 1e-12:
+                J_new[:, 1] = np.array([0.0, float(self.kin.deg_per_step(Axis.ALT))], dtype=np.float64)
+
+            if not np.all(np.isfinite(J_new)):
+                return None
+            det_J = float(np.linalg.det(J_new))
+            if (not np.isfinite(det_J)) or abs(det_J) < 1e-12:
+                return None
+            try:
+                cond_J = float(np.linalg.cond(J_new))
+            except np.linalg.LinAlgError:
+                return None
+            if (not np.isfinite(cond_J)) or cond_J > 1e10:
+                return None
+
+            pred_use = S_use @ J_new.T
+            res_az_use = np.array(
+                [_wrap_deg_180(float(D_use[i, 0]) - float(pred_use[i, 0])) for i in range(n_use)],
+                dtype=np.float64,
+            )
+            res_alt_use = (D_use[:, 1] - pred_use[:, 1]).astype(np.float64)
+            sse_az = float(np.dot(res_az_use, res_az_use))
+            sse_alt = float(np.dot(res_alt_use, res_alt_use))
+            dof = max(1, n_use - p)
+
+            XtX = (S_active.T @ S_active) + (lam * (reg.T @ reg))
+            try:
+                XtX_inv = np.linalg.inv(XtX)
+            except np.linalg.LinAlgError:
+                XtX_inv = np.linalg.pinv(XtX)
+
+            sigma2_az = sse_az / float(dof)
+            sigma2_alt = sse_alt / float(dof)
+            std_beta_az_active = np.sqrt(np.maximum(np.diag(XtX_inv) * sigma2_az, 0.0))
+            std_beta_alt_active = np.sqrt(np.maximum(np.diag(XtX_inv) * sigma2_alt, 0.0))
+
+            pred_all = S @ J_new.T
+            res_az_all = np.array(
+                [_wrap_deg_180(float(D[i, 0]) - float(pred_all[i, 0])) for i in range(n)],
+                dtype=np.float64,
+            )
+            res_alt_all = (D[:, 1] - pred_all[:, 1]).astype(np.float64)
+
+            return {
+                "mask": mask.copy(),
+                "n_use": n_use,
+                "p": p,
+                "active_cols": active_cols,
+                "J_new": J_new,
+                "res_az_use": res_az_use,
+                "res_alt_use": res_alt_use,
+                "res_az_all": res_az_all,
+                "res_alt_all": res_alt_all,
+                "std_beta_az_active": std_beta_az_active,
+                "std_beta_alt_active": std_beta_alt_active,
+            }
+
+        mask = np.ones(n, dtype=bool)
+        fit = _solve_with_mask(mask)
+        if fit is None:
             return False
 
-        self.J_deg_per_step = J_new.astype(np.float64)
+        # Robust outlier rejection on total residual norm using MAD scale.
+        min_keep = max(int(min_samples), 3)
+        if n >= max(min_keep + 2, 5):
+            for _ in range(3):
+                res_norm = np.hypot(fit["res_az_all"], fit["res_alt_all"])
+                finite = np.isfinite(res_norm)
+                need = max(min_keep, int(fit["p"]) + 1)
+                if int(np.sum(finite)) < need:
+                    break
 
-        pred = S @ B
-        res_az = np.array(
-            [_wrap_deg_180(float(D[i, 0]) - float(pred[i, 0])) for i in range(n)],
-            dtype=np.float64,
-        )
-        res_alt = (D[:, 1] - pred[:, 1]).astype(np.float64)
-        sse_az = float(np.dot(res_az, res_az))
-        sse_alt = float(np.dot(res_alt, res_alt))
-        dof = max(1, n - 2)
+                med = float(np.median(res_norm[finite]))
+                mad = float(np.median(np.abs(res_norm[finite] - med)))
+                sigma = float(1.4826 * mad)
+                thr = med + 4.5 * sigma
+                thr = max(float(20.0 / 3600.0), float(thr if np.isfinite(thr) else 0.0))
 
-        XtX = (S.T @ S) + (lam * (reg.T @ reg))
-        try:
-            XtX_inv = np.linalg.inv(XtX)
-        except np.linalg.LinAlgError:
-            XtX_inv = np.linalg.pinv(XtX)
+                new_mask = finite & (res_norm <= thr)
+                if bool(finite[-1]):
+                    # Keep reference sample (zero delta row) to preserve anchor.
+                    new_mask[-1] = True
 
-        sigma2_az = sse_az / float(dof)
-        sigma2_alt = sse_alt / float(dof)
-        var_beta_az = np.maximum(np.diag(XtX_inv) * sigma2_az, 0.0)
-        var_beta_alt = np.maximum(np.diag(XtX_inv) * sigma2_alt, 0.0)
-        std_beta_az = np.sqrt(var_beta_az)
-        std_beta_alt = np.sqrt(var_beta_alt)
+                if int(np.sum(new_mask)) < need:
+                    idx_f = np.flatnonzero(finite)
+                    order = idx_f[np.argsort(res_norm[idx_f])]
+                    keep = order[:need]
+                    new_mask = np.zeros_like(mask, dtype=bool)
+                    new_mask[keep] = True
+                    if bool(finite[-1]):
+                        new_mask[-1] = True
 
-        self.model_fit_samples = int(n)
+                if np.array_equal(new_mask, mask):
+                    break
+
+                fit_new = _solve_with_mask(new_mask)
+                if fit_new is None:
+                    break
+                mask = new_mask
+                fit = fit_new
+
+        self.J_deg_per_step = np.asarray(fit["J_new"], dtype=np.float64)
+
+        res_az = np.asarray(fit["res_az_use"], dtype=np.float64)
+        res_alt = np.asarray(fit["res_alt_use"], dtype=np.float64)
+
+        self.model_fit_samples = int(fit["n_use"])
         self.model_fit_rms_az_deg = float(np.sqrt(np.mean(np.square(res_az))))
         self.model_fit_rms_alt_deg = float(np.sqrt(np.mean(np.square(res_alt))))
         self.model_fit_rms_arcsec = float(
             np.sqrt(np.mean(np.square(res_az) + np.square(res_alt))) * 3600.0
         )
 
+        n_out = int(n - int(fit["n_use"]))
+        if n_out > 0:
+            log_info(
+                None,
+                f"GoTo: manual fit rejected outliers={n_out}/{n}",
+                throttle_s=0.2,
+                throttle_key="goto_fit_manual_outliers",
+            )
+
         self.model_yaw_deg = 0.0
         self.model_pitch_deg = 0.0
         self.model_yaw_err_deg = 0.0
         self.model_pitch_err_deg = 0.0
 
-        self.J00_err = float(std_beta_az[0])
-        self.J01_err = float(std_beta_az[1])
-        self.J10_err = float(std_beta_alt[0])
-        self.J11_err = float(std_beta_alt[1])
+        # Start with conservative defaults for non-fitted columns.
+        self.J00_err = 0.0
+        self.J01_err = 0.0
+        self.J10_err = 0.0
+        self.J11_err = 0.0
+        active_cols = list(fit["active_cols"])
+        std_beta_az_active = np.asarray(fit["std_beta_az_active"], dtype=np.float64)
+        std_beta_alt_active = np.asarray(fit["std_beta_alt_active"], dtype=np.float64)
+        for ridx, cidx in enumerate(active_cols):
+            if cidx == 0:
+                self.J00_err = float(std_beta_az_active[ridx])
+                self.J10_err = float(std_beta_alt_active[ridx])
+            else:
+                self.J01_err = float(std_beta_az_active[ridx])
+                self.J11_err = float(std_beta_alt_active[ridx])
 
         self.model_non_orthogonality_deg = _non_orthogonality_deg_from_J(self.J_deg_per_step)
         self.model_non_orthogonality_err_deg = 0.0
@@ -1344,6 +1573,7 @@ def platesolving_center_to_altaz_deg(
 # ============================================================
 
 MoveStepsFn = Callable[[Axis, int, int, int], Any]
+RateMountFn = Callable[[float, float], Any]
 StopFn = Callable[[], Any]
 GetFrameFn = Callable[[], Optional[np.ndarray]]
 
@@ -1474,6 +1704,7 @@ class GoToController:
         get_live_frame: GetFrameFn,
         platesolving_cfg: PlatesolvingConfig,
         move_steps: MoveStepsFn,
+        rate_mount: Optional[RateMountFn] = None,
         stop: Optional[StopFn] = None,
         tracking_pause: Optional[Callable[[bool], Any]] = None,
         tracking_keyframe_reset: Optional[Callable[[], Any]] = None,
@@ -1593,21 +1824,30 @@ class GoToController:
                         alpha = _clamp(alpha, -1.0, 1.0)
                         dsteps *= alpha
 
-                # Execute movement (blocking) per axis.
-                if stop is not None:
-                    try:
-                        stop()
-                    except Exception as exc:
-                        log_error(None, "GoTo: stop failed before move", exc)
+                # Execute movement as simultaneous vector (RATE), fallback to per-axis MOVE.
+                if rate_mount is not None:
+                    self._exec_rate_vector_move(
+                        rate_mount,
+                        dsteps,
+                        delay_us_az=int(self.cfg.slew_delay_us_az),
+                        delay_us_alt=int(self.cfg.slew_delay_us_alt),
+                        stop=stop,
+                    )
+                else:
+                    if stop is not None:
+                        try:
+                            stop()
+                        except Exception as exc:
+                            log_error(None, "GoTo: stop failed before move", exc)
 
-                self._exec_steps(move_steps, Axis.AZ, float(dsteps[0]), delay_us=int(self.cfg.slew_delay_us_az))
-                self._exec_steps(move_steps, Axis.ALT, float(dsteps[1]), delay_us=int(self.cfg.slew_delay_us_alt))
+                    self._exec_steps(move_steps, Axis.AZ, float(dsteps[0]), delay_us=int(self.cfg.slew_delay_us_az))
+                    self._exec_steps(move_steps, Axis.ALT, float(dsteps[1]), delay_us=int(self.cfg.slew_delay_us_alt))
 
-                if stop is not None:
-                    try:
-                        stop()
-                    except Exception as exc:
-                        log_error(None, "GoTo: stop failed after move", exc)
+                    if stop is not None:
+                        try:
+                            stop()
+                        except Exception as exc:
+                            log_error(None, "GoTo: stop failed after move", exc)
 
                 # Settle
                 time.sleep(max(0.0, float(self.cfg.settle_s)))
@@ -1710,6 +1950,77 @@ class GoToController:
 
         # Perform the actual move
         move_steps(axis, direction, steps, int(delay_us))
+
+    def _delay_us_to_rate_steps_s(self, delay_us: int) -> float:
+        d = max(1, int(delay_us))
+        # MOVE uses roughly HIGH+LOW delays, i.e. ~2*delay_us per microstep.
+        return float(1.0e6 / (2.0 * float(d)))
+
+    def _exec_rate_vector_move(
+        self,
+        rate_mount: RateMountFn,
+        dsteps: np.ndarray,
+        *,
+        delay_us_az: int,
+        delay_us_alt: int,
+        stop: Optional[StopFn] = None,
+    ) -> None:
+        s_az = int(round(float(dsteps[0])))
+        s_alt = int(round(float(dsteps[1])))
+        if s_az == 0 and s_alt == 0:
+            return
+
+        # Update model counters first (same policy as _exec_steps).
+        if s_az != 0:
+            self.model.note_manual_move(Axis.AZ, +1 if s_az >= 0 else -1, abs(s_az))
+        if s_alt != 0:
+            self.model.note_manual_move(Axis.ALT, +1 if s_alt >= 0 else -1, abs(s_alt))
+
+        max_rate_az = max(1e-3, self._delay_us_to_rate_steps_s(int(delay_us_az)))
+        max_rate_alt = max(1e-3, self._delay_us_to_rate_steps_s(int(delay_us_alt)))
+        t_az = abs(float(s_az)) / max_rate_az if s_az != 0 else 0.0
+        t_alt = abs(float(s_alt)) / max_rate_alt if s_alt != 0 else 0.0
+        duration_s = max(t_az, t_alt)
+        if duration_s <= 0.0:
+            return
+
+        az_rate = _clamp(float(s_az) / duration_s, -max_rate_az, +max_rate_az)
+        alt_rate = _clamp(float(s_alt) / duration_s, -max_rate_alt, +max_rate_alt)
+        log_info(
+            None,
+            "GoTo: rate move "
+            f"dsteps=[{s_az:+d},{s_alt:+d}] "
+            f"rates=[{az_rate:+.2f},{alt_rate:+.2f}] steps/s "
+            f"dur={duration_s:.3f}s",
+            throttle_s=0.02,
+            throttle_key="goto_rate_move",
+        )
+
+        if stop is not None:
+            try:
+                stop()
+            except Exception as exc:
+                log_error(None, "GoTo: stop failed before rate move", exc)
+
+        t0 = time.perf_counter()
+        try:
+            rate_mount(float(az_rate), float(alt_rate))
+            while True:
+                dt = float(time.perf_counter() - t0)
+                rem = float(duration_s - dt)
+                if rem <= 0.0:
+                    break
+                time.sleep(min(0.02, rem))
+        finally:
+            try:
+                rate_mount(0.0, 0.0)
+            except Exception as exc:
+                log_error(None, "GoTo: failed to stop rate move", exc)
+            if stop is not None:
+                try:
+                    stop()
+                except Exception as exc:
+                    log_error(None, "GoTo: stop failed after rate move", exc)
 
     # -------------------------
     # Calibration (blocking)
@@ -2784,16 +3095,18 @@ class GoToWorker(BaseWorker):
             # physical +AZ/-AZ motion. Use physical sign for roll orientation.
             slew_rate_for_roll = -slew_rate_for_roll
         roll_deg = _roll_deg_from_drift_delta(dv, slew_rate_for_roll)
+        roll_axis_deg = _roll_axis_equivalent_deg(roll_deg)
         out["ok"] = True
         out["status"] = "OK"
         out["roll_deg"] = roll_deg
+        out["roll_axis_deg"] = roll_axis_deg
 
         self._publish_state({"camera": {"roll_deg": float(roll_deg)}})
         log_info(
             self._out_log,
             "GoTo: Roll estimate OK "
             f"slew_rate_cmd={used_slew_rate:+.2f} slew_rate_eff={slew_rate_for_roll:+.2f} invert_az={int(invert_az)} "
-            f"roll_raw={roll_raw_deg:+.3f}deg roll={roll_deg:+.3f}deg "
+            f"roll_raw={roll_raw_deg:+.3f}deg roll={roll_deg:+.3f}deg roll_axis={roll_axis_deg:+.3f}deg "
             f"v0=[{float(v0[0]):.3f},{float(v0[1]):.3f}] "
             f"v1=[{float(v1[0]):.3f},{float(v1[1]):.3f}] "
             f"dv=[{float(dv[0]):.3f},{float(dv[1]):.3f}]",
@@ -4677,6 +4990,7 @@ class GoToWorker(BaseWorker):
                     target,
                     get_live_frame=self._get_live_raw16,
                     move_steps=self._move_steps,
+                    rate_mount=self._rate_mount,
                     stop=self._stop_mount,
                     platesolving_cfg=platesolving_cfg,
                     stages=stages,
@@ -4815,22 +5129,25 @@ class GoToWorker(BaseWorker):
                 min_samples = int(params.get("min_samples", 3))
                 ridge = float(params.get("ridge", 1e-12))
                 ok = bool(self._goto.model.fit_J_from_manual_samples(min_samples=min_samples, ridge=ridge))
+                n_manual = int(len(getattr(self._goto.model, "_manual_steps_abs", [])))
                 synced_from_manual = False
                 if ok and not bool(getattr(self._goto.model, "synced", False)):
                     synced_from_manual = bool(self._goto.model.sync_from_latest_manual_sample())
                 self._publish_j_matrix_state()
+                fail_reason = "ERR_INSUFFICIENT_SAMPLES" if n_manual < min_samples else "ERR_DEGENERATE_MODEL"
                 self._publish_state(
                     {
                         "goto": {
                             "synced": bool(getattr(self._goto.model, "synced", False)),
                             "status": GotoStatus.OK if ok else GotoStatus.FAIL,
-                            "reason": None if ok else "ERR_INSUFFICIENT_SAMPLES",
+                            "reason": None if ok else fail_reason,
                         }
                     }
                 )
                 log_info(
                     self._out_log,
                     f"GoTo: FIT_MODEL ok={ok} min_samples={min_samples} "
+                    f"manual_samples={n_manual} "
                     f"synced={bool(getattr(self._goto.model, 'synced', False))} "
                     f"synced_from_manual={synced_from_manual}",
                 )
