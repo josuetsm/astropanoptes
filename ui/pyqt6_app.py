@@ -1083,18 +1083,6 @@ class AstroPanoptesWindow(QMainWindow):
         self.sb_goto_ps_mininl.setRange(1, 100)
         self.sb_goto_ps_mininl.setValue(self.cfg.platesolving.min_inliers)
 
-        self.ds_rightcal_radius = QDoubleSpinBox()
-        self.ds_rightcal_radius.setRange(0.1, 5.0)
-        self.ds_rightcal_radius.setDecimals(2)
-        self.ds_rightcal_radius.setValue(0.5)
-        self.ds_rightcal_radius.setSuffix(" deg")
-
-        self.ds_rightcal_theta_tol = QDoubleSpinBox()
-        self.ds_rightcal_theta_tol.setRange(1.0, 90.0)
-        self.ds_rightcal_theta_tol.setDecimals(1)
-        self.ds_rightcal_theta_tol.setValue(20.0)
-        self.ds_rightcal_theta_tol.setSuffix(" deg")
-
         self.ds_autocal_ps_radius = QDoubleSpinBox()
         self.ds_autocal_ps_radius.setRange(0.1, 30.0)
         self.ds_autocal_ps_radius.setDecimals(2)
@@ -1152,71 +1140,9 @@ class AstroPanoptesWindow(QMainWindow):
         rowps.addWidget(self.sb_goto_ps_mininl)
         rowps.addStretch(1)
 
-        self.sb_calib_dpad_steps = QSpinBox()
-        self.sb_calib_dpad_steps.setRange(1, 2_000_000)
-        self.sb_calib_dpad_steps.setValue(300)
-
-        self.sb_calib_dpad_delay = QSpinBox()
-        self.sb_calib_dpad_delay.setRange(50, 200_000)
-        self.sb_calib_dpad_delay.setValue(int(self.cfg.goto.slew_delay_us))
-        self.sb_calib_dpad_delay.setSuffix(" µs")
-
-        def _mk_cal_btn(text: str) -> QToolButton:
-            button = QToolButton()
-            button.setText(text)
-            button.setFixedSize(QSize(28, 28))
-            button.setStyleSheet(
-                "QToolButton { border-radius:8px; background:#1f1f1f; border:1px solid #3a3a3a; "
-                "color:#e8e8e8; font-size:11px; }"
-                "QToolButton:hover { background:#262626; border:1px solid #5a5a5a; }"
-            )
-            return button
-
-        self.b_cal_up = _mk_cal_btn("▲")
-        self.b_cal_down = _mk_cal_btn("▼")
-        self.b_cal_left = _mk_cal_btn("◀")
-        self.b_cal_right = _mk_cal_btn("▶")
-
-        grid_cal = QGridLayout()
-        grid_cal.setHorizontalSpacing(4)
-        grid_cal.setVerticalSpacing(4)
-        grid_cal.setContentsMargins(0, 0, 0, 0)
-        grid_cal.addWidget(self.b_cal_up, 0, 1)
-        grid_cal.addWidget(self.b_cal_left, 1, 0)
-        grid_cal.addWidget(self.b_cal_right, 1, 2)
-        grid_cal.addWidget(self.b_cal_down, 2, 1)
-
-        self.calib_dpad_frame = QFrame()
-        col_dpad = QVBoxLayout(self.calib_dpad_frame)
-        col_dpad.setContentsMargins(0, 0, 0, 0)
-        col_dpad.setSpacing(6)
-
-        rowd_params = QHBoxLayout()
-        rowd_params.setContentsMargins(0, 0, 0, 0)
-        rowd_params.addWidget(QLabel("steps:"))
-        rowd_params.addWidget(self.sb_calib_dpad_steps)
-        rowd_params.addSpacing(10)
-        rowd_params.addWidget(QLabel("delay_us:"))
-        rowd_params.addWidget(self.sb_calib_dpad_delay)
-        rowd_params.addSpacing(14)
-        rowd_params.addWidget(QLabel("PS radius:"))
-        rowd_params.addWidget(self.ds_rightcal_radius)
-        rowd_params.addSpacing(8)
-        rowd_params.addWidget(QLabel("θ tol:"))
-        rowd_params.addWidget(self.ds_rightcal_theta_tol)
-        rowd_params.addStretch(1)
-        col_dpad.addLayout(rowd_params)
-
-        rowd_pad = QHBoxLayout()
-        rowd_pad.setContentsMargins(0, 0, 0, 0)
-        rowd_pad.addStretch(1)
-        rowd_pad.addLayout(grid_cal)
-        rowd_pad.addStretch(1)
-        col_dpad.addLayout(rowd_pad)
-
         self.btn_goto = QPushButton("GoTo")
         self.btn_cancel = QPushButton("Cancel")
-        self.btn_autocal = QPushButton("AutoCalibrate")
+        self.btn_autocal = QPushButton("Platesolving")
         self.btn_roll = QPushButton("Estimar Roll")
         self.btn_fit_model = QPushButton("Fit GoTo Model")
         self.btn_home = QPushButton("Home")
@@ -1239,10 +1165,6 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_roll.clicked.connect(self._goto_estimate_roll)
         self.btn_fit_model.clicked.connect(self._goto_fit_model)
         self.btn_home.clicked.connect(self._home)
-        self.b_cal_right.clicked.connect(lambda: self._goto_calibrate_dpad("right"))
-        self.b_cal_left.clicked.connect(lambda: self._goto_calibrate_dpad("left"))
-        self.b_cal_up.clicked.connect(lambda: self._goto_calibrate_dpad("up"))
-        self.b_cal_down.clicked.connect(lambda: self._goto_calibrate_dpad("down"))
 
         self.lbl_goto_samples = QLabel("0")
 
@@ -1252,7 +1174,6 @@ class AstroPanoptesWindow(QMainWindow):
         form.addRow("AutoCal PS mode:", self.dd_autocal_ps_mode)
         form.addRow("AutoCal manual:", self.autocal_manual_frame)
         form.addRow(rowps)
-        form.addRow("Calib D-pad:", self.calib_dpad_frame)
         form.addRow(rowb)
         form.addRow("manual samples:", self.lbl_goto_samples)
 
@@ -1488,25 +1409,6 @@ class AstroPanoptesWindow(QMainWindow):
     def _goto_estimate_roll(self) -> None:
         self.runner.request_goto_estimate_roll()
         self._log("[goto] Estimar Roll")
-
-    def _goto_calibrate_dpad(self, direction: str) -> None:
-        params = {
-            "strategy": "direction_scan",
-            "scan_steps": 1,
-            "scan_step_microsteps": int(self.sb_calib_dpad_steps.value()),
-            "delay_us": int(self.sb_calib_dpad_delay.value()),
-            "scan_ps_radius_deg": float(self.ds_rightcal_radius.value()),
-            "scan_theta_tol_deg": float(self.ds_rightcal_theta_tol.value()),
-            "scan_direction": str(direction).strip().lower(),
-            "N_seed": int(self.sb_goto_ps_nseeds.value()),
-            "min_inliers": int(self.sb_goto_ps_mininl.value()),
-        }
-        self.runner.request_goto_calibrate(params)
-        self._log(
-            "[goto] Calib D-pad "
-            f"(dir={params['scan_direction']}, microsteps={params['scan_step_microsteps']}, "
-            f"delay_us={params['delay_us']}, radius={params['scan_ps_radius_deg']:.2f}deg)"
-        )
 
     def _goto_fit_model(self) -> None:
         self.runner.request_goto_fit_model()

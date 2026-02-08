@@ -65,12 +65,12 @@ class CoreSmokeTests(unittest.TestCase):
     def test_goto_model_manual_fit_reports_params_and_errors(self) -> None:
         model = GoToModel()
         j_true = np.array([[0.0120, 0.0018], [0.0007, 0.0085]], dtype=np.float64)
-        yaw_true = 121.5
-        pitch_true = 38.25
+        base_steps = np.array([5200.0, -2100.0], dtype=np.float64)
+        base_az_alt = np.array([121.5, 38.25], dtype=np.float64)
         theta_true = 17.0
         rng = np.random.default_rng(7)
 
-        samples = np.array(
+        deltas = np.array(
             [
                 [-1200.0, -800.0],
                 [-800.0, 600.0],
@@ -81,14 +81,16 @@ class CoreSmokeTests(unittest.TestCase):
             ],
             dtype=np.float64,
         )
-        for s_az, s_alt in samples:
-            model.steps_est = np.array([s_az, s_alt], dtype=np.float64)
-            az = yaw_true + j_true[0, 0] * s_az + j_true[0, 1] * s_alt
-            alt = pitch_true + j_true[1, 0] * s_az + j_true[1, 1] * s_alt
+        for d_az, d_alt in deltas:
+            d_steps = np.array([d_az, d_alt], dtype=np.float64)
+            model.steps_est = base_steps + d_steps
+            d_altaz = j_true @ d_steps
+            az = float(base_az_alt[0] + d_altaz[0])
+            alt = float(base_az_alt[1] + d_altaz[1])
             theta = theta_true + float(rng.normal(0.0, 0.15))
             model.add_manual_sample(np.array([az % 360.0, alt], dtype=np.float64), theta_deg=theta)
 
-        ok = model.fit_J_from_manual_samples(min_samples=6, ridge=1e-12)
+        ok = model.fit_J_from_manual_samples(min_samples=6, ridge=1e-9)
         self.assertTrue(ok)
         self.assertEqual(model.model_fit_samples, 6)
         self.assertEqual(model.model_roll_samples, 6)
@@ -101,10 +103,10 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertTrue(np.isfinite(model.model_non_orthogonality_err_deg))
         self.assertTrue(np.isfinite(model.model_roll_deg))
         self.assertTrue(np.isfinite(model.model_roll_err_deg))
-        self.assertTrue(np.isfinite(model.model_yaw_deg))
-        self.assertTrue(np.isfinite(model.model_yaw_err_deg))
-        self.assertTrue(np.isfinite(model.model_pitch_deg))
-        self.assertTrue(np.isfinite(model.model_pitch_err_deg))
+        self.assertEqual(model.model_yaw_deg, 0.0)
+        self.assertEqual(model.model_yaw_err_deg, 0.0)
+        self.assertEqual(model.model_pitch_deg, 0.0)
+        self.assertEqual(model.model_pitch_err_deg, 0.0)
         self.assertTrue(np.isfinite(model.model_fit_rms_arcsec))
         self.assertTrue(np.isfinite(model.J00_err))
         self.assertTrue(np.isfinite(model.J11_err))

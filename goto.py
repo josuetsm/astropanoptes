@@ -1004,8 +1004,7 @@ class GoToModel:
         az_alt = _as_array2(az_alt_deg)
         self._manual_steps_abs.append(self.steps_est.copy())
         self._manual_az_alt_abs.append(az_alt.copy())
-        # Backward-compatible argument: theta_deg. For the extended model this is
-        # interpreted as a roll estimate sample (deg).
+        # Backward-compatible argument: theta_deg interpreted as a roll sample (deg).
         roll_sample = roll_deg if roll_deg is not None else theta_deg
         if roll_sample is not None:
             roll = float(roll_sample)
@@ -1033,70 +1032,62 @@ class GoToModel:
         return True
 
     def fit_J_from_manual_samples(self, *, min_samples: int = 3, ridge: float = 1e-12) -> bool:
-        """Fit J from absolute manual samples (steps, AltAz).
+        """Fit J from absolute manual samples (steps, AltAz) using relative deltas.
 
-        Solves a linear model with intercept:
-          az  ~= yaw   + J00*s_az + J01*s_alt
-          alt ~= pitch + J10*s_az + J11*s_alt
+        Simple model (no pitch/yaw intercepts):
+          d_az  ~= J00*d_s_az + J01*d_s_alt
+          d_alt ~= J10*d_s_az + J11*d_s_alt
 
-        This exposes:
-          - axis non-orthogonality (from J columns)
-          - telescope yaw/pitch offsets (intercepts)
-          - camera roll (from stored plate-solve theta samples)
-          - uncertainty estimates (standard errors)
+        Deltas are computed against the latest manual sample. Camera roll is still
+        estimated from stored plate-solve angle samples.
         """
         if len(self._manual_steps_abs) < int(min_samples):
             return False
 
-        S = np.stack(self._manual_steps_abs, axis=0)  # (N,2)
-        A = np.stack(self._manual_az_alt_abs, axis=0)  # (N,2) [az, alt] in deg
-        n = int(S.shape[0])
+        S_abs = np.stack(self._manual_steps_abs, axis=0).astype(np.float64)  # (N,2)
+        A_abs = np.stack(self._manual_az_alt_abs, axis=0).astype(np.float64)  # (N,2) [az, alt] in deg
+        n = int(S_abs.shape[0])
         if n < int(min_samples):
             return False
 
-        az_deg = A[:, 0].astype(np.float64)
-        alt_deg = A[:, 1].astype(np.float64)
-
-        az_center = _circular_mean_deg(az_deg)
-        az_unwrapped = np.array(
-            [float(az_center + _wrap_deg_180(float(az) - float(az_center))) for az in az_deg],
+        s_ref = S_abs[-1, :]
+        a_ref = A_abs[-1, :]
+        S = S_abs - s_ref  # (N,2)
+        d_az = np.array(
+            [_wrap_deg_180(float(A_abs[i, 0]) - float(a_ref[0])) for i in range(n)],
             dtype=np.float64,
         )
+        d_alt = (A_abs[:, 1] - float(a_ref[1])).astype(np.float64)
+        D = np.column_stack((d_az, d_alt)).astype(np.float64)  # (N,2)
 
-        Y = np.column_stack((az_unwrapped, alt_deg)).astype(np.float64)  # (N,2)
-        X = np.column_stack((np.ones(n, dtype=np.float64), S)).astype(np.float64)  # (N,3)
-
-        reg = np.diag([0.0, 1.0, 1.0]).astype(np.float64)
+        reg = np.eye(2, dtype=np.float64)
         lam = max(0.0, float(ridge))
         if lam > 0.0:
-            X_aug = np.vstack((X, math.sqrt(lam) * reg))
-            Y_aug = np.vstack((Y, np.zeros((3, 2), dtype=np.float64)))
+            S_aug = np.vstack((S, math.sqrt(lam) * reg))
+            D_aug = np.vstack((D, np.zeros((2, 2), dtype=np.float64)))
         else:
-            X_aug = X
-            Y_aug = Y
+            S_aug = S
+            D_aug = D
 
-        B, *_ = np.linalg.lstsq(X_aug, Y_aug, rcond=None)  # (3,2)
-        J_new = np.array(
-            [[float(B[1, 0]), float(B[2, 0])], [float(B[1, 1]), float(B[2, 1])]],
-            dtype=np.float64,
-        )
+        B, *_ = np.linalg.lstsq(S_aug, D_aug, rcond=None)  # (2,2)
+        J_new = B.T.astype(np.float64)
 
         if not np.all(np.isfinite(J_new)):
             return False
 
         self.J_deg_per_step = J_new.astype(np.float64)
 
-        pred = X @ B
+        pred = S @ B
         res_az = np.array(
-            [_wrap_deg_180(float(Y[i, 0]) - float(pred[i, 0])) for i in range(n)],
+            [_wrap_deg_180(float(D[i, 0]) - float(pred[i, 0])) for i in range(n)],
             dtype=np.float64,
         )
-        res_alt = (Y[:, 1] - pred[:, 1]).astype(np.float64)
+        res_alt = (D[:, 1] - pred[:, 1]).astype(np.float64)
         sse_az = float(np.dot(res_az, res_az))
         sse_alt = float(np.dot(res_alt, res_alt))
-        dof = max(1, n - 3)
+        dof = max(1, n - 2)
 
-        XtX = (X.T @ X) + (lam * (reg.T @ reg))
+        XtX = (S.T @ S) + (lam * (reg.T @ reg))
         try:
             XtX_inv = np.linalg.inv(XtX)
         except np.linalg.LinAlgError:
@@ -1116,15 +1107,15 @@ class GoToModel:
             np.sqrt(np.mean(np.square(res_az) + np.square(res_alt))) * 3600.0
         )
 
-        self.model_yaw_deg = _wrap_deg_360(float(B[0, 0]))
-        self.model_pitch_deg = float(B[0, 1])
-        self.model_yaw_err_deg = float(std_beta_az[0])
-        self.model_pitch_err_deg = float(std_beta_alt[0])
+        self.model_yaw_deg = 0.0
+        self.model_pitch_deg = 0.0
+        self.model_yaw_err_deg = 0.0
+        self.model_pitch_err_deg = 0.0
 
-        self.J00_err = float(std_beta_az[1])
-        self.J01_err = float(std_beta_az[2])
-        self.J10_err = float(std_beta_alt[1])
-        self.J11_err = float(std_beta_alt[2])
+        self.J00_err = float(std_beta_az[0])
+        self.J01_err = float(std_beta_az[1])
+        self.J10_err = float(std_beta_alt[0])
+        self.J11_err = float(std_beta_alt[1])
 
         self.model_non_orthogonality_deg = _non_orthogonality_deg_from_J(self.J_deg_per_step)
         self.model_non_orthogonality_err_deg = 0.0
@@ -1165,6 +1156,8 @@ class GoToModel:
         th = np.asarray(self._manual_roll_deg_abs, dtype=np.float64).reshape(-1)
         th = th[np.isfinite(th)]
         self.model_roll_samples = int(th.size)
+        self.model_roll_deg = 0.0
+        self.model_roll_err_deg = 0.0
         if th.size >= 1:
             self.model_roll_deg = _wrap_deg_180(_circular_mean_deg(th))
             if th.size >= 2:
@@ -2784,7 +2777,13 @@ class GoToWorker(BaseWorker):
             return out
 
         roll_raw_deg = float(math.degrees(math.atan2(float(dv[1]), float(dv[0]))))
-        roll_deg = _roll_deg_from_drift_delta(dv, used_slew_rate)
+        invert_az = bool(getattr(mount_cfg, "invert_az", False))
+        slew_rate_for_roll = float(used_slew_rate)
+        if invert_az:
+            # If AZ direction is inverted at mount level, command sign is opposite to
+            # physical +AZ/-AZ motion. Use physical sign for roll orientation.
+            slew_rate_for_roll = -slew_rate_for_roll
+        roll_deg = _roll_deg_from_drift_delta(dv, slew_rate_for_roll)
         out["ok"] = True
         out["status"] = "OK"
         out["roll_deg"] = roll_deg
@@ -2793,7 +2792,7 @@ class GoToWorker(BaseWorker):
         log_info(
             self._out_log,
             "GoTo: Roll estimate OK "
-            f"slew_rate_steps_s={used_slew_rate:+.2f} "
+            f"slew_rate_cmd={used_slew_rate:+.2f} slew_rate_eff={slew_rate_for_roll:+.2f} invert_az={int(invert_az)} "
             f"roll_raw={roll_raw_deg:+.3f}deg roll={roll_deg:+.3f}deg "
             f"v0=[{float(v0[0]):.3f},{float(v0[1]):.3f}] "
             f"v1=[{float(v1[0]):.3f},{float(v1[1]):.3f}] "
@@ -4262,13 +4261,15 @@ class GoToWorker(BaseWorker):
             )
 
         if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
-            def _wrap_deg_180(x: float) -> float:
+            # Keep these local helpers uniquely named to avoid shadowing module helpers
+            # referenced by closures declared earlier in this method.
+            def _local_wrap_deg_180(x: float) -> float:
                 y = (float(x) + 180.0) % 360.0 - 180.0
                 if y <= -180.0:
                     y += 360.0
                 return float(y)
 
-            def _wrap_deg_360(x: float) -> float:
+            def _local_wrap_deg_360(x: float) -> float:
                 y = float(x) % 360.0
                 if y < 0.0:
                     y += 360.0
@@ -4297,7 +4298,7 @@ class GoToWorker(BaseWorker):
                         P_hPa=float(getattr(observer, "refraction_P_hPa", 1013.25)),
                         T_C=float(getattr(observer, "refraction_T_C", 15.0)),
                     )
-                daz = _wrap_deg_180(float(az1) - az0)
+                daz = _local_wrap_deg_180(float(az1) - az0)
                 dalt = float(alt1) - alt0
                 return np.array(
                     [
@@ -4338,7 +4339,7 @@ class GoToWorker(BaseWorker):
                         break
                     step = np.linalg.solve(J, -resid)
                     step = np.clip(step, -5.0, 5.0)
-                    az = _wrap_deg_360(az + float(step[0]))
+                    az = _local_wrap_deg_360(az + float(step[0]))
                     alt = float(alt + float(step[1]))
                     alt = float(np.clip(alt, goto_cfg.alt_min_deg, goto_cfg.alt_max_deg))
                 resid_norm = float(np.linalg.norm(_predict_rate(az, alt, t_ref) - v_obs))
@@ -4608,8 +4609,6 @@ class GoToWorker(BaseWorker):
             f"[{float(rep['J10_err']):.3e},{float(rep['J11_err']):.3e}]] "
             f"nonorth={float(rep['model_non_orthogonality_deg']):+.4f}±{float(rep['model_non_orthogonality_err_deg']):.4f}deg "
             f"roll={float(rep['model_roll_deg']):+.3f}±{float(rep['model_roll_err_deg']):.3f}deg "
-            f"yaw={float(rep['model_yaw_deg']):+.4f}±{float(rep['model_yaw_err_deg']):.4f}deg "
-            f"pitch={float(rep['model_pitch_deg']):+.4f}±{float(rep['model_pitch_err_deg']):.4f}deg "
             f"rms=[az={float(rep['model_fit_rms_az_deg']):.4f}deg "
             f"alt={float(rep['model_fit_rms_alt_deg']):.4f}deg "
             f"tot={float(rep['model_fit_rms_arcsec']):.2f}arcsec]",
