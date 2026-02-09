@@ -352,10 +352,14 @@ class AstroPanoptesWindow(QMainWindow):
         top.setFrameShape(QFrame.Shape.StyledPanel)
         top.setStyleSheet("QFrame { border:1px solid #2a2a2a; border-radius:10px; background:#161616; }")
 
-        self.btn_connect_all = QPushButton("Connect all")
-        self.btn_disconnect_all = QPushButton("Disconnect all")
-        self.btn_connect_all.clicked.connect(self._connect_all)
-        self.btn_disconnect_all.clicked.connect(self._disconnect_all)
+        self.btn_connect_camera = QPushButton("Connect camera")
+        self.btn_disconnect_camera = QPushButton("Disconnect camera")
+        self.btn_connect_mount = QPushButton("Connect mount")
+        self.btn_disconnect_mount = QPushButton("Disconnect mount")
+        self.btn_connect_camera.clicked.connect(self._connect_camera)
+        self.btn_disconnect_camera.clicked.connect(self._disconnect_camera)
+        self.btn_connect_mount.clicked.connect(self._connect_mount)
+        self.btn_disconnect_mount.clicked.connect(self._disconnect_mount)
 
         self.ch_cam = Chip("Camera")
         self.ch_mount = Chip("Mount")
@@ -383,8 +387,10 @@ class AstroPanoptesWindow(QMainWindow):
         row = QHBoxLayout()
         row.setContentsMargins(10, 8, 10, 8)
         row.setSpacing(10)
-        row.addWidget(self.btn_connect_all)
-        row.addWidget(self.btn_disconnect_all)
+        row.addWidget(self.btn_connect_camera)
+        row.addWidget(self.btn_disconnect_camera)
+        row.addWidget(self.btn_connect_mount)
+        row.addWidget(self.btn_disconnect_mount)
         row.addSpacing(8)
         for widget in [
             self.ch_cam,
@@ -1275,15 +1281,21 @@ class AstroPanoptesWindow(QMainWindow):
         self.runner.request_camera_record_raw(duration_s=20.0, out_dir="raw_output", basename=basename)
         self._log(f"[camera] Record 20s RAW -> raw_output/{basename}.npy")
 
-    def _connect_all(self) -> None:
+    def _connect_camera(self) -> None:
         self.runner.request_camera_connect(self.cfg.camera.camera_index)
-        self.runner.request_mount_connect(self.cfg.mount.port, self.cfg.mount.baudrate)
-        self._log("[top] Connect all")
+        self._log("[top] Connect camera")
 
-    def _disconnect_all(self) -> None:
+    def _disconnect_camera(self) -> None:
         self.runner.request_camera_disconnect()
+        self._log("[top] Disconnect camera")
+
+    def _connect_mount(self) -> None:
+        self.runner.request_mount_connect(self.cfg.mount.port, self.cfg.mount.baudrate)
+        self._log("[top] Connect mount")
+
+    def _disconnect_mount(self) -> None:
         self.runner.request_mount_disconnect()
-        self._log("[top] Disconnect all")
+        self._log("[top] Disconnect mount")
 
     def _od_start(self) -> None:
         self.od_enabled = True

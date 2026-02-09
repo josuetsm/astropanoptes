@@ -26,3 +26,7 @@ myenv/
 
 # Ignore Jupyter notebooks
 *.ipynb
+
+# Generated data/images
+*.npy
+*.png
