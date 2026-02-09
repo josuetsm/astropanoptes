@@ -4,7 +4,7 @@ import numpy as np
 import pandas as pd
 
 from config import AppConfig
-from goto import GoToModel, MountKinematics, _roll_deg_from_drift_delta
+from goto import GoToModel, MountKinematics, _roll_deg_from_drift_delta, _roll_equivalent_near_reference_deg
 from platesolving import select_guide_star_indices
 from stacking import StackEngine
 from tracking import make_tracking_state, tracking_step, tracking_set_params
@@ -126,6 +126,12 @@ class CoreSmokeTests(unittest.TestCase):
         dv_left = np.array([np.cos(np.deg2rad(150.0)), np.sin(np.deg2rad(150.0))], dtype=np.float64)
         roll_left = _roll_deg_from_drift_delta(dv_left, -20.0)
         self.assertAlmostEqual(roll_left, -30.0, places=6)
+
+    def test_roll_equivalent_near_reference_prefers_continuous_branch(self) -> None:
+        # Same axis orientation as +6 deg, but in opposite 180-deg branch.
+        self.assertAlmostEqual(_roll_equivalent_near_reference_deg(-174.0, 0.0), 6.0, places=6)
+        # If previous roll is near -180 branch, keep that branch.
+        self.assertAlmostEqual(_roll_equivalent_near_reference_deg(6.0, -170.0), -174.0, places=6)
 
     def test_goto_model_manual_fit_keeps_unexcited_axis_column(self) -> None:
         model = GoToModel()

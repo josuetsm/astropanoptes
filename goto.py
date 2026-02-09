@@ -670,6 +670,24 @@ def _roll_axis_equivalent_deg(roll_deg: float) -> float:
     return float(r)
 
 
+def _roll_equivalent_near_reference_deg(roll_deg: float, ref_deg: float) -> float:
+    """
+    Pick the equivalent roll branch (r or r+180) closest to a reference angle.
+
+    This prevents sporadic 180-deg branch flips from propagating to consumers
+    that expect a temporally stable camera roll estimate.
+    """
+    r0 = _wrap_deg_180(float(roll_deg))
+    if not np.isfinite(ref_deg):
+        return float(r0)
+    r1 = _wrap_deg_180(float(r0) + 180.0)
+    d0 = abs(_wrap_deg_180(float(r0) - float(ref_deg)))
+    d1 = abs(_wrap_deg_180(float(r1) - float(ref_deg)))
+    if d1 < d0:
+        return float(r1)
+    return float(r0)
+
+
 def _now_time() -> Time:
     # astropy Time uses UTC by default
     return Time.now()
@@ -3094,11 +3112,18 @@ class GoToWorker(BaseWorker):
             # If AZ direction is inverted at mount level, command sign is opposite to
             # physical +AZ/-AZ motion. Use physical sign for roll orientation.
             slew_rate_for_roll = -slew_rate_for_roll
-        roll_deg = _roll_deg_from_drift_delta(dv, slew_rate_for_roll)
+        roll_branch_deg = _roll_deg_from_drift_delta(dv, slew_rate_for_roll)
+        try:
+            prev_roll_deg = float(getattr(self._get_state().camera, "roll_deg", float("nan")))
+        except Exception:
+            prev_roll_deg = float("nan")
+        prev_roll_ref_deg = _roll_axis_equivalent_deg(prev_roll_deg) if np.isfinite(prev_roll_deg) else float("nan")
+        roll_deg = _roll_equivalent_near_reference_deg(roll_branch_deg, prev_roll_ref_deg)
         roll_axis_deg = _roll_axis_equivalent_deg(roll_deg)
         out["ok"] = True
         out["status"] = "OK"
         out["roll_deg"] = roll_deg
+        out["roll_deg_raw"] = roll_branch_deg
         out["roll_axis_deg"] = roll_axis_deg
 
         self._publish_state({"camera": {"roll_deg": float(roll_deg)}})
@@ -3106,7 +3131,9 @@ class GoToWorker(BaseWorker):
             self._out_log,
             "GoTo: Roll estimate OK "
             f"slew_rate_cmd={used_slew_rate:+.2f} slew_rate_eff={slew_rate_for_roll:+.2f} invert_az={int(invert_az)} "
-            f"roll_raw={roll_raw_deg:+.3f}deg roll={roll_deg:+.3f}deg roll_axis={roll_axis_deg:+.3f}deg "
+            f"roll_raw={roll_raw_deg:+.3f}deg roll_branch={roll_branch_deg:+.3f}deg "
+            f"roll_prev={prev_roll_deg:+.3f}deg roll_ref={prev_roll_ref_deg:+.3f}deg "
+            f"roll={roll_deg:+.3f}deg roll_axis={roll_axis_deg:+.3f}deg "
             f"v0=[{float(v0[0]):.3f},{float(v0[1]):.3f}] "
             f"v1=[{float(v1[0]):.3f},{float(v1[1]):.3f}] "
             f"dv=[{float(dv[0]):.3f},{float(dv[1]):.3f}]",
