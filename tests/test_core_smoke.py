@@ -132,6 +132,8 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(_roll_equivalent_near_reference_deg(-174.0, 0.0), 6.0, places=6)
         # If previous roll is near -180 branch, keep that branch.
         self.assertAlmostEqual(_roll_equivalent_near_reference_deg(6.0, -170.0), -174.0, places=6)
+        # Exact branch tie keeps canonical wrapped branch.
+        self.assertAlmostEqual(_roll_equivalent_near_reference_deg(45.0, -45.0), 45.0, places=6)
 
     def test_goto_model_manual_fit_keeps_unexcited_axis_column(self) -> None:
         model = GoToModel()
@@ -155,6 +157,39 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertGreater(abs(float(np.linalg.det(model.J_deg_per_step))), 1e-12)
         self.assertAlmostEqual(model.J_deg_per_step[0, 1], j_before[0, 1], places=12)
         self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_before[1, 1], places=12)
+
+    def test_goto_model_reset_manual_samples_and_sync(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        model.steps_est = np.array([1234.0, -567.0], dtype=np.float64)
+        model.add_manual_sample(np.array([210.0, 42.0], dtype=np.float64), theta_deg=12.5)
+        self.assertTrue(model.sync_from_latest_manual_sample())
+        model.model_roll_deg = 5.0
+        model.model_roll_err_deg = 1.0
+        model.model_roll_samples = 1
+        model.model_fit_samples = 3
+        model.model_fit_rms_az_deg = 0.1
+        model.model_fit_rms_alt_deg = 0.2
+        model.model_fit_rms_arcsec = 100.0
+
+        model.reset_manual_samples_and_sync()
+
+        self.assertFalse(model.synced)
+        self.assertEqual(len(model._manual_steps_abs), 0)
+        self.assertEqual(len(model._manual_az_alt_abs), 0)
+        self.assertEqual(len(model._manual_roll_deg_abs), 0)
+        self.assertIsNone(model.last_solve_az_alt_deg)
+        self.assertIsNone(model.last_solve_steps_est)
+        self.assertEqual(model.last_solve_time, 0.0)
+        np.testing.assert_allclose(model.ref_steps, model.steps_est)
+        np.testing.assert_allclose(model.ref_az_alt_deg, np.zeros(2, dtype=np.float64))
+        self.assertEqual(model.model_roll_deg, 0.0)
+        self.assertEqual(model.model_roll_err_deg, 0.0)
+        self.assertEqual(model.model_roll_samples, 0)
+        self.assertEqual(model.model_fit_samples, 0)
+        self.assertEqual(model.model_fit_rms_az_deg, 0.0)
+        self.assertEqual(model.model_fit_rms_alt_deg, 0.0)
+        self.assertEqual(model.model_fit_rms_arcsec, 0.0)
 
     def test_goto_model_manual_fit_rejects_outlier_sample(self) -> None:
         model = GoToModel()

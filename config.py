@@ -85,6 +85,10 @@ class StackingConfig:
     # alignment
     resp_min: float = 0.08
     outlier_k_mad: float = 3.0
+    align_median_k: int = 3
+    smooth_k: int = 30
+    max_shift_px: int = 50
+    use_subpixel: bool = True
 
     # drizzle / mosaic
     drizzle_scale: float = 2.0     # 1.5,2.0,2.5,3.0
@@ -98,6 +102,7 @@ class StackingConfig:
 
     # preview
     preview_hz: float = 1.0
+    preview_log_vmin: float = 5.0
 
     # backend
     backend: Literal["cpu"] = "cpu"

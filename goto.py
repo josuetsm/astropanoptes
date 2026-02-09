@@ -1142,6 +1142,27 @@ class GoToModel:
         self.last_solve_time = time.time()
         return True
 
+    def reset_manual_samples_and_sync(self) -> None:
+        """Drop manual sample history and clear current sync/solve anchor."""
+        self._manual_steps_abs.clear()
+        self._manual_az_alt_abs.clear()
+        self._manual_roll_deg_abs.clear()
+
+        self.synced = False
+        self.ref_steps = self.steps_est.copy()
+        self.ref_az_alt_deg = np.zeros(2, dtype=np.float64)
+        self.last_solve_az_alt_deg = None
+        self.last_solve_steps_est = None
+        self.last_solve_time = 0.0
+
+        self.model_roll_deg = 0.0
+        self.model_roll_err_deg = 0.0
+        self.model_roll_samples = 0
+        self.model_fit_samples = 0
+        self.model_fit_rms_az_deg = 0.0
+        self.model_fit_rms_alt_deg = 0.0
+        self.model_fit_rms_arcsec = 0.0
+
     def fit_J_from_manual_samples(self, *, min_samples: int = 3, ridge: float = 1e-12) -> bool:
         """Fit J from absolute manual samples (steps, AltAz) using relative deltas.
 
@@ -1891,9 +1912,12 @@ class GoToController:
                     if (not bool(getattr(sol, "success", False))) and bool(self.cfg.solve_near_predicted):
                         # Recovery attempt: if prediction is off, re-acquire around the target itself.
                         target_retry: TargetType = {"az_deg": float(altaz_tgt[0]), "alt_deg": float(altaz_tgt[1])}
+                        retry_radius_seq = self.cfg.platesolving_radius_deg_seq
                         log_info(
                             None,
-                            f"GoTo: platesolve retry near target (iter={it + 1}, status={getattr(sol, 'status', 'UNKNOWN')})",
+                            "GoTo: platesolve retry near target "
+                            f"(iter={it + 1}, status={getattr(sol, 'status', 'UNKNOWN')}, "
+                            f"radius_seq={tuple(retry_radius_seq)})",
                             throttle_s=0.2,
                             throttle_key="goto_ps_retry_target",
                         )
@@ -1901,7 +1925,7 @@ class GoToController:
                             get_live_frame=get_live_frame,
                             target_for_solver=target_retry,
                             platesolving_cfg=platesolving_cfg,
-                            radius_deg_seq=(5.0, 10.0, 20.0),
+                            radius_deg_seq=retry_radius_seq,
                             obstime=solve_time,
                         )
                         if bool(getattr(sol_retry, "success", False)):
@@ -2857,6 +2881,8 @@ class GoToWorker(BaseWorker):
         roll_line_max_shift_px = float(params.get("roll_line_max_shift_px", 120.0))
         roll_max_rel_std = float(params.get("roll_max_rel_std", 0.35))
         roll_max_speed_px_s = float(params.get("roll_max_speed_px_s", max(120.0, roll_stack_vmax_px_s)))
+        roll_guard_prev_axis = bool(params.get("roll_guard_prev_axis", True))
+        roll_max_axis_jump_deg = float(params.get("roll_max_axis_jump_deg", 35.0))
 
         if roll_window < 1:
             roll_window = 1
@@ -2885,6 +2911,8 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_BAD_SPEED_LIMIT"
             log_error(self._out_log, "GoTo: Roll estimate failed (invalid roll_max_speed_px_s)")
             return out
+        if (not np.isfinite(roll_max_axis_jump_deg)) or roll_max_axis_jump_deg <= 0.0:
+            roll_guard_prev_axis = False
         if (not roll_use_stack) and (not roll_use_line):
             out["status"] = "ERR_ROLL_METHOD"
             log_error(self._out_log, "GoTo: Roll estimate failed (all methods disabled)")
@@ -3120,6 +3148,22 @@ class GoToWorker(BaseWorker):
         prev_roll_ref_deg = _roll_axis_equivalent_deg(prev_roll_deg) if np.isfinite(prev_roll_deg) else float("nan")
         roll_deg = _roll_equivalent_near_reference_deg(roll_branch_deg, prev_roll_ref_deg)
         roll_axis_deg = _roll_axis_equivalent_deg(roll_deg)
+        axis_jump_deg = float("nan")
+        if roll_guard_prev_axis and np.isfinite(prev_roll_ref_deg):
+            axis_jump_deg = abs(_wrap_deg_180(float(roll_axis_deg) - float(prev_roll_ref_deg)))
+            if axis_jump_deg > float(roll_max_axis_jump_deg):
+                out["status"] = "ERR_ROLL_AXIS_JUMP"
+                out["roll_deg"] = roll_deg
+                out["roll_deg_raw"] = roll_branch_deg
+                out["roll_axis_deg"] = roll_axis_deg
+                out["roll_axis_jump_deg"] = axis_jump_deg
+                log_error(
+                    self._out_log,
+                    "GoTo: Roll estimate rejected (axis jump too large) "
+                    f"jump={axis_jump_deg:.3f}deg max={float(roll_max_axis_jump_deg):.3f}deg "
+                    f"prev_ref={prev_roll_ref_deg:+.3f}deg roll_axis={roll_axis_deg:+.3f}deg",
+                )
+                return out
         out["ok"] = True
         out["status"] = "OK"
         out["roll_deg"] = roll_deg
@@ -3134,6 +3178,7 @@ class GoToWorker(BaseWorker):
             f"roll_raw={roll_raw_deg:+.3f}deg roll_branch={roll_branch_deg:+.3f}deg "
             f"roll_prev={prev_roll_deg:+.3f}deg roll_ref={prev_roll_ref_deg:+.3f}deg "
             f"roll={roll_deg:+.3f}deg roll_axis={roll_axis_deg:+.3f}deg "
+            f"axis_jump={axis_jump_deg:+.3f}deg guard={int(roll_guard_prev_axis)} "
             f"v0=[{float(v0[0]):.3f},{float(v0[1]):.3f}] "
             f"v1=[{float(v1[0]):.3f},{float(v1[1]):.3f}] "
             f"dv=[{float(dv[0]):.3f},{float(dv[1]):.3f}]",
@@ -5180,6 +5225,35 @@ class GoToWorker(BaseWorker):
                 )
                 if ok:
                     self._log_model_fit_state(prefix="GoTo: FIT_MODEL report")
+
+            elif kind == "reset":
+                model = self._goto.model
+                n_manual_prev = int(len(getattr(model, "_manual_steps_abs", [])))
+                was_synced = bool(getattr(model, "synced", False))
+                model.reset_manual_samples_and_sync()
+                self._publish_state(
+                    {
+                        "goto": {
+                            "manual_samples": 0,
+                            "synced": False,
+                            "pointing_valid": False,
+                            "pointing_az_deg": 0.0,
+                            "pointing_alt_deg": 0.0,
+                            "pointing_ra_deg": 0.0,
+                            "pointing_dec_deg": 0.0,
+                            "last_error_arcsec": 0.0,
+                            "autocal_status": GotoAutocalStatus.IDLE,
+                            "autocal_reason": None,
+                            "autocal_last_ok": False,
+                            "status": GotoStatus.OK,
+                            "reason": None,
+                        }
+                    }
+                )
+                log_info(
+                    self._out_log,
+                    f"GoTo: RESET ok=True manual_samples={n_manual_prev}->0 synced={was_synced}->False",
+                )
 
             else:
                 self._publish_state(

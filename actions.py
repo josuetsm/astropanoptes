@@ -60,6 +60,7 @@ class ActionType(str, Enum):
     GOTO_AUTOCALIBRATE = "GOTO_AUTOCALIBRATE"
     GOTO_FIT_MODEL = "GOTO_FIT_MODEL"
     GOTO_ESTIMATE_ROLL = "GOTO_ESTIMATE_ROLL"
+    GOTO_RESET = "GOTO_RESET"
     GOTO_CANCEL = "GOTO_CANCEL"
 
     # live overlay
@@ -271,6 +272,10 @@ def goto_calibrate(params: Dict[str, Any]) -> Action:
 
 def goto_fit_model(params: Dict[str, Any] | None = None) -> Action:
     return Action(ActionType.GOTO_FIT_MODEL, {"params": params or {}}, _now())
+
+
+def goto_reset() -> Action:
+    return Action(ActionType.GOTO_RESET, {}, _now())
 
 
 def goto_cancel() -> Action:

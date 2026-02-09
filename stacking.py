@@ -1,25 +1,20 @@
 # stacking.py
 from __future__ import annotations
 
-import math
-import time
-import threading
 import queue
+import threading
+import time
 from dataclasses import dataclass, field
-from typing import Dict, Tuple, Optional, Any, List, Literal
+from typing import Any, Dict, List, Literal, Optional
 
-import numpy as np
 import cv2
+import numpy as np
+
 from config import AppConfig
-from imaging import (
-    ensure_raw16_bayer,
-    debayer_cv2,
-    warp_rgb16,
-)
-from preview import stretch_to_u8
+from imaging import ensure_raw16_bayer
 from logging_utils import log_error
+from preview import stretch_to_u8
 from workers import BaseWorker
-from sep_utils import sep_detect_from_raw16, estimate_shift_from_objects
 
 # ============================================================
 # Types
@@ -27,14 +22,320 @@ from sep_utils import sep_detect_from_raw16, estimate_shift_from_objects
 
 ColorMode = Literal["mono", "rgb"]
 
-_EPS = 1e-9
+_BAYER_TO_GRAY_CODE: Dict[str, int] = {
+    "RGGB": cv2.COLOR_BAYER_RG2GRAY,
+    "BGGR": cv2.COLOR_BAYER_BG2GRAY,
+    "GRBG": cv2.COLOR_BAYER_GR2GRAY,
+    "GBRG": cv2.COLOR_BAYER_GB2GRAY,
+}
 
+
+def _odd_ksize(v: int, *, minimum: int = 1) -> int:
+    k = max(int(v), int(minimum))
+    if (k % 2) == 0:
+        k += 1
+    return k
+
+
+def _smooth_kernel(k: int) -> np.ndarray:
+    x = np.ones(max(1, int(k)), dtype=np.float64)
+    return x / x.sum()
+
+
+def _bayer_to_gray_code(pattern: str) -> int:
+    return _BAYER_TO_GRAY_CODE.get(str(pattern).upper(), cv2.COLOR_BAYER_RG2GRAY)
+
+
+# ============================================================
+# Live Mosaic Stacker (GRAY)
+# ============================================================
+
+class LiveMosaicStackerGray:
+    def __init__(
+        self,
+        *,
+        align_median_k: int,
+        smooth_k: int,
+        max_shift_px: int,
+        use_subpixel: bool,
+        preview_log_vmin: float,
+        bayer_to_gray_code: int,
+    ):
+        self.align_median_k = _odd_ksize(align_median_k, minimum=1)
+        self.smooth_k = max(1, int(smooth_k))
+        self.max_shift_px = max(1, int(max_shift_px))
+        self.use_subpixel = bool(use_subpixel)
+        self.preview_log_vmin = float(preview_log_vmin)
+        self.bayer_to_gray_code = int(bayer_to_gray_code)
+        self.kernel = _smooth_kernel(self.smooth_k)
+
+        self.sum: Optional[np.ndarray] = None
+        self.wgt: Optional[np.ndarray] = None
+        self.canvas_h = 0
+        self.canvas_w = 0
+        self.frame_h = 0
+        self.frame_w = 0
+
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+        self.last_dx = 0.0
+        self.last_dy = 0.0
+        self.n = 0
+
+    def reset(self) -> None:
+        self.sum = None
+        self.wgt = None
+        self.canvas_h = 0
+        self.canvas_w = 0
+        self.frame_h = 0
+        self.frame_w = 0
+        self.pos_x = 0.0
+        self.pos_y = 0.0
+        self.last_dx = 0.0
+        self.last_dy = 0.0
+        self.n = 0
+
+    def has_data(self) -> bool:
+        return self.sum is not None and self.wgt is not None and self.n > 0
+
+    def _profile_1d(self, img_u16: np.ndarray, which: str) -> np.ndarray:
+        img = cv2.medianBlur(img_u16, self.align_median_k)
+        if which == "dx":
+            p = img.max(axis=0).astype(np.float64, copy=False)
+        elif which == "dy":
+            p = img.max(axis=1).astype(np.float64, copy=False)
+        else:
+            raise ValueError("which must be dx or dy")
+        return np.convolve(p, self.kernel, mode="same")
+
+    @staticmethod
+    def _shift_1d_centered(
+        p_ref: np.ndarray,
+        p_cur: np.ndarray,
+        *,
+        center: float,
+        max_shift: int,
+        subpixel: bool,
+    ) -> float:
+        if not np.isfinite(center):
+            center = 0.0
+
+        a = p_cur - p_cur.mean()
+        b = p_ref - p_ref.mean()
+
+        corr = np.correlate(a, b, mode="full")
+        if not np.any(np.isfinite(corr)):
+            return 0.0
+
+        L = len(p_cur)
+        shifts = np.arange(-(L - 1), L, dtype=np.float64)
+
+        lo = float(center) - float(max_shift)
+        hi = float(center) + float(max_shift)
+        mask = (shifts >= lo) & (shifts <= hi)
+        if np.any(mask):
+            corr[~mask] = -np.inf
+
+        i0 = int(np.argmax(corr))
+        if not np.isfinite(corr[i0]):
+            return 0.0
+        shift_int = i0 - (L - 1)
+
+        if not subpixel:
+            return float(shift_int)
+
+        delta = 0.0
+        if 1 <= i0 < (len(corr) - 1):
+            y0, y1, y2 = float(corr[i0 - 1]), float(corr[i0]), float(corr[i0 + 1])
+            if np.isfinite(y0) and np.isfinite(y1) and np.isfinite(y2):
+                denom = y0 - 2.0 * y1 + y2
+                if np.isfinite(denom) and abs(denom) > 1e-12:
+                    cand = 0.5 * (y0 - y2) / denom
+                    if np.isfinite(cand):
+                        delta = cand
+
+        out = float(shift_int + delta)
+        if not np.isfinite(out):
+            return float(shift_int)
+        return out
+
+    def _raw_to_gray_align(self, raw_u16: np.ndarray) -> np.ndarray:
+        raw_f = cv2.medianBlur(raw_u16, self.align_median_k)
+        return cv2.cvtColor(raw_f, self.bayer_to_gray_code)
+
+    def _raw_to_gray_stack(self, raw_u16: np.ndarray) -> np.ndarray:
+        return cv2.cvtColor(raw_u16, self.bayer_to_gray_code)
+
+    @staticmethod
+    def _warp_gray(img: np.ndarray, tx: float, ty: float) -> np.ndarray:
+        h, w = img.shape
+        M = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty]], dtype=np.float32)
+        return cv2.warpAffine(
+            img,
+            M,
+            (w, h),
+            flags=cv2.INTER_LINEAR,
+            borderMode=cv2.BORDER_CONSTANT,
+            borderValue=0,
+        )
+
+    def _ensure_canvas(self, x0: int, y0: int, w: int, h: int) -> tuple[int, int]:
+        if self.sum is None or self.wgt is None:
+            return x0, y0
+
+        pad_l = max(0, -x0)
+        pad_t = max(0, -y0)
+        pad_r = max(0, x0 + w - self.canvas_w)
+        pad_b = max(0, y0 + h - self.canvas_h)
+
+        if pad_l or pad_t or pad_r or pad_b:
+            new_h = self.canvas_h + pad_t + pad_b
+            new_w = self.canvas_w + pad_l + pad_r
+
+            new_sum = np.zeros((new_h, new_w), np.float64)
+            new_wgt = np.zeros((new_h, new_w), np.float64)
+
+            new_sum[pad_t : pad_t + self.canvas_h, pad_l : pad_l + self.canvas_w] = self.sum
+            new_wgt[pad_t : pad_t + self.canvas_h, pad_l : pad_l + self.canvas_w] = self.wgt
+
+            self.sum = new_sum
+            self.wgt = new_wgt
+            self.canvas_h = new_h
+            self.canvas_w = new_w
+
+            self.pos_x += float(pad_l)
+            self.pos_y += float(pad_t)
+
+            x0 += pad_l
+            y0 += pad_t
+
+        return x0, y0
+
+    def add_frame(self, raw_u16: np.ndarray) -> None:
+        gray_align = self._raw_to_gray_align(raw_u16)
+        gray_stack = self._raw_to_gray_stack(raw_u16)
+        h, w = gray_stack.shape
+
+        if self.sum is None or self.wgt is None:
+            self.sum = gray_stack.astype(np.float64, copy=False)
+            self.wgt = np.ones((h, w), np.float64)
+            self.canvas_h = h
+            self.canvas_w = w
+            self.frame_h = h
+            self.frame_w = w
+            self.n = 1
+            self.last_dx = 0.0
+            self.last_dy = 0.0
+            return
+
+        if (h != self.frame_h) or (w != self.frame_w):
+            # ROI/binning changed while stacking: reinitialize to keep state consistent.
+            self.reset()
+            self.sum = gray_stack.astype(np.float64, copy=False)
+            self.wgt = np.ones((h, w), np.float64)
+            self.canvas_h = h
+            self.canvas_w = w
+            self.frame_h = h
+            self.frame_w = w
+            self.n = 1
+            return
+
+        x_ref = int(np.floor(self.pos_x))
+        y_ref = int(np.floor(self.pos_y))
+        x_ref, y_ref = self._ensure_canvas(x_ref, y_ref, w, h)
+
+        ref = np.zeros((h, w), np.uint16)
+        W = self.wgt[y_ref : y_ref + h, x_ref : x_ref + w]
+        S = self.sum[y_ref : y_ref + h, x_ref : x_ref + w]
+        m = W > 0
+        if np.any(m):
+            ref_vals = np.clip(S[m] / W[m], 0.0, 65535.0)
+            ref[m] = ref_vals.astype(np.uint16, copy=False)
+
+        dx = self._shift_1d_centered(
+            self._profile_1d(ref, "dx"),
+            self._profile_1d(gray_align, "dx"),
+            center=self.last_dx,
+            max_shift=self.max_shift_px,
+            subpixel=self.use_subpixel,
+        )
+        dy = self._shift_1d_centered(
+            self._profile_1d(ref, "dy"),
+            self._profile_1d(gray_align, "dy"),
+            center=self.last_dy,
+            max_shift=self.max_shift_px,
+            subpixel=self.use_subpixel,
+        )
+        if not np.isfinite(dx):
+            dx = 0.0
+        if not np.isfinite(dy):
+            dy = 0.0
+
+        self.pos_x -= dx
+        self.pos_y -= dy
+        self.last_dx = float(dx)
+        self.last_dy = float(dy)
+
+        x0 = int(np.floor(self.pos_x))
+        y0 = int(np.floor(self.pos_y))
+        fx = float(self.pos_x - x0)
+        fy = float(self.pos_y - y0)
+
+        x0, y0 = self._ensure_canvas(x0, y0, w, h)
+
+        if self.use_subpixel:
+            warped = self._warp_gray(gray_stack, fx, fy)
+        else:
+            warped = gray_stack
+
+        self.sum[y0 : y0 + h, x0 : x0 + w] += warped.astype(np.float64, copy=False)
+        self.wgt[y0 : y0 + h, x0 : x0 + w] += 1.0
+        self.n += 1
+
+    def get_mean_u16(self) -> Optional[np.ndarray]:
+        if self.sum is None or self.wgt is None:
+            return None
+
+        if self.sum.shape != self.wgt.shape:
+            h = min(self.sum.shape[0], self.wgt.shape[0])
+            w = min(self.sum.shape[1], self.wgt.shape[1])
+            src_sum = self.sum[:h, :w]
+            src_wgt = self.wgt[:h, :w]
+        else:
+            src_sum = self.sum
+            src_wgt = self.wgt
+
+        mean = np.zeros_like(src_sum, dtype=np.float64)
+        np.divide(src_sum, src_wgt, out=mean, where=src_wgt > 0)
+        mean = np.nan_to_num(mean, nan=0.0, posinf=65535.0, neginf=0.0)
+        return np.clip(mean, 0.0, 65535.0).astype(np.uint16)
+
+    def get_weight_f32(self) -> Optional[np.ndarray]:
+        if self.wgt is None:
+            return None
+        return np.nan_to_num(self.wgt, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
+
+    def get_preview_u8(self) -> Optional[np.ndarray]:
+        mean = self.get_mean_u16()
+        if mean is None:
+            return None
+        x = np.log1p(mean.astype(np.float32, copy=False))
+        vmax = float(x.max()) if x.size > 0 else self.preview_log_vmin + 1.0
+        denom = max(vmax - self.preview_log_vmin, 1e-6)
+        y = (x - self.preview_log_vmin) / denom
+        y = np.clip(y, 0.0, 1.0)
+        return (y * 255.0 + 0.5).astype(np.uint8)
+
+
+# ============================================================
+# Metrics + Engine
+# ============================================================
 
 @dataclass
 class StackingMetrics:
     enabled: bool = False
 
-    # drizzle / mosaic
+    # legacy fields preserved for UI/state compatibility
     scale: float = 2.0
     pixfrac: float = 0.8
     tile_size_out: int = 512
@@ -58,251 +359,141 @@ class StackingMetrics:
 
 
 @dataclass
-class Tile:
-    sum: np.ndarray          # float32 (H,W) or (H,W,3)
-    w: np.ndarray            # float32 (H,W)
-    hits: int = 0
-    last_used_t: float = 0.0
-
-
-@dataclass
-class TileCanvas:
-    tile_size: int
-    max_tiles: int
-    color_mode: ColorMode
-
-    tiles: Dict[Tuple[int, int], Tile] = field(default_factory=dict)
-    tiles_evicted: int = 0
-
-    def _alloc_tile(self) -> Tile:
-        ts = self.tile_size
-        if self.color_mode == "mono":
-            s = np.zeros((ts, ts), dtype=np.float32)
-        else:
-            s = np.zeros((ts, ts, 3), dtype=np.float32)
-        w = np.zeros((ts, ts), dtype=np.float32)
-        return Tile(sum=s, w=w)
-
-    def get_or_create(self, key: Tuple[int, int], now: float) -> Tile:
-        t = self.tiles.get(key)
-        if t is not None:
-            t.last_used_t = now
-            return t
-
-        if len(self.tiles) >= self.max_tiles:
-            lru_key = min(self.tiles.items(), key=lambda kv: kv[1].last_used_t)[0]
-            del self.tiles[lru_key]
-            self.tiles_evicted += 1
-
-        t = self._alloc_tile()
-        t.last_used_t = now
-        self.tiles[key] = t
-        return t
-
-    def num_tiles(self) -> int:
-        return len(self.tiles)
-
-
-# ============================================================
-# Alignment utilities (robust, CPU-only)
-# ============================================================
-
-def _mad(x: np.ndarray) -> float:
-    med = np.median(x)
-    return float(np.median(np.abs(x - med))) + _EPS
-
-
-# ============================================================
-# Affine / tiling helpers
-# ============================================================
-
-def _build_dst_to_src_affine(
-    *,
-    tile_u0: float,
-    tile_v0: float,
-    scale: float,
-    dx: float,
-    dy: float,
-    theta_rad: float,
-) -> np.ndarray:
-    """
-    2x3 affine matrix mapping DEST(tile-local output coords) -> SRC(frame coords),
-    for cv2.warpAffine with WARP_INVERSE_MAP.
-
-    Forward model (src->global_out):
-        [u; v] = scale * ( R*[x; y] + [dx; dy] )
-
-    Inverse (global_out->src):
-        [x; y] = R^T * ([u; v]/scale - [dx; dy])
-
-    tile-local dest:
-        u = tile_u0 + x_out, v = tile_v0 + y_out
-    """
-    c = math.cos(theta_rad)
-    s = math.sin(theta_rad)
-    inv_scale = 1.0 / scale
-
-    a11 = c * inv_scale
-    a12 = s * inv_scale
-    a21 = -s * inv_scale
-    a22 = c * inv_scale
-
-    b1 = c * (tile_u0 * inv_scale - dx) + s * (tile_v0 * inv_scale - dy)
-    b2 = -s * (tile_u0 * inv_scale - dx) + c * (tile_v0 * inv_scale - dy)
-
-    return np.array([[a11, a12, b1],
-                     [a21, a22, b2]], dtype=np.float32)
-
-
-def _warp_affine_tile(src: np.ndarray, M: np.ndarray, dsize: Tuple[int, int], is_color: bool) -> np.ndarray:
-    flags = cv2.INTER_LINEAR | cv2.WARP_INVERSE_MAP
-    border_value = (0, 0, 0) if is_color else 0
-    warped = cv2.warpAffine(
-        src, M, dsize, flags=flags,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=border_value
-    )
-    return warped.astype(np.float32, copy=False)
-
-
-def _warp_mask_tile(src_shape: Tuple[int, int], M: np.ndarray, dsize: Tuple[int, int]) -> np.ndarray:
-    """
-    Warp a ones-mask to compute valid pixels; returns float32 mask in {0,1}.
-    """
-    h, w = src_shape
-    ones = np.ones((h, w), dtype=np.uint8)
-    flags = cv2.INTER_NEAREST | cv2.WARP_INVERSE_MAP
-    m = cv2.warpAffine(
-        ones, M, dsize, flags=flags,
-        borderMode=cv2.BORDER_CONSTANT, borderValue=0
-    )
-    return (m > 0).astype(np.float32, copy=False)
-
-
-def _dst_tile_fully_inside_src(M_dst_to_src: np.ndarray, dsize: Tuple[int, int], src_w: int, src_h: int) -> bool:
-    """
-    If the entire destination tile maps inside the source bounds, we can skip warping the mask.
-    """
-    tw, th = dsize
-    corners = np.array(
-        [[0.0, 0.0, 1.0],
-         [tw - 1.0, 0.0, 1.0],
-         [0.0, th - 1.0, 1.0],
-         [tw - 1.0, th - 1.0, 1.0]],
-        dtype=np.float32
-    )
-    src_xy = corners @ M_dst_to_src.T  # (4,2)
-    x = src_xy[:, 0]
-    y = src_xy[:, 1]
-    return bool(
-        (x.min() >= 0.0) and (y.min() >= 0.0) and (x.max() <= (src_w - 1.0)) and (y.max() <= (src_h - 1.0))
-    )
-
-
-def _corners_bbox_out(
-    w: int,
-    h: int,
-    *,
-    scale: float,
-    dx: float,
-    dy: float,
-    theta_rad: float,
-) -> Tuple[float, float, float, float]:
-    """
-    Bounding box in output coords for transformed source frame.
-    """
-    c = math.cos(theta_rad)
-    s = math.sin(theta_rad)
-
-    corners = np.array(
-        [[0.0, 0.0],
-         [float(w - 1), 0.0],
-         [0.0, float(h - 1)],
-         [float(w - 1), float(h - 1)]],
-        dtype=np.float32
-    )
-    x = corners[:, 0]
-    y = corners[:, 1]
-    xr = c * x - s * y
-    yr = s * x + c * y
-    u = scale * (xr + dx)
-    v = scale * (yr + dy)
-    return float(u.min()), float(v.min()), float(u.max()), float(v.max())
-
-
-# ============================================================
-# Engine
-# ============================================================
-
-@dataclass
 class StackEngine:
     cfg: AppConfig
     metrics: StackingMetrics = field(default_factory=StackingMetrics)
 
     enabled: bool = False
     color_mode: ColorMode = "mono"
-    canvas: Optional[TileCanvas] = None
+    canvas: Optional[Any] = None
 
-    # preview snapshot
     _preview_jpeg: Optional[bytes] = None
     _preview_lock: threading.Lock = field(default_factory=threading.Lock)
-
-    # persistent alignment reference (SEP objects, full-res)
-    _ref_align_xy: Optional[np.ndarray] = None
+    _live_gray: Optional[LiveMosaicStackerGray] = None
+    _stack_lock: threading.RLock = field(default_factory=threading.RLock)
 
     def configure_from_cfg(self) -> None:
-        scfg = self.cfg.stacking
-        self.color_mode = scfg.color_mode
-        self.canvas = TileCanvas(
-            tile_size=scfg.tile_size_out,
-            max_tiles=scfg.max_tiles,
-            color_mode=scfg.color_mode,
-        )
-        self.metrics.scale = float(scfg.drizzle_scale)
-        self.metrics.pixfrac = float(scfg.pixfrac)
-        self.metrics.tile_size_out = int(scfg.tile_size_out)
-        self.metrics.max_tiles = int(scfg.max_tiles)
+        with self._stack_lock:
+            scfg = self.cfg.stacking
+            self.color_mode = "mono"
+            self.canvas = None
+            self._live_gray = LiveMosaicStackerGray(
+                align_median_k=int(getattr(scfg, "align_median_k", 3)),
+                smooth_k=int(getattr(scfg, "smooth_k", 30)),
+                max_shift_px=int(getattr(scfg, "max_shift_px", 50)),
+                use_subpixel=bool(getattr(scfg, "use_subpixel", True)),
+                preview_log_vmin=float(getattr(scfg, "preview_log_vmin", 5.0)),
+                bayer_to_gray_code=_bayer_to_gray_code(str(scfg.bayer_pattern)),
+            )
+            self.metrics.scale = float(scfg.drizzle_scale)
+            self.metrics.pixfrac = float(scfg.pixfrac)
+            self.metrics.tile_size_out = int(scfg.tile_size_out)
+            self.metrics.max_tiles = int(scfg.max_tiles)
 
     def start(self) -> None:
-        if self.canvas is None:
-            self.configure_from_cfg()
-        self.enabled = True
-        self.metrics.enabled = True
+        with self._stack_lock:
+            if self._live_gray is None:
+                self.configure_from_cfg()
+            self.enabled = True
+            self.metrics.enabled = True
 
     def stop(self) -> None:
-        self.enabled = False
-        self.metrics.enabled = False
+        with self._stack_lock:
+            self.enabled = False
+            self.metrics.enabled = False
 
     def reset(self) -> None:
-        if self.canvas is not None:
-            self.canvas.tiles.clear()
-            self.canvas.tiles_evicted = 0
+        with self._stack_lock:
+            if self._live_gray is not None:
+                self._live_gray.reset()
 
-        self._ref_align_xy = None
+            with self._preview_lock:
+                self._preview_jpeg = None
 
-        with self._preview_lock:
-            self._preview_jpeg = None
-
-        self.metrics.frames_in = 0
-        self.metrics.frames_used = 0
-        self.metrics.frames_dropped = 0
-        self.metrics.frames_rejected = 0
-        self.metrics.tiles_evicted = 0
-        self.metrics.last_resp = 0.0
-        self.metrics.last_dx = 0.0
-        self.metrics.last_dy = 0.0
-        self.metrics.last_theta_deg = 0.0
-        self.metrics.stacking_fps = 0.0
+            self.metrics.frames_in = 0
+            self.metrics.frames_used = 0
+            self.metrics.frames_dropped = 0
+            self.metrics.frames_rejected = 0
+            self.metrics.tiles_used = 0
+            self.metrics.tiles_evicted = 0
+            self.metrics.last_resp = 0.0
+            self.metrics.last_dx = 0.0
+            self.metrics.last_dy = 0.0
+            self.metrics.last_theta_deg = 0.0
+            self.metrics.stacking_fps = 0.0
+            self.metrics.last_preview_t = 0.0
 
     def set_params(self, **kwargs: Any) -> None:
-        scfg = self.cfg.stacking
-        for k, v in kwargs.items():
-            if hasattr(scfg, k):
-                setattr(scfg, k, v)
-        self.configure_from_cfg()
+        with self._stack_lock:
+            scfg = self.cfg.stacking
+            for k, v in kwargs.items():
+                if hasattr(scfg, k):
+                    setattr(scfg, k, v)
+            was_enabled = bool(self.enabled)
+            self.configure_from_cfg()
+            self.enabled = was_enabled
+            self.metrics.enabled = was_enabled
+            with self._preview_lock:
+                self._preview_jpeg = None
 
     def get_preview_jpeg(self) -> Optional[bytes]:
         with self._preview_lock:
             return self._preview_jpeg
+
+    def get_stack_mean(self, *, out_dtype: Optional[np.dtype] = np.float32) -> Optional[np.ndarray]:
+        with self._stack_lock:
+            if self._live_gray is None:
+                return None
+            mean_u16 = self._live_gray.get_mean_u16()
+            if mean_u16 is None:
+                return None
+            if out_dtype is None:
+                return mean_u16
+            if out_dtype == np.uint16:
+                return mean_u16
+            return mean_u16.astype(out_dtype, copy=False)
+
+    def get_stack_weight(self, *, out_dtype: Optional[np.dtype] = np.float32) -> Optional[np.ndarray]:
+        with self._stack_lock:
+            if self._live_gray is None:
+                return None
+            w = self._live_gray.get_weight_f32()
+            if w is None:
+                return None
+            if out_dtype is None:
+                return w
+            return w.astype(out_dtype, copy=False)
+
+    def get_stack_snapshot(
+        self,
+        *,
+        mean_dtype: Optional[np.dtype] = np.float32,
+        wgt_dtype: Optional[np.dtype] = np.float32,
+    ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
+        with self._stack_lock:
+            if self._live_gray is None:
+                return None, None
+
+            mean_u16 = self._live_gray.get_mean_u16()
+            wgt_f32 = self._live_gray.get_weight_f32()
+            if mean_u16 is None:
+                return None, None
+
+            if mean_dtype is None:
+                mean = mean_u16
+            elif mean_dtype == np.uint16:
+                mean = mean_u16
+            else:
+                mean = mean_u16.astype(mean_dtype, copy=False)
+
+            if wgt_f32 is None:
+                wgt = None
+            elif wgt_dtype is None:
+                wgt = wgt_f32
+            else:
+                wgt = wgt_f32.astype(wgt_dtype, copy=False)
+
+            return mean, wgt
 
     def get_latest_stack_frame(
         self,
@@ -311,259 +502,95 @@ class StackEngine:
         strategy: str = "median_tile",
         out_dtype: Optional[np.dtype] = np.uint8,
     ) -> Optional[np.ndarray]:
-        if self.canvas is None or self.canvas.num_tiles() == 0:
-            return None
-        if str(strategy) != "median_tile":
-            return None
+        with self._stack_lock:
+            _ = kind
+            if str(strategy) not in ("median_tile", "full", "full_mosaic"):
+                return None
 
-        keys = list(self.canvas.tiles.keys())
-        txs = np.array([k[0] for k in keys], dtype=np.int32)
-        tys = np.array([k[1] for k in keys], dtype=np.int32)
-        k_med = (int(np.median(txs)), int(np.median(tys)))
-        if k_med not in self.canvas.tiles:
-            k_med = keys[0]
+            if self._live_gray is None:
+                return None
+            mean_u16 = self._live_gray.get_mean_u16()
+            if mean_u16 is None:
+                return None
 
-        tile = self.canvas.tiles[k_med]
-        w = np.maximum(tile.w, 1e-6)
-
-        if self.color_mode == "mono":
-            img = (tile.sum / w).astype(np.float32, copy=False)
-        else:
-            img = (tile.sum / w[..., None]).astype(np.float32, copy=False)
-            if str(kind) == "mono":
-                img = img.mean(axis=2)
-
-        if out_dtype is None:
-            return img
-        if out_dtype == np.uint8:
-            return stretch_to_u8(img)
-        if out_dtype == np.float32:
-            return img.astype(np.float32, copy=False)
-        return img.astype(out_dtype, copy=False)
-
-    # --------------------------------------------------------
-    # Core batch step
-    # --------------------------------------------------------
+            img_f32 = mean_u16.astype(np.float32, copy=False)
+            if out_dtype is None:
+                return img_f32
+            if out_dtype == np.uint8:
+                return stretch_to_u8(img_f32)
+            if out_dtype == np.float32:
+                return img_f32
+            return img_f32.astype(out_dtype, copy=False)
 
     def step_batch(self, batch: List[Dict[str, Any]]) -> None:
-        """
-        batch items: dict with keys:
-          - raw16: np.ndarray (H,W) uint16 Bayer
-          - t: float timestamp
-        """
-        if not self.enabled or self.canvas is None or not batch:
-            return
+        with self._stack_lock:
+            if not self.enabled or self._live_gray is None or not batch:
+                return
 
-        scfg = self.cfg.stacking
-        t0 = time.perf_counter()
-        self.metrics.frames_in += len(batch)
+            t0 = time.perf_counter()
+            scfg = self.cfg.stacking
+            self.metrics.frames_in += len(batch)
 
-        # 1) Alignment objects from RAW16 via SEP (full-res).
-        align_xy: List[np.ndarray] = []
-        raw16_work_list: List[np.ndarray] = []
-        for item in batch:
-            raw16_work = ensure_raw16_bayer(item["raw16"])
-            raw16_work_list.append(raw16_work)
-            _, _, _, obj_xy = sep_detect_from_raw16(
-                raw16_work,
-                sep_bw=int(self.cfg.sep.bw),
-                sep_bh=int(self.cfg.sep.bh),
-                sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
-                sep_minarea=int(self.cfg.sep.minarea),
-                max_sources=int(self.cfg.platesolving.max_det),
-            )
-            align_xy.append(obj_xy)
+            used = 0
+            rejected = 0
 
-        # 2) Persistent reference (stabilizes across batches).
-        if self._ref_align_xy is None:
-            self._ref_align_xy = align_xy[0].copy()
-        ref_xy = self._ref_align_xy
-
-        # 3) Shifts relative to reference (full-res).
-        dxs_full = np.zeros(len(batch), dtype=np.float32)
-        dys_full = np.zeros(len(batch), dtype=np.float32)
-        resps = np.zeros(len(batch), dtype=np.float32)
-
-        ref_shape = raw16_work_list[0].shape if raw16_work_list else (0, 0)
-        max_shift = float(max(ref_shape) / 2.0) if ref_shape[0] > 0 else 0.0
-        for i, obj_xy in enumerate(align_xy):
-            dx, dy, resp, _ = estimate_shift_from_objects(ref_xy, obj_xy, max_shift_px=max_shift)
-            dxs_full[i] = float(dx)
-            dys_full[i] = float(dy)
-            resps[i] = float(resp)
-
-        # 4) Robust gating: response + shift outliers (radial MAD).
-        resp_min = float(scfg.resp_min)
-        k_mad = float(scfg.outlier_k_mad)
-        mad_floor_px = 0.35  # prevents collapse when motion is tiny
-
-        med_dx = float(np.median(dxs_full))
-        med_dy = float(np.median(dys_full))
-        dist = np.sqrt((dxs_full - med_dx) ** 2 + (dys_full - med_dy) ** 2).astype(np.float32, copy=False)
-        mad_dist = max(_mad(dist), mad_floor_px)
-
-        used: List[int] = []
-        for i in range(len(batch)):
-            if float(resps[i]) < resp_min:
-                continue
-            if float(dist[i]) > (k_mad * mad_dist):
-                continue
-            used.append(i)
-
-        if not used:
-            self.metrics.frames_rejected += len(batch)
-            return
-
-        self.metrics.frames_rejected += (len(batch) - len(used))
-
-        # 5) Reference update (EMA in reference coordinates) using best-response frame.
-        i_best = int(max(used, key=lambda j: float(resps[j])))
-        dx_best = float(dxs_full[i_best])
-        dy_best = float(dys_full[i_best])
-
-        best_xy = align_xy[i_best]
-        if best_xy.size > 0:
-            shifted_best = best_xy + np.array([[dx_best, dy_best]], dtype=np.float64)
-            self._ref_align_xy = shifted_best.astype(np.float64, copy=False)
-
-        # 6) Accumulate accepted frames into tiles (drizzle grid). Rotation hook kept at zero.
-        scale = float(scfg.drizzle_scale)
-        tile_size = int(scfg.tile_size_out)
-        pixfrac = float(scfg.pixfrac)
-        theta_rad = 0.0
-        theta_deg = 0.0
-
-        now = time.time()
-        dsize = (tile_size, tile_size)
-
-        for i in used:
-            raw16_work = raw16_work_list[i]
-            dx = float(dxs_full[i])
-            dy = float(dys_full[i])
-            resp = float(resps[i])
-
-            w_frame = float(np.clip((resp - resp_min) / max(1e-6, (1.0 - resp_min)), 0.0, 1.0))
-            if w_frame <= 0.0:
-                continue
-
-            rgb16 = debayer_cv2(raw16_work, pattern=scfg.bayer_pattern, edge_aware=False)
-            M_shift = np.array([[1.0, 0.0, dx], [0.0, 1.0, dy]], dtype=np.float32)
-            rgb16_aligned = warp_rgb16(rgb16, M_shift)
-            if self.color_mode == "mono":
-                src = rgb16_aligned.astype(np.float32, copy=False).mean(axis=2)
-                src_is_color = False
-            else:
-                src = rgb16_aligned.astype(np.float32, copy=False)
-                src_is_color = True
-            if pixfrac > 0.7:
-                src = cv2.GaussianBlur(src, (0, 0), sigmaX=0.6, sigmaY=0.6)
-            h, w = src.shape[:2]
-
-            dx_stack = 0.0
-            dy_stack = 0.0
-
-            u_min, v_min, u_max, v_max = _corners_bbox_out(
-                w, h, scale=scale, dx=dx_stack, dy=dy_stack, theta_rad=theta_rad
-            )
-
-            tx0 = int(math.floor(u_min / tile_size))
-            ty0 = int(math.floor(v_min / tile_size))
-            tx1 = int(math.floor(u_max / tile_size))
-            ty1 = int(math.floor(v_max / tile_size))
-
-            for ty in range(ty0, ty1 + 1):
-                for tx in range(tx0, tx1 + 1):
-                    tile = self.canvas.get_or_create((tx, ty), now)
-                    tile.hits += 1
-
-                    tile_u0 = float(tx * tile_size)
-                    tile_v0 = float(ty * tile_size)
-
-                    M = _build_dst_to_src_affine(
-                        tile_u0=tile_u0,
-                        tile_v0=tile_v0,
-                        scale=scale,
-                        dx=dx_stack,
-                        dy=dy_stack,
-                        theta_rad=theta_rad,
+            for item in batch:
+                try:
+                    raw16_work = ensure_raw16_bayer(item["raw16"])
+                    self._live_gray.add_frame(raw16_work)
+                    used += 1
+                except Exception as exc:
+                    rejected += 1
+                    log_error(
+                        None,
+                        "Stacking: live-stacking frame failed",
+                        exc,
+                        throttle_s=2.0,
+                        throttle_key="stacking_live_frame_failed",
                     )
 
-                    warped = _warp_affine_tile(src, M, dsize, is_color=src_is_color)
+            self.metrics.frames_used += used
+            self.metrics.frames_rejected += rejected
+            self.metrics.tiles_used = 1 if self._live_gray.has_data() else 0
+            self.metrics.tiles_evicted = 0
+            self.metrics.last_resp = 1.0 if used > 0 else 0.0
+            self.metrics.last_dx = float(self._live_gray.last_dx)
+            self.metrics.last_dy = float(self._live_gray.last_dy)
+            self.metrics.last_theta_deg = 0.0
 
-                    if _dst_tile_fully_inside_src(M, dsize, src_w=w, src_h=h):
-                        mask = np.full((tile_size, tile_size), w_frame, dtype=np.float32)
-                    else:
-                        mask = _warp_mask_tile((h, w), M, dsize) * w_frame
+            dt = time.perf_counter() - t0
+            if used > 0 and dt > 1e-6:
+                fps_now = float(used) / dt
+                self.metrics.stacking_fps = 0.9 * self.metrics.stacking_fps + 0.1 * fps_now
 
-                    if self.color_mode == "mono":
-                        tile.sum += warped * mask
-                    else:
-                        tile.sum += warped * mask[..., None]
-                    tile.w += mask
-
-        # 7) Metrics + preview.
-        self.metrics.frames_used += len(used)
-        self.metrics.tiles_used = self.canvas.num_tiles()
-        self.metrics.tiles_evicted = self.canvas.tiles_evicted
-        self.metrics.last_resp = float(np.median(resps[used]))
-        self.metrics.last_dx = float(np.median(dxs_full[used]))
-        self.metrics.last_dy = float(np.median(dys_full[used]))
-        self.metrics.last_theta_deg = float(theta_deg)
-
-        dt = time.perf_counter() - t0
-        if dt > 1e-6:
-            fps_now = float(len(used) / dt)
-            self.metrics.stacking_fps = 0.9 * self.metrics.stacking_fps + 0.1 * fps_now
-
-        now_t = time.time()
-        if (now_t - self.metrics.last_preview_t) >= (1.0 / max(1e-6, float(scfg.preview_hz))):
-            self.metrics.last_preview_t = now_t
-            self._update_preview_jpeg()
+            now_t = time.time()
+            preview_hz = float(getattr(scfg, "preview_hz", 1.0))
+            if (now_t - self.metrics.last_preview_t) >= (1.0 / max(1e-6, preview_hz)):
+                self.metrics.last_preview_t = now_t
+                self._update_preview_jpeg()
 
     def _update_preview_jpeg(self) -> None:
-        """
-        Build a lightweight preview from a representative tile (median of keys).
-        """
-        if self.canvas is None or self.canvas.num_tiles() == 0:
-            with self._preview_lock:
-                self._preview_jpeg = None
-            return
+        with self._stack_lock:
+            if self._live_gray is None:
+                with self._preview_lock:
+                    self._preview_jpeg = None
+                return
 
-        keys = list(self.canvas.tiles.keys())
-        txs = np.array([k[0] for k in keys], dtype=np.int32)
-        tys = np.array([k[1] for k in keys], dtype=np.int32)
-        k_med = (int(np.median(txs)), int(np.median(tys)))
-        if k_med not in self.canvas.tiles:
-            k_med = keys[0]
+            u8 = self._live_gray.get_preview_u8()
+            if u8 is None:
+                with self._preview_lock:
+                    self._preview_jpeg = None
+                return
 
-        tile = self.canvas.tiles[k_med]
-        w = np.maximum(tile.w, 1e-6)
-
-        if self.color_mode == "mono":
-            img = (tile.sum / w).astype(np.float32, copy=False)
-            u8 = stretch_to_u8(img)
             u8s = cv2.resize(
                 u8,
                 (max(1, u8.shape[1] // 2), max(1, u8.shape[0] // 2)),
                 interpolation=cv2.INTER_AREA,
             )
             ok, jpg = cv2.imencode(".jpg", u8s, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
-        else:
-            img = (tile.sum / w[..., None]).astype(np.float32, copy=False)
-            u8 = stretch_to_u8(img)  # supports (H,W,3)
-            u8s = cv2.resize(
-                u8,
-                (max(1, u8.shape[1] // 2), max(1, u8.shape[0] // 2)),
-                interpolation=cv2.INTER_AREA,
-            )
-            ok, jpg = cv2.imencode(
-                ".jpg",
-                cv2.cvtColor(u8s, cv2.COLOR_RGB2BGR),
-                [int(cv2.IMWRITE_JPEG_QUALITY), 85],
-            )
 
-        with self._preview_lock:
-            self._preview_jpeg = jpg.tobytes() if ok else None
+            with self._preview_lock:
+                self._preview_jpeg = jpg.tobytes() if ok else None
 
 
 # ============================================================

@@ -1145,6 +1145,7 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_autocal = QPushButton("Platesolving")
         self.btn_roll = QPushButton("Estimar Roll")
         self.btn_fit_model = QPushButton("Fit GoTo Model")
+        self.btn_reset_goto = QPushButton("Reset")
         self.btn_home = QPushButton("Home")
 
         rowb = QHBoxLayout()
@@ -1154,6 +1155,7 @@ class AstroPanoptesWindow(QMainWindow):
             self.btn_autocal,
             self.btn_roll,
             self.btn_fit_model,
+            self.btn_reset_goto,
             self.btn_home,
         ]:
             rowb.addWidget(button)
@@ -1164,6 +1166,7 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_autocal.clicked.connect(self._autocalibrate)
         self.btn_roll.clicked.connect(self._goto_estimate_roll)
         self.btn_fit_model.clicked.connect(self._goto_fit_model)
+        self.btn_reset_goto.clicked.connect(self._goto_reset)
         self.btn_home.clicked.connect(self._home)
 
         self.lbl_goto_samples = QLabel("0")
@@ -1413,6 +1416,10 @@ class AstroPanoptesWindow(QMainWindow):
     def _goto_fit_model(self) -> None:
         self.runner.request_goto_fit_model()
         self._log("[goto] Fit GoTo Model")
+
+    def _goto_reset(self) -> None:
+        self.runner.request_goto_reset()
+        self._log("[goto] Reset manual samples + sync")
 
     def _home(self) -> None:
         target = {
