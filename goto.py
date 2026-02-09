@@ -25,7 +25,7 @@ A GoTo is done as a closed-loop:
   1) estimate current mount AltAz (from last solve, otherwise from model)
   2) compute desired target AltAz (at current time/location)
   3) convert error (deg) -> correction steps via inv(J)
-  4) move both axes simultaneously via RATE (fallback: MOVE per axis)
+  4) compute one correction and execute MOVE in sequence (AZ then ALT)
   5) plate-solve near the predicted center to measure the new AltAz
   6) iterate until tolerance (default 10 arcsec) or max iters
 
@@ -1756,6 +1756,8 @@ class GoToController:
         Intended to be executed in a dedicated thread by AppRunner.
         """
         st = GoToStatus(ok=False, status="RUNNING")
+        # Kept for API compatibility; single-stage GoTo now uses MOVE only.
+        _ = rate_mount
 
         if not self.model.synced:
             st.status = "ERR_NOT_SYNCED"
@@ -1770,7 +1772,15 @@ class GoToController:
             except Exception as exc:
                 log_error(None, "GoTo: failed to pause tracking", exc)
 
-        stages = max(1, int(stages))
+        requested_stages = max(1, int(stages))
+        if requested_stages != 1:
+            log_info(
+                None,
+                f"GoTo: forcing single-stage MOVE path (requested_stages={requested_stages})",
+                throttle_s=1.0,
+                throttle_key="goto_force_single_stage",
+            )
+        stages = 1
         use_platesolving_feedback = bool(platesolving_feedback)
 
         try:
@@ -1829,19 +1839,17 @@ class GoToController:
 
                 dsteps = invJ @ d_altaz_vec
 
-                remaining = max(1, stages - it)
-                stage_scale = 1.0 / float(remaining)
-                dsteps *= stage_scale
-
                 # Apply gain and clamp.
                 dsteps *= float(self.cfg.gain)
 
-                # Hard clamp per iteration (infinity norm)
-                dsteps = np.clip(
-                    dsteps,
-                    -float(self.cfg.max_step_per_iter),
-                    +float(self.cfg.max_step_per_iter),
-                )
+                # Optional hard clamp per iteration (infinity norm).
+                max_step_per_iter = int(self.cfg.max_step_per_iter)
+                if max_step_per_iter > 0:
+                    dsteps = np.clip(
+                        dsteps,
+                        -float(max_step_per_iter),
+                        +float(max_step_per_iter),
+                    )
 
                 # Predict after move to enforce ALT bounds.
                 # (We clamp ALT delta if needed. AZ is free.)
@@ -1863,30 +1871,41 @@ class GoToController:
                         alpha = _clamp(alpha, -1.0, 1.0)
                         dsteps *= alpha
 
-                # Execute movement as simultaneous vector (RATE), fallback to per-axis MOVE.
-                if rate_mount is not None:
-                    self._exec_rate_vector_move(
-                        rate_mount,
-                        dsteps,
-                        delay_us_az=int(self.cfg.slew_delay_us_az),
-                        delay_us_alt=int(self.cfg.slew_delay_us_alt),
-                        stop=stop,
-                    )
-                else:
-                    if stop is not None:
-                        try:
-                            stop()
-                        except Exception as exc:
-                            log_error(None, "GoTo: stop failed before move", exc)
+                # Execute one "L" move: AZ first, then ALT.
+                # Speed is adaptive: farther targets use lower delay_us (faster).
+                err_distance_deg = float(math.hypot(float(daz), float(dalt)))
+                delay_us_az = self._adaptive_slew_delay_us(
+                    err_distance_deg,
+                    int(self.cfg.slew_delay_us_az),
+                )
+                delay_us_alt = self._adaptive_slew_delay_us(
+                    err_distance_deg,
+                    int(self.cfg.slew_delay_us_alt),
+                )
+                log_info(
+                    None,
+                    "GoTo: single-stage L move "
+                    f"dist={err_distance_deg:.3f}deg "
+                    f"dsteps=[{int(round(float(dsteps[0]))):+d},{int(round(float(dsteps[1]))):+d}] "
+                    f"delay_us=[AZ={int(delay_us_az)},ALT={int(delay_us_alt)}]",
+                    throttle_s=0.02,
+                    throttle_key="goto_single_stage_move",
+                )
 
-                    self._exec_steps(move_steps, Axis.AZ, float(dsteps[0]), delay_us=int(self.cfg.slew_delay_us_az))
-                    self._exec_steps(move_steps, Axis.ALT, float(dsteps[1]), delay_us=int(self.cfg.slew_delay_us_alt))
+                if stop is not None:
+                    try:
+                        stop()
+                    except Exception as exc:
+                        log_error(None, "GoTo: stop failed before move", exc)
 
-                    if stop is not None:
-                        try:
-                            stop()
-                        except Exception as exc:
-                            log_error(None, "GoTo: stop failed after move", exc)
+                self._exec_steps(move_steps, Axis.AZ, float(dsteps[0]), delay_us=int(delay_us_az))
+                self._exec_steps(move_steps, Axis.ALT, float(dsteps[1]), delay_us=int(delay_us_alt))
+
+                if stop is not None:
+                    try:
+                        stop()
+                    except Exception as exc:
+                        log_error(None, "GoTo: stop failed after move", exc)
 
                 # Settle
                 time.sleep(max(0.0, float(self.cfg.settle_s)))
@@ -1992,6 +2011,24 @@ class GoToController:
 
         # Perform the actual move
         move_steps(axis, direction, steps, int(delay_us))
+
+    def _adaptive_slew_delay_us(
+        self,
+        distance_deg: float,
+        base_delay_us: int,
+        *,
+        min_delay_us: int = 100,
+        full_speed_distance_deg: float = 20.0,
+    ) -> int:
+        """Map angular distance to MOVE delay (bigger distance => smaller delay)."""
+        base_i = max(1, int(base_delay_us))
+        min_i = max(1, min(int(min_delay_us), base_i))
+        dist = max(0.0, float(distance_deg))
+        if float(full_speed_distance_deg) <= 1e-9:
+            return int(min_i)
+        alpha = _clamp(dist / float(full_speed_distance_deg), 0.0, 1.0)
+        delay = float(base_i) - alpha * float(base_i - min_i)
+        return int(max(min_i, round(delay)))
 
     def _delay_us_to_rate_steps_s(self, delay_us: int) -> float:
         d = max(1, int(delay_us))
@@ -5019,7 +5056,8 @@ class GoToWorker(BaseWorker):
             if kind == "goto":
                 delay_us = int(params.get("delay_us", goto_cfg.slew_delay_us))
                 tol_arcsec = float(params.get("tol_arcsec", goto_cfg.tol_arcsec))
-                stages = int(params.get("stages", goto_cfg.stages))
+                stages_requested = int(params.get("stages", goto_cfg.stages))
+                stages = 1
                 platesolving_feedback = bool(params.get("platesolving_feedback", goto_cfg.platesolving_feedback))
                 gain = float(params.get("gain", goto_cfg.gain))
                 ps_overrides: Dict[str, Any] = {}
@@ -5036,25 +5074,34 @@ class GoToWorker(BaseWorker):
                             f"GoTo: invalid platesolving overrides for request ({ps_overrides})",
                             exc,
                         )
-                max_step_per_iter = int(goto_cfg.max_step_per_iter)
                 if "max_step_per_iter" in params:
                     max_step_per_iter = int(params.get("max_step_per_iter"))
-                else:
+                elif "max_step_deg" in params:
                     max_step_deg = float(params.get("max_step_deg", 5.0))
                     j_matrix = self._goto.model.J_deg_per_step
                     max_abs_deg_per_step = float(np.max(np.abs(j_matrix))) if j_matrix is not None and j_matrix.size else 0.0
                     if max_abs_deg_per_step > 0.0:
                         max_step_per_iter = int(max(1, round(max_step_deg / max_abs_deg_per_step)))
+                    else:
+                        max_step_per_iter = 0
+                else:
+                    # Single-stage "L" go-to should not be clipped by default.
+                    max_step_per_iter = 0
+                if stages_requested != 1:
+                    log_info(
+                        self._out_log,
+                        f"GoTo: request stages={stages_requested} overridden to 1 (single-stage L move)",
+                    )
 
                 self._goto.cfg = replace(
                     self._goto.cfg,
                     tol_arcsec=tol_arcsec,
-                    max_iters=stages,
+                    max_iters=1,
                     gain=gain,
                     max_step_per_iter=max_step_per_iter,
                     slew_delay_us_az=delay_us,
                     slew_delay_us_alt=delay_us,
-                    stages=stages,
+                    stages=1,
                     platesolving_feedback=platesolving_feedback,
                 )
 
@@ -5062,10 +5109,9 @@ class GoToWorker(BaseWorker):
                     target,
                     get_live_frame=self._get_live_raw16,
                     move_steps=self._move_steps,
-                    rate_mount=self._rate_mount,
                     stop=self._stop_mount,
                     platesolving_cfg=platesolving_cfg,
-                    stages=stages,
+                    stages=1,
                     platesolving_feedback=platesolving_feedback,
                 )
                 err_norm = float(status.err_norm_arcsec())
