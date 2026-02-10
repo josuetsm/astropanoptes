@@ -30,3 +30,6 @@ myenv/
 # Generated data/images
 *.npy
 *.png
+
+# Stacking outputs
+stack_output/
