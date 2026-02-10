@@ -62,6 +62,8 @@ class ActionType(str, Enum):
     GOTO_ESTIMATE_ROLL = "GOTO_ESTIMATE_ROLL"
     GOTO_RESET = "GOTO_RESET"
     GOTO_CANCEL = "GOTO_CANCEL"
+    GOTO_LIST_SAMPLES = "GOTO_LIST_SAMPLES"
+    GOTO_PRUNE_OUTLIERS = "GOTO_PRUNE_OUTLIERS"
 
     # live overlay
     LIVE_SEP_SET_PARAMS = "LIVE_SEP_SET_PARAMS"
@@ -280,6 +282,14 @@ def goto_reset() -> Action:
 
 def goto_cancel() -> Action:
     return Action(ActionType.GOTO_CANCEL, {}, _now())
+
+
+def goto_list_samples(params: Dict[str, Any] | None = None) -> Action:
+    return Action(ActionType.GOTO_LIST_SAMPLES, {"params": params or {}}, _now())
+
+
+def goto_prune_outliers(params: Dict[str, Any] | None = None) -> Action:
+    return Action(ActionType.GOTO_PRUNE_OUTLIERS, {"params": params or {}}, _now())
 
 
 # -------------------------

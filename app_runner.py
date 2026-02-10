@@ -44,6 +44,8 @@ from actions import (
     goto_fit_model,
     goto_reset,
     goto_cancel,
+    goto_list_samples,
+    goto_prune_outliers,
     live_sep_set_params,
     mount_connect,
     mount_disconnect,
@@ -66,7 +68,7 @@ from logging_utils import log_info, log_error
 
 from camera_poa import POACameraDevice, CameraStream
 from imaging import ensure_raw16_bayer
-from preview import make_preview_jpeg, encode_jpeg, stretch_to_u8
+from preview import make_preview_jpeg, encode_jpeg
 from mount_arduino import ArduinoMount
 
 from tracking import (
@@ -560,6 +562,12 @@ class AppRunner:
     def request_goto_fit_model(self, params: Dict[str, Any] | None = None) -> None:
         self.enqueue(goto_fit_model(params))
 
+    def request_goto_list_samples(self, params: Dict[str, Any] | None = None) -> None:
+        self.enqueue(goto_list_samples(params))
+
+    def request_goto_prune_outliers(self, params: Dict[str, Any] | None = None) -> None:
+        self.enqueue(goto_prune_outliers(params))
+
     def request_goto_reset(self) -> None:
         self.enqueue(goto_reset())
 
@@ -1047,14 +1055,57 @@ class AppRunner:
     # -------------------------
     # Stacking save helper
     # -------------------------
+    def _stacking_capture_basename(self, basename: str) -> str:
+        prefix = str(basename).strip() or "stack"
+        safe_prefix = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in prefix)
+        safe_prefix = safe_prefix.strip("_") or "stack"
+
+        capture_dt = _dt.datetime.now()
+        fr = self._get_latest_frame()
+        if fr is not None:
+            try:
+                t_capture = float(fr.t_capture)
+            except Exception:
+                t_capture = float("nan")
+            if np.isfinite(t_capture) and t_capture > 0.0:
+                try:
+                    capture_dt = _dt.datetime.fromtimestamp(t_capture)
+                except Exception:
+                    pass
+
+        az = float("nan")
+        alt = float("nan")
+        try:
+            az_alt = self._goto.model.current_az_alt_deg()
+        except Exception:
+            az_alt = None
+
+        if az_alt is not None and len(az_alt) >= 2:
+            try:
+                az = float(az_alt[0]) % 360.0
+                alt = float(np.clip(float(az_alt[1]), -90.0, 90.0))
+            except Exception:
+                az = float("nan")
+                alt = float("nan")
+
+        if (not np.isfinite(az)) or (not np.isfinite(alt)):
+            st = self.get_state()
+            if bool(getattr(st.goto, "pointing_valid", False)):
+                az = float(st.goto.pointing_az_deg) % 360.0
+                alt = float(np.clip(float(st.goto.pointing_alt_deg), -90.0, 90.0))
+
+        stamp = capture_dt.strftime("%Y%m%d_%H%M%S")
+        az_txt = "NA" if not np.isfinite(az) else f"{az:06.2f}"
+        alt_txt = "NA" if not np.isfinite(alt) else f"{alt:+06.2f}"
+        return f"{safe_prefix}_{stamp}_az{az_txt}_alt{alt_txt}"
+
     def _save_stacking(self, out_dir: str, basename: str, fmt: str) -> None:
         """
         Save current live-stacking mosaic to disk.
 
         Two files are produced:
           - a raw floating-point numpy array (.npy) with stacked mean;
-          - a weights map (.npy) with per-pixel frame counts;
-          - a stretched PNG image (.png) for quick viewing.
+          - a logarithmic stretched PNG image (.png) in uint16.
         The output directory is created if necessary.  Errors are logged but
         otherwise ignored.
 
@@ -1063,15 +1114,15 @@ class AppRunner:
         out_dir : str
             Directory in which to save the files.
         basename : str
-            Base name for the output files; suffixes `_raw.npy` and
-            `_stretch.png` will be appended.
+            Prefix used for the output files.  The final file name also
+            includes capture timestamp and pointing az/alt.
         fmt : str
             Ignored; included for API compatibility.
         """
         eng = self._stacking.engine
         try:
-            out, wgt = eng.get_stack_snapshot(mean_dtype=np.float32, wgt_dtype=np.float32)
-            if out is None:
+            raw, _ = eng.get_stack_snapshot(mean_dtype=np.float32, wgt_dtype=np.float32)
+            if raw is None:
                 log_info(self.out_log, "Stacking: save skipped (no data)")
                 return
 
@@ -1080,27 +1131,28 @@ class AppRunner:
                 Path(out_dir).mkdir(parents=True, exist_ok=True)
             except Exception:
                 pass
-            # Save raw
-            raw_path = os.path.join(out_dir, f"{basename}_raw.npy")
-            np.save(raw_path, out)
-            # Save weights map
-            wgt_path = os.path.join(out_dir, f"{basename}_wgt.npy")
-            if wgt is not None:
-                np.save(wgt_path, wgt)
-            # Save stretched image
-            u8 = stretch_to_u8(out)
-            stretch_path = os.path.join(out_dir, f"{basename}_stretch.png")
-            if u8.ndim == 2:
-                cv2.imwrite(stretch_path, u8)
+
+            final_basename = self._stacking_capture_basename(basename)
+
+            # Save raw stack
+            raw_path = os.path.join(out_dir, f"{final_basename}_raw.npy")
+            np.save(raw_path, raw)
+
+            # Save logarithmic PNG (uint16)
+            img = np.log(raw.astype(np.float64) + 1.0)
+            vmin = float(img.mean() - 0.1)
+            vmax = float(img.max())
+            denom = (vmax - vmin) if (vmax > vmin) else 1.0
+            img_clip = np.clip(img, vmin, vmax)
+            img_u16 = ((img_clip - vmin) * (65535.0 / denom)).astype(np.uint16)
+
+            png_path = os.path.join(out_dir, f"{final_basename}.png")
+            if img_u16.ndim == 2:
+                cv2.imwrite(png_path, img_u16)
             else:
-                cv2.imwrite(stretch_path, cv2.cvtColor(u8, cv2.COLOR_RGB2BGR))
-            if wgt is not None:
-                log_info(
-                    self.out_log,
-                    f"Stacking: saved raw to {raw_path}, wgt to {wgt_path}, and stretch to {stretch_path}",
-                )
-            else:
-                log_info(self.out_log, f"Stacking: saved raw to {raw_path} and stretch to {stretch_path}")
+                cv2.imwrite(png_path, cv2.cvtColor(img_u16, cv2.COLOR_RGB2BGR))
+
+            log_info(self.out_log, f"Stacking: saved raw to {raw_path} and png to {png_path}")
         except Exception as exc:
             log_error(self.out_log, "Stacking: save failed", exc)
 
@@ -1537,7 +1589,7 @@ class AppRunner:
             log_info(self.out_log, "Stacking: RESET_DEFAULTS")
             return
 
-        # Save stacked mosaic (raw + stretch)
+        # Save stacked mosaic (raw + png)
         if t == ActionType.STACKING_SAVE:
             # Payload should contain out_dir, basename, fmt; defaults provided
             if isinstance(p, dict):
@@ -1546,9 +1598,9 @@ class AppRunner:
                 fmt = str(p.get("fmt", "png"))
                 self._save_stacking(out_dir, basename, fmt)
             else:
-                # Fallback to default directory and timestamp
+                # Fallback to default directory and basename
                 out_dir = "stack_output"
-                basename = _dt.datetime.now().strftime("%Y%m%d_%H%M%S")
+                basename = "stack"
                 fmt = "png"
                 self._save_stacking(out_dir, basename, fmt)
             return
@@ -1717,6 +1769,16 @@ class AppRunner:
         if t == ActionType.GOTO_FIT_MODEL:
             params = p.get('params', {})
             self._goto_worker.request(kind='fit_model', target=None, params=params)
+            return
+
+        if t == ActionType.GOTO_LIST_SAMPLES:
+            params = p.get('params', {})
+            self._goto_worker.request(kind='list_samples', target=None, params=params)
+            return
+
+        if t == ActionType.GOTO_PRUNE_OUTLIERS:
+            params = p.get('params', {})
+            self._goto_worker.request(kind='prune_outliers', target=None, params=params)
             return
 
         if t == ActionType.GOTO_RESET:

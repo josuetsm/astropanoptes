@@ -42,7 +42,9 @@ Notes
 
 from __future__ import annotations
 
+import csv
 import math
+import os
 import random
 import time
 import threading
@@ -93,6 +95,103 @@ TargetType = Union[
     str,
     Dict[str, Any],
 ]
+
+_GOTO_CSV_LOG_LOCK = threading.Lock()
+
+_GOTO_MANUAL_SAMPLE_CSV_FIELDS = [
+    "ts_unix",
+    "ts_utc",
+    "sample_idx",
+    "steps_az",
+    "steps_alt",
+    "az_deg",
+    "alt_deg",
+    "roll_deg",
+    "synced",
+    "ref_steps_az",
+    "ref_steps_alt",
+    "ref_az_mount_deg",
+    "ref_alt_mount_deg",
+    "R00",
+    "R01",
+    "R02",
+    "R10",
+    "R11",
+    "R12",
+    "R20",
+    "R21",
+    "R22",
+]
+
+_GOTO_MODEL_FIT_CSV_FIELDS = [
+    "ts_unix",
+    "ts_utc",
+    "fit_kind",
+    "ok",
+    "reason",
+    "min_samples",
+    "ridge",
+    "total_samples",
+    "used_samples",
+    "outliers",
+    "J00",
+    "J01",
+    "J10",
+    "J11",
+    "J00_err",
+    "J01_err",
+    "J10_err",
+    "J11_err",
+    "model_fit_rms_az_deg",
+    "model_fit_rms_alt_deg",
+    "model_fit_rms_arcsec",
+    "model_non_orthogonality_deg",
+    "model_non_orthogonality_err_deg",
+    "model_roll_deg",
+    "model_roll_err_deg",
+    "model_roll_samples",
+    "model_pitch_deg",
+    "model_pitch_err_deg",
+    "model_yaw_deg",
+    "model_yaw_err_deg",
+    "R00",
+    "R01",
+    "R02",
+    "R10",
+    "R11",
+    "R12",
+    "R20",
+    "R21",
+    "R22",
+]
+
+
+def _goto_logs_dir() -> str:
+    v = str(os.environ.get("ASTROPANOPTES_GOTO_LOG_DIR", "")).strip()
+    if v:
+        return v
+    return os.path.join("stack_output", "goto_logs")
+
+
+def _utc_str(ts_unix: float) -> str:
+    return time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(float(ts_unix)))
+
+
+def _append_csv_log_row(filename: str, fieldnames: Sequence[str], row: Dict[str, Any]) -> None:
+    try:
+        log_dir = _goto_logs_dir()
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, filename)
+        with _GOTO_CSV_LOG_LOCK:
+            write_header = (not os.path.exists(path)) or (os.path.getsize(path) <= 0)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=list(fieldnames), extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(dict(row))
+    except Exception as exc:
+        key = f"goto_csv_log_{str(filename).replace('.', '_')}"
+        log_error(None, f"GoTo: failed to append CSV log ({filename})", exc, throttle_s=5.0, throttle_key=key)
 
 
 # ============================================================
@@ -172,6 +271,105 @@ def _non_orthogonality_deg_from_J(J: np.ndarray) -> float:
     if A.shape != (2, 2):
         return 0.0
     return _non_orthogonality_deg_from_params(A[0, 0], A[0, 1], A[1, 0], A[1, 1])
+
+
+def _altaz_deg_to_unit_vec(az_deg: float, alt_deg: float) -> np.ndarray:
+    """AltAz (deg) -> ENU unit vector [x_east, y_north, z_up]."""
+    az = math.radians(float(az_deg))
+    alt = math.radians(float(alt_deg))
+    c_alt = math.cos(alt)
+    x = c_alt * math.sin(az)
+    y = c_alt * math.cos(az)
+    z = math.sin(alt)
+    return np.array([x, y, z], dtype=np.float64)
+
+
+def _unit_vec_to_altaz_deg(v: np.ndarray) -> np.ndarray:
+    vv = np.asarray(v, dtype=np.float64).reshape(3)
+    n = float(np.linalg.norm(vv))
+    if (not np.isfinite(n)) or n <= 0.0:
+        raise ValueError("invalid vector norm")
+    vv = vv / n
+    x = float(vv[0])
+    y = float(vv[1])
+    z = _clamp(float(vv[2]), -1.0, 1.0)
+    alt_deg = math.degrees(math.asin(z))
+    az_deg = _wrap_deg_360(math.degrees(math.atan2(x, y)))
+    return np.array([az_deg, alt_deg], dtype=np.float64)
+
+
+def _coerce_rotation_matrix(R: np.ndarray) -> np.ndarray:
+    """Return a finite right-handed orthonormal 3x3 rotation matrix."""
+    A = np.asarray(R, dtype=np.float64)
+    if A.shape != (3, 3) or (not np.all(np.isfinite(A))):
+        return np.eye(3, dtype=np.float64)
+    try:
+        U, _, Vt = np.linalg.svd(A)
+    except np.linalg.LinAlgError:
+        return np.eye(3, dtype=np.float64)
+    Rn = U @ Vt
+    if float(np.linalg.det(Rn)) < 0.0:
+        U[:, -1] *= -1.0
+        Rn = U @ Vt
+    if not np.all(np.isfinite(Rn)):
+        return np.eye(3, dtype=np.float64)
+    return Rn.astype(np.float64)
+
+
+def _rotate_altaz_deg(az_alt_deg: np.ndarray, R: np.ndarray) -> np.ndarray:
+    aa = _as_array2(az_alt_deg)
+    v = _altaz_deg_to_unit_vec(float(aa[0]), float(aa[1]))
+    vr = np.asarray(R, dtype=np.float64) @ v
+    return _unit_vec_to_altaz_deg(vr)
+
+
+def _fit_rotation_kabsch(src_unit: np.ndarray, dst_unit: np.ndarray) -> Optional[np.ndarray]:
+    """Best-fit rotation R with dst ~= R @ src for unit vectors."""
+    src = np.asarray(src_unit, dtype=np.float64).reshape(-1, 3)
+    dst = np.asarray(dst_unit, dtype=np.float64).reshape(-1, 3)
+    if src.shape != dst.shape or int(src.shape[0]) < 3:
+        return None
+    finite = np.all(np.isfinite(src), axis=1) & np.all(np.isfinite(dst), axis=1)
+    src = src[finite]
+    dst = dst[finite]
+    if int(src.shape[0]) < 3:
+        return None
+
+    H = src.T @ dst
+    try:
+        U, _, Vt = np.linalg.svd(H)
+    except np.linalg.LinAlgError:
+        return None
+    R = Vt.T @ U.T
+    if float(np.linalg.det(R)) < 0.0:
+        Vt[-1, :] *= -1.0
+        R = Vt.T @ U.T
+    if not np.all(np.isfinite(R)):
+        return None
+    return _coerce_rotation_matrix(R)
+
+
+def _rotation_rotvec_deg(R: np.ndarray) -> np.ndarray:
+    """Axis-angle rotation vector in degrees (ENU axes)."""
+    A = _coerce_rotation_matrix(R)
+    tr = float(np.trace(A))
+    c = _clamp(0.5 * (tr - 1.0), -1.0, 1.0)
+    ang = float(math.acos(c))
+    if ang <= 1e-12:
+        return np.zeros(3, dtype=np.float64)
+    s = float(math.sin(ang))
+    if abs(s) <= 1e-12:
+        return np.zeros(3, dtype=np.float64)
+    axis = np.array(
+        [
+            float(A[2, 1] - A[1, 2]),
+            float(A[0, 2] - A[2, 0]),
+            float(A[1, 0] - A[0, 1]),
+        ],
+        dtype=np.float64,
+    ) / (2.0 * s)
+    rv = axis * ang
+    return np.degrees(rv).astype(np.float64)
 
 
 def _flatten_points(xy: np.ndarray) -> np.ndarray:
@@ -818,6 +1016,9 @@ class GoToModel:
     Mapping:
       d_altaz = J_deg_per_step @ d_steps
       where d_altaz = [d_az_deg, d_alt_deg]^T and d_steps = [d_az, d_alt]^T.
+
+    Global correction:
+      AltAz_world ~= R_mount_to_world * AltAz_mount_model (on unit vectors).
     """
 
     kin: MountKinematics = field(default_factory=MountKinematics)
@@ -828,7 +1029,11 @@ class GoToModel:
     # Reference (sync)
     synced: bool = False
     ref_steps: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
+    # Reference in mount-model frame (before global spherical correction).
     ref_az_alt_deg: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))  # [az, alt]
+
+    # Global all-sky correction: world ~= R_mount_to_world * mount_model.
+    R_mount_to_world: np.ndarray = field(default_factory=lambda: np.eye(3, dtype=np.float64))
 
     # Current estimated step counter (relative, but we store absolute in same units as ref_steps)
     steps_est: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
@@ -915,18 +1120,127 @@ class GoToModel:
         d_alt = s if axis == Axis.ALT else 0.0
         self.steps_history.append(np.array([d_az, d_alt], dtype=np.float64))
 
+    def _csv_rotation_values(self) -> Dict[str, float]:
+        R = self._rotation_mount_to_world()
+        return {
+            "R00": float(R[0, 0]),
+            "R01": float(R[0, 1]),
+            "R02": float(R[0, 2]),
+            "R10": float(R[1, 0]),
+            "R11": float(R[1, 1]),
+            "R12": float(R[1, 2]),
+            "R20": float(R[2, 0]),
+            "R21": float(R[2, 1]),
+            "R22": float(R[2, 2]),
+        }
+
+    def _log_manual_sample_csv(self, *, sample_idx: int, az_alt_world: np.ndarray, roll_sample: Optional[float]) -> None:
+        ts_unix = float(self.last_solve_time if self.last_solve_time > 0.0 else time.time())
+        az_alt = _as_array2(az_alt_world)
+        roll_out = float(roll_sample) if roll_sample is not None and np.isfinite(float(roll_sample)) else ""
+        row: Dict[str, Any] = {
+            "ts_unix": ts_unix,
+            "ts_utc": _utc_str(ts_unix),
+            "sample_idx": int(sample_idx),
+            "steps_az": float(self.steps_est[0]),
+            "steps_alt": float(self.steps_est[1]),
+            "az_deg": float(az_alt[0]),
+            "alt_deg": float(az_alt[1]),
+            "roll_deg": roll_out,
+            "synced": int(bool(self.synced)),
+            "ref_steps_az": float(self.ref_steps[0]),
+            "ref_steps_alt": float(self.ref_steps[1]),
+            "ref_az_mount_deg": float(self.ref_az_alt_deg[0]),
+            "ref_alt_mount_deg": float(self.ref_az_alt_deg[1]),
+        }
+        row.update(self._csv_rotation_values())
+        _append_csv_log_row("goto_manual_samples.csv", _GOTO_MANUAL_SAMPLE_CSV_FIELDS, row)
+
+    def _log_fit_csv(
+        self,
+        *,
+        fit_kind: str,
+        ok: bool,
+        reason: str,
+        min_samples: int,
+        ridge: float,
+        total_samples: int,
+        used_samples: int,
+    ) -> None:
+        ts_unix = float(time.time())
+        rep = self.model_fit_report()
+        row: Dict[str, Any] = {
+            "ts_unix": ts_unix,
+            "ts_utc": _utc_str(ts_unix),
+            "fit_kind": str(fit_kind),
+            "ok": int(bool(ok)),
+            "reason": str(reason),
+            "min_samples": int(min_samples),
+            "ridge": float(ridge),
+            "total_samples": int(total_samples),
+            "used_samples": int(used_samples),
+            "outliers": int(max(0, int(total_samples) - int(used_samples))),
+            "J00": float(self.J_deg_per_step[0, 0]),
+            "J01": float(self.J_deg_per_step[0, 1]),
+            "J10": float(self.J_deg_per_step[1, 0]),
+            "J11": float(self.J_deg_per_step[1, 1]),
+            "J00_err": float(rep["J00_err"]),
+            "J01_err": float(rep["J01_err"]),
+            "J10_err": float(rep["J10_err"]),
+            "J11_err": float(rep["J11_err"]),
+            "model_fit_rms_az_deg": float(rep["model_fit_rms_az_deg"]),
+            "model_fit_rms_alt_deg": float(rep["model_fit_rms_alt_deg"]),
+            "model_fit_rms_arcsec": float(rep["model_fit_rms_arcsec"]),
+            "model_non_orthogonality_deg": float(rep["model_non_orthogonality_deg"]),
+            "model_non_orthogonality_err_deg": float(rep["model_non_orthogonality_err_deg"]),
+            "model_roll_deg": float(rep["model_roll_deg"]),
+            "model_roll_err_deg": float(rep["model_roll_err_deg"]),
+            "model_roll_samples": int(rep["model_roll_samples"]),
+            "model_pitch_deg": float(rep["model_pitch_deg"]),
+            "model_pitch_err_deg": float(rep["model_pitch_err_deg"]),
+            "model_yaw_deg": float(rep["model_yaw_deg"]),
+            "model_yaw_err_deg": float(rep["model_yaw_err_deg"]),
+        }
+        row.update(self._csv_rotation_values())
+        _append_csv_log_row("goto_model_fit_log.csv", _GOTO_MODEL_FIT_CSV_FIELDS, row)
+
+    def _rotation_mount_to_world(self) -> np.ndarray:
+        R = _coerce_rotation_matrix(self.R_mount_to_world)
+        self.R_mount_to_world = R
+        return R
+
+    def _mount_to_world_altaz(self, az_alt_mount_deg: np.ndarray) -> np.ndarray:
+        return _rotate_altaz_deg(_as_array2(az_alt_mount_deg), self._rotation_mount_to_world())
+
+    def _world_to_mount_altaz(self, az_alt_world_deg: np.ndarray) -> np.ndarray:
+        R = self._rotation_mount_to_world()
+        return _rotate_altaz_deg(_as_array2(az_alt_world_deg), R.T)
+
+    def sync_from_world_az_alt(self, az_alt_world_deg: np.ndarray) -> bool:
+        """Sync reference from a world AltAz measurement."""
+        ref_world = _as_array2(az_alt_world_deg)
+        ref_mount = self._world_to_mount_altaz(ref_world)
+
+        self.synced = True
+        self.ref_steps = self.steps_est.copy()
+        self.ref_az_alt_deg = ref_mount.copy()
+        self.last_solve_az_alt_deg = ref_world.copy()
+        self.last_solve_steps_est = self.steps_est.copy()
+        self.last_solve_time = time.time()
+        return True
+
     def predict_az_alt_deg(self, *, from_ref: bool = False) -> np.ndarray:
         """Predict current mount AZ/ALT from the model + steps.
 
-        If from_ref=True, returns ref_az_alt_deg.
+        If from_ref=True, returns the world AltAz corresponding to ref_az_alt_deg.
         """
         if from_ref or (not self.synced):
-            return self.ref_az_alt_deg.copy()
+            return self._mount_to_world_altaz(self.ref_az_alt_deg)
         dsteps = self.steps_est - self.ref_steps
         daltaz = self.J_deg_per_step @ dsteps
-        az = _wrap_deg_360(self.ref_az_alt_deg[0] + float(daltaz[0]))
-        alt = float(self.ref_az_alt_deg[1] + float(daltaz[1]))
-        return np.array([az, alt], dtype=np.float64)
+        az_mount = _wrap_deg_360(float(self.ref_az_alt_deg[0]) + float(daltaz[0]))
+        alt_mount = float(self.ref_az_alt_deg[1] + float(daltaz[1]))
+        return self._mount_to_world_altaz(np.array([az_mount, alt_mount], dtype=np.float64))
 
     def current_az_alt_deg(self) -> Optional[np.ndarray]:
         """Best estimate of current mount AZ/ALT.
@@ -937,9 +1251,10 @@ class GoToModel:
             if self.last_solve_steps_est is not None:
                 dsteps = self.steps_est - self.last_solve_steps_est
                 daltaz = self.J_deg_per_step @ dsteps
-                az = _wrap_deg_360(float(self.last_solve_az_alt_deg[0]) + float(daltaz[0]))
-                alt = float(self.last_solve_az_alt_deg[1]) + float(daltaz[1])
-                return np.array([az, alt], dtype=np.float64)
+                last_mount = self._world_to_mount_altaz(self.last_solve_az_alt_deg)
+                az_mount = _wrap_deg_360(float(last_mount[0]) + float(daltaz[0]))
+                alt_mount = float(last_mount[1]) + float(daltaz[1])
+                return self._mount_to_world_altaz(np.array([az_mount, alt_mount], dtype=np.float64))
             return self.last_solve_az_alt_deg.copy()
         if not self.synced:
             return None
@@ -950,14 +1265,15 @@ class GoToModel:
 
         Returns True if steps_est was updated from the solve.
         """
-        az_alt_deg = _as_array2(az_alt_deg)
+        az_alt_world = _as_array2(az_alt_deg)
         updated_steps = False
 
         if self.synced:
+            az_alt_mount = self._world_to_mount_altaz(az_alt_world)
             daltaz = np.array(
                 [
-                    _wrap_deg_180(float(az_alt_deg[0]) - float(self.ref_az_alt_deg[0])),
-                    float(az_alt_deg[1]) - float(self.ref_az_alt_deg[1]),
+                    _wrap_deg_180(float(az_alt_mount[0]) - float(self.ref_az_alt_deg[0])),
+                    float(az_alt_mount[1]) - float(self.ref_az_alt_deg[1]),
                 ],
                 dtype=np.float64,
             )
@@ -975,7 +1291,7 @@ class GoToModel:
                     self.steps_est = self.ref_steps + dsteps
                     updated_steps = True
 
-        self.last_solve_az_alt_deg = az_alt_deg.copy()
+        self.last_solve_az_alt_deg = az_alt_world.copy()
         self.last_solve_steps_est = self.steps_est.copy()
         self.last_solve_time = time.time()
         return bool(updated_steps)
@@ -992,6 +1308,15 @@ class GoToModel:
         Returns True if an update was applied.
         """
         if len(self._calib_steps) < int(min_samples):
+            self._log_fit_csv(
+                fit_kind="calibration",
+                ok=False,
+                reason="INSUFFICIENT_SAMPLES",
+                min_samples=int(min_samples),
+                ridge=float(ridge),
+                total_samples=int(len(self._calib_steps)),
+                used_samples=0,
+            )
             return False
         S_all = np.stack(self._calib_steps, axis=0).astype(np.float64)  # (N,2)
         D_all = np.stack(self._calib_daltaz, axis=0).astype(np.float64)  # (N,2)
@@ -1045,6 +1370,15 @@ class GoToModel:
         mask = np.ones(n_all, dtype=bool)
         fit = _solve_with_mask(mask)
         if fit is None:
+            self._log_fit_csv(
+                fit_kind="calibration",
+                ok=False,
+                reason="DEGENERATE_MODEL",
+                min_samples=int(min_samples),
+                ridge=float(ridge),
+                total_samples=int(n_all),
+                used_samples=0,
+            )
             return False
 
         # Robust outlier rejection on total residual norm using MAD scale.
@@ -1060,8 +1394,9 @@ class GoToModel:
                 med = float(np.median(res_norm[finite]))
                 mad = float(np.median(np.abs(res_norm[finite] - med)))
                 sigma = float(1.4826 * mad)
+                floor = float(20.0 / 3600.0)
                 thr = med + 4.5 * sigma
-                thr = max(float(20.0 / 3600.0), float(thr if np.isfinite(thr) else 0.0))
+                thr = max(floor, float(thr if np.isfinite(thr) else 0.0))
 
                 new_mask = finite & (res_norm <= thr)
                 if int(np.sum(new_mask)) < min_keep:
@@ -1072,7 +1407,17 @@ class GoToModel:
                     new_mask[keep] = True
 
                 if np.array_equal(new_mask, mask):
-                    break
+                    # Fallback: if one sample is clearly separated, prune the worst.
+                    idx_f = np.flatnonzero(finite & mask)
+                    if int(idx_f.size) <= min_keep:
+                        break
+                    worst = int(idx_f[np.argmax(res_norm[idx_f])])
+                    worst_res = float(res_norm[worst])
+                    med_ref = max(float(med), floor)
+                    if not (np.isfinite(worst_res) and worst_res > max(5.0 * floor, 3.0 * med_ref)):
+                        break
+                    new_mask = mask.copy()
+                    new_mask[worst] = False
 
                 fit_new = _solve_with_mask(new_mask)
                 if fit_new is None:
@@ -1102,6 +1447,15 @@ class GoToModel:
                 throttle_s=0.2,
                 throttle_key="goto_fit_calib_outliers",
             )
+        self._log_fit_csv(
+            fit_kind="calibration",
+            ok=True,
+            reason="OK",
+            min_samples=int(min_samples),
+            ridge=float(ridge),
+            total_samples=int(n_all),
+            used_samples=int(fit["n_use"]),
+        )
         return True
 
     def add_manual_sample(
@@ -1117,14 +1471,19 @@ class GoToModel:
         self._manual_az_alt_abs.append(az_alt.copy())
         # Backward-compatible argument: theta_deg interpreted as a roll sample (deg).
         roll_sample = roll_deg if roll_deg is not None else theta_deg
+        roll_store = float("nan")
         if roll_sample is not None:
             roll = float(roll_sample)
             if np.isfinite(roll):
-                self._manual_roll_deg_abs.append(_wrap_deg_180(roll))
+                roll_store = _wrap_deg_180(roll)
+        # Keep one roll slot per sample (NaN when missing) so index-based pruning is safe.
+        self._manual_roll_deg_abs.append(float(roll_store))
         self.last_solve_az_alt_deg = az_alt.copy()
         self.last_solve_steps_est = self.steps_est.copy()
         self.last_solve_time = time.time()
-        return int(len(self._manual_steps_abs))
+        n_samples = int(len(self._manual_steps_abs))
+        self._log_manual_sample_csv(sample_idx=n_samples, az_alt_world=az_alt, roll_sample=roll_sample)
+        return n_samples
 
     def sync_from_latest_manual_sample(self) -> bool:
         """Set absolute reference from the latest manual (steps, AltAz) sample."""
@@ -1132,12 +1491,13 @@ class GoToModel:
             return False
 
         ref_steps = _as_array2(self._manual_steps_abs[-1])
-        ref_az_alt = _as_array2(self._manual_az_alt_abs[-1])
+        ref_az_alt_world = _as_array2(self._manual_az_alt_abs[-1])
+        ref_az_alt_mount = self._world_to_mount_altaz(ref_az_alt_world)
 
         self.synced = True
         self.ref_steps = ref_steps.copy()
-        self.ref_az_alt_deg = ref_az_alt.copy()
-        self.last_solve_az_alt_deg = ref_az_alt.copy()
+        self.ref_az_alt_deg = ref_az_alt_mount.copy()
+        self.last_solve_az_alt_deg = ref_az_alt_world.copy()
         self.last_solve_steps_est = ref_steps.copy()
         self.last_solve_time = time.time()
         return True
@@ -1163,34 +1523,250 @@ class GoToModel:
         self.model_fit_rms_alt_deg = 0.0
         self.model_fit_rms_arcsec = 0.0
 
+    def _manual_reference_index_from_steps(self, S_abs: np.ndarray, idx: np.ndarray) -> int:
+        if int(idx.size) <= 1:
+            return int(idx[0]) if int(idx.size) == 1 else 0
+        S_use = S_abs[idx, :]
+        dmat = np.linalg.norm(S_use[:, None, :] - S_use[None, :, :], axis=2)
+        med_d = np.median(dmat, axis=1)
+        return int(idx[int(np.argmin(med_d))])
+
+    def _manual_residuals_against_model(
+        self,
+        *,
+        J_model: np.ndarray,
+        R_mount_to_world: np.ndarray,
+    ) -> Optional[Dict[str, Any]]:
+        n = int(len(self._manual_steps_abs))
+        if n <= 0:
+            return {
+                "ref_idx": 0,
+                "res_az_deg": np.zeros(0, dtype=np.float64),
+                "res_alt_deg": np.zeros(0, dtype=np.float64),
+                "res_norm_deg": np.zeros(0, dtype=np.float64),
+                "threshold_deg": float("nan"),
+                "suggested_outlier_mask": np.zeros(0, dtype=bool),
+            }
+
+        J = np.asarray(J_model, dtype=np.float64)
+        if J.shape != (2, 2) or (not np.all(np.isfinite(J))):
+            return None
+        R = _coerce_rotation_matrix(R_mount_to_world)
+
+        S_abs = np.stack(self._manual_steps_abs, axis=0).astype(np.float64)
+        A_world = np.stack(self._manual_az_alt_abs, axis=0).astype(np.float64)
+
+        idx_all = np.arange(n, dtype=int)
+        ref_idx = self._manual_reference_index_from_steps(S_abs, idx_all)
+        s_ref = S_abs[ref_idx, :]
+        S_rel = S_abs - s_ref
+
+        A_mount = np.zeros((n, 2), dtype=np.float64)
+        R_inv = R.T
+        for i in range(n):
+            A_mount[i, :] = _rotate_altaz_deg(A_world[i, :], R_inv)
+
+        a_ref_mount = A_mount[ref_idx, :]
+        d_mount = S_rel @ J.T
+
+        A_world_pred = np.zeros((n, 2), dtype=np.float64)
+        for i in range(n):
+            az_m = _wrap_deg_360(float(a_ref_mount[0]) + float(d_mount[i, 0]))
+            alt_m = float(a_ref_mount[1] + float(d_mount[i, 1]))
+            A_world_pred[i, :] = _rotate_altaz_deg(np.array([az_m, alt_m], dtype=np.float64), R)
+
+        res_az = np.array(
+            [_wrap_deg_180(float(A_world[i, 0]) - float(A_world_pred[i, 0])) for i in range(n)],
+            dtype=np.float64,
+        )
+        res_alt = (A_world[:, 1] - A_world_pred[:, 1]).astype(np.float64)
+        res_norm = np.hypot(res_az, res_alt).astype(np.float64)
+
+        finite = np.isfinite(res_norm)
+        if int(np.sum(finite)) <= 0:
+            threshold = float("nan")
+            out_mask = np.zeros(n, dtype=bool)
+        else:
+            med = float(np.median(res_norm[finite]))
+            mad = float(np.median(np.abs(res_norm[finite] - med)))
+            sigma = float(1.4826 * mad)
+            floor = float(20.0 / 3600.0)
+            threshold = max(floor, float(med + 4.5 * sigma if np.isfinite(sigma) else floor))
+            out_mask = finite & (res_norm > float(threshold))
+
+        return {
+            "ref_idx": int(ref_idx),
+            "res_az_deg": res_az,
+            "res_alt_deg": res_alt,
+            "res_norm_deg": res_norm,
+            "threshold_deg": float(threshold),
+            "suggested_outlier_mask": out_mask.astype(bool),
+        }
+
+    def manual_samples_deviation_report(self, *, sort_by_deviation: bool = True) -> List[Dict[str, Any]]:
+        """Return per-sample residuals against the current model."""
+        n = int(len(self._manual_steps_abs))
+        if n <= 0:
+            return []
+
+        J = np.asarray(self.J_deg_per_step, dtype=np.float64)
+        if J.shape != (2, 2) or (not np.all(np.isfinite(J))):
+            J = np.array(
+                [
+                    [float(self.kin.deg_per_step(Axis.AZ)), 0.0],
+                    [0.0, float(self.kin.deg_per_step(Axis.ALT))],
+                ],
+                dtype=np.float64,
+            )
+
+        resid = self._manual_residuals_against_model(
+            J_model=J,
+            R_mount_to_world=self._rotation_mount_to_world(),
+        )
+        if resid is None:
+            return []
+
+        S_abs = np.stack(self._manual_steps_abs, axis=0).astype(np.float64)
+        A_world = np.stack(self._manual_az_alt_abs, axis=0).astype(np.float64)
+        res_az = np.asarray(resid["res_az_deg"], dtype=np.float64)
+        res_alt = np.asarray(resid["res_alt_deg"], dtype=np.float64)
+        res_norm = np.asarray(resid["res_norm_deg"], dtype=np.float64)
+        out_mask = np.asarray(resid["suggested_outlier_mask"], dtype=bool)
+        threshold = float(resid["threshold_deg"])
+        ref_idx = int(resid["ref_idx"])
+
+        order = np.arange(n, dtype=int)
+        if bool(sort_by_deviation):
+            order = np.argsort(res_norm)[::-1]
+
+        report: List[Dict[str, Any]] = []
+        for rank, i in enumerate(order, start=1):
+            report.append(
+                {
+                    "sample_idx": int(i),
+                    "rank_deviation": int(rank),
+                    "is_ref_idx": bool(int(i) == ref_idx),
+                    "steps_az": float(S_abs[i, 0]),
+                    "steps_alt": float(S_abs[i, 1]),
+                    "az_deg": float(A_world[i, 0]),
+                    "alt_deg": float(A_world[i, 1]),
+                    "dev_az_deg": float(res_az[i]),
+                    "dev_alt_deg": float(res_alt[i]),
+                    "dev_deg": float(res_norm[i]),
+                    "dev_arcsec": float(res_norm[i] * 3600.0),
+                    "outlier_suggested": bool(out_mask[i]),
+                    "threshold_deg": float(threshold),
+                    "threshold_arcsec": float(threshold * 3600.0 if np.isfinite(threshold) else float("nan")),
+                }
+            )
+        return report
+
+    def prune_manual_outliers(self, *, min_samples: int = 3, ridge: float = 1e-12) -> Dict[str, Any]:
+        """Remove manual samples whose residuals are outliers vs current model."""
+        n_before = int(len(self._manual_steps_abs))
+        out: Dict[str, Any] = {
+            "ok": False,
+            "status": "RUNNING",
+            "n_before": n_before,
+            "n_after": n_before,
+            "removed_indices": [],
+            "removed_count": 0,
+            "fit_before_ok": False,
+            "fit_after_ok": False,
+            "threshold_arcsec": float("nan"),
+        }
+
+        if n_before <= 0:
+            out["status"] = "ERR_NO_SAMPLES"
+            return out
+        if n_before <= int(min_samples):
+            out["status"] = "ERR_INSUFFICIENT_MARGIN"
+            return out
+
+        fit_before_ok = bool(self.fit_J_from_manual_samples(min_samples=int(min_samples), ridge=float(ridge)))
+        out["fit_before_ok"] = fit_before_ok
+
+        report = self.manual_samples_deviation_report(sort_by_deviation=True)
+        if not report:
+            out["status"] = "ERR_NO_REPORT"
+            return out
+
+        threshold_arcsec = float(report[0].get("threshold_arcsec", float("nan")))
+        out["threshold_arcsec"] = threshold_arcsec
+
+        suggested = [int(r["sample_idx"]) for r in report if bool(r.get("outlier_suggested", False))]
+        if not suggested:
+            out["status"] = "NO_OUTLIERS"
+            return out
+
+        max_remove = max(0, n_before - int(min_samples))
+        if max_remove <= 0:
+            out["status"] = "ERR_INSUFFICIENT_MARGIN"
+            return out
+
+        selected = suggested[:max_remove]
+        selected_set = set(int(i) for i in selected)
+        remove_desc = sorted(selected_set, reverse=True)
+
+        n_roll = int(len(self._manual_roll_deg_abs))
+        roll_aligned = (n_roll == n_before)
+
+        for idx in remove_desc:
+            if 0 <= int(idx) < len(self._manual_steps_abs):
+                del self._manual_steps_abs[int(idx)]
+            if 0 <= int(idx) < len(self._manual_az_alt_abs):
+                del self._manual_az_alt_abs[int(idx)]
+            if roll_aligned and 0 <= int(idx) < len(self._manual_roll_deg_abs):
+                del self._manual_roll_deg_abs[int(idx)]
+
+        if not roll_aligned:
+            # Legacy sessions may have compressed roll history without per-sample alignment.
+            self._manual_roll_deg_abs.clear()
+
+        n_after = int(len(self._manual_steps_abs))
+        out["n_after"] = n_after
+        out["removed_indices"] = [int(i) for i in sorted(selected_set)]
+        out["removed_count"] = int(len(selected_set))
+
+        fit_after_ok = False
+        if n_after >= int(min_samples):
+            fit_after_ok = bool(self.fit_J_from_manual_samples(min_samples=int(min_samples), ridge=float(ridge)))
+        out["fit_after_ok"] = fit_after_ok
+
+        out["ok"] = bool(len(selected_set) > 0)
+        out["status"] = "OK" if out["ok"] else "NO_OUTLIERS"
+        return out
+
     def fit_J_from_manual_samples(self, *, min_samples: int = 3, ridge: float = 1e-12) -> bool:
-        """Fit J from absolute manual samples (steps, AltAz) using relative deltas.
-
-        Simple model (no pitch/yaw intercepts):
-          d_az  ~= J00*d_s_az + J01*d_s_alt
-          d_alt ~= J10*d_s_az + J11*d_s_alt
-
-        Deltas are computed against the latest manual sample. Camera roll is still
-        estimated from stored plate-solve angle samples.
-        """
+        """Fit local J plus a global spherical correction from manual samples."""
         if len(self._manual_steps_abs) < int(min_samples):
+            self._log_fit_csv(
+                fit_kind="manual",
+                ok=False,
+                reason="INSUFFICIENT_SAMPLES",
+                min_samples=int(min_samples),
+                ridge=float(ridge),
+                total_samples=int(len(self._manual_steps_abs)),
+                used_samples=0,
+            )
             return False
 
         S_abs = np.stack(self._manual_steps_abs, axis=0).astype(np.float64)  # (N,2)
-        A_abs = np.stack(self._manual_az_alt_abs, axis=0).astype(np.float64)  # (N,2) [az, alt] in deg
+        A_world = np.stack(self._manual_az_alt_abs, axis=0).astype(np.float64)  # (N,2) [az, alt] in deg
         n = int(S_abs.shape[0])
         if n < int(min_samples):
+            self._log_fit_csv(
+                fit_kind="manual",
+                ok=False,
+                reason="INSUFFICIENT_SAMPLES",
+                min_samples=int(min_samples),
+                ridge=float(ridge),
+                total_samples=int(n),
+                used_samples=0,
+            )
             return False
 
-        s_ref = S_abs[-1, :]
-        a_ref = A_abs[-1, :]
-        S = S_abs - s_ref  # (N,2)
-        d_az = np.array(
-            [_wrap_deg_180(float(A_abs[i, 0]) - float(a_ref[0])) for i in range(n)],
-            dtype=np.float64,
-        )
-        d_alt = (A_abs[:, 1] - float(a_ref[1])).astype(np.float64)
-        D = np.column_stack((d_az, d_alt)).astype(np.float64)  # (N,2)
+        ref_world_before = self.predict_az_alt_deg(from_ref=True) if bool(self.synced) else None
 
         J_prev = np.asarray(self.J_deg_per_step, dtype=np.float64)
         if J_prev.shape != (2, 2) or not np.all(np.isfinite(J_prev)):
@@ -1201,14 +1777,72 @@ class GoToModel:
                 ],
                 dtype=np.float64,
             )
+        R_prev = self._rotation_mount_to_world()
 
-        def _solve_with_mask(mask: np.ndarray) -> Optional[Dict[str, Any]]:
+        V_world_obs = np.array(
+            [_altaz_deg_to_unit_vec(float(A_world[i, 0]), float(A_world[i, 1])) for i in range(n)],
+            dtype=np.float64,
+        )
+
+        def _world_to_mount_samples(R_mount_to_world: np.ndarray) -> np.ndarray:
+            R = _coerce_rotation_matrix(R_mount_to_world)
+            R_inv = R.T
+            A_mount = np.zeros((n, 2), dtype=np.float64)
+            for i in range(n):
+                A_mount[i, :] = _rotate_altaz_deg(A_world[i, :], R_inv)
+            return A_mount
+
+        def _predict_mount_world(
+            *,
+            S_rel: np.ndarray,
+            a_ref_mount: np.ndarray,
+            J_new: np.ndarray,
+            R_mount_to_world: np.ndarray,
+        ) -> Dict[str, np.ndarray]:
+            d_mount = S_rel @ J_new.T
+            A_mount_pred = np.zeros((n, 2), dtype=np.float64)
+            A_world_pred = np.zeros((n, 2), dtype=np.float64)
+            V_mount_pred = np.zeros((n, 3), dtype=np.float64)
+            for i in range(n):
+                az_m = _wrap_deg_360(float(a_ref_mount[0]) + float(d_mount[i, 0]))
+                alt_m = float(a_ref_mount[1]) + float(d_mount[i, 1])
+                A_mount_pred[i, :] = np.array([az_m, alt_m], dtype=np.float64)
+                A_world_pred[i, :] = _rotate_altaz_deg(A_mount_pred[i, :], R_mount_to_world)
+                V_mount_pred[i, :] = _altaz_deg_to_unit_vec(az_m, alt_m)
+            return {
+                "A_mount_pred": A_mount_pred,
+                "A_world_pred": A_world_pred,
+                "V_mount_pred": V_mount_pred,
+            }
+
+        def _solve_given_rotation(mask: np.ndarray, R_seed: np.ndarray) -> Optional[Dict[str, Any]]:
             idx = np.flatnonzero(mask)
             n_use = int(idx.size)
             if n_use < int(min_samples):
                 return None
 
-            S_use = S[idx, :]
+            A_mount = _world_to_mount_samples(R_seed)
+            # Use a central reference sample (in step space) instead of pinning to
+            # the latest sample. This avoids bias when the latest sample is an outlier.
+            if n_use == 1:
+                ref_idx = int(idx[0])
+            else:
+                S_use_abs = S_abs[idx, :]
+                dmat = np.linalg.norm(S_use_abs[:, None, :] - S_use_abs[None, :, :], axis=2)
+                med_d = np.median(dmat, axis=1)
+                ref_idx = int(idx[int(np.argmin(med_d))])
+
+            s_ref = S_abs[ref_idx, :]
+            a_ref_mount = A_mount[ref_idx, :]
+            S_rel = S_abs - s_ref  # (N,2)
+            d_az = np.array(
+                [_wrap_deg_180(float(A_mount[i, 0]) - float(a_ref_mount[0])) for i in range(n)],
+                dtype=np.float64,
+            )
+            d_alt = (A_mount[:, 1] - float(a_ref_mount[1])).astype(np.float64)
+            D = np.column_stack((d_az, d_alt)).astype(np.float64)  # (N,2)
+
+            S_use = S_rel[idx, :]
             D_use = D[idx, :]
 
             # Solve only for excited columns to avoid collapsing unobserved axes.
@@ -1257,14 +1891,39 @@ class GoToModel:
             if (not np.isfinite(cond_J)) or cond_J > 1e10:
                 return None
 
-            pred_use = S_use @ J_new.T
-            res_az_use = np.array(
-                [_wrap_deg_180(float(D_use[i, 0]) - float(pred_use[i, 0])) for i in range(n_use)],
+            pred_seed = _predict_mount_world(
+                S_rel=S_rel,
+                a_ref_mount=a_ref_mount,
+                J_new=J_new,
+                R_mount_to_world=_coerce_rotation_matrix(R_seed),
+            )
+            R_fit = _fit_rotation_kabsch(pred_seed["V_mount_pred"][idx, :], V_world_obs[idx, :])
+            if R_fit is None:
+                R_fit = _coerce_rotation_matrix(R_seed)
+
+            pred = _predict_mount_world(
+                S_rel=S_rel,
+                a_ref_mount=a_ref_mount,
+                J_new=J_new,
+                R_mount_to_world=R_fit,
+            )
+
+            res_az_all = np.array(
+                [_wrap_deg_180(float(A_world[i, 0]) - float(pred["A_world_pred"][i, 0])) for i in range(n)],
                 dtype=np.float64,
             )
-            res_alt_use = (D_use[:, 1] - pred_use[:, 1]).astype(np.float64)
-            sse_az = float(np.dot(res_az_use, res_az_use))
-            sse_alt = float(np.dot(res_alt_use, res_alt_use))
+            res_alt_all = (A_world[:, 1] - pred["A_world_pred"][:, 1]).astype(np.float64)
+            res_az_use = res_az_all[idx]
+            res_alt_use = res_alt_all[idx]
+
+            pred_use_mount = pred["A_mount_pred"][idx, :]
+            res_az_use_mount = np.array(
+                [_wrap_deg_180(float(D_use[i, 0]) - float((S_use @ J_new.T)[i, 0])) for i in range(n_use)],
+                dtype=np.float64,
+            )
+            res_alt_use_mount = (D_use[:, 1] - (S_use @ J_new.T)[:, 1]).astype(np.float64)
+            sse_az = float(np.dot(res_az_use_mount, res_az_use_mount))
+            sse_alt = float(np.dot(res_alt_use_mount, res_alt_use_mount))
             dof = max(1, n_use - p)
 
             XtX = (S_active.T @ S_active) + (lam * (reg.T @ reg))
@@ -1272,25 +1931,20 @@ class GoToModel:
                 XtX_inv = np.linalg.inv(XtX)
             except np.linalg.LinAlgError:
                 XtX_inv = np.linalg.pinv(XtX)
-
             sigma2_az = sse_az / float(dof)
             sigma2_alt = sse_alt / float(dof)
             std_beta_az_active = np.sqrt(np.maximum(np.diag(XtX_inv) * sigma2_az, 0.0))
             std_beta_alt_active = np.sqrt(np.maximum(np.diag(XtX_inv) * sigma2_alt, 0.0))
 
-            pred_all = S @ J_new.T
-            res_az_all = np.array(
-                [_wrap_deg_180(float(D[i, 0]) - float(pred_all[i, 0])) for i in range(n)],
-                dtype=np.float64,
-            )
-            res_alt_all = (D[:, 1] - pred_all[:, 1]).astype(np.float64)
-
+            _ = pred_use_mount  # explicit keep for readability / parity
             return {
                 "mask": mask.copy(),
                 "n_use": n_use,
                 "p": p,
+                "ref_idx": int(ref_idx),
                 "active_cols": active_cols,
                 "J_new": J_new,
+                "R_new": R_fit,
                 "res_az_use": res_az_use,
                 "res_alt_use": res_alt_use,
                 "res_az_all": res_az_all,
@@ -1299,9 +1953,33 @@ class GoToModel:
                 "std_beta_alt_active": std_beta_alt_active,
             }
 
+        def _solve_with_mask(mask: np.ndarray) -> Optional[Dict[str, Any]]:
+            R_iter = _coerce_rotation_matrix(R_prev)
+            fit_local: Optional[Dict[str, Any]] = None
+            for _ in range(4):
+                candidate = _solve_given_rotation(mask, R_iter)
+                if candidate is None:
+                    return None
+                fit_local = candidate
+                R_next = _coerce_rotation_matrix(candidate["R_new"])
+                delta = float(np.max(np.abs(R_next - R_iter)))
+                R_iter = R_next
+                if (not np.isfinite(delta)) or delta < 1e-10:
+                    break
+            return fit_local
+
         mask = np.ones(n, dtype=bool)
         fit = _solve_with_mask(mask)
         if fit is None:
+            self._log_fit_csv(
+                fit_kind="manual",
+                ok=False,
+                reason="DEGENERATE_MODEL",
+                min_samples=int(min_samples),
+                ridge=float(ridge),
+                total_samples=int(n),
+                used_samples=0,
+            )
             return False
 
         # Robust outlier rejection on total residual norm using MAD scale.
@@ -1317,13 +1995,11 @@ class GoToModel:
                 med = float(np.median(res_norm[finite]))
                 mad = float(np.median(np.abs(res_norm[finite] - med)))
                 sigma = float(1.4826 * mad)
+                floor = float(20.0 / 3600.0)
                 thr = med + 4.5 * sigma
-                thr = max(float(20.0 / 3600.0), float(thr if np.isfinite(thr) else 0.0))
+                thr = max(floor, float(thr if np.isfinite(thr) else 0.0))
 
                 new_mask = finite & (res_norm <= thr)
-                if bool(finite[-1]):
-                    # Keep reference sample (zero delta row) to preserve anchor.
-                    new_mask[-1] = True
 
                 if int(np.sum(new_mask)) < need:
                     idx_f = np.flatnonzero(finite)
@@ -1331,11 +2007,32 @@ class GoToModel:
                     keep = order[:need]
                     new_mask = np.zeros_like(mask, dtype=bool)
                     new_mask[keep] = True
-                    if bool(finite[-1]):
-                        new_mask[-1] = True
 
                 if np.array_equal(new_mask, mask):
-                    break
+                    # Fallback: if one sample is clearly separated, prune it.
+                    idx_f = np.flatnonzero(finite & mask)
+                    if int(np.sum(mask)) <= need or int(idx_f.size) == 0:
+                        break
+                    med_ref = max(float(med), floor)
+                    thr_fallback = max(5.0 * floor, 3.0 * med_ref)
+                    order = idx_f[np.argsort(res_norm[idx_f])[::-1]]
+                    accepted = False
+                    for cand in order:
+                        cand_res = float(res_norm[int(cand)])
+                        if (not np.isfinite(cand_res)) or cand_res <= thr_fallback:
+                            break
+                        trial_mask = mask.copy()
+                        trial_mask[int(cand)] = False
+                        fit_trial = _solve_with_mask(trial_mask)
+                        if fit_trial is None:
+                            continue
+                        mask = trial_mask
+                        fit = fit_trial
+                        accepted = True
+                        break
+                    if not accepted:
+                        break
+                    continue
 
                 fit_new = _solve_with_mask(new_mask)
                 if fit_new is None:
@@ -1343,7 +2040,40 @@ class GoToModel:
                 mask = new_mask
                 fit = fit_new
 
+        # If robust-MAD kept all samples, try a leave-one-out fallback and accept
+        # only if it yields a clearly better fit. This catches high-leverage outliers.
+        if int(fit["n_use"]) == n and n > int(min_keep):
+            res_norm_all = np.hypot(fit["res_az_all"], fit["res_alt_all"]).astype(np.float64)
+            base_use = np.hypot(fit["res_az_use"], fit["res_alt_use"]).astype(np.float64)
+            base_rms = float(np.sqrt(np.mean(np.square(base_use)))) if int(base_use.size) > 0 else float("inf")
+            med_all = float(np.median(res_norm_all[np.isfinite(res_norm_all)])) if int(np.sum(np.isfinite(res_norm_all))) > 0 else float("inf")
+            floor = float(20.0 / 3600.0)
+
+            best: Optional[Tuple[int, Dict[str, Any], float]] = None
+            for cand in range(n):
+                trial_mask = np.ones(n, dtype=bool)
+                trial_mask[cand] = False
+                fit_trial = _solve_with_mask(trial_mask)
+                if fit_trial is None:
+                    continue
+                trial_use = np.hypot(fit_trial["res_az_use"], fit_trial["res_alt_use"]).astype(np.float64)
+                if int(trial_use.size) == 0:
+                    continue
+                trial_rms = float(np.sqrt(np.mean(np.square(trial_use))))
+                if (best is None) or (trial_rms < float(best[2])):
+                    best = (cand, fit_trial, trial_rms)
+
+            if best is not None and np.isfinite(base_rms):
+                cand_idx, fit_trial, trial_rms = best
+                cand_res = float(res_norm_all[int(cand_idx)]) if int(cand_idx) < int(res_norm_all.size) else 0.0
+                med_ref = max(float(med_all), floor)
+                if np.isfinite(cand_res) and trial_rms < 0.85 * base_rms and cand_res > max(5.0 * floor, 2.5 * med_ref):
+                    fit = fit_trial
+
         self.J_deg_per_step = np.asarray(fit["J_new"], dtype=np.float64)
+        self.R_mount_to_world = _coerce_rotation_matrix(fit["R_new"])
+        if ref_world_before is not None and np.all(np.isfinite(ref_world_before)):
+            self.ref_az_alt_deg = self._world_to_mount_altaz(ref_world_before)
 
         res_az = np.asarray(fit["res_az_use"], dtype=np.float64)
         res_alt = np.asarray(fit["res_alt_use"], dtype=np.float64)
@@ -1364,10 +2094,22 @@ class GoToModel:
                 throttle_key="goto_fit_manual_outliers",
             )
 
-        self.model_yaw_deg = 0.0
-        self.model_pitch_deg = 0.0
-        self.model_yaw_err_deg = 0.0
-        self.model_pitch_err_deg = 0.0
+        # Rotation summary (small-angle components in ENU frame).
+        rotvec_deg = _rotation_rotvec_deg(self.R_mount_to_world)
+        pitch_deg = float(rotvec_deg[0])  # around East axis (north/south tilt).
+        yaw_deg = float(rotvec_deg[2])    # around Up axis (azimuth bias).
+        self.model_pitch_deg = 0.0 if abs(pitch_deg) < 1e-12 else pitch_deg
+        self.model_yaw_deg = 0.0 if abs(yaw_deg) < 1e-12 else yaw_deg
+        if int(self.model_fit_samples) >= 2:
+            self.model_yaw_err_deg = float(np.std(res_az, ddof=1) / math.sqrt(float(self.model_fit_samples)))
+            self.model_pitch_err_deg = float(np.std(res_alt, ddof=1) / math.sqrt(float(self.model_fit_samples)))
+        else:
+            self.model_yaw_err_deg = 0.0
+            self.model_pitch_err_deg = 0.0
+        if abs(float(self.model_yaw_err_deg)) < 1e-12:
+            self.model_yaw_err_deg = 0.0
+        if abs(float(self.model_pitch_err_deg)) < 1e-12:
+            self.model_pitch_err_deg = 0.0
 
         # Start with conservative defaults for non-fitted columns.
         self.J00_err = 0.0
@@ -1434,6 +2176,15 @@ class GoToModel:
             else:
                 self.model_roll_err_deg = 0.0
 
+        self._log_fit_csv(
+            fit_kind="manual",
+            ok=True,
+            reason="OK",
+            min_samples=int(min_samples),
+            ridge=float(ridge),
+            total_samples=int(n),
+            used_samples=int(fit["n_use"]),
+        )
         return True
 
     def model_fit_report(self) -> Dict[str, float]:
@@ -1646,13 +2397,7 @@ class GoToController:
             obstime=obstime,
         )
 
-        self.model.synced = True
-        self.model.ref_steps = self.model.steps_est.copy()
-        self.model.ref_az_alt_deg = az_alt.copy()
-        self.model.last_solve_az_alt_deg = az_alt.copy()
-        self.model.last_solve_steps_est = self.model.steps_est.copy()
-        self.model.last_solve_time = time.time()
-        return True
+        return bool(self.model.sync_from_world_az_alt(az_alt))
 
     # -------------------------
     # Platesolving helper
@@ -5271,6 +6016,89 @@ class GoToWorker(BaseWorker):
                 )
                 if ok:
                     self._log_model_fit_state(prefix="GoTo: FIT_MODEL report")
+
+            elif kind == "list_samples":
+                report = self._goto.model.manual_samples_deviation_report(sort_by_deviation=True)
+                n_manual = int(len(getattr(self._goto.model, "_manual_steps_abs", [])))
+                if not report:
+                    self._publish_state(
+                        {
+                            "goto": {
+                                "manual_samples": int(n_manual),
+                                "status": GotoStatus.OK,
+                                "reason": "LIST_SAMPLES_EMPTY",
+                            }
+                        }
+                    )
+                    log_info(self._out_log, "GoTo: LIST_SAMPLES no manual samples")
+                else:
+                    thr_arcsec = float(report[0].get("threshold_arcsec", float("nan")))
+                    log_info(
+                        self._out_log,
+                        f"GoTo: LIST_SAMPLES n={n_manual} threshold={thr_arcsec:.2f}arcsec (sorted by deviation)",
+                    )
+                    for row in report:
+                        idx = int(row.get("sample_idx", -1))
+                        rank = int(row.get("rank_deviation", 0))
+                        dev_arcsec = float(row.get("dev_arcsec", float("nan")))
+                        dev_az_arcsec = float(row.get("dev_az_deg", float("nan"))) * 3600.0
+                        dev_alt_arcsec = float(row.get("dev_alt_deg", float("nan"))) * 3600.0
+                        out_tag = "OUTLIER" if bool(row.get("outlier_suggested", False)) else "inlier"
+                        ref_tag = " ref" if bool(row.get("is_ref_idx", False)) else ""
+                        log_info(
+                            self._out_log,
+                            "GoTo: SAMPLE "
+                            f"idx={idx} rank={rank} {out_tag}{ref_tag} "
+                            f"dev={dev_arcsec:.2f}arcsec "
+                            f"(az={dev_az_arcsec:+.2f}, alt={dev_alt_arcsec:+.2f}) "
+                            f"steps=[{float(row.get('steps_az', 0.0)):.0f},{float(row.get('steps_alt', 0.0)):.0f}] "
+                            f"altaz=[{float(row.get('az_deg', 0.0)):.4f},{float(row.get('alt_deg', 0.0)):.4f}]",
+                        )
+                    self._publish_state(
+                        {
+                            "goto": {
+                                "manual_samples": int(n_manual),
+                                "status": GotoStatus.OK,
+                                "reason": "LIST_SAMPLES",
+                            }
+                        }
+                    )
+
+            elif kind == "prune_outliers":
+                min_samples = int(params.get("min_samples", 3))
+                ridge = float(params.get("ridge", 1e-12))
+                out = self._goto.model.prune_manual_outliers(min_samples=min_samples, ridge=ridge)
+                n_after = int(out.get("n_after", len(getattr(self._goto.model, "_manual_steps_abs", []))))
+                removed = int(out.get("removed_count", 0))
+                removed_indices = list(out.get("removed_indices", []))
+                prune_ok = bool(out.get("ok", False))
+                prune_status = str(out.get("status", "UNKNOWN"))
+                synced_from_manual = False
+                if prune_ok and (not bool(getattr(self._goto.model, "synced", False))) and n_after > 0:
+                    synced_from_manual = bool(self._goto.model.sync_from_latest_manual_sample())
+                self._publish_state(
+                    {
+                        "goto": {
+                            "manual_samples": int(n_after),
+                            "synced": bool(getattr(self._goto.model, "synced", False)),
+                            "status": GotoStatus.OK if prune_status in ("OK", "NO_OUTLIERS") else GotoStatus.FAIL,
+                            "reason": f"PRUNE_OUTLIERS_{prune_status}",
+                        }
+                    }
+                )
+                log_info(
+                    self._out_log,
+                    "GoTo: PRUNE_OUTLIERS "
+                    f"status={prune_status} ok={prune_ok} "
+                    f"removed={removed} indices={removed_indices} "
+                    f"n_before={int(out.get('n_before', 0))} n_after={n_after} "
+                    f"threshold={float(out.get('threshold_arcsec', float('nan'))):.2f}arcsec "
+                    f"fit_before_ok={bool(out.get('fit_before_ok', False))} "
+                    f"fit_after_ok={bool(out.get('fit_after_ok', False))} "
+                    f"synced_from_manual={synced_from_manual}",
+                )
+                if prune_ok:
+                    self._log_model_fit_state(prefix="GoTo: PRUNE_OUTLIERS report")
 
             elif kind == "reset":
                 model = self._goto.model

@@ -1151,6 +1151,8 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_autocal = QPushButton("Platesolving")
         self.btn_roll = QPushButton("Estimar Roll")
         self.btn_fit_model = QPushButton("Fit GoTo Model")
+        self.btn_list_samples = QPushButton("Listar Muestras")
+        self.btn_prune_outliers = QPushButton("Eliminar Outliers")
         self.btn_reset_goto = QPushButton("Reset")
         self.btn_home = QPushButton("Home")
 
@@ -1161,6 +1163,8 @@ class AstroPanoptesWindow(QMainWindow):
             self.btn_autocal,
             self.btn_roll,
             self.btn_fit_model,
+            self.btn_list_samples,
+            self.btn_prune_outliers,
             self.btn_reset_goto,
             self.btn_home,
         ]:
@@ -1172,6 +1176,8 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_autocal.clicked.connect(self._autocalibrate)
         self.btn_roll.clicked.connect(self._goto_estimate_roll)
         self.btn_fit_model.clicked.connect(self._goto_fit_model)
+        self.btn_list_samples.clicked.connect(self._goto_list_samples)
+        self.btn_prune_outliers.clicked.connect(self._goto_prune_outliers)
         self.btn_reset_goto.clicked.connect(self._goto_reset)
         self.btn_home.clicked.connect(self._home)
 
@@ -1340,7 +1346,7 @@ class AstroPanoptesWindow(QMainWindow):
 
     def _stacking_save(self) -> None:
         self.runner.request_stacking_save(out_dir="stack_output", basename="stack", fmt="png")
-        self._log("[stacking] Save Stack -> stack_output/stack.png")
+        self._log("[stacking] Save Stack -> stack_output/stack_YYYYMMDD_HHMMSS_azXXX_altYYY.{raw.npy,png}")
 
     def _platesolve_start(self) -> None:
         target = self.ed_ps_target.text().strip()
@@ -1428,6 +1434,14 @@ class AstroPanoptesWindow(QMainWindow):
     def _goto_fit_model(self) -> None:
         self.runner.request_goto_fit_model()
         self._log("[goto] Fit GoTo Model")
+
+    def _goto_list_samples(self) -> None:
+        self.runner.request_goto_list_samples()
+        self._log("[goto] Listar muestras manuales")
+
+    def _goto_prune_outliers(self) -> None:
+        self.runner.request_goto_prune_outliers()
+        self._log("[goto] Eliminar muestras outliers")
 
     def _goto_reset(self) -> None:
         self.runner.request_goto_reset()
