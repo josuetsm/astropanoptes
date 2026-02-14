@@ -372,6 +372,47 @@ def _rotation_rotvec_deg(R: np.ndarray) -> np.ndarray:
     return np.degrees(rv).astype(np.float64)
 
 
+def _rotvec_deg_to_rotation_matrix(rotvec_deg: np.ndarray) -> np.ndarray:
+    """Rotation matrix from axis-angle rotvec in degrees (ENU axes)."""
+    rv_deg = np.asarray(rotvec_deg, dtype=np.float64).reshape(3,)
+    if not np.all(np.isfinite(rv_deg)):
+        return np.eye(3, dtype=np.float64)
+    rv = np.deg2rad(rv_deg)
+    ang = float(np.linalg.norm(rv))
+    if ang <= 1e-12:
+        return np.eye(3, dtype=np.float64)
+    axis = rv / ang
+    kx, ky, kz = float(axis[0]), float(axis[1]), float(axis[2])
+    K = np.array(
+        [
+            [0.0, -kz, ky],
+            [kz, 0.0, -kx],
+            [-ky, kx, 0.0],
+        ],
+        dtype=np.float64,
+    )
+    I = np.eye(3, dtype=np.float64)
+    R = I + math.sin(ang) * K + (1.0 - math.cos(ang)) * (K @ K)
+    return _coerce_rotation_matrix(R)
+
+
+def _limit_rotation_tilt_ns_oe_deg(R: np.ndarray, *, max_tilt_deg: float) -> np.ndarray:
+    """
+    Clamp NS/OE tilt (ENU rotvec x/y components) to a hard limit.
+
+    We keep the z component (azimuth encoder zero offset) unconstrained.
+    """
+    R0 = _coerce_rotation_matrix(R)
+    lim = float(max_tilt_deg)
+    if (not np.isfinite(lim)) or lim <= 0.0:
+        return R0
+    rv = _rotation_rotvec_deg(R0)
+    rv_limited = rv.copy()
+    rv_limited[0] = _clamp(float(rv_limited[0]), -lim, +lim)  # tilt NS
+    rv_limited[1] = _clamp(float(rv_limited[1]), -lim, +lim)  # tilt OE
+    return _rotvec_deg_to_rotation_matrix(rv_limited)
+
+
 def _flatten_points(xy: np.ndarray) -> np.ndarray:
     P = np.asarray(xy, dtype=np.float64).reshape(-1, 2)
     return P
@@ -1034,6 +1075,8 @@ class GoToModel:
 
     # Global all-sky correction: world ~= R_mount_to_world * mount_model.
     R_mount_to_world: np.ndarray = field(default_factory=lambda: np.eye(3, dtype=np.float64))
+    # Hard limit for mount base tilts (NS/OE components of the global rotation).
+    max_tilt_ns_oe_deg: float = 2.0
 
     # Current estimated step counter (relative, but we store absolute in same units as ref_steps)
     steps_est: np.ndarray = field(default_factory=lambda: np.zeros(2, dtype=np.float64))
@@ -1205,9 +1248,11 @@ class GoToModel:
         _append_csv_log_row("goto_model_fit_log.csv", _GOTO_MODEL_FIT_CSV_FIELDS, row)
 
     def _rotation_mount_to_world(self) -> np.ndarray:
-        R = _coerce_rotation_matrix(self.R_mount_to_world)
-        self.R_mount_to_world = R
-        return R
+        self.R_mount_to_world = _limit_rotation_tilt_ns_oe_deg(
+            _coerce_rotation_matrix(self.R_mount_to_world),
+            max_tilt_deg=float(self.max_tilt_ns_oe_deg),
+        )
+        return self.R_mount_to_world
 
     def _mount_to_world_altaz(self, az_alt_mount_deg: np.ndarray) -> np.ndarray:
         return _rotate_altaz_deg(_as_array2(az_alt_mount_deg), self._rotation_mount_to_world())
@@ -1514,10 +1559,15 @@ class GoToModel:
         self.last_solve_az_alt_deg = None
         self.last_solve_steps_est = None
         self.last_solve_time = 0.0
+        self.R_mount_to_world = np.eye(3, dtype=np.float64)
 
         self.model_roll_deg = 0.0
         self.model_roll_err_deg = 0.0
         self.model_roll_samples = 0
+        self.model_pitch_deg = 0.0
+        self.model_pitch_err_deg = 0.0
+        self.model_yaw_deg = 0.0
+        self.model_yaw_err_deg = 0.0
         self.model_fit_samples = 0
         self.model_fit_rms_az_deg = 0.0
         self.model_fit_rms_alt_deg = 0.0
@@ -1530,6 +1580,61 @@ class GoToModel:
         dmat = np.linalg.norm(S_use[:, None, :] - S_use[None, :, :], axis=2)
         med_d = np.median(dmat, axis=1)
         return int(idx[int(np.argmin(med_d))])
+
+    def _fit_rotation_from_manual_samples(
+        self,
+        *,
+        S_abs: np.ndarray,
+        A_world: np.ndarray,
+        sample_mask: np.ndarray,
+        J_model: np.ndarray,
+        max_iter: int = 6,
+    ) -> np.ndarray:
+        idx = np.flatnonzero(np.asarray(sample_mask, dtype=bool))
+        if int(idx.size) < 3:
+            return self._rotation_mount_to_world()
+
+        J = np.asarray(J_model, dtype=np.float64)
+        if J.shape != (2, 2) or (not np.all(np.isfinite(J))):
+            return self._rotation_mount_to_world()
+
+        ref_idx = self._manual_reference_index_from_steps(S_abs, idx)
+        s_ref = np.asarray(S_abs[ref_idx, :], dtype=np.float64).reshape(2,)
+        S_rel = np.asarray(S_abs[idx, :] - s_ref[None, :], dtype=np.float64)
+        A_world_use = np.asarray(A_world[idx, :], dtype=np.float64)
+
+        R_est = self._rotation_mount_to_world()
+        for _ in range(max(1, int(max_iter))):
+            a_ref_mount = _rotate_altaz_deg(A_world[ref_idx, :], R_est.T)
+
+            A_mount_pred = np.zeros((int(idx.size), 2), dtype=np.float64)
+            for i in range(int(idx.size)):
+                d_mount = J @ S_rel[i, :]
+                A_mount_pred[i, 0] = _wrap_deg_360(float(a_ref_mount[0]) + float(d_mount[0]))
+                A_mount_pred[i, 1] = float(a_ref_mount[1]) + float(d_mount[1])
+
+            src = np.stack(
+                [_altaz_deg_to_unit_vec(float(a[0]), float(a[1])) for a in A_mount_pred],
+                axis=0,
+            )
+            dst = np.stack(
+                [_altaz_deg_to_unit_vec(float(a[0]), float(a[1])) for a in A_world_use],
+                axis=0,
+            )
+            R_fit = _fit_rotation_kabsch(src, dst)
+            if R_fit is None:
+                break
+            R_fit = _limit_rotation_tilt_ns_oe_deg(
+                R_fit,
+                max_tilt_deg=float(self.max_tilt_ns_oe_deg),
+            )
+
+            d_rot = _rotation_rotvec_deg(R_fit @ R_est.T)
+            R_est = R_fit
+            if float(np.linalg.norm(d_rot)) < 1e-7:
+                break
+
+        return _coerce_rotation_matrix(R_est)
 
     def _manual_residuals_against_model(
         self,
@@ -1738,7 +1843,12 @@ class GoToModel:
         return out
 
     def fit_J_from_manual_samples(self, *, min_samples: int = 3, ridge: float = 1e-12) -> bool:
-        """Fit local J plus a global spherical correction from manual samples."""
+        """Fit J from manual samples and estimate global mount->world rotation.
+
+        J captures step-domain anisotropy/coupling (AZ vs ALT microsteps are distinct).
+        R_mount_to_world is estimated with Wahba/Kabsch and constrained with hard
+        NS/OE tilt limits (|tilt| <= max_tilt_ns_oe_deg).
+        """
         if len(self._manual_steps_abs) < int(min_samples):
             self._log_fit_csv(
                 fit_kind="manual",
@@ -1752,7 +1862,7 @@ class GoToModel:
             return False
 
         S_abs = np.stack(self._manual_steps_abs, axis=0).astype(np.float64)  # (N,2)
-        A_world = np.stack(self._manual_az_alt_abs, axis=0).astype(np.float64)  # (N,2) [az, alt] in deg
+        A_abs = np.stack(self._manual_az_alt_abs, axis=0).astype(np.float64)  # (N,2) [az, alt] in deg
         n = int(S_abs.shape[0])
         if n < int(min_samples):
             self._log_fit_csv(
@@ -1777,69 +1887,22 @@ class GoToModel:
                 ],
                 dtype=np.float64,
             )
-        R_prev = self._rotation_mount_to_world()
 
-        V_world_obs = np.array(
-            [_altaz_deg_to_unit_vec(float(A_world[i, 0]), float(A_world[i, 1])) for i in range(n)],
-            dtype=np.float64,
-        )
-
-        def _world_to_mount_samples(R_mount_to_world: np.ndarray) -> np.ndarray:
-            R = _coerce_rotation_matrix(R_mount_to_world)
-            R_inv = R.T
-            A_mount = np.zeros((n, 2), dtype=np.float64)
-            for i in range(n):
-                A_mount[i, :] = _rotate_altaz_deg(A_world[i, :], R_inv)
-            return A_mount
-
-        def _predict_mount_world(
-            *,
-            S_rel: np.ndarray,
-            a_ref_mount: np.ndarray,
-            J_new: np.ndarray,
-            R_mount_to_world: np.ndarray,
-        ) -> Dict[str, np.ndarray]:
-            d_mount = S_rel @ J_new.T
-            A_mount_pred = np.zeros((n, 2), dtype=np.float64)
-            A_world_pred = np.zeros((n, 2), dtype=np.float64)
-            V_mount_pred = np.zeros((n, 3), dtype=np.float64)
-            for i in range(n):
-                az_m = _wrap_deg_360(float(a_ref_mount[0]) + float(d_mount[i, 0]))
-                alt_m = float(a_ref_mount[1]) + float(d_mount[i, 1])
-                A_mount_pred[i, :] = np.array([az_m, alt_m], dtype=np.float64)
-                A_world_pred[i, :] = _rotate_altaz_deg(A_mount_pred[i, :], R_mount_to_world)
-                V_mount_pred[i, :] = _altaz_deg_to_unit_vec(az_m, alt_m)
-            return {
-                "A_mount_pred": A_mount_pred,
-                "A_world_pred": A_world_pred,
-                "V_mount_pred": V_mount_pred,
-            }
-
-        def _solve_given_rotation(mask: np.ndarray, R_seed: np.ndarray) -> Optional[Dict[str, Any]]:
+        def _solve_with_mask(mask: np.ndarray) -> Optional[Dict[str, Any]]:
             idx = np.flatnonzero(mask)
             n_use = int(idx.size)
             if n_use < int(min_samples):
                 return None
 
-            A_mount = _world_to_mount_samples(R_seed)
-            # Use a central reference sample (in step space) instead of pinning to
-            # the latest sample. This avoids bias when the latest sample is an outlier.
-            if n_use == 1:
-                ref_idx = int(idx[0])
-            else:
-                S_use_abs = S_abs[idx, :]
-                dmat = np.linalg.norm(S_use_abs[:, None, :] - S_use_abs[None, :, :], axis=2)
-                med_d = np.median(dmat, axis=1)
-                ref_idx = int(idx[int(np.argmin(med_d))])
-
+            ref_idx = self._manual_reference_index_from_steps(S_abs, idx)
             s_ref = S_abs[ref_idx, :]
-            a_ref_mount = A_mount[ref_idx, :]
+            a_ref = A_abs[ref_idx, :]
             S_rel = S_abs - s_ref  # (N,2)
             d_az = np.array(
-                [_wrap_deg_180(float(A_mount[i, 0]) - float(a_ref_mount[0])) for i in range(n)],
+                [_wrap_deg_180(float(A_abs[i, 0]) - float(a_ref[0])) for i in range(n)],
                 dtype=np.float64,
             )
-            d_alt = (A_mount[:, 1] - float(a_ref_mount[1])).astype(np.float64)
+            d_alt = (A_abs[:, 1] - float(a_ref[1])).astype(np.float64)
             D = np.column_stack((d_az, d_alt)).astype(np.float64)  # (N,2)
 
             S_use = S_rel[idx, :]
@@ -1891,39 +1954,14 @@ class GoToModel:
             if (not np.isfinite(cond_J)) or cond_J > 1e10:
                 return None
 
-            pred_seed = _predict_mount_world(
-                S_rel=S_rel,
-                a_ref_mount=a_ref_mount,
-                J_new=J_new,
-                R_mount_to_world=_coerce_rotation_matrix(R_seed),
-            )
-            R_fit = _fit_rotation_kabsch(pred_seed["V_mount_pred"][idx, :], V_world_obs[idx, :])
-            if R_fit is None:
-                R_fit = _coerce_rotation_matrix(R_seed)
-
-            pred = _predict_mount_world(
-                S_rel=S_rel,
-                a_ref_mount=a_ref_mount,
-                J_new=J_new,
-                R_mount_to_world=R_fit,
-            )
-
-            res_az_all = np.array(
-                [_wrap_deg_180(float(A_world[i, 0]) - float(pred["A_world_pred"][i, 0])) for i in range(n)],
+            pred_use = S_use @ J_new.T
+            res_az_use = np.array(
+                [_wrap_deg_180(float(D_use[i, 0]) - float(pred_use[i, 0])) for i in range(n_use)],
                 dtype=np.float64,
             )
-            res_alt_all = (A_world[:, 1] - pred["A_world_pred"][:, 1]).astype(np.float64)
-            res_az_use = res_az_all[idx]
-            res_alt_use = res_alt_all[idx]
-
-            pred_use_mount = pred["A_mount_pred"][idx, :]
-            res_az_use_mount = np.array(
-                [_wrap_deg_180(float(D_use[i, 0]) - float((S_use @ J_new.T)[i, 0])) for i in range(n_use)],
-                dtype=np.float64,
-            )
-            res_alt_use_mount = (D_use[:, 1] - (S_use @ J_new.T)[:, 1]).astype(np.float64)
-            sse_az = float(np.dot(res_az_use_mount, res_az_use_mount))
-            sse_alt = float(np.dot(res_alt_use_mount, res_alt_use_mount))
+            res_alt_use = (D_use[:, 1] - pred_use[:, 1]).astype(np.float64)
+            sse_az = float(np.dot(res_az_use, res_az_use))
+            sse_alt = float(np.dot(res_alt_use, res_alt_use))
             dof = max(1, n_use - p)
 
             XtX = (S_active.T @ S_active) + (lam * (reg.T @ reg))
@@ -1931,12 +1969,19 @@ class GoToModel:
                 XtX_inv = np.linalg.inv(XtX)
             except np.linalg.LinAlgError:
                 XtX_inv = np.linalg.pinv(XtX)
+
             sigma2_az = sse_az / float(dof)
             sigma2_alt = sse_alt / float(dof)
             std_beta_az_active = np.sqrt(np.maximum(np.diag(XtX_inv) * sigma2_az, 0.0))
             std_beta_alt_active = np.sqrt(np.maximum(np.diag(XtX_inv) * sigma2_alt, 0.0))
 
-            _ = pred_use_mount  # explicit keep for readability / parity
+            pred_all = S_rel @ J_new.T
+            res_az_all = np.array(
+                [_wrap_deg_180(float(D[i, 0]) - float(pred_all[i, 0])) for i in range(n)],
+                dtype=np.float64,
+            )
+            res_alt_all = (D[:, 1] - pred_all[:, 1]).astype(np.float64)
+
             return {
                 "mask": mask.copy(),
                 "n_use": n_use,
@@ -1944,7 +1989,6 @@ class GoToModel:
                 "ref_idx": int(ref_idx),
                 "active_cols": active_cols,
                 "J_new": J_new,
-                "R_new": R_fit,
                 "res_az_use": res_az_use,
                 "res_alt_use": res_alt_use,
                 "res_az_all": res_az_all,
@@ -1952,21 +1996,6 @@ class GoToModel:
                 "std_beta_az_active": std_beta_az_active,
                 "std_beta_alt_active": std_beta_alt_active,
             }
-
-        def _solve_with_mask(mask: np.ndarray) -> Optional[Dict[str, Any]]:
-            R_iter = _coerce_rotation_matrix(R_prev)
-            fit_local: Optional[Dict[str, Any]] = None
-            for _ in range(4):
-                candidate = _solve_given_rotation(mask, R_iter)
-                if candidate is None:
-                    return None
-                fit_local = candidate
-                R_next = _coerce_rotation_matrix(candidate["R_new"])
-                delta = float(np.max(np.abs(R_next - R_iter)))
-                R_iter = R_next
-                if (not np.isfinite(delta)) or delta < 1e-10:
-                    break
-            return fit_local
 
         mask = np.ones(n, dtype=bool)
         fit = _solve_with_mask(mask)
@@ -2046,7 +2075,11 @@ class GoToModel:
             res_norm_all = np.hypot(fit["res_az_all"], fit["res_alt_all"]).astype(np.float64)
             base_use = np.hypot(fit["res_az_use"], fit["res_alt_use"]).astype(np.float64)
             base_rms = float(np.sqrt(np.mean(np.square(base_use)))) if int(base_use.size) > 0 else float("inf")
-            med_all = float(np.median(res_norm_all[np.isfinite(res_norm_all)])) if int(np.sum(np.isfinite(res_norm_all))) > 0 else float("inf")
+            med_all = (
+                float(np.median(res_norm_all[np.isfinite(res_norm_all)]))
+                if int(np.sum(np.isfinite(res_norm_all))) > 0
+                else float("inf")
+            )
             floor = float(20.0 / 3600.0)
 
             best: Optional[Tuple[int, Dict[str, Any], float]] = None
@@ -2065,18 +2098,43 @@ class GoToModel:
 
             if best is not None and np.isfinite(base_rms):
                 cand_idx, fit_trial, trial_rms = best
-                cand_res = float(res_norm_all[int(cand_idx)]) if int(cand_idx) < int(res_norm_all.size) else 0.0
+                cand_res = (
+                    float(res_norm_all[int(cand_idx)])
+                    if int(cand_idx) < int(res_norm_all.size)
+                    else 0.0
+                )
                 med_ref = max(float(med_all), floor)
-                if np.isfinite(cand_res) and trial_rms < 0.85 * base_rms and cand_res > max(5.0 * floor, 2.5 * med_ref):
+                if (
+                    np.isfinite(cand_res)
+                    and trial_rms < 0.85 * base_rms
+                    and cand_res > max(5.0 * floor, 2.5 * med_ref)
+                ):
                     fit = fit_trial
 
         self.J_deg_per_step = np.asarray(fit["J_new"], dtype=np.float64)
-        self.R_mount_to_world = _coerce_rotation_matrix(fit["R_new"])
+        self.R_mount_to_world = self._fit_rotation_from_manual_samples(
+            S_abs=S_abs,
+            A_world=A_abs,
+            sample_mask=np.asarray(fit["mask"], dtype=bool),
+            J_model=self.J_deg_per_step,
+        )
+        self.R_mount_to_world = self._rotation_mount_to_world()
         if ref_world_before is not None and np.all(np.isfinite(ref_world_before)):
             self.ref_az_alt_deg = self._world_to_mount_altaz(ref_world_before)
 
         res_az = np.asarray(fit["res_az_use"], dtype=np.float64)
         res_alt = np.asarray(fit["res_alt_use"], dtype=np.float64)
+        resid_model = self._manual_residuals_against_model(
+            J_model=self.J_deg_per_step,
+            R_mount_to_world=self.R_mount_to_world,
+        )
+        if resid_model is not None:
+            idx_use = np.flatnonzero(np.asarray(fit["mask"], dtype=bool))
+            res_az_all = np.asarray(resid_model["res_az_deg"], dtype=np.float64)
+            res_alt_all = np.asarray(resid_model["res_alt_deg"], dtype=np.float64)
+            if int(idx_use.size) > 0 and int(res_az_all.size) >= int(np.max(idx_use) + 1):
+                res_az = res_az_all[idx_use]
+                res_alt = res_alt_all[idx_use]
 
         self.model_fit_samples = int(fit["n_use"])
         self.model_fit_rms_az_deg = float(np.sqrt(np.mean(np.square(res_az))))
@@ -2094,22 +2152,12 @@ class GoToModel:
                 throttle_key="goto_fit_manual_outliers",
             )
 
-        # Rotation summary (small-angle components in ENU frame).
-        rotvec_deg = _rotation_rotvec_deg(self.R_mount_to_world)
-        pitch_deg = float(rotvec_deg[0])  # around East axis (north/south tilt).
-        yaw_deg = float(rotvec_deg[2])    # around Up axis (azimuth bias).
-        self.model_pitch_deg = 0.0 if abs(pitch_deg) < 1e-12 else pitch_deg
-        self.model_yaw_deg = 0.0 if abs(yaw_deg) < 1e-12 else yaw_deg
-        if int(self.model_fit_samples) >= 2:
-            self.model_yaw_err_deg = float(np.std(res_az, ddof=1) / math.sqrt(float(self.model_fit_samples)))
-            self.model_pitch_err_deg = float(np.std(res_alt, ddof=1) / math.sqrt(float(self.model_fit_samples)))
-        else:
-            self.model_yaw_err_deg = 0.0
-            self.model_pitch_err_deg = 0.0
-        if abs(float(self.model_yaw_err_deg)) < 1e-12:
-            self.model_yaw_err_deg = 0.0
-        if abs(float(self.model_pitch_err_deg)) < 1e-12:
-            self.model_pitch_err_deg = 0.0
+        rv_deg = _rotation_rotvec_deg(self.R_mount_to_world)
+        # Report NS/OE tilts from ENU rotvec x/y components.
+        self.model_pitch_deg = float(rv_deg[0])
+        self.model_yaw_deg = float(rv_deg[1])
+        self.model_yaw_err_deg = 0.0
+        self.model_pitch_err_deg = 0.0
 
         # Start with conservative defaults for non-fitted columns.
         self.J00_err = 0.0
@@ -2293,6 +2341,13 @@ def _looks_like_planet_target(target: TargetType) -> Optional[str]:
     return None
 
 
+def _observer_without_refraction(observer: ObserverConfig) -> ObserverConfig:
+    try:
+        return replace(observer, refraction_enable=False)
+    except Exception:
+        return observer
+
+
 def resolve_target_icrs(
     target: TargetType,
     *,
@@ -2318,9 +2373,10 @@ def resolve_target_icrs(
         return c.icrs
 
     # Delegate everything else to the plate-solver's parser (includes AltAz dict).
+    observer_no_refract = _observer_without_refraction(observer)
     return parse_target_to_icrs(
         target,
-        observer=observer,
+        observer=observer_no_refract,
         obstime=obstime,
     ).icrs
 
@@ -2337,14 +2393,8 @@ def icrs_to_altaz_deg(
     altaz = coord_icrs.transform_to(AltAz(obstime=obstime, location=loc))
     az = _wrap_deg_360(float(altaz.az.deg))
     alt_true = float(altaz.alt.deg)
-    alt = alt_true
-    if bool(getattr(observer, "refraction_enable", False)):
-        alt = alt_true + _R_true_to_app_deg(
-            alt_true,
-            P_hPa=float(getattr(observer, "refraction_P_hPa", 1013.25)),
-            T_C=float(getattr(observer, "refraction_T_C", 15.0)),
-        )
-    return np.array([az, alt], dtype=np.float64)
+    # GoTo model uses true AltAz (no atmospheric refraction correction).
+    return np.array([az, alt_true], dtype=np.float64)
 
 
 def platesolving_center_to_altaz_deg(
@@ -2465,7 +2515,7 @@ class GoToController:
                 target=target_for_solver,
                 cfg=cfg2,
                 sep_cfg=self.cfg.sep,
-                observer=self.cfg.observer,
+                observer=_observer_without_refraction(self.cfg.observer),
                 obstime=obstime,
                 progress_cb=None,
             )
@@ -2572,8 +2622,16 @@ class GoToController:
                     st.status = "OK"
                     return st
 
-                # Convert error -> steps using inverse J.
-                d_altaz_vec = np.array([daz, dalt], dtype=np.float64)
+                # Convert world error -> mount-frame error, then mount error -> steps via inv(J).
+                altaz_tgt_mount = self.model._world_to_mount_altaz(altaz_tgt)
+                altaz_cur_mount = self.model._world_to_mount_altaz(altaz_cur)
+                d_altaz_vec = np.array(
+                    [
+                        _wrap_deg_180(float(altaz_tgt_mount[0]) - float(altaz_cur_mount[0])),
+                        float(altaz_tgt_mount[1]) - float(altaz_cur_mount[1]),
+                    ],
+                    dtype=np.float64,
+                )
                 J = self.model.J_deg_per_step
                 try:
                     invJ = np.linalg.inv(J)
@@ -2598,9 +2656,11 @@ class GoToController:
 
                 # Predict after move to enforce ALT bounds.
                 # (We clamp ALT delta if needed. AZ is free.)
-                pred_after = altaz_cur.copy()
-                pred_after[0] = _wrap_deg_360(float(pred_after[0]) + float((J @ dsteps)[0]))
-                pred_after[1] = float(pred_after[1]) + float((J @ dsteps)[1])
+                pred_after_mount = altaz_cur_mount.copy()
+                d_mount_pred = J @ dsteps
+                pred_after_mount[0] = _wrap_deg_360(float(pred_after_mount[0]) + float(d_mount_pred[0]))
+                pred_after_mount[1] = float(pred_after_mount[1]) + float(d_mount_pred[1])
+                pred_after = self.model._mount_to_world_altaz(pred_after_mount)
 
                 if pred_after[1] < float(self.cfg.alt_min_deg) or pred_after[1] > float(self.cfg.alt_max_deg):
                     # Scale down ALT component only.
@@ -2610,7 +2670,7 @@ class GoToController:
                     delta_alt_allowed = float(alt_target - float(altaz_cur[1]))
 
                     # Solve for a scale alpha on dsteps such that ALT change matches allowed.
-                    dalt_pred = float((J @ dsteps)[1])
+                    dalt_pred = float(pred_after[1] - float(altaz_cur[1]))
                     if abs(dalt_pred) > 1e-12:
                         alpha = float(delta_alt_allowed / dalt_pred)
                         alpha = _clamp(alpha, -1.0, 1.0)
@@ -2951,8 +3011,8 @@ class GoToController:
                 ang = random.uniform(0.0, 2.0 * math.pi)
                 radius = math.sqrt(random.random()) * max_radius
 
-                daz_deg = radius * math.cos(ang)
-                dalt_deg = radius * math.sin(ang)
+                daz_mount_deg = radius * math.cos(ang)
+                dalt_mount_deg = radius * math.sin(ang)
 
                 J = self.model.J_deg_per_step
                 try:
@@ -2964,7 +3024,7 @@ class GoToController:
                     J = self.model.J_deg_per_step
                     invJ = np.linalg.inv(J)
 
-                dsteps = invJ @ np.array([daz_deg, dalt_deg], dtype=np.float64)
+                dsteps = invJ @ np.array([daz_mount_deg, dalt_mount_deg], dtype=np.float64)
 
                 # Commanded steps are integers; use the same for prediction + sampling
                 dsteps = np.array([float(int(round(dsteps[0]))), float(int(round(dsteps[1])))], dtype=np.float64)
@@ -2976,15 +3036,20 @@ class GoToController:
                 if altaz_cur is None:
                     out["status"] = "ERR_NO_CURRENT"
                     return out
+                altaz_cur_mount = self.model._world_to_mount_altaz(altaz_cur)
 
-                pred_after = altaz_cur.copy()
-                pred_after[0] = _wrap_deg_360(float(pred_after[0]) + float((J @ dsteps)[0]))
-                pred_after[1] = float(pred_after[1]) + float((J @ dsteps)[1])
+                pred_after_mount = altaz_cur_mount.copy()
+                d_mount_pred = J @ dsteps
+                pred_after_mount[0] = _wrap_deg_360(float(pred_after_mount[0]) + float(d_mount_pred[0]))
+                pred_after_mount[1] = float(pred_after_mount[1]) + float(d_mount_pred[1])
+                pred_after = self.model._mount_to_world_altaz(pred_after_mount)
                 if pred_after[1] < float(self.cfg.alt_min_deg) or pred_after[1] > float(self.cfg.alt_max_deg):
                     # flip the ALT component
                     dsteps[1] *= -1.0
-                    pred_after[1] = float(altaz_cur[1]) + float((J @ dsteps)[1])
-                    pred_after[1] = _clamp(pred_after[1], self.cfg.alt_min_deg, self.cfg.alt_max_deg)
+                    d_mount_pred = J @ dsteps
+                    pred_after_mount[0] = _wrap_deg_360(float(altaz_cur_mount[0]) + float(d_mount_pred[0]))
+                    pred_after_mount[1] = float(altaz_cur_mount[1]) + float(d_mount_pred[1])
+                    pred_after = self.model._mount_to_world_altaz(pred_after_mount)
 
                 if stop is not None:
                     try:
@@ -3024,11 +3089,12 @@ class GoToController:
                     obstime=_now_time(),
                 )
 
-                # Measured delta (wrap az)
-                daltaz_meas = np.array(
+                # Measured mount-frame delta (J is modeled in mount frame).
+                altaz_new_mount = self.model._world_to_mount_altaz(altaz_new)
+                daltaz_meas_mount = np.array(
                     [
-                        _wrap_deg_180(float(altaz_new[0]) - float(altaz_cur[0])),
-                        float(altaz_new[1]) - float(altaz_cur[1]),
+                        _wrap_deg_180(float(altaz_new_mount[0]) - float(altaz_cur_mount[0])),
+                        float(altaz_new_mount[1]) - float(altaz_cur_mount[1]),
                     ],
                     dtype=np.float64,
                 )
@@ -3036,7 +3102,7 @@ class GoToController:
                 # Measured step delta (what we commanded this sample)
                 dsteps_meas = np.array([float(dsteps[0]), float(dsteps[1])], dtype=np.float64)
 
-                self.model.add_calibration_sample(dsteps_meas, daltaz_meas)
+                self.model.add_calibration_sample(dsteps_meas, daltaz_meas_mount)
                 self.model.apply_plate_solve(altaz_new)
 
             # Fit
@@ -3634,21 +3700,22 @@ class GoToWorker(BaseWorker):
         roll_window = int(params.get("roll_window", 60))
         roll_frames = int(params.get("roll_frames", max(roll_window + 5, 80)))
         roll_dt_min = float(params.get("roll_dt_min_s", 0.0))
-        roll_timeout_s = float(params.get("roll_capture_timeout_s", 12.0))
+        roll_timeout_s = float(params.get("roll_capture_timeout_s", 18.0))
         roll_min_sources = int(params.get("roll_min_sources", 1))
 
         roll_rate_steps_s = float(
-            params.get("roll_rate_steps_s", min(40.0, float(getattr(mount_cfg, "default_rate", 80.0))))
+            params.get("roll_rate_steps_s", min(10.0, float(getattr(mount_cfg, "default_rate", 80.0))))
         )
         roll_rate_steps_s = abs(float(roll_rate_steps_s))
-        roll_rate_max_steps_s = float(params.get("roll_rate_max_steps_s", 50.0))
-        roll_rate_min_steps_s = float(params.get("roll_rate_min_steps_s", 10.0))
-        roll_rate_backoff = float(params.get("roll_rate_backoff", 0.65))
-        roll_rate_attempts = int(params.get("roll_rate_attempts", 3))
+        roll_rate_max_steps_s = float(params.get("roll_rate_max_steps_s", 10.0))
+        roll_rate_min_steps_s = float(params.get("roll_rate_min_steps_s", 2.5))
+        roll_rate_backoff = float(params.get("roll_rate_backoff", 0.70))
+        roll_rate_attempts = int(params.get("roll_rate_attempts", 4))
         roll_follow_vx = bool(params.get("roll_follow_vx", True))
         roll_ramp_s = float(params.get("roll_ramp_s", 0.6))
         roll_ramp_hz = float(params.get("roll_ramp_hz", 25.0))
         roll_settle_s = float(params.get("roll_settle_s", 0.2))
+        roll_timeout_slow_scale_max = float(params.get("roll_capture_timeout_slow_scale_max", 3.0))
 
         roll_stack_median_k = int(params.get("roll_stack_median_k", 3))
         roll_stack_smooth_k = int(params.get("roll_stack_smooth_k", 20))
@@ -3686,9 +3753,11 @@ class GoToWorker(BaseWorker):
         if roll_rate_steps_s < roll_rate_min_steps_s:
             roll_rate_steps_s = float(roll_rate_min_steps_s)
         if not np.isfinite(roll_rate_backoff) or not (0.0 < roll_rate_backoff < 1.0):
-            roll_rate_backoff = 0.65
+            roll_rate_backoff = 0.70
         if roll_rate_attempts < 1:
             roll_rate_attempts = 1
+        if (not np.isfinite(roll_timeout_slow_scale_max)) or roll_timeout_slow_scale_max < 1.0:
+            roll_timeout_slow_scale_max = 1.0
         if not np.isfinite(roll_max_speed_px_s) or roll_max_speed_px_s <= 0.0:
             out["status"] = "ERR_BAD_SPEED_LIMIT"
             log_error(self._out_log, "GoTo: Roll estimate failed (invalid roll_max_speed_px_s)")
@@ -3699,6 +3768,19 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_ROLL_METHOD"
             log_error(self._out_log, "GoTo: Roll estimate failed (all methods disabled)")
             return out
+
+        def _capture_timeout_for_rate(rate_steps_s: float) -> float:
+            timeout_s = float(roll_timeout_s)
+            if timeout_s <= 0.0:
+                return timeout_s
+            rate_abs = abs(float(rate_steps_s))
+            if (not np.isfinite(rate_abs)) or rate_abs <= 1e-9:
+                return timeout_s
+            scale = float(roll_rate_steps_s) / rate_abs
+            if not np.isfinite(scale) or scale < 1.0:
+                scale = 1.0
+            scale = min(float(roll_timeout_slow_scale_max), float(scale))
+            return float(timeout_s * scale)
 
         def _estimate_drift(frames: List[_AutocalFrame], label: str) -> Optional[np.ndarray]:
             v = None
@@ -3781,7 +3863,8 @@ class GoToWorker(BaseWorker):
             f"rate_steps_s={roll_rate_steps_s:.1f} ramp_s={roll_ramp_s:.2f} "
             f"use_stack={int(roll_use_stack)} use_line={int(roll_use_line)} "
             f"max_rel_std={roll_max_rel_std:.3f} max_speed={roll_max_speed_px_s:.1f} "
-            f"follow_vx={int(roll_follow_vx)} attempts={roll_rate_attempts} backoff={roll_rate_backoff:.2f}",
+            f"follow_vx={int(roll_follow_vx)} attempts={roll_rate_attempts} backoff={roll_rate_backoff:.2f} "
+            f"capture_timeout_s={roll_timeout_s:.2f} timeout_scale_max={roll_timeout_slow_scale_max:.2f}",
         )
 
         frames0 = self._autocal_capture_frames(
@@ -3821,10 +3904,12 @@ class GoToWorker(BaseWorker):
         rate_try = float(roll_rate_steps_s)
         for attempt_idx in range(int(roll_rate_attempts)):
             rate_signed = float(slew_sign * rate_try)
+            attempt_timeout_s = _capture_timeout_for_rate(rate_try)
             log_info(
                 self._out_log,
                 "GoTo: Roll slew attempt "
-                f"{attempt_idx + 1}/{int(roll_rate_attempts)} rate_steps_s={rate_signed:+.2f}",
+                f"{attempt_idx + 1}/{int(roll_rate_attempts)} rate_steps_s={rate_signed:+.2f} "
+                f"capture_timeout_s={attempt_timeout_s:.2f}",
             )
 
             frames_try: List[_AutocalFrame] = []
@@ -3840,7 +3925,7 @@ class GoToWorker(BaseWorker):
                     time.sleep(float(roll_settle_s))
                 frames_try = self._autocal_capture_frames(
                     n_frames=int(roll_frames),
-                    timeout_s=float(roll_timeout_s),
+                    timeout_s=float(attempt_timeout_s),
                     min_dt_s=float(roll_dt_min),
                     min_usable_frames=max(0, int(roll_frames)),
                     min_usable_sources=max(1, int(roll_min_sources)),
@@ -3874,12 +3959,14 @@ class GoToWorker(BaseWorker):
             if attempt_idx + 1 < int(roll_rate_attempts):
                 next_rate = float(rate_try) * float(roll_rate_backoff)
                 if next_rate < float(roll_rate_min_steps_s):
-                    log_error(
-                        self._out_log,
-                        "GoTo: Roll slew retry aborted (rate would be below min) "
-                        f"next={next_rate:.2f} min={float(roll_rate_min_steps_s):.2f}",
-                    )
-                    break
+                    if rate_try <= float(roll_rate_min_steps_s) + 1e-9:
+                        log_error(
+                            self._out_log,
+                            "GoTo: Roll slew retry aborted (already at min rate) "
+                            f"rate={rate_try:.2f} min={float(roll_rate_min_steps_s):.2f}",
+                        )
+                        break
+                    next_rate = float(roll_rate_min_steps_s)
                 log_info(
                     self._out_log,
                     "GoTo: Roll slew retry with lower rate "
@@ -4210,7 +4297,7 @@ class GoToWorker(BaseWorker):
         mount_cfg = self._get_mount_cfg()
         platesolving_cfg = self._get_platesolving_cfg()
         sep_cfg = self._get_sep_cfg()
-        observer = self._get_observer()
+        observer = _observer_without_refraction(self._get_observer())
 
         ps_overrides: Dict[str, Any] = {}
         if "N_seed" in params:
@@ -4574,7 +4661,7 @@ class GoToWorker(BaseWorker):
         mount_cfg = self._get_mount_cfg()
         platesolving_cfg = self._get_platesolving_cfg()
         sep_cfg = self._get_sep_cfg()
-        observer = self._get_observer()
+        observer = _observer_without_refraction(self._get_observer())
 
         ps_overrides: Dict[str, Any] = {}
         if "N_seed" in params:
@@ -4626,11 +4713,7 @@ class GoToWorker(BaseWorker):
         drift_stack_max_shift_cap = int(params.get("drift_stack_max_shift_cap", 200))
         drift_stack_profile_q = params.get("drift_stack_profile_q", None)
         drift_stack_use_subpixel = bool(params.get("drift_stack_use_subpixel", False))
-        drift_refract_enable = bool(params.get("drift_refract_enable", True))
-        drift_refract_P_hPa = float(params.get("drift_refract_P_hPa", 1013.25))
-        drift_refract_T_C = float(params.get("drift_refract_T_C", 15.0))
-        drift_refract_max_iter = int(params.get("drift_refract_max_iter", 12))
-        drift_refract_lm_lambda = float(params.get("drift_refract_lm_lambda", 1e-2))
+        drift_refract_enable = False
         pointing_method = str(params.get("pointing_method", "horiz_drift")).strip().lower()
         drift_pointing_omega = float(
             params.get(
@@ -4706,14 +4789,6 @@ class GoToWorker(BaseWorker):
                     drift_stack_profile_q = None
             except (TypeError, ValueError):
                 drift_stack_profile_q = None
-        if not np.isfinite(drift_refract_P_hPa) or drift_refract_P_hPa <= 0.0:
-            drift_refract_P_hPa = 1013.25
-        if not np.isfinite(drift_refract_T_C):
-            drift_refract_T_C = 15.0
-        if drift_refract_max_iter < 1:
-            drift_refract_max_iter = 1
-        if drift_refract_lm_lambda <= 0.0 or not np.isfinite(drift_refract_lm_lambda):
-            drift_refract_lm_lambda = 1e-2
 
         log_info(
             self._out_log,
@@ -4731,7 +4806,6 @@ class GoToWorker(BaseWorker):
             f"drift_stack_enable={int(bool(drift_stack_enable))} window={int(drift_stack_window)} "
             f"vmax={drift_stack_vmax_px_s:.1f} "
             f"drift_refract_enable={int(bool(drift_refract_enable))} "
-            f"P_hPa={drift_refract_P_hPa:.1f} T_C={drift_refract_T_C:.1f} "
             f"autocal_ps_radius_deg={autocal_solve_radius_deg:.2f} autocal_ps_gmax={autocal_solve_gmax:.2f} "
             f"autocal_ps_mode={autocal_ps_mode} "
             f"pointing_method={pointing_method} omega_arcsec_s={drift_pointing_omega:.3f} "
@@ -5148,18 +5222,6 @@ class GoToWorker(BaseWorker):
             def _solve_drift_to_azalt(v_xy: np.ndarray) -> List[Tuple[float, float]]:
                 vx = float(v_xy[0])
                 vy_up = float(v_xy[1])
-                if drift_refract_enable:
-                    return _drift_to_az_alt_refracted(
-                        vx,
-                        vy_up,
-                        phi_deg=float(getattr(observer, "lat_deg", 0.0)),
-                        omega_arcsec_s=float(drift_pointing_omega),
-                        scale_arcsec_per_px=arcsec_per_px,
-                        P_hPa=float(drift_refract_P_hPa),
-                        T_C=float(drift_refract_T_C),
-                        max_iter=int(drift_refract_max_iter),
-                        lm_lambda=float(drift_refract_lm_lambda),
-                    )
                 return _drift_to_az_alt(
                     vx,
                     vy_up,
@@ -5446,25 +5508,11 @@ class GoToWorker(BaseWorker):
                 loc = observer.location()
                 az0 = float(az_deg)
                 alt0 = float(alt_deg)
-                alt_true0 = alt0
-                if bool(getattr(observer, "refraction_enable", False)):
-                    alt_true0 = _unrefract_app_to_true(
-                        alt0,
-                        P_hPa=float(getattr(observer, "refraction_P_hPa", 1013.25)),
-                        T_C=float(getattr(observer, "refraction_T_C", 15.0)),
-                    )
-                altaz0 = AltAz(az=az0 * u.deg, alt=alt_true0 * u.deg, obstime=t0, location=loc)
+                altaz0 = AltAz(az=az0 * u.deg, alt=alt0 * u.deg, obstime=t0, location=loc)
                 coord = SkyCoord(altaz0)
                 altaz1 = coord.transform_to(AltAz(obstime=t0 + float(dt_s) * u.s, location=loc))
                 az1 = float(altaz1.az.deg)
-                alt_true1 = float(altaz1.alt.deg)
-                alt1 = alt_true1
-                if bool(getattr(observer, "refraction_enable", False)):
-                    alt1 = alt_true1 + _R_true_to_app_deg(
-                        alt_true1,
-                        P_hPa=float(getattr(observer, "refraction_P_hPa", 1013.25)),
-                        T_C=float(getattr(observer, "refraction_T_C", 15.0)),
-                    )
+                alt1 = float(altaz1.alt.deg)
                 daz = _local_wrap_deg_180(float(az1) - az0)
                 dalt = float(alt1) - alt0
                 return np.array(

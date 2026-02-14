@@ -164,6 +164,10 @@ class AppRunner:
         tracking_set_params(
             self._tracking_state,
             resp_min=self.cfg.tracking.resp_min,
+            align_median_k=int(self.cfg.stacking.align_median_k),
+            align_smooth_k=int(self.cfg.stacking.smooth_k),
+            align_max_shift_px=float(self.cfg.stacking.max_shift_px),
+            align_use_subpixel=bool(self.cfg.stacking.use_subpixel),
             sep_bw=int(self.cfg.sep.bw),
             sep_bh=int(self.cfg.sep.bh),
             sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
@@ -840,6 +844,10 @@ class AppRunner:
         tracking_set_params(
             self._tracking_state,
             resp_min=self.cfg.tracking.resp_min,
+            align_median_k=int(self.cfg.stacking.align_median_k),
+            align_smooth_k=int(self.cfg.stacking.smooth_k),
+            align_max_shift_px=float(self.cfg.stacking.max_shift_px),
+            align_use_subpixel=bool(self.cfg.stacking.use_subpixel),
             sep_bw=int(self.cfg.sep.bw),
             sep_bh=int(self.cfg.sep.bh),
             sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
@@ -851,6 +859,13 @@ class AppRunner:
     def _reset_stacking_defaults(self) -> None:
         self.cfg.stacking = replace(self.default_cfg.stacking)
         self._stacking.engine.configure_from_cfg()
+        tracking_set_params(
+            self._tracking_state,
+            align_median_k=int(self.cfg.stacking.align_median_k),
+            align_smooth_k=int(self.cfg.stacking.smooth_k),
+            align_max_shift_px=float(self.cfg.stacking.max_shift_px),
+            align_use_subpixel=bool(self.cfg.stacking.use_subpixel),
+        )
 
     def _reset_platesolving_defaults(self) -> None:
         with self._platesolving_cfg_lock:
@@ -1094,9 +1109,17 @@ class AppRunner:
                 az = float(st.goto.pointing_az_deg) % 360.0
                 alt = float(np.clip(float(st.goto.pointing_alt_deg), -90.0, 90.0))
 
+        def _coord_token(value: float, *, signed: bool) -> str:
+            if not np.isfinite(value):
+                return "NA"
+            if signed:
+                sign = "m" if value < 0.0 else "p"
+                return f"{sign}{abs(value):05.2f}".replace(".", "p")
+            return f"{value:06.2f}".replace(".", "p")
+
         stamp = capture_dt.strftime("%Y%m%d_%H%M%S")
-        az_txt = "NA" if not np.isfinite(az) else f"{az:06.2f}"
-        alt_txt = "NA" if not np.isfinite(alt) else f"{alt:+06.2f}"
+        az_txt = _coord_token(az, signed=False)
+        alt_txt = _coord_token(alt, signed=True)
         return f"{safe_prefix}_{stamp}_az{az_txt}_alt{alt_txt}"
 
     def _save_stacking(self, out_dir: str, basename: str, fmt: str) -> None:
@@ -1581,6 +1604,17 @@ class AppRunner:
         if t == ActionType.STACKING_SET_PARAMS:
             if isinstance(p, dict):
                 self._stacking.set_params(**p)
+                align_updates = {}
+                if "align_median_k" in p:
+                    align_updates["align_median_k"] = int(self.cfg.stacking.align_median_k)
+                if "smooth_k" in p:
+                    align_updates["align_smooth_k"] = int(self.cfg.stacking.smooth_k)
+                if "max_shift_px" in p:
+                    align_updates["align_max_shift_px"] = float(self.cfg.stacking.max_shift_px)
+                if "use_subpixel" in p:
+                    align_updates["align_use_subpixel"] = bool(self.cfg.stacking.use_subpixel)
+                if align_updates:
+                    tracking_set_params(self._tracking_state, **align_updates)
                 log_info(self.out_log, f"Stacking: SET_PARAMS {list(p.keys())}")
             return
 

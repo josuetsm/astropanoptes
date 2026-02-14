@@ -1156,20 +1156,30 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_reset_goto = QPushButton("Reset")
         self.btn_home = QPushButton("Home")
 
-        rowb = QHBoxLayout()
+        rowb_top = QHBoxLayout()
         for button in [
             self.btn_goto,
             self.btn_cancel,
             self.btn_autocal,
             self.btn_roll,
+            self.btn_home,
+        ]:
+            rowb_top.addWidget(button)
+        rowb_top.addStretch(1)
+
+        rowb_bottom = QHBoxLayout()
+        for button in [
             self.btn_fit_model,
             self.btn_list_samples,
             self.btn_prune_outliers,
             self.btn_reset_goto,
-            self.btn_home,
         ]:
-            rowb.addWidget(button)
-        rowb.addStretch(1)
+            rowb_bottom.addWidget(button)
+        rowb_bottom.addStretch(1)
+
+        rowb = QVBoxLayout()
+        rowb.addLayout(rowb_top)
+        rowb.addLayout(rowb_bottom)
 
         self.btn_goto.clicked.connect(self._goto_start)
         self.btn_cancel.clicked.connect(self._goto_cancel)
@@ -1346,7 +1356,7 @@ class AstroPanoptesWindow(QMainWindow):
 
     def _stacking_save(self) -> None:
         self.runner.request_stacking_save(out_dir="stack_output", basename="stack", fmt="png")
-        self._log("[stacking] Save Stack -> stack_output/stack_YYYYMMDD_HHMMSS_azXXX_altYYY.{raw.npy,png}")
+        self._log("[stacking] Save Stack -> stack_output/stack_YYYYMMDD_HHMMSS_az123p45_altp67p89.{raw.npy,png}")
 
     def _platesolve_start(self) -> None:
         target = self.ed_ps_target.text().strip()

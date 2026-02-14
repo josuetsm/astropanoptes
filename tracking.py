@@ -8,6 +8,11 @@ import numpy as np
 from logging_utils import log_error
 from sep_utils import sep_detect_from_raw16
 
+try:
+    import cv2
+except Exception:  # pragma: no cover - runtime fallback for limited envs
+    cv2 = None
+
 
 # ============================================================
 # Config dataclasses
@@ -51,6 +56,14 @@ class SepTrackingConfig:
 
 
 @dataclass
+class AlignmentConfig:
+    median_k: int = 3
+    smooth_k: int = 30
+    max_shift_px: float = 50.0
+    use_subpixel: bool = False
+
+
+@dataclass
 class CalibrationConfig:
     """
     Modelo: v_pxps = A * u + b
@@ -72,6 +85,7 @@ class AutoCalConfig:
 @dataclass
 class TrackingConfig:
     resp_min: float = 0.06
+    align: AlignmentConfig = field(default_factory=AlignmentConfig)
     keyframe: KeyframeConfig = field(default_factory=KeyframeConfig)
     pi: PIConfig = field(default_factory=PIConfig)
     rate: RateLimiterConfig = field(default_factory=RateLimiterConfig)
@@ -107,8 +121,11 @@ class TrackingState:
 
     # incremental tracking
     prev_obj_xy: Optional[np.ndarray] = None
+    prev_align_u16: Optional[np.ndarray] = None
     prev_t: Optional[float] = None
     fail: int = 0
+    last_dx_inc: float = 0.0
+    last_dy_inc: float = 0.0
 
     # filtered velocity estimate (px/s)
     vpx: float = 0.0
@@ -119,6 +136,7 @@ class TrackingState:
 
     # keyframe & absolute correction
     key_obj_xy: Optional[np.ndarray] = None
+    key_align_u16: Optional[np.ndarray] = None
     key_t: Optional[float] = None
     x_hat: float = 0.0
     y_hat: float = 0.0
@@ -171,6 +189,17 @@ def clamp(x: float, lo: float, hi: float) -> float:
     return float(max(lo, min(hi, x)))
 
 
+def _ensure_raw16_bayer(frame: np.ndarray) -> np.ndarray:
+    arr = np.asarray(frame)
+    if arr.dtype != np.uint16:
+        raise TypeError(f"raw16 must be uint16, got {arr.dtype}")
+    if arr.ndim == 2:
+        return arr
+    if arr.ndim == 3 and arr.shape[2] == 1:
+        return arr[..., 0]
+    raise ValueError(f"raw16 must have shape (H,W) or (H,W,1), got {arr.shape}")
+
+
 def rate_ramp(cur: float, target: float, max_delta: float) -> float:
     d = target - cur
     d = clamp(d, -max_delta, +max_delta)
@@ -186,6 +215,141 @@ def compute_A_pinv_dls(A: np.ndarray, lam: float) -> np.ndarray:
     I = np.eye(2, dtype=np.float64)
     M = AtA + (float(lam) * float(lam)) * I
     return np.linalg.inv(M) @ A.T
+
+
+def _odd_ksize(v: int, *, minimum: int = 1) -> int:
+    k = max(int(v), int(minimum))
+    if (k % 2) == 0:
+        k += 1
+    return k
+
+
+def _smooth_kernel(k: int) -> np.ndarray:
+    x = np.ones(max(1, int(k)), dtype=np.float64)
+    return x / x.sum()
+
+
+def _median_blur_u16(img_u16: np.ndarray, *, median_k: int) -> np.ndarray:
+    img = np.asarray(img_u16, dtype=np.uint16)
+    k = _odd_ksize(median_k, minimum=1)
+    if k <= 1:
+        return img
+    if cv2 is None:
+        return img
+    return cv2.medianBlur(img, k)
+
+
+def _profile_1d(img_u16: np.ndarray, which: str, *, median_k: int, kernel: np.ndarray) -> np.ndarray:
+    img = _median_blur_u16(img_u16, median_k=int(median_k))
+    if which == "dx":
+        p = img.max(axis=0).astype(np.float64, copy=False)
+    elif which == "dy":
+        p = img.max(axis=1).astype(np.float64, copy=False)
+    else:
+        raise ValueError("which must be dx or dy")
+    return np.convolve(p, kernel, mode="same")
+
+
+def _shift_1d_centered(
+    p_ref: np.ndarray,
+    p_cur: np.ndarray,
+    *,
+    center: float,
+    max_shift: int,
+    subpixel: bool,
+) -> Tuple[float, float]:
+    if not np.isfinite(center):
+        center = 0.0
+
+    a = np.asarray(p_cur, dtype=np.float64)
+    b = np.asarray(p_ref, dtype=np.float64)
+    a = a - float(np.mean(a))
+    b = b - float(np.mean(b))
+
+    norm = float(np.linalg.norm(a) * np.linalg.norm(b))
+    if (not np.isfinite(norm)) or norm <= 1e-12:
+        return 0.0, 0.0
+
+    corr = np.correlate(a, b, mode="full")
+    if corr.size == 0 or (not np.any(np.isfinite(corr))):
+        return 0.0, 0.0
+
+    L = len(a)
+    shifts = np.arange(-(L - 1), L, dtype=np.float64)
+    lo = float(center) - float(max_shift)
+    hi = float(center) + float(max_shift)
+    mask = (shifts >= lo) & (shifts <= hi)
+    if np.any(mask):
+        corr[~mask] = -np.inf
+
+    i0 = int(np.argmax(corr))
+    if not np.isfinite(corr[i0]):
+        return 0.0, 0.0
+    shift_int = i0 - (L - 1)
+    resp = clamp(float(corr[i0]) / norm, 0.0, 1.0)
+
+    if not subpixel:
+        return float(shift_int), float(resp)
+
+    delta = 0.0
+    if 1 <= i0 < (len(corr) - 1):
+        y0, y1, y2 = float(corr[i0 - 1]), float(corr[i0]), float(corr[i0 + 1])
+        if np.isfinite(y0) and np.isfinite(y1) and np.isfinite(y2):
+            denom = y0 - 2.0 * y1 + y2
+            if np.isfinite(denom) and abs(denom) > 1e-12:
+                cand = 0.5 * (y0 - y2) / denom
+                if np.isfinite(cand):
+                    delta = cand
+
+    out = float(shift_int + delta)
+    if not np.isfinite(out):
+        out = float(shift_int)
+    return out, float(resp)
+
+
+def estimate_shift_from_profile_alignment(
+    ref_u16: np.ndarray,
+    cur_u16: np.ndarray,
+    *,
+    center_dx: float,
+    center_dy: float,
+    max_shift_px: float,
+    median_k: int,
+    smooth_k: int,
+    use_subpixel: bool,
+) -> Tuple[float, float, float]:
+    ref = _ensure_raw16_bayer(ref_u16)
+    cur = _ensure_raw16_bayer(cur_u16)
+    if ref.shape != cur.shape:
+        return 0.0, 0.0, 0.0
+
+    kernel = _smooth_kernel(int(smooth_k))
+    max_shift = max(1, int(round(float(max_shift_px))))
+
+    dx, rx = _shift_1d_centered(
+        _profile_1d(ref, "dx", median_k=int(median_k), kernel=kernel),
+        _profile_1d(cur, "dx", median_k=int(median_k), kernel=kernel),
+        center=float(center_dx),
+        max_shift=max_shift,
+        subpixel=bool(use_subpixel),
+    )
+    dy, ry = _shift_1d_centered(
+        _profile_1d(ref, "dy", median_k=int(median_k), kernel=kernel),
+        _profile_1d(cur, "dy", median_k=int(median_k), kernel=kernel),
+        center=float(center_dy),
+        max_shift=max_shift,
+        subpixel=bool(use_subpixel),
+    )
+
+    if not np.isfinite(dx):
+        dx = 0.0
+    if not np.isfinite(dy):
+        dy = 0.0
+
+    resp = float(min(rx, ry))
+    if not np.isfinite(resp):
+        resp = 0.0
+    return float(dx), float(dy), float(resp)
 
 
 def _extract_obj_xy_and_flux(obj_xy: np.ndarray) -> Tuple[np.ndarray, np.ndarray]:
@@ -382,8 +546,11 @@ def make_tracking_state(cfg: Optional[TrackingConfig] = None) -> TrackingState:
 
 def reset_tracker(state: TrackingState, *, now_t: float, mode: str = "STABILIZE") -> None:
     state.prev_obj_xy = None
+    state.prev_align_u16 = None
     state.prev_t = None
     state.fail = 0
+    state.last_dx_inc = 0.0
+    state.last_dy_inc = 0.0
     state.vpx = 0.0
     state.vpy = 0.0
     state.vx_inst = 0.0
@@ -396,6 +563,7 @@ def reset_tracker(state: TrackingState, *, now_t: float, mode: str = "STABILIZE"
     state.t_mode = float(now_t)
 
     state.key_obj_xy = None
+    state.key_align_u16 = None
     state.key_t = None
     state.x_hat = 0.0
     state.y_hat = 0.0
@@ -409,9 +577,14 @@ def reset_keyframe(
     state: TrackingState,
     obj_xy: Optional[np.ndarray],
     *,
+    align_u16: Optional[np.ndarray],
     now_t: float,
 ) -> None:
     state.key_obj_xy = obj_xy
+    if align_u16 is None:
+        state.key_align_u16 = None
+    else:
+        state.key_align_u16 = np.asarray(align_u16, dtype=np.uint16).copy()
     state.key_t = float(now_t)
     state.x_hat = 0.0
     state.y_hat = 0.0
@@ -431,6 +604,14 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
         try:
             if k == "resp_min":
                 cfg.resp_min = float(v)
+            elif k in ("align_median_k", "median_k"):
+                cfg.align.median_k = int(v)
+            elif k in ("align_smooth_k", "smooth_k"):
+                cfg.align.smooth_k = int(v)
+            elif k in ("align_max_shift_px", "max_shift_px"):
+                cfg.align.max_shift_px = float(v)
+            elif k in ("align_use_subpixel", "use_subpixel"):
+                cfg.align.use_subpixel = bool(v)
             elif k == "kp":
                 cfg.pi.kp = float(v)
             elif k == "ki":
@@ -471,16 +652,19 @@ def tracking_step(
     """
     Un paso de tracking puro (sin tocar hardware):
     - SEP sobre RAW16 con median blur k=3 para hotpixels.
-    - Alineación por centroides con matching por flux (fuentes brillantes) incremental (v)
-      + keyframe abs correction (x_hat/y_hat).
+    - Alineación por perfiles 1D (misma estrategia que stacking):
+      max por eje + suavizado + correlación cruzada centrada.
+      Se usa tanto para incremental (v) como para corrección absoluta contra keyframe.
     - Si tracking_enabled y hay A_pinv (auto), computa RATE targets (pero NO envía).
       AppRunner es quien envía RATE al Arduino.
 
     raw16 debe ser un frame Bayer RAW16 uint16.
     """
+    raw_align = _ensure_raw16_bayer(raw16)
+
     cfg_sep = state.cfg.sep_track
     _, _, objects, _ = sep_detect_from_raw16(
-        raw16,
+        raw_align,
         sep_bw=int(cfg_sep.bw),
         sep_bh=int(cfg_sep.bh),
         sep_thresh_sigma=float(cfg_sep.thresh_sigma),
@@ -498,13 +682,14 @@ def tracking_step(
 
     # keyframe init/pending
     if state.key_obj_xy is None:
-        reset_keyframe(state, obj_xy, now_t=now_t)
+        reset_keyframe(state, obj_xy, align_u16=raw_align, now_t=now_t)
     elif isinstance(state.key_obj_xy, str) and state.key_obj_xy == "PENDING":
-        reset_keyframe(state, obj_xy, now_t=now_t)
+        reset_keyframe(state, obj_xy, align_u16=raw_align, now_t=now_t)
 
     # first frame
-    if state.prev_obj_xy is None or state.prev_t is None:
+    if state.prev_align_u16 is None or state.prev_t is None:
         state.prev_obj_xy = obj_xy
+        state.prev_align_u16 = raw_align.copy()
         state.prev_t = now_t
         return TrackingOutput(
             ok=True,
@@ -533,13 +718,21 @@ def tracking_step(
         1.0,
         4.0,
     )
-    # vector de deriva (px) por matching de flujo
-    dx_inc, dy_inc, resp_inc, _ = estimate_shift_from_flux_match(
-        state.prev_obj_xy,
-        obj_xy,
-        max_shift_px=max_shift_inc,
-        min_sources=int(state.cfg.sep_track.min_sources),
+    max_shift_inc = min(max_shift_inc, float(state.cfg.align.max_shift_px))
+
+    # Vector de deriva (px) por correlación de perfiles, centrada en el último shift.
+    dx_inc, dy_inc, resp_inc = estimate_shift_from_profile_alignment(
+        state.prev_align_u16,
+        raw_align,
+        center_dx=float(state.last_dx_inc),
+        center_dy=float(state.last_dy_inc),
+        max_shift_px=float(max_shift_inc),
+        median_k=int(state.cfg.align.median_k),
+        smooth_k=int(state.cfg.align.smooth_k),
+        use_subpixel=bool(state.cfg.align.use_subpixel),
     )
+    state.last_dx_inc = float(dx_inc)
+    state.last_dy_inc = float(dy_inc)
     mag_inc = float(np.hypot(dx_inc, dy_inc))
 
     good_inc = (
@@ -569,6 +762,7 @@ def tracking_step(
 
     if good_inc:
         state.prev_obj_xy = obj_xy
+        state.prev_align_u16 = raw_align.copy()
         state.prev_t = now_t
 
     # fail reset
@@ -595,13 +789,17 @@ def tracking_step(
         )
 
     # ABS correction against keyframe
-    if isinstance(state.key_obj_xy, np.ndarray):
+    if state.key_align_u16 is not None:
         if (state.abs_last_t is None) or ((now_t - float(state.abs_last_t)) >= float(state.cfg.keyframe.abs_corr_every_s)):
-            dx_abs, dy_abs, resp_abs, _ = estimate_shift_from_flux_match(
-                state.key_obj_xy,
-                obj_xy,
+            dx_abs, dy_abs, resp_abs = estimate_shift_from_profile_alignment(
+                state.key_align_u16,
+                raw_align,
+                center_dx=float(state.x_hat),
+                center_dy=float(state.y_hat),
                 max_shift_px=float(state.cfg.keyframe.abs_max_px),
-                min_sources=int(state.cfg.sep_track.min_sources),
+                median_k=int(state.cfg.align.median_k),
+                smooth_k=int(state.cfg.align.smooth_k),
+                use_subpixel=bool(state.cfg.align.use_subpixel),
             )
             state.abs_last_t = now_t
             state.abs_resp_last = float(resp_abs)
@@ -662,7 +860,7 @@ def tracking_step(
         # keyframe refresh when stable
         e_mag = float(np.hypot(ex, ey))
         if (e_mag <= float(state.cfg.keyframe.keyframe_refresh_px)) and (float(state.abs_resp_last) >= float(state.cfg.keyframe.abs_resp_min)):
-            reset_keyframe(state, obj_xy, now_t=now_t)
+            reset_keyframe(state, obj_xy, align_u16=raw_align, now_t=now_t)
 
     else:
         # no calib -> hold rates at 0

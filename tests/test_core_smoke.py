@@ -2,10 +2,20 @@ import unittest
 
 import numpy as np
 import pandas as pd
+from astropy.coordinates import SkyCoord
+from astropy.time import Time
 
 from config import AppConfig
-from goto import GoToModel, MountKinematics, _roll_deg_from_drift_delta, _roll_equivalent_near_reference_deg
-from platesolving import select_guide_star_indices
+from goto import (
+    GoToModel,
+    MountKinematics,
+    _roll_deg_from_drift_delta,
+    _roll_equivalent_near_reference_deg,
+    _rotvec_deg_to_rotation_matrix,
+    _rotate_altaz_deg,
+    icrs_to_altaz_deg,
+)
+from platesolving import ObserverConfig, select_guide_star_indices
 from stacking import StackEngine
 from tracking import make_tracking_state, tracking_step, tracking_set_params
 
@@ -261,6 +271,66 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(model.J_deg_per_step[0, 1], j_true[0, 1], places=4)
         self.assertAlmostEqual(model.J_deg_per_step[1, 0], j_true[1, 0], places=4)
         self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_true[1, 1], places=4)
+
+    def test_goto_model_manual_fit_rotation_tilt_is_limited(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        model.max_tilt_ns_oe_deg = 2.0
+
+        j_true = np.array([[0.0011, 0.0002], [-0.0001, 0.0010]], dtype=np.float64)
+        base_steps = np.array([2400.0, -800.0], dtype=np.float64)
+        base_mount = np.array([170.0, 42.0], dtype=np.float64)
+        # Intentionally above tilt limits; fit must clamp x/y to +/-2 deg.
+        r_true = _rotvec_deg_to_rotation_matrix(np.array([5.0, -4.0, 12.0], dtype=np.float64))
+        deltas = np.array(
+            [
+                [-900.0, -500.0],
+                [-600.0, 400.0],
+                [-200.0, -300.0],
+                [250.0, 300.0],
+                [700.0, -450.0],
+                [1100.0, 800.0],
+            ],
+            dtype=np.float64,
+        )
+
+        for d_az, d_alt in deltas:
+            d_steps = np.array([d_az, d_alt], dtype=np.float64)
+            model.steps_est = base_steps + d_steps
+            d_mount = j_true @ d_steps
+            az_mount = float(base_mount[0] + d_mount[0]) % 360.0
+            alt_mount = float(base_mount[1] + d_mount[1])
+            world = _rotate_altaz_deg(np.array([az_mount, alt_mount], dtype=np.float64), r_true)
+            model.add_manual_sample(world, theta_deg=0.0)
+
+        ok = model.fit_J_from_manual_samples(min_samples=5, ridge=1e-9)
+        self.assertTrue(ok)
+        self.assertLessEqual(abs(float(model.model_pitch_deg)), 2.000001)
+        self.assertLessEqual(abs(float(model.model_yaw_deg)), 2.000001)
+
+    def test_goto_icrs_to_altaz_ignores_refraction_flag(self) -> None:
+        coord = SkyCoord(ra=210.0, dec=-20.0, unit="deg", frame="icrs")
+        t = Time("2026-02-13T03:00:00", format="isot", scale="utc")
+        obs_no = ObserverConfig(
+            lat_deg=-30.0,
+            lon_deg=-70.0,
+            height_m=1000.0,
+            refraction_enable=False,
+            refraction_P_hPa=850.0,
+            refraction_T_C=5.0,
+        )
+        obs_yes = ObserverConfig(
+            lat_deg=-30.0,
+            lon_deg=-70.0,
+            height_m=1000.0,
+            refraction_enable=True,
+            refraction_P_hPa=850.0,
+            refraction_T_C=5.0,
+        )
+        altaz_no = icrs_to_altaz_deg(coord, observer=obs_no, obstime=t)
+        altaz_yes = icrs_to_altaz_deg(coord, observer=obs_yes, obstime=t)
+        self.assertAlmostEqual(float(altaz_no[0]), float(altaz_yes[0]), places=9)
+        self.assertAlmostEqual(float(altaz_no[1]), float(altaz_yes[1]), places=9)
 
 
 if __name__ == "__main__":
