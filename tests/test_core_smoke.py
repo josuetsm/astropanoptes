@@ -1,5 +1,7 @@
 import unittest
 import time
+import os
+import tempfile
 
 import numpy as np
 import pandas as pd
@@ -233,6 +235,100 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertEqual(model.model_fit_rms_az_deg, 0.0)
         self.assertEqual(model.model_fit_rms_alt_deg, 0.0)
         self.assertEqual(model.model_fit_rms_arcsec, 0.0)
+
+    def test_goto_model_restore_last_log_recovers_latest_state(self) -> None:
+        prev_log_dir = os.environ.get("ASTROPANOPTES_GOTO_LOG_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = tmpdir
+
+                source_model = GoToModel()
+                source_model.init_from_mechanics()
+
+                source_model.steps_est = np.array([1000.0, 2000.0], dtype=np.float64)
+                source_model.add_manual_sample(np.array([120.0, 45.0], dtype=np.float64), theta_deg=5.0)
+                self.assertTrue(source_model.sync_from_latest_manual_sample())
+
+                source_model.steps_est = np.array([1350.0, 1780.0], dtype=np.float64)
+                source_model.add_manual_sample(np.array([121.2, 44.7], dtype=np.float64), theta_deg=6.0)
+
+                J_restore = np.array([[0.00123, 0.00011], [-0.00007, 0.00101]], dtype=np.float64)
+                R_restore = _rotvec_deg_to_rotation_matrix(np.array([0.3, -0.2, 0.7], dtype=np.float64))
+
+                source_model.J_deg_per_step = J_restore.copy()
+                source_model.J00_err = 1.0e-6
+                source_model.J01_err = 2.0e-6
+                source_model.J10_err = 3.0e-6
+                source_model.J11_err = 4.0e-6
+                source_model.model_non_orthogonality_deg = 0.12
+                source_model.model_non_orthogonality_err_deg = 0.03
+                source_model.model_roll_deg = 6.5
+                source_model.model_roll_err_deg = 0.4
+                source_model.model_roll_samples = 2
+                source_model.model_pitch_deg = 0.15
+                source_model.model_pitch_err_deg = 0.02
+                source_model.model_yaw_deg = -0.10
+                source_model.model_yaw_err_deg = 0.02
+                source_model.model_fit_samples = 2
+                source_model.model_fit_rms_az_deg = 0.010
+                source_model.model_fit_rms_alt_deg = 0.020
+                source_model.model_fit_rms_arcsec = 22.0
+                source_model.R_mount_to_world = R_restore.copy()
+                source_model._log_fit_csv(
+                    fit_kind="manual",
+                    ok=True,
+                    reason="OK",
+                    min_samples=2,
+                    ridge=1e-12,
+                    total_samples=2,
+                    used_samples=2,
+                )
+
+                restored = GoToModel()
+                restored.init_from_mechanics()
+                out = restored.restore_from_latest_logs()
+
+                self.assertTrue(bool(out.get("ok", False)))
+                self.assertEqual(str(out.get("status")), "OK")
+                self.assertEqual(int(out.get("manual_samples", -1)), 2)
+                self.assertTrue(restored.synced)
+                self.assertEqual(len(restored._manual_steps_abs), 2)
+                np.testing.assert_allclose(
+                    restored.ref_steps,
+                    np.array([1000.0, 2000.0], dtype=np.float64),
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+                np.testing.assert_allclose(
+                    restored.steps_est,
+                    np.array([1350.0, 1780.0], dtype=np.float64),
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+                np.testing.assert_allclose(restored.J_deg_per_step, J_restore, rtol=0.0, atol=1e-15)
+                np.testing.assert_allclose(restored.R_mount_to_world, R_restore, rtol=0.0, atol=1e-12)
+                self.assertAlmostEqual(restored.model_fit_rms_arcsec, 22.0, places=9)
+        finally:
+            if prev_log_dir is None:
+                os.environ.pop("ASTROPANOPTES_GOTO_LOG_DIR", None)
+            else:
+                os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = prev_log_dir
+
+    def test_goto_model_restore_last_log_handles_no_logs(self) -> None:
+        prev_log_dir = os.environ.get("ASTROPANOPTES_GOTO_LOG_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = tmpdir
+                model = GoToModel()
+                model.init_from_mechanics()
+                out = model.restore_from_latest_logs()
+                self.assertFalse(bool(out.get("ok", False)))
+                self.assertEqual(str(out.get("status")), "NO_LOGS")
+        finally:
+            if prev_log_dir is None:
+                os.environ.pop("ASTROPANOPTES_GOTO_LOG_DIR", None)
+            else:
+                os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = prev_log_dir
 
     def test_goto_model_manual_fit_rejects_outlier_sample(self) -> None:
         model = GoToModel()

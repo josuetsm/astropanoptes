@@ -1157,6 +1157,7 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_fit_model = QPushButton("Fit GoTo Model")
         self.btn_list_samples = QPushButton("Listar Muestras")
         self.btn_prune_outliers = QPushButton("Eliminar Outliers")
+        self.btn_restore_last_log = QPushButton("Cargar Último Registro")
         self.btn_reset_goto = QPushButton("Reset")
         self.btn_home = QPushButton("Home")
 
@@ -1176,6 +1177,7 @@ class AstroPanoptesWindow(QMainWindow):
             self.btn_fit_model,
             self.btn_list_samples,
             self.btn_prune_outliers,
+            self.btn_restore_last_log,
             self.btn_reset_goto,
         ]:
             rowb_bottom.addWidget(button)
@@ -1192,6 +1194,7 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_fit_model.clicked.connect(self._goto_fit_model)
         self.btn_list_samples.clicked.connect(self._goto_list_samples)
         self.btn_prune_outliers.clicked.connect(self._goto_prune_outliers)
+        self.btn_restore_last_log.clicked.connect(self._goto_restore_last_log)
         self.btn_reset_goto.clicked.connect(self._goto_reset)
         self.btn_home.clicked.connect(self._home)
 
@@ -1461,6 +1464,10 @@ class AstroPanoptesWindow(QMainWindow):
     def _goto_prune_outliers(self) -> None:
         self.runner.request_goto_prune_outliers()
         self._log("[goto] Eliminar muestras outliers")
+
+    def _goto_restore_last_log(self) -> None:
+        self.runner.request_goto_restore_last_log()
+        self._log("[goto] Cargar ultimo registro desde CSV (backup)")
 
     def _goto_reset(self) -> None:
         self.runner.request_goto_reset()

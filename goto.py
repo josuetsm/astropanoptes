@@ -1247,6 +1247,274 @@ class GoToModel:
         row.update(self._csv_rotation_values())
         _append_csv_log_row("goto_model_fit_log.csv", _GOTO_MODEL_FIT_CSV_FIELDS, row)
 
+    def restore_from_latest_logs(self, *, log_dir: Optional[str] = None) -> Dict[str, Any]:
+        """
+        Restore GoTo model state from the latest persisted CSV logs.
+
+        Manual samples are restored from the last contiguous sample_idx block
+        in ``goto_manual_samples.csv`` (last session-like segment).
+        Model/J state is restored from the latest valid row in
+        ``goto_model_fit_log.csv``.
+        """
+
+        def _as_float(value: Any, default: float = float("nan")) -> float:
+            try:
+                s = str(value).strip()
+                if s == "":
+                    return float(default)
+                return float(s)
+            except Exception:
+                return float(default)
+
+        def _as_int(value: Any, default: int = 0) -> int:
+            v = _as_float(value, float(default))
+            if not np.isfinite(v):
+                return int(default)
+            return int(round(float(v)))
+
+        def _as_bool(value: Any, default: bool = False) -> bool:
+            s = str(value).strip().lower()
+            if s in ("1", "true", "yes", "y", "on"):
+                return True
+            if s in ("0", "false", "no", "n", "off", ""):
+                return False
+            try:
+                return bool(int(float(s)))
+            except Exception:
+                return bool(default)
+
+        def _read_rows(path: str) -> List[Dict[str, str]]:
+            if not os.path.exists(path):
+                return []
+            rows: List[Dict[str, str]] = []
+            with _GOTO_CSV_LOG_LOCK:
+                with open(path, "r", newline="", encoding="utf-8") as f:
+                    for row in csv.DictReader(f):
+                        if row:
+                            rows.append(dict(row))
+            return rows
+
+        def _rotation_from_row(row: Dict[str, Any]) -> Optional[np.ndarray]:
+            vals = [
+                _as_float(row.get("R00", float("nan"))),
+                _as_float(row.get("R01", float("nan"))),
+                _as_float(row.get("R02", float("nan"))),
+                _as_float(row.get("R10", float("nan"))),
+                _as_float(row.get("R11", float("nan"))),
+                _as_float(row.get("R12", float("nan"))),
+                _as_float(row.get("R20", float("nan"))),
+                _as_float(row.get("R21", float("nan"))),
+                _as_float(row.get("R22", float("nan"))),
+            ]
+            if not all(np.isfinite(v) for v in vals):
+                return None
+            R = np.asarray(vals, dtype=np.float64).reshape(3, 3)
+            return _coerce_rotation_matrix(R)
+
+        base_dir = str(log_dir).strip() if log_dir is not None else _goto_logs_dir()
+        manual_path = os.path.join(base_dir, "goto_manual_samples.csv")
+        fit_path = os.path.join(base_dir, "goto_model_fit_log.csv")
+
+        manual_rows = _read_rows(manual_path)
+        fit_rows = _read_rows(fit_path)
+        if not manual_rows and not fit_rows:
+            return {
+                "ok": False,
+                "status": "NO_LOGS",
+                "manual_samples": 0,
+                "synced": bool(self.synced),
+            }
+
+        manual_entries: List[Dict[str, Any]] = []
+        for row in manual_rows:
+            sample_idx = _as_int(row.get("sample_idx", -1), -1)
+            steps_az = _as_float(row.get("steps_az", float("nan")))
+            steps_alt = _as_float(row.get("steps_alt", float("nan")))
+            az_deg = _as_float(row.get("az_deg", float("nan")))
+            alt_deg = _as_float(row.get("alt_deg", float("nan")))
+            if sample_idx <= 0:
+                continue
+            if not all(np.isfinite(v) for v in (steps_az, steps_alt, az_deg, alt_deg)):
+                continue
+            roll_deg = _as_float(row.get("roll_deg", float("nan")))
+            ref_steps_az = _as_float(row.get("ref_steps_az", 0.0), 0.0)
+            ref_steps_alt = _as_float(row.get("ref_steps_alt", 0.0), 0.0)
+            ref_az_mount = _as_float(row.get("ref_az_mount_deg", 0.0), 0.0)
+            ref_alt_mount = _as_float(row.get("ref_alt_mount_deg", 0.0), 0.0)
+            ts_unix = _as_float(row.get("ts_unix", float("nan")))
+            manual_entries.append(
+                {
+                    "sample_idx": int(sample_idx),
+                    "steps": np.array([steps_az, steps_alt], dtype=np.float64),
+                    "az_alt": np.array([_wrap_deg_360(az_deg), alt_deg], dtype=np.float64),
+                    "roll_deg": float(roll_deg),
+                    "synced": bool(_as_bool(row.get("synced", 0), False)),
+                    "ref_steps": np.array([ref_steps_az, ref_steps_alt], dtype=np.float64),
+                    "ref_az_alt_mount": np.array([_wrap_deg_360(ref_az_mount), ref_alt_mount], dtype=np.float64),
+                    "ts_unix": float(ts_unix) if np.isfinite(ts_unix) else float("nan"),
+                    "R": _rotation_from_row(row),
+                }
+            )
+
+        # Keep only the latest contiguous block by sample_idx (last session-like block).
+        manual_session: List[Dict[str, Any]] = []
+        if manual_entries:
+            expected = int(manual_entries[-1]["sample_idx"])
+            for entry in reversed(manual_entries):
+                if int(entry["sample_idx"]) != expected:
+                    break
+                manual_session.append(entry)
+                if expected <= 1:
+                    break
+                expected -= 1
+            manual_session.reverse()
+
+        fit_entry: Optional[Dict[str, Any]] = None
+        for row in reversed(fit_rows):
+            J00 = _as_float(row.get("J00", float("nan")))
+            J01 = _as_float(row.get("J01", float("nan")))
+            J10 = _as_float(row.get("J10", float("nan")))
+            J11 = _as_float(row.get("J11", float("nan")))
+            if not all(np.isfinite(v) for v in (J00, J01, J10, J11)):
+                continue
+            ts_unix = _as_float(row.get("ts_unix", float("nan")))
+            fit_entry = {
+                "J": np.array([[J00, J01], [J10, J11]], dtype=np.float64),
+                "J00_err": _as_float(row.get("J00_err", 0.0), 0.0),
+                "J01_err": _as_float(row.get("J01_err", 0.0), 0.0),
+                "J10_err": _as_float(row.get("J10_err", 0.0), 0.0),
+                "J11_err": _as_float(row.get("J11_err", 0.0), 0.0),
+                "model_fit_rms_az_deg": _as_float(row.get("model_fit_rms_az_deg", 0.0), 0.0),
+                "model_fit_rms_alt_deg": _as_float(row.get("model_fit_rms_alt_deg", 0.0), 0.0),
+                "model_fit_rms_arcsec": _as_float(row.get("model_fit_rms_arcsec", 0.0), 0.0),
+                "model_non_orthogonality_deg": _as_float(row.get("model_non_orthogonality_deg", 0.0), 0.0),
+                "model_non_orthogonality_err_deg": _as_float(row.get("model_non_orthogonality_err_deg", 0.0), 0.0),
+                "model_roll_deg": _as_float(row.get("model_roll_deg", 0.0), 0.0),
+                "model_roll_err_deg": _as_float(row.get("model_roll_err_deg", 0.0), 0.0),
+                "model_roll_samples": _as_int(row.get("model_roll_samples", 0), 0),
+                "model_pitch_deg": _as_float(row.get("model_pitch_deg", 0.0), 0.0),
+                "model_pitch_err_deg": _as_float(row.get("model_pitch_err_deg", 0.0), 0.0),
+                "model_yaw_deg": _as_float(row.get("model_yaw_deg", 0.0), 0.0),
+                "model_yaw_err_deg": _as_float(row.get("model_yaw_err_deg", 0.0), 0.0),
+                "model_fit_samples": _as_int(row.get("used_samples", row.get("model_fit_samples", 0)), 0),
+                "ts_unix": float(ts_unix) if np.isfinite(ts_unix) else float("nan"),
+                "R": _rotation_from_row(row),
+            }
+            break
+
+        if not manual_session and fit_entry is None:
+            return {
+                "ok": False,
+                "status": "NO_VALID_ROWS",
+                "manual_samples": 0,
+                "synced": bool(self.synced),
+            }
+
+        prev_steps = self.steps_est.copy()
+
+        self._calib_steps.clear()
+        self._calib_daltaz.clear()
+        self._manual_steps_abs.clear()
+        self._manual_az_alt_abs.clear()
+        self._manual_roll_deg_abs.clear()
+        self.steps_history.clear()
+
+        self.synced = False
+        self.ref_steps = prev_steps.copy()
+        self.ref_az_alt_deg = np.zeros(2, dtype=np.float64)
+        self.last_solve_az_alt_deg = None
+        self.last_solve_steps_est = None
+        self.last_solve_time = 0.0
+
+        self.J00_err = 0.0
+        self.J01_err = 0.0
+        self.J10_err = 0.0
+        self.J11_err = 0.0
+        self.model_non_orthogonality_deg = _non_orthogonality_deg_from_J(self.J_deg_per_step)
+        self.model_non_orthogonality_err_deg = 0.0
+        self.model_roll_deg = 0.0
+        self.model_roll_err_deg = 0.0
+        self.model_roll_samples = 0
+        self.model_pitch_deg = 0.0
+        self.model_pitch_err_deg = 0.0
+        self.model_yaw_deg = 0.0
+        self.model_yaw_err_deg = 0.0
+        self.model_fit_samples = 0
+        self.model_fit_rms_az_deg = 0.0
+        self.model_fit_rms_alt_deg = 0.0
+        self.model_fit_rms_arcsec = 0.0
+
+        latest_rot_ts = float("-inf")
+        latest_rot = np.eye(3, dtype=np.float64)
+
+        if manual_session:
+            self._manual_steps_abs = [np.asarray(e["steps"], dtype=np.float64).copy() for e in manual_session]
+            self._manual_az_alt_abs = [np.asarray(e["az_alt"], dtype=np.float64).copy() for e in manual_session]
+            self._manual_roll_deg_abs = [float(e["roll_deg"]) for e in manual_session]
+
+            last = manual_session[-1]
+            self.steps_est = np.asarray(last["steps"], dtype=np.float64).copy()
+            self.last_solve_steps_est = self.steps_est.copy()
+            self.last_solve_az_alt_deg = np.asarray(last["az_alt"], dtype=np.float64).copy()
+            ts = float(last["ts_unix"])
+            self.last_solve_time = ts if np.isfinite(ts) else 0.0
+            self.synced = bool(last["synced"])
+            if self.synced:
+                self.ref_steps = np.asarray(last["ref_steps"], dtype=np.float64).copy()
+                self.ref_az_alt_deg = np.asarray(last["ref_az_alt_mount"], dtype=np.float64).copy()
+            else:
+                self.ref_steps = self.steps_est.copy()
+                self.ref_az_alt_deg = np.zeros(2, dtype=np.float64)
+
+            R_last = last.get("R", None)
+            if R_last is not None:
+                latest_rot = np.asarray(R_last, dtype=np.float64)
+                latest_rot_ts = ts if np.isfinite(ts) else float("-inf")
+        else:
+            self.steps_est = prev_steps.copy()
+            self.ref_steps = self.steps_est.copy()
+
+        if fit_entry is not None:
+            self.J_deg_per_step = np.asarray(fit_entry["J"], dtype=np.float64)
+            self.J00_err = float(fit_entry["J00_err"])
+            self.J01_err = float(fit_entry["J01_err"])
+            self.J10_err = float(fit_entry["J10_err"])
+            self.J11_err = float(fit_entry["J11_err"])
+            self.model_non_orthogonality_deg = float(fit_entry["model_non_orthogonality_deg"])
+            self.model_non_orthogonality_err_deg = float(fit_entry["model_non_orthogonality_err_deg"])
+            self.model_roll_deg = float(fit_entry["model_roll_deg"])
+            self.model_roll_err_deg = float(fit_entry["model_roll_err_deg"])
+            self.model_roll_samples = int(fit_entry["model_roll_samples"])
+            self.model_pitch_deg = float(fit_entry["model_pitch_deg"])
+            self.model_pitch_err_deg = float(fit_entry["model_pitch_err_deg"])
+            self.model_yaw_deg = float(fit_entry["model_yaw_deg"])
+            self.model_yaw_err_deg = float(fit_entry["model_yaw_err_deg"])
+            self.model_fit_samples = int(max(0, int(fit_entry["model_fit_samples"])))
+            self.model_fit_rms_az_deg = float(fit_entry["model_fit_rms_az_deg"])
+            self.model_fit_rms_alt_deg = float(fit_entry["model_fit_rms_alt_deg"])
+            self.model_fit_rms_arcsec = float(fit_entry["model_fit_rms_arcsec"])
+
+            R_fit = fit_entry.get("R", None)
+            ts_fit = float(fit_entry["ts_unix"])
+            if R_fit is not None and (not np.isfinite(latest_rot_ts) or ts_fit >= latest_rot_ts):
+                latest_rot = np.asarray(R_fit, dtype=np.float64)
+
+        self.R_mount_to_world = _limit_rotation_tilt_ns_oe_deg(
+            _coerce_rotation_matrix(latest_rot),
+            max_tilt_deg=float(self.max_tilt_ns_oe_deg),
+        )
+
+        return {
+            "ok": True,
+            "status": "OK",
+            "manual_samples": int(len(self._manual_steps_abs)),
+            "synced": bool(self.synced),
+            "loaded_manual": bool(manual_session),
+            "loaded_fit": bool(fit_entry is not None),
+            "manual_path": str(manual_path),
+            "fit_path": str(fit_path),
+        }
+
     def _rotation_mount_to_world(self) -> np.ndarray:
         self.R_mount_to_world = _limit_rotation_tilt_ns_oe_deg(
             _coerce_rotation_matrix(self.R_mount_to_world),
@@ -6191,6 +6459,34 @@ class GoToWorker(BaseWorker):
                 )
                 if prune_ok:
                     self._log_model_fit_state(prefix="GoTo: PRUNE_OUTLIERS report")
+
+            elif kind == "restore_last_log":
+                model = self._goto.model
+                out = model.restore_from_latest_logs()
+                ok = bool(out.get("ok", False))
+                status = str(out.get("status", "UNKNOWN"))
+                n_manual = int(out.get("manual_samples", len(getattr(model, "_manual_steps_abs", []))))
+                self._publish_state(
+                    {
+                        "goto": {
+                            "manual_samples": int(n_manual),
+                            "synced": bool(getattr(model, "synced", False)),
+                            "status": GotoStatus.OK if ok else GotoStatus.FAIL,
+                            "reason": f"RESTORE_{status}",
+                        }
+                    }
+                )
+                log_info(
+                    self._out_log,
+                    "GoTo: RESTORE_LAST_LOG "
+                    f"status={status} ok={ok} "
+                    f"manual_samples={n_manual} "
+                    f"synced={bool(getattr(model, 'synced', False))} "
+                    f"loaded_manual={bool(out.get('loaded_manual', False))} "
+                    f"loaded_fit={bool(out.get('loaded_fit', False))}",
+                )
+                if ok:
+                    self._log_model_fit_state(prefix="GoTo: RESTORE_LAST_LOG report")
 
             elif kind == "reset":
                 model = self._goto.model

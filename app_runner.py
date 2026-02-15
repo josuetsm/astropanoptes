@@ -43,6 +43,7 @@ from actions import (
     goto_calibrate,
     goto_fit_model,
     goto_reset,
+    goto_restore_last_log,
     goto_cancel,
     goto_list_samples,
     goto_prune_outliers,
@@ -584,6 +585,9 @@ class AppRunner:
 
     def request_goto_reset(self) -> None:
         self.enqueue(goto_reset())
+
+    def request_goto_restore_last_log(self) -> None:
+        self.enqueue(goto_restore_last_log())
 
     def request_goto_cancel(self) -> None:
         self.enqueue(goto_cancel())
@@ -1941,6 +1945,10 @@ class AppRunner:
 
         if t == ActionType.GOTO_RESET:
             self._goto_worker.request(kind='reset', target=None, params={})
+            return
+
+        if t == ActionType.GOTO_RESTORE_LAST_LOG:
+            self._goto_worker.request(kind='restore_last_log', target=None, params={})
             return
 
         if t == ActionType.GOTO_CANCEL:
