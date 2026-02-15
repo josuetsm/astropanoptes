@@ -29,6 +29,15 @@ _BAYER_TO_GRAY_CODE: Dict[str, int] = {
     "GBRG": cv2.COLOR_BAYER_GB2GRAY,
 }
 
+_BAYER_TO_RGB_CODE: Dict[str, int] = {
+    # OpenCV Bayer codes are typically consumed as BGR images. We keep an internal
+    # RGB stack, so we use the *2BGR conversion constants to land channels in RGB order.
+    "RGGB": cv2.COLOR_BayerRG2BGR,
+    "BGGR": cv2.COLOR_BayerBG2BGR,
+    "GRBG": cv2.COLOR_BayerGR2BGR,
+    "GBRG": cv2.COLOR_BayerGB2BGR,
+}
+
 
 def _odd_ksize(v: int, *, minimum: int = 1) -> int:
     k = max(int(v), int(minimum))
@@ -46,27 +55,35 @@ def _bayer_to_gray_code(pattern: str) -> int:
     return _BAYER_TO_GRAY_CODE.get(str(pattern).upper(), cv2.COLOR_BAYER_RG2GRAY)
 
 
+def _bayer_to_rgb_code(pattern: str) -> int:
+    return _BAYER_TO_RGB_CODE.get(str(pattern).upper(), cv2.COLOR_BayerRG2BGR)
+
+
 # ============================================================
-# Live Mosaic Stacker (GRAY)
+# Live Mosaic Stacker (alignment in gray, stack in gray or RGB)
 # ============================================================
 
 class LiveMosaicStackerGray:
     def __init__(
         self,
         *,
+        color_mode: ColorMode,
         align_median_k: int,
         smooth_k: int,
         max_shift_px: int,
         use_subpixel: bool,
         preview_log_vmin: float,
         bayer_to_gray_code: int,
+        bayer_to_rgb_code: int,
     ):
+        self.color_mode: ColorMode = "rgb" if str(color_mode).lower() == "rgb" else "mono"
         self.align_median_k = _odd_ksize(align_median_k, minimum=1)
         self.smooth_k = max(1, int(smooth_k))
         self.max_shift_px = max(1, int(max_shift_px))
         self.use_subpixel = bool(use_subpixel)
         self.preview_log_vmin = float(preview_log_vmin)
         self.bayer_to_gray_code = int(bayer_to_gray_code)
+        self.bayer_to_rgb_code = int(bayer_to_rgb_code)
         self.kernel = _smooth_kernel(self.smooth_k)
 
         self.sum: Optional[np.ndarray] = None
@@ -163,12 +180,14 @@ class LiveMosaicStackerGray:
         raw_f = cv2.medianBlur(raw_u16, self.align_median_k)
         return cv2.cvtColor(raw_f, self.bayer_to_gray_code)
 
-    def _raw_to_gray_stack(self, raw_u16: np.ndarray) -> np.ndarray:
+    def _raw_to_stack(self, raw_u16: np.ndarray) -> np.ndarray:
+        if self.color_mode == "rgb":
+            return cv2.cvtColor(raw_u16, self.bayer_to_rgb_code)
         return cv2.cvtColor(raw_u16, self.bayer_to_gray_code)
 
     @staticmethod
-    def _warp_gray(img: np.ndarray, tx: float, ty: float) -> np.ndarray:
-        h, w = img.shape
+    def _warp_img(img: np.ndarray, tx: float, ty: float) -> np.ndarray:
+        h, w = img.shape[:2]
         M = np.array([[1.0, 0.0, tx], [0.0, 1.0, ty]], dtype=np.float32)
         return cv2.warpAffine(
             img,
@@ -192,10 +211,15 @@ class LiveMosaicStackerGray:
             new_h = self.canvas_h + pad_t + pad_b
             new_w = self.canvas_w + pad_l + pad_r
 
-            new_sum = np.zeros((new_h, new_w), np.float64)
+            if self.sum.ndim == 2:
+                new_sum = np.zeros((new_h, new_w), np.float64)
+                new_sum[pad_t : pad_t + self.canvas_h, pad_l : pad_l + self.canvas_w] = self.sum
+            else:
+                channels = int(self.sum.shape[2])
+                new_sum = np.zeros((new_h, new_w, channels), np.float64)
+                new_sum[pad_t : pad_t + self.canvas_h, pad_l : pad_l + self.canvas_w, :] = self.sum
             new_wgt = np.zeros((new_h, new_w), np.float64)
 
-            new_sum[pad_t : pad_t + self.canvas_h, pad_l : pad_l + self.canvas_w] = self.sum
             new_wgt[pad_t : pad_t + self.canvas_h, pad_l : pad_l + self.canvas_w] = self.wgt
 
             self.sum = new_sum
@@ -211,13 +235,34 @@ class LiveMosaicStackerGray:
 
         return x0, y0
 
+    def _build_ref_gray_u16(self, y0: int, x0: int, h: int, w: int) -> np.ndarray:
+        if self.sum is None or self.wgt is None:
+            return np.zeros((h, w), np.uint16)
+
+        W = self.wgt[y0 : y0 + h, x0 : x0 + w]
+        S = self.sum[y0 : y0 + h, x0 : x0 + w]
+        m = W > 0
+
+        if self.color_mode == "rgb" and S.ndim == 3:
+            ref_rgb = np.zeros((h, w, 3), np.uint16)
+            if np.any(m):
+                ref_vals = np.clip(S[m] / W[m, None], 0.0, 65535.0)
+                ref_rgb[m] = ref_vals.astype(np.uint16, copy=False)
+            return cv2.cvtColor(ref_rgb, cv2.COLOR_RGB2GRAY)
+
+        ref = np.zeros((h, w), np.uint16)
+        if np.any(m):
+            ref_vals = np.clip(S[m] / W[m], 0.0, 65535.0)
+            ref[m] = ref_vals.astype(np.uint16, copy=False)
+        return ref
+
     def add_frame(self, raw_u16: np.ndarray) -> None:
         gray_align = self._raw_to_gray_align(raw_u16)
-        gray_stack = self._raw_to_gray_stack(raw_u16)
-        h, w = gray_stack.shape
+        stack_img = self._raw_to_stack(raw_u16)
+        h, w = stack_img.shape[:2]
 
         if self.sum is None or self.wgt is None:
-            self.sum = gray_stack.astype(np.float64, copy=False)
+            self.sum = stack_img.astype(np.float64, copy=False)
             self.wgt = np.ones((h, w), np.float64)
             self.canvas_h = h
             self.canvas_w = w
@@ -231,7 +276,7 @@ class LiveMosaicStackerGray:
         if (h != self.frame_h) or (w != self.frame_w):
             # ROI/binning changed while stacking: reinitialize to keep state consistent.
             self.reset()
-            self.sum = gray_stack.astype(np.float64, copy=False)
+            self.sum = stack_img.astype(np.float64, copy=False)
             self.wgt = np.ones((h, w), np.float64)
             self.canvas_h = h
             self.canvas_w = w
@@ -243,14 +288,7 @@ class LiveMosaicStackerGray:
         x_ref = int(np.floor(self.pos_x))
         y_ref = int(np.floor(self.pos_y))
         x_ref, y_ref = self._ensure_canvas(x_ref, y_ref, w, h)
-
-        ref = np.zeros((h, w), np.uint16)
-        W = self.wgt[y_ref : y_ref + h, x_ref : x_ref + w]
-        S = self.sum[y_ref : y_ref + h, x_ref : x_ref + w]
-        m = W > 0
-        if np.any(m):
-            ref_vals = np.clip(S[m] / W[m], 0.0, 65535.0)
-            ref[m] = ref_vals.astype(np.uint16, copy=False)
+        ref = self._build_ref_gray_u16(y_ref, x_ref, h, w)
 
         dx = self._shift_1d_centered(
             self._profile_1d(ref, "dx"),
@@ -284,11 +322,14 @@ class LiveMosaicStackerGray:
         x0, y0 = self._ensure_canvas(x0, y0, w, h)
 
         if self.use_subpixel:
-            warped = self._warp_gray(gray_stack, fx, fy)
+            warped = self._warp_img(stack_img, fx, fy)
         else:
-            warped = gray_stack
+            warped = stack_img
 
-        self.sum[y0 : y0 + h, x0 : x0 + w] += warped.astype(np.float64, copy=False)
+        if warped.ndim == 2:
+            self.sum[y0 : y0 + h, x0 : x0 + w] += warped.astype(np.float64, copy=False)
+        else:
+            self.sum[y0 : y0 + h, x0 : x0 + w, :] += warped.astype(np.float64, copy=False)
         self.wgt[y0 : y0 + h, x0 : x0 + w] += 1.0
         self.n += 1
 
@@ -296,17 +337,17 @@ class LiveMosaicStackerGray:
         if self.sum is None or self.wgt is None:
             return None
 
-        if self.sum.shape != self.wgt.shape:
-            h = min(self.sum.shape[0], self.wgt.shape[0])
-            w = min(self.sum.shape[1], self.wgt.shape[1])
+        h = min(self.sum.shape[0], self.wgt.shape[0])
+        w = min(self.sum.shape[1], self.wgt.shape[1])
+        src_wgt = self.wgt[:h, :w]
+        if self.sum.ndim == 2:
             src_sum = self.sum[:h, :w]
-            src_wgt = self.wgt[:h, :w]
+            mean = np.zeros_like(src_sum, dtype=np.float64)
+            np.divide(src_sum, src_wgt, out=mean, where=src_wgt > 0)
         else:
-            src_sum = self.sum
-            src_wgt = self.wgt
-
-        mean = np.zeros_like(src_sum, dtype=np.float64)
-        np.divide(src_sum, src_wgt, out=mean, where=src_wgt > 0)
+            src_sum = self.sum[:h, :w, :]
+            mean = np.zeros_like(src_sum, dtype=np.float64)
+            np.divide(src_sum, src_wgt[..., None], out=mean, where=src_wgt[..., None] > 0)
         mean = np.nan_to_num(mean, nan=0.0, posinf=65535.0, neginf=0.0)
         return np.clip(mean, 0.0, 65535.0).astype(np.uint16)
 
@@ -319,6 +360,17 @@ class LiveMosaicStackerGray:
         mean = self.get_mean_u16()
         if mean is None:
             return None
+
+        if mean.ndim == 3:
+            x = np.log1p(mean.astype(np.float32, copy=False))
+            y = np.empty_like(x, dtype=np.float32)
+            for c in range(3):
+                xc = x[..., c]
+                vmax_c = float(xc.max()) if xc.size > 0 else self.preview_log_vmin + 1.0
+                denom_c = max(vmax_c - self.preview_log_vmin, 1e-6)
+                y[..., c] = np.clip((xc - self.preview_log_vmin) / denom_c, 0.0, 1.0)
+            return (y * 255.0 + 0.5).astype(np.uint8)
+
         x = np.log1p(mean.astype(np.float32, copy=False))
         vmax = float(x.max()) if x.size > 0 else self.preview_log_vmin + 1.0
         denom = max(vmax - self.preview_log_vmin, 1e-6)
@@ -375,15 +427,18 @@ class StackEngine:
     def configure_from_cfg(self) -> None:
         with self._stack_lock:
             scfg = self.cfg.stacking
-            self.color_mode = "mono"
+            color_mode = str(getattr(scfg, "color_mode", "mono")).lower()
+            self.color_mode = "rgb" if color_mode == "rgb" else "mono"
             self.canvas = None
             self._live_gray = LiveMosaicStackerGray(
+                color_mode=self.color_mode,
                 align_median_k=int(getattr(scfg, "align_median_k", 3)),
                 smooth_k=int(getattr(scfg, "smooth_k", 30)),
                 max_shift_px=int(getattr(scfg, "max_shift_px", 50)),
                 use_subpixel=bool(getattr(scfg, "use_subpixel", True)),
                 preview_log_vmin=float(getattr(scfg, "preview_log_vmin", 5.0)),
                 bayer_to_gray_code=_bayer_to_gray_code(str(scfg.bayer_pattern)),
+                bayer_to_rgb_code=_bayer_to_rgb_code(str(scfg.bayer_pattern)),
             )
             self.metrics.scale = float(scfg.drizzle_scale)
             self.metrics.pixfrac = float(scfg.pixfrac)
@@ -587,7 +642,8 @@ class StackEngine:
                 (max(1, u8.shape[1] // 2), max(1, u8.shape[0] // 2)),
                 interpolation=cv2.INTER_AREA,
             )
-            ok, jpg = cv2.imencode(".jpg", u8s, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
+            u8_for_jpeg = u8s if u8s.ndim == 2 else cv2.cvtColor(u8s, cv2.COLOR_RGB2BGR)
+            ok, jpg = cv2.imencode(".jpg", u8_for_jpeg, [int(cv2.IMWRITE_JPEG_QUALITY), 85])
 
             with self._preview_lock:
                 self._preview_jpeg = jpg.tobytes() if ok else None

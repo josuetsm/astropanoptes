@@ -789,6 +789,9 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_st_stop = QPushButton("Stop")
         self.btn_st_reset = QPushButton("Reset")
         self.btn_st_save = QPushButton("Save Stack")
+        self.cb_st_color = QCheckBox("Stacking a color (RGB, Bayer RGGB)")
+        self.cb_st_color.setChecked(str(self.cfg.stacking.color_mode).lower() == "rgb")
+        self.cb_st_color.toggled.connect(self._stacking_color_toggled)
 
         row = QHBoxLayout()
         for button in [self.btn_st_start, self.btn_st_stop, self.btn_st_reset, self.btn_st_save]:
@@ -801,6 +804,7 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_st_save.clicked.connect(self._stacking_save)
 
         form.addRow(row)
+        form.addRow(self.cb_st_color)
         box.setLayout(form)
 
         layout.addWidget(box)
@@ -1357,6 +1361,11 @@ class AstroPanoptesWindow(QMainWindow):
     def _stacking_save(self) -> None:
         self.runner.request_stacking_save(out_dir="stack_output", basename="stack", fmt="png")
         self._log("[stacking] Save Stack -> stack_output/stack_YYYYMMDD_HHMMSS_az123p45_altp67p89.{raw.npy,png}")
+
+    def _stacking_color_toggled(self, checked: bool) -> None:
+        color_mode = "rgb" if bool(checked) else "mono"
+        self.runner.request_stacking_params(color_mode=color_mode, bayer_pattern="RGGB")
+        self._log(f"[stacking] color_mode={color_mode} (stack RGB RGGB, alignment mono)")
 
     def _platesolve_start(self) -> None:
         target = self.ed_ps_target.text().strip()

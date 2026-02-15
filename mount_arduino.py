@@ -65,10 +65,6 @@ class ArduinoConfig:
     flush_on_send: bool = True
     reset_input_on_send: bool = True
 
-    # RATE performance
-    rate_read_timeout_s: float = 0.01
-    rate_reset_input: bool = True
-
     # reconnect behavior
     allow_reconnect: bool = True
 
@@ -81,12 +77,11 @@ class ArduinoController:
       PING                  -> READY
       ENABLE 0|1            -> OK
       STOP                  -> OK
-      RATE vA vB            -> OK RATE <vA> <vB>
       MS <8|16|32|64>       -> OK MS <az> <alt>
       MS AZ <...>           -> OK MS <az> <alt>
       MS ALT <...>          -> OK MS <az> <alt>
       MOVE A|B FWD|REV steps delay_us -> OK
-      STATUS                -> EN=... RATE=... MS=...
+      STATUS                -> EN=... MS=... MOVE=...
     """
 
     def __init__(self, cfg: ArduinoConfig):
@@ -185,7 +180,7 @@ class ArduinoController:
     def _drain_lines(self, max_lines: int = 10, max_time_s: float = 0.05) -> List[str]:
         """
         Lee y descarta líneas disponibles por un tiempo acotado.
-        Útil para evitar backlog de respuestas (especialmente con RATE).
+        Útil para evitar backlog de respuestas.
         """
         if not self.is_connected:
             return []
@@ -273,59 +268,6 @@ class ArduinoController:
                 self._ser = None
                 raise
 
-    def send_fast(self, cmd: str, *, reset_input: bool = True, read_timeout_s: float = 0.01) -> str:
-        """
-        Versión para alta frecuencia (RATE):
-        - escribe el comando
-        - opcionalmente descarta backlog antes
-        - intenta leer 1 línea con timeout muy corto (para no bloquear)
-        """
-        cmd = (cmd or "").strip()
-        if not cmd:
-            return ""
-        if not self._ensure_connected():
-            raise RuntimeError("Mount not connected")
-
-        with self._lock:
-            ser = self._ser
-            if ser is None or not bool(getattr(ser, "is_open", True)):
-                raise RuntimeError("Mount serial not open")
-
-            try:
-                if reset_input:
-                    try:
-                        ser.reset_input_buffer()
-                    except Exception as exc:
-                        log_error(None, "Mount: failed to reset input buffer (fast)", exc, throttle_s=5.0, throttle_key="mount_reset_input_fast")
-
-                ser.write((cmd + "\n").encode("ascii", errors="ignore"))
-                if self.cfg.flush_on_send:
-                    try:
-                        ser.flush()
-                    except Exception as exc:
-                        log_error(None, "Mount: failed to flush serial buffer (fast)", exc, throttle_s=5.0, throttle_key="mount_flush_fast")
-
-                old_timeout = getattr(ser, "timeout", None)
-                try:
-                    ser.timeout = float(read_timeout_s)
-                    line = ser.readline().decode(errors="ignore").strip()
-                finally:
-                    try:
-                        if old_timeout is not None:
-                            ser.timeout = old_timeout
-                    except Exception as exc:
-                        log_error(None, "Mount: failed to restore serial timeout (fast)", exc, throttle_s=5.0, throttle_key="mount_timeout_restore_fast")
-
-                return line or ""
-            except Exception as exc:
-                log_error(None, "Mount: send_fast failed", exc, throttle_s=5.0, throttle_key="mount_send_fast")
-                try:
-                    ser.close()
-                except Exception as exc:
-                    log_error(None, "Mount: failed to close serial after send_fast error", exc, throttle_s=5.0, throttle_key="mount_close_after_send_fast")
-                self._ser = None
-                raise
-
     # ----------------------------
     # High-level commands
     # ----------------------------
@@ -339,17 +281,6 @@ class ArduinoController:
     def stop(self) -> str:
         return self.send("STOP", timeout_s=0.30)
 
-    def rate(self, v_az: float, v_alt: float) -> str:
-        """
-        RATE a alta frecuencia: usar send_fast.
-        Firmware responde "OK RATE ...", pero aquí no bloqueamos esperando.
-        """
-        return self.send_fast(
-            f"RATE {float(v_az):.3f} {float(v_alt):.3f}",
-            reset_input=bool(self.cfg.rate_reset_input),
-            read_timeout_s=float(self.cfg.rate_read_timeout_s),
-        )
-
     def move(self, axis: str, direction: str, steps: int, delay_us: int) -> str:
         axis = (axis or "").strip().upper()
         direction = (direction or "").strip().upper()
@@ -361,8 +292,9 @@ class ArduinoController:
 
         steps_i = max(0, int(steps))
         delay_i = max(0, int(delay_us))
-        # MOVE es blocking en firmware; timeout debe escalar con la duración esperada
-        # Aproximación: cada microstep hace HIGH+LOW con delay_us => ~2*delay_us por paso
+        # Works with both firmware variants:
+        # - legacy blocking MOVE (needs long timeout);
+        # - new non-blocking MOVE (returns immediately anyway).
         est_s = (float(steps_i) * 2.0 * float(delay_i)) / 1.0e6
         timeout_s = max(3.50, est_s + 1.5)
         return self.send(f"MOVE {axis} {direction} {steps_i} {delay_i}", timeout_s=float(timeout_s))
@@ -424,13 +356,36 @@ class ArduinoMount:
     def set_microsteps(self, az_div: int, alt_div: int) -> str:
         return self.ctrl.set_microsteps(int(az_div), int(alt_div))
 
-    def move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> str:
+    @staticmethod
+    def _estimate_move_duration_s(steps: int, delay_us: int) -> float:
+        steps_i = max(0, int(steps))
+        delay_i = max(0, int(delay_us))
+        # Firmware MOVE cadence is approximately one step every (delay_us + pulse_us).
+        pulse_us = 3.0
+        return float(steps_i) * ((float(delay_i) + pulse_us) / 1.0e6)
+
+    def move_steps(
+        self,
+        axis: Axis,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        *,
+        blocking: bool = True,
+        stop_before_move: bool = True,
+    ) -> str:
         """
         Movimiento manual determinista (tu modo preferido):
           MOVE A|B FWD|REV steps delay_us
 
         axis: Axis.AZ / Axis.ALT
         direction: -1 o +1  (>=0 => FWD, <0 => REV)
+        blocking:
+          - True: espera duración estimada del movimiento.
+          - False: retorna inmediatamente tras enviar MOVE.
+        stop_before_move:
+          - True: envía STOP antes de MOVE (cancela cualquier movimiento previo).
+          - False: no envía STOP; permite solapar MOVEs en ejes distintos.
         """
         # Validación mínima
         if int(steps) <= 0:
@@ -441,17 +396,27 @@ class ArduinoMount:
         ax = _axis_to_fw(axis)
         dr = _dir_to_fw(int(direction))
 
-        # Seguridad: si algo estaba en RATE/continuous, detener antes.
-        # (El AppRunner ya hace stop() antes de llamar, pero aquí es idempotente.)
-        try:
-            self.ctrl.stop()
-        except Exception as exc:
-            log_error(None, "Mount: failed to stop before move", exc, throttle_s=5.0, throttle_key="mount_stop_before_move")
+        if bool(stop_before_move):
+            # Seguridad: detener planes de MOVE en progreso antes de iniciar el nuevo.
+            # (El AppRunner ya hace stop() antes de llamar, pero aquí es idempotente.)
+            try:
+                self.ctrl.stop()
+            except Exception as exc:
+                log_error(
+                    None,
+                    "Mount: failed to stop before move",
+                    exc,
+                    throttle_s=5.0,
+                    throttle_key="mount_stop_before_move",
+                )
 
-        return self.ctrl.move(ax, dr, int(steps), int(delay_us))
-
-    def rate(self, v_az: float, v_alt: float) -> str:
-        return self.ctrl.rate(float(v_az), float(v_alt))
+        resp = self.ctrl.move(ax, dr, int(steps), int(delay_us))
+        if bool(blocking):
+            wait_s = self._estimate_move_duration_s(int(steps), int(delay_us))
+            # Small safety margin for serial/firmware jitter.
+            if wait_s > 0.0:
+                time.sleep(wait_s + 0.05)
+        return resp
 
 
 class MountMoveWorker(BaseWorker):
@@ -496,12 +461,13 @@ class MountMoveWorker(BaseWorker):
         delay_us = int(request["delay_us"])
 
         try:
-            mount.stop()
             mount.move_steps(
                 axis=axis,
                 direction=direction,
                 steps=steps,
                 delay_us=delay_us,
+                blocking=False,
+                stop_before_move=False,
             )
 
             self._note_manual_move(axis, direction, steps)

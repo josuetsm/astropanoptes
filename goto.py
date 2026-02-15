@@ -2676,7 +2676,7 @@ class GoToController:
                         alpha = _clamp(alpha, -1.0, 1.0)
                         dsteps *= alpha
 
-                # Execute one "L" move: AZ first, then ALT.
+                # Execute one two-axis MOVE command set in parallel (AZ + ALT).
                 # Speed is adaptive: farther targets use lower delay_us (faster).
                 err_distance_deg = float(math.hypot(float(daz), float(dalt)))
                 delay_us_az = self._adaptive_slew_delay_us(
@@ -2689,7 +2689,7 @@ class GoToController:
                 )
                 log_info(
                     None,
-                    "GoTo: single-stage L move "
+                    "GoTo: single-stage 2-axis move "
                     f"dist={err_distance_deg:.3f}deg "
                     f"dsteps=[{int(round(float(dsteps[0]))):+d},{int(round(float(dsteps[1]))):+d}] "
                     f"delay_us=[AZ={int(delay_us_az)},ALT={int(delay_us_alt)}]",
@@ -2697,20 +2697,14 @@ class GoToController:
                     throttle_key="goto_single_stage_move",
                 )
 
-                if stop is not None:
-                    try:
-                        stop()
-                    except Exception as exc:
-                        log_error(None, "GoTo: stop failed before move", exc)
-
-                self._exec_steps(move_steps, Axis.AZ, float(dsteps[0]), delay_us=int(delay_us_az))
-                self._exec_steps(move_steps, Axis.ALT, float(dsteps[1]), delay_us=int(delay_us_alt))
-
-                if stop is not None:
-                    try:
-                        stop()
-                    except Exception as exc:
-                        log_error(None, "GoTo: stop failed after move", exc)
+                self._exec_steps_parallel(
+                    move_steps,
+                    dsteps_az=float(dsteps[0]),
+                    dsteps_alt=float(dsteps[1]),
+                    delay_us_az=int(delay_us_az),
+                    delay_us_alt=int(delay_us_alt),
+                    stop=stop,
+                )
 
                 # Settle
                 time.sleep(max(0.0, float(self.cfg.settle_s)))
@@ -2816,6 +2810,56 @@ class GoToController:
 
         # Perform the actual move
         move_steps(axis, direction, steps, int(delay_us))
+        # MOVE may be dispatched asynchronously by the runtime callback.
+        # Wait estimated move duration so callers that expect blocking semantics
+        # (calibration, dithers, etc.) remain deterministic.
+        wait_s = self._estimate_move_duration_s(steps, int(delay_us))
+        if wait_s > 0.0:
+            time.sleep(wait_s + 0.02)
+
+    @staticmethod
+    def _estimate_move_duration_s(steps: int, delay_us: int) -> float:
+        steps_i = max(0, int(steps))
+        delay_i = max(0, int(delay_us))
+        pulse_us = 3.0
+        return float(steps_i) * ((float(delay_i) + pulse_us) / 1.0e6)
+
+    def _exec_steps_parallel(
+        self,
+        move_steps: MoveStepsFn,
+        *,
+        dsteps_az: float,
+        dsteps_alt: float,
+        delay_us_az: int,
+        delay_us_alt: int,
+        stop: Optional[StopFn] = None,
+    ) -> None:
+        s_az = int(round(float(dsteps_az)))
+        s_alt = int(round(float(dsteps_alt)))
+        if s_az == 0 and s_alt == 0:
+            return
+
+        if stop is not None:
+            try:
+                stop()
+            except Exception as exc:
+                log_error(None, "GoTo: stop failed before parallel move", exc)
+
+        if s_az != 0:
+            dir_az = +1 if s_az >= 0 else -1
+            self.model.note_manual_move(Axis.AZ, dir_az, abs(s_az))
+            move_steps(Axis.AZ, dir_az, abs(s_az), int(delay_us_az))
+
+        if s_alt != 0:
+            dir_alt = +1 if s_alt >= 0 else -1
+            self.model.note_manual_move(Axis.ALT, dir_alt, abs(s_alt))
+            move_steps(Axis.ALT, dir_alt, abs(s_alt), int(delay_us_alt))
+
+        wait_az = self._estimate_move_duration_s(abs(s_az), int(delay_us_az))
+        wait_alt = self._estimate_move_duration_s(abs(s_alt), int(delay_us_alt))
+        wait_s = max(wait_az, wait_alt)
+        if wait_s > 0.0:
+            time.sleep(wait_s + 0.02)
 
     def _adaptive_slew_delay_us(
         self,

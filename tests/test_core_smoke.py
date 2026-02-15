@@ -1,4 +1,5 @@
 import unittest
+import time
 
 import numpy as np
 import pandas as pd
@@ -7,6 +8,8 @@ from astropy.time import Time
 
 from config import AppConfig
 from goto import (
+    GoToConfig,
+    GoToController,
     GoToModel,
     MountKinematics,
     _roll_deg_from_drift_delta,
@@ -53,6 +56,36 @@ class CoreSmokeTests(unittest.TestCase):
         engine.step_batch([{"raw16": raw, "t": 0.0}])
         engine.stop()
         self.assertIsNotNone(engine.metrics)
+
+    def test_stacking_engine_rgb_mode_uses_rggb(self) -> None:
+        cfg = AppConfig()
+        cfg.stacking.color_mode = "rgb"
+        cfg.stacking.bayer_pattern = "RGGB"
+        engine = StackEngine(cfg)
+        engine.configure_from_cfg()
+        engine.start()
+
+        raw = np.zeros((32, 32), dtype=np.uint16)
+        raw[0::2, 0::2] = 1000  # R
+        raw[0::2, 1::2] = 2000  # G
+        raw[1::2, 0::2] = 2000  # G
+        raw[1::2, 1::2] = 3000  # B
+
+        engine.step_batch([{"raw16": raw, "t": 0.0}])
+        mean = engine.get_stack_mean(out_dtype=np.uint16)
+        engine.stop()
+
+        self.assertIsNotNone(mean)
+        if mean is None:
+            self.fail("mean stack should not be None in rgb mode")
+        self.assertEqual(mean.ndim, 3)
+        self.assertEqual(mean.shape[2], 3)
+
+        r_mean = float(np.mean(mean[..., 0]))
+        g_mean = float(np.mean(mean[..., 1]))
+        b_mean = float(np.mean(mean[..., 2]))
+        self.assertLess(r_mean, g_mean)
+        self.assertLess(g_mean, b_mean)
 
     def test_platesolving_guides_smoke(self) -> None:
         df = pd.DataFrame({"phot_g_mean_mag": [10.0, 11.0, 9.0]})
@@ -271,6 +304,30 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(model.J_deg_per_step[0, 1], j_true[0, 1], places=4)
         self.assertAlmostEqual(model.J_deg_per_step[1, 0], j_true[1, 0], places=4)
         self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_true[1, 1], places=4)
+
+    def test_goto_parallel_move_dispatches_both_axes(self) -> None:
+        ctrl = GoToController(cfg=GoToConfig(), model=GoToModel())
+        calls: list[tuple[str, int, int, int, float]] = []
+
+        def _fake_move(axis, direction, steps, delay_us):
+            calls.append((axis.value, int(direction), int(steps), int(delay_us), time.perf_counter()))
+
+        t0 = time.perf_counter()
+        ctrl._exec_steps_parallel(
+            _fake_move,
+            dsteps_az=120.0,
+            dsteps_alt=-90.0,
+            delay_us_az=60,
+            delay_us_alt=80,
+            stop=None,
+        )
+        elapsed = time.perf_counter() - t0
+
+        self.assertEqual(len(calls), 2)
+        self.assertEqual(calls[0][0], "az")
+        self.assertEqual(calls[1][0], "alt")
+        self.assertLess(abs(calls[1][4] - calls[0][4]), 0.01)
+        self.assertGreater(elapsed, 0.01)
 
     def test_goto_model_manual_fit_rotation_tilt_is_limited(self) -> None:
         model = GoToModel()

@@ -7,9 +7,8 @@
 //   MS <8|16|32|64>                 (set both axes)
 //   MS AZ <8|16|32|64>
 //   MS ALT <8|16|32|64>
-//   RATE vA vB                      (signed microsteps/s; A=AZ, B=ALT)
-//   STOP                            (same as RATE 0 0)
-//   MOVE A|B FWD|REV steps delay_us (blocking microstep move)
+//   STOP                            (cancela planes MOVE)
+//   MOVE A|B FWD|REV steps delay_us (non-blocking per-axis microstep move)
 //   STATUS
 //
 // Pinout:
@@ -42,19 +41,15 @@ const uint8_t ALT_MS2 = 11;
 // pulse width for STEP pin (us)
 const uint16_t STEP_PULSE_US = 3;
 
-// Current rate in microsteps/s. Signed.
-volatile float g_rateA = 0.0f;
-volatile float g_rateB = 0.0f;
-
 bool g_enabled = false;
 
-// Next scheduled step times
-uint32_t nextA_us = 0;
-uint32_t nextB_us = 0;
-
-// Periods in microseconds (0 = stopped)
-uint32_t perA_us = 0;
-uint32_t perB_us = 0;
+// MOVE scheduler (non-blocking, one plan per axis)
+volatile long g_moveRemA = 0;
+volatile long g_moveRemB = 0;
+uint32_t movePerA_us = 0;
+uint32_t movePerB_us = 0;
+uint32_t moveNextA_us = 0;
+uint32_t moveNextB_us = 0;
 
 // Current microsteps per full-step (8/16/32/64)
 volatile uint16_t g_ms_az = 64;
@@ -111,37 +106,33 @@ static bool setMicrostepsALT(uint16_t ms) {
   return true;
 }
 
-// Update per-axis periods and direction pins based on g_rate*
-void applyRates() {
-  float ra = g_rateA;
-  float rb = g_rateB;
-
-  if (ra == 0.0f) perA_us = 0;
-  else perA_us = (uint32_t)(1000000.0f / fabs(ra));
-
-  if (rb == 0.0f) perB_us = 0;
-  else perB_us = (uint32_t)(1000000.0f / fabs(rb));
-
-  // define HIGH=FWD
-  digitalWrite(DIR_A, (ra >= 0.0f) ? HIGH : LOW);
-  digitalWrite(DIR_B, (rb >= 0.0f) ? HIGH : LOW);
-
-  uint32_t now = micros();
-  if (perA_us > 0) nextA_us = now + perA_us;
-  if (perB_us > 0) nextB_us = now + perB_us;
+void clearMovePlans() {
+  g_moveRemA = 0;
+  g_moveRemB = 0;
+  movePerA_us = 0;
+  movePerB_us = 0;
+  moveNextA_us = 0;
+  moveNextB_us = 0;
 }
 
-void handleMoveBlocking(char axis, bool fwd, long steps, long delay_us) {
+void startMoveNonBlocking(char axis, bool fwd, long steps, long delay_us) {
   if (steps <= 0) return;
+  if (delay_us < 0) delay_us = 0;
 
-  if (axis == 'A') digitalWrite(DIR_A, fwd ? HIGH : LOW);
-  else             digitalWrite(DIR_B, fwd ? HIGH : LOW);
+  // Preserve "delay_us between pulses" semantics while accounting for pulse width.
+  uint32_t per_us = (uint32_t)(max(1L, delay_us + (long)STEP_PULSE_US));
+  uint32_t now = micros();
 
-  uint8_t stepPin = (axis == 'A') ? STEP_A : STEP_B;
-
-  for (long i = 0; i < steps; i++) {
-    pulseStep(stepPin);
-    if (delay_us > 0) delayMicroseconds((unsigned int)delay_us);
+  if (axis == 'A') {
+    digitalWrite(DIR_A, fwd ? HIGH : LOW);
+    g_moveRemA = steps;
+    movePerA_us = per_us;
+    moveNextA_us = now;
+  } else {
+    digitalWrite(DIR_B, fwd ? HIGH : LOW);
+    g_moveRemB = steps;
+    movePerB_us = per_us;
+    moveNextB_us = now;
   }
 }
 
@@ -195,17 +186,28 @@ void setup() {
 }
 
 void loop() {
-  // ---- Continuous stepping (parallel) ----
+  // ---- MOVE plans (parallel by axis) ----
   if (g_enabled) {
     uint32_t now = micros();
 
-    if (perA_us > 0 && (int32_t)(now - nextA_us) >= 0) {
+    if (g_moveRemA > 0 && movePerA_us > 0 && (int32_t)(now - moveNextA_us) >= 0) {
       pulseStep(STEP_A);
-      nextA_us += perA_us;
+      g_moveRemA -= 1;
+      moveNextA_us += movePerA_us;
+      if (g_moveRemA <= 0) {
+        g_moveRemA = 0;
+        movePerA_us = 0;
+      }
     }
-    if (perB_us > 0 && (int32_t)(now - nextB_us) >= 0) {
+
+    if (g_moveRemB > 0 && movePerB_us > 0 && (int32_t)(now - moveNextB_us) >= 0) {
       pulseStep(STEP_B);
-      nextB_us += perB_us;
+      g_moveRemB -= 1;
+      moveNextB_us += movePerB_us;
+      if (g_moveRemB <= 0) {
+        g_moveRemB = 0;
+        movePerB_us = 0;
+      }
     }
   }
 
@@ -227,34 +229,16 @@ void loop() {
     char *a = strtok(NULL, " ");
     int on = a ? atoi(a) : 0;
     setEnable(on != 0);
-    if (g_enabled) applyRates();
-    else { perA_us = perB_us = 0; }
+    if (!g_enabled) {
+      clearMovePlans();
+    }
     Serial.println("OK");
     return;
   }
 
   if (!strcmp(tok, "STOP")) {
-    g_rateA = 0.0f;
-    g_rateB = 0.0f;
-    applyRates();
+    clearMovePlans();
     Serial.println("OK");
-    return;
-  }
-
-  if (!strcmp(tok, "RATE")) {
-    char *a = strtok(NULL, " ");
-    char *b = strtok(NULL, " ");
-    float ra = a ? atof(a) : 0.0f;
-    float rb = b ? atof(b) : 0.0f;
-
-    g_rateA = ra;
-    g_rateB = rb;
-    applyRates();
-
-    Serial.print("OK RATE ");
-    Serial.print(g_rateA, 3);
-    Serial.print(" ");
-    Serial.println(g_rateB, 3);
     return;
   }
 
@@ -262,11 +246,6 @@ void loop() {
     // MS <ms> | MS AZ <ms> | MS ALT <ms>
     char *a1 = strtok(NULL, " ");
     if (!a1) { Serial.println("ERR"); return; }
-
-    // Stop rates during MS change for safety (keeps direction clean too)
-    float ra = g_rateA, rb = g_rateB;
-    g_rateA = 0.0f; g_rateB = 0.0f;
-    applyRates();
 
     bool ok = false;
 
@@ -279,10 +258,6 @@ void loop() {
       uint16_t ms = (uint16_t)atoi(a1);
       ok = setMicrostepsAZ(ms) && setMicrostepsALT(ms);
     }
-
-    // restore rates
-    g_rateA = ra; g_rateB = rb;
-    applyRates();
 
     if (!ok) { Serial.println("ERR"); return; }
     Serial.print("OK MS ");
@@ -307,14 +282,7 @@ void loop() {
     long delay_us = atol(du);
     if (delay_us < 0) delay_us = 0;
 
-    float ra = g_rateA, rb = g_rateB;
-    g_rateA = 0.0f; g_rateB = 0.0f;
-    applyRates();
-
-    handleMoveBlocking(axis, fwd, steps, delay_us);
-
-    g_rateA = ra; g_rateB = rb;
-    applyRates();
+    startMoveNonBlocking(axis, fwd, steps, delay_us);
 
     Serial.println("OK");
     return;
@@ -323,14 +291,14 @@ void loop() {
   if (!strcmp(tok, "STATUS")) {
     Serial.print("EN=");
     Serial.print(g_enabled ? 1 : 0);
-    Serial.print(" RATE=");
-    Serial.print(g_rateA, 3);
-    Serial.print(",");
-    Serial.print(g_rateB, 3);
     Serial.print(" MS=");
     Serial.print(g_ms_az);
     Serial.print(",");
-    Serial.println(g_ms_alt);
+    Serial.print(g_ms_alt);
+    Serial.print(" MOVE=");
+    Serial.print(g_moveRemA);
+    Serial.print(",");
+    Serial.println(g_moveRemB);
     return;
   }
 

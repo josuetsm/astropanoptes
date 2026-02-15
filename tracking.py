@@ -68,7 +68,7 @@ class CalibrationConfig:
     """
     Modelo: v_pxps = A * u + b
 
-    - u: [u_az, u_alt] en µsteps/s (tal como envías RATE)
+    - u: [u_az, u_alt] en µsteps/s (señal de control; AppRunner la discretiza a MOVE)
     - v: [vx, vy] en px/s (medido por SEP: centroides/flux)
     """
     lambda_dls: float = 0.05               # DLS para pinv
@@ -655,8 +655,8 @@ def tracking_step(
     - Alineación por perfiles 1D (misma estrategia que stacking):
       max por eje + suavizado + correlación cruzada centrada.
       Se usa tanto para incremental (v) como para corrección absoluta contra keyframe.
-    - Si tracking_enabled y hay A_pinv (auto), computa RATE targets (pero NO envía).
-      AppRunner es quien envía RATE al Arduino.
+    - Si tracking_enabled y hay A_pinv (auto), computa targets de velocidad (µsteps/s) (pero NO envía).
+      AppRunner discretiza esa velocidad en comandos MOVE al Arduino.
 
     raw16 debe ser un frame Bayer RAW16 uint16.
     """

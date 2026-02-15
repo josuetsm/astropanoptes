@@ -58,6 +58,7 @@ from actions import (
     platesolving_set_params,
     stacking_reset,
     stacking_save,
+    stacking_set_params,
     stacking_start,
     stacking_stop,
     tracking_set_params,
@@ -127,7 +128,7 @@ class AppRunner:
         - aplica actions
         - actualiza AppState
         - genera preview JPEG a view_hz
-        - ejecuta tracking y envía RATE a la montura si tracking está ON
+        - ejecuta tracking y corrige con MOVE discreto si tracking está ON
         - encola frames a stacking si stacking está ON
     - Ejecutar plate solving bajo demanda en thread dedicado (no bloquea loop).
     - Exponer getters thread-safe para UI.
@@ -229,6 +230,15 @@ class AppRunner:
             publish_state=self._update_state,
             out_log=self.out_log,
         )
+        self._manual_move_active_until_s: Dict[str, float] = {
+            Axis.AZ.value: 0.0,
+            Axis.ALT.value: 0.0,
+        }
+        self._rate_emul_lock = threading.Lock()
+        self._rate_emul_last_t: Optional[float] = None
+        self._rate_emul_acc_az: float = 0.0
+        self._rate_emul_acc_alt: float = 0.0
+        self._rate_emul_active: bool = False
         self._goto_worker = GoToWorker(
             goto_controller=self._goto,
             get_state=self.get_state,
@@ -596,6 +606,9 @@ class AppRunner:
     def request_stacking_reset(self) -> None:
         self.enqueue(stacking_reset())
 
+    def request_stacking_params(self, **kwargs: Any) -> None:
+        self.enqueue(stacking_set_params(**kwargs))
+
     def request_stacking_save(self, **kwargs: Any) -> None:
         self.enqueue(stacking_save(**kwargs))
 
@@ -625,40 +638,148 @@ class AppRunner:
         except Exception as exc:
             log_error(self.out_log, "Tracking: failed to reset keyframe", exc)
 
+    def _estimate_manual_move_runtime_s(self, *, steps: int, delay_us: int) -> float:
+        steps_i = max(0, int(steps))
+        delay_i = max(0, int(delay_us))
+        pulse_us = 3.0
+        return float(steps_i) * ((float(delay_i) + pulse_us) / 1.0e6)
+
+    def _mark_manual_move_active(self, *, axis: Axis, steps: int, delay_us: int) -> None:
+        est_s = self._estimate_manual_move_runtime_s(steps=steps, delay_us=delay_us)
+        until = _perf() + est_s + 0.05
+        key = axis.value
+        prev = float(self._manual_move_active_until_s.get(key, 0.0))
+        self._manual_move_active_until_s[key] = max(prev, until)
+
+    def _clear_manual_move_activity(self) -> None:
+        self._manual_move_active_until_s[Axis.AZ.value] = 0.0
+        self._manual_move_active_until_s[Axis.ALT.value] = 0.0
+
+    def _reset_rate_emulation(self) -> None:
+        with self._rate_emul_lock:
+            self._rate_emul_last_t = _perf()
+            self._rate_emul_acc_az = 0.0
+            self._rate_emul_acc_alt = 0.0
+            self._rate_emul_active = False
+
     def _is_manual_move_active(self) -> bool:
-        return bool(self._mount_move_worker.is_busy())
+        if self._mount_move_worker.is_busy():
+            return True
+        now = _perf()
+        return now < max(
+            float(self._manual_move_active_until_s.get(Axis.AZ.value, 0.0)),
+            float(self._manual_move_active_until_s.get(Axis.ALT.value, 0.0)),
+        )
+
+    def _rate_to_delay_us(self, rate_steps_s: float, *, axis: Axis) -> int:
+        rate_abs = abs(float(rate_steps_s))
+        if rate_abs <= 1e-9:
+            base = int(self.cfg.mount.slew_delay_us_az if axis == Axis.AZ else self.cfg.mount.slew_delay_us_alt)
+            return max(1, base)
+        # Firmware cadence ~= 1e6 / (delay_us + pulse_us), pulse_us ~= 3.
+        delay = int(round((1.0e6 / rate_abs) - 3.0))
+        return max(1, min(delay, 50000))
+
+    def _send_move_steps_direct(self, *, axis: Axis, signed_steps: int, delay_us: int) -> None:
+        if self._mount is None or signed_steps == 0:
+            return
+        direction = +1 if int(signed_steps) >= 0 else -1
+        steps = abs(int(signed_steps))
+        self._mount.move_steps(
+            axis=axis,
+            direction=direction,
+            steps=steps,
+            delay_us=int(delay_us),
+            blocking=False,
+            stop_before_move=False,
+        )
 
     def _mount_rate_safe(self, az: float, alt: float) -> None:
         if self._mount is None:
             return
-        if self._is_manual_move_active():
-            return
+        with self._rate_emul_lock:
+            now = _perf()
+            if self._rate_emul_last_t is None:
+                self._rate_emul_last_t = now
+            dt = float(now - float(self._rate_emul_last_t))
+            if not np.isfinite(dt) or dt < 0.0:
+                dt = 0.0
+            dt = min(dt, 0.25)
+            self._rate_emul_last_t = now
+
+            az_cmd = float(az)
+            alt_cmd = float(alt)
+            is_stop = (abs(az_cmd) <= 1e-9) and (abs(alt_cmd) <= 1e-9)
+
+            if is_stop:
+                self._rate_emul_acc_az = 0.0
+                self._rate_emul_acc_alt = 0.0
+                was_active = bool(self._rate_emul_active)
+                self._rate_emul_active = False
+                if not was_active:
+                    return
+                try:
+                    self._mount.stop()
+                except Exception as exc:
+                    self._update_state(
+                        {
+                            "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "MOVE stop failed"},
+                            "tracking": {
+                                "enabled": False,
+                                "status": TrackingStatus.OFF,
+                                "mode": TrackingMode.IDLE,
+                                "last_error": "mount STOP failed",
+                            },
+                        }
+                    )
+                    log_error(self.out_log, "Mount: STOP failed (rate emulation)", exc, throttle_s=2.0, throttle_key="mount_stop_rate_emul")
+                return
+
+            if self._is_manual_move_active():
+                return
+
+            if dt > 0.0:
+                self._rate_emul_acc_az += az_cmd * dt
+                self._rate_emul_acc_alt += alt_cmd * dt
+
+            step_az = int(np.trunc(self._rate_emul_acc_az))
+            step_alt = int(np.trunc(self._rate_emul_acc_alt))
+            step_az = int(max(-400, min(400, step_az)))
+            step_alt = int(max(-400, min(400, step_alt)))
+
+            self._rate_emul_acc_az -= float(step_az)
+            self._rate_emul_acc_alt -= float(step_alt)
+            self._rate_emul_active = True
+
+            if step_az == 0 and step_alt == 0:
+                return
+
+            delay_az = self._rate_to_delay_us(abs(az_cmd), axis=Axis.AZ)
+            delay_alt = self._rate_to_delay_us(abs(alt_cmd), axis=Axis.ALT)
+
         try:
-            self._mount.rate(float(az), float(alt))
+            if step_az != 0:
+                self._send_move_steps_direct(axis=Axis.AZ, signed_steps=step_az, delay_us=delay_az)
+            if step_alt != 0:
+                self._send_move_steps_direct(axis=Axis.ALT, signed_steps=step_alt, delay_us=delay_alt)
         except Exception as exc:
             self._update_state(
                 {
-                    "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "RATE failed"},
+                    "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "MOVE command failed"},
                     "tracking": {
                         "enabled": False,
                         "status": TrackingStatus.OFF,
                         "mode": TrackingMode.IDLE,
-                        "last_error": "mount RATE failed",
+                        "last_error": "mount MOVE failed",
                     },
                 }
             )
-            log_error(
-                self.out_log,
-                "Mount: RATE failed",
-                exc,
-                throttle_s=2.0,
-                throttle_key="mount_rate",
-            )
+            log_error(self.out_log, "Mount: MOVE rate-emulation failed", exc, throttle_s=2.0, throttle_key="mount_move_rate_emul")
 
     def _goto_move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
         if self._mount is None:
             raise RuntimeError("mount not connected")
-        self._mount.move_steps(axis, direction, steps, delay_us)
+        self._mount.move_steps(axis, direction, steps, delay_us, blocking=False, stop_before_move=False)
 
     def _pause_tracking_for_goto(self) -> bool:
         was_tracking = self._get_tracking_enabled()
@@ -973,6 +1094,8 @@ class AppRunner:
     # Mount
     # -------------------------
     def _shutdown_mount(self) -> None:
+        self._reset_rate_emulation()
+        self._clear_manual_move_activity()
         if self._mount is not None:
             try:
                 self._mount.disconnect()
@@ -999,6 +1122,8 @@ class AppRunner:
             log_error(self.out_log, "Mount: connect failed", exc)
 
     def _mount_stop(self) -> None:
+        self._reset_rate_emulation()
+        self._clear_manual_move_activity()
         if self._mount is None:
             return
         try:
@@ -1032,9 +1157,7 @@ class AppRunner:
     def _mount_move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
         if self._mount is None or not self._mount.is_connected():
             return
-        if self._mount_move_worker.is_busy():
-            log_info(self.out_log, "Mount: MOVE ignored; previous move still running")
-            return
+        self._mark_manual_move_active(axis=axis, steps=int(steps), delay_us=int(delay_us))
         self._mount_move_worker.request(
             axis=axis,
             direction=direction,
@@ -1290,17 +1413,16 @@ class AppRunner:
                         tracking_enabled=bool(tracking_on),
                     )
 
-                    if not self._is_manual_move_active():
-                        try:
-                            self._mount.rate(float(out.rate_az), float(out.rate_alt))
-                        except Exception as exc:
-                            self._update_state(
-                                {
-                                    "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "tracking rate failed"},
-                                    "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE, "last_error": "mount.rate failed", "n_det": int(out.n_det)},
-                                }
-                            )
-                            log_error(self.out_log, "Tracking: mount.rate failed", exc, throttle_s=2.0, throttle_key="tracking_mount_rate")
+                    try:
+                        self._mount_rate_safe(float(out.rate_az), float(out.rate_alt))
+                    except Exception as exc:
+                        self._update_state(
+                            {
+                                "mount": {"status": MountStatus.ERROR, "connected": False, "last_error": "tracking move failed"},
+                                "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE, "last_error": "mount MOVE failed", "n_det": int(out.n_det)},
+                            }
+                        )
+                        log_error(self.out_log, "Tracking: mount MOVE failed", exc, throttle_s=2.0, throttle_key="tracking_mount_move")
 
                     tracking_mode = self._tracking_mode_from_output(out.mode)
                     self._update_state(
@@ -1535,6 +1657,7 @@ class AppRunner:
             if not self._tracking_state.auto.ok or self._tracking_state.auto.A_pinv is None:
                 auto_reset(self._tracking_state, src="auto")
             self._update_state({"tracking": {"enabled": True, "status": TrackingStatus.RUNNING, "mode": TrackingMode.IDLE}})
+            self._reset_rate_emulation()
             self._mount_rate_safe(0.0, 0.0)
             self._tracking_keyframe_reset()
             log_info(self.out_log, "Tracking: START")
@@ -1542,6 +1665,7 @@ class AppRunner:
 
         if t == ActionType.TRACKING_STOP:
             self._update_state({"tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE}})
+            self._reset_rate_emulation()
             self._mount_rate_safe(0.0, 0.0)
             log_info(self.out_log, "Tracking: STOP")
             return
