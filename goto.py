@@ -1323,6 +1323,7 @@ class GoToModel:
                 "status": "NO_LOGS",
                 "manual_samples": 0,
                 "synced": bool(self.synced),
+                "camera_roll_deg": float("nan"),
             }
 
         manual_entries: List[Dict[str, Any]] = []
@@ -1408,6 +1409,7 @@ class GoToModel:
                 "status": "NO_VALID_ROWS",
                 "manual_samples": 0,
                 "synced": bool(self.synced),
+                "camera_roll_deg": float("nan"),
             }
 
         prev_steps = self.steps_est.copy()
@@ -1504,6 +1506,18 @@ class GoToModel:
             max_tilt_deg=float(self.max_tilt_ns_oe_deg),
         )
 
+        camera_roll_deg = float("nan")
+        if fit_entry is not None:
+            cand = float(fit_entry.get("model_roll_deg", float("nan")))
+            if np.isfinite(cand):
+                camera_roll_deg = _wrap_deg_180(cand)
+        if (not np.isfinite(camera_roll_deg)) and manual_session:
+            for entry in reversed(manual_session):
+                cand = float(entry.get("roll_deg", float("nan")))
+                if np.isfinite(cand):
+                    camera_roll_deg = _wrap_deg_180(cand)
+                    break
+
         return {
             "ok": True,
             "status": "OK",
@@ -1511,6 +1525,7 @@ class GoToModel:
             "synced": bool(self.synced),
             "loaded_manual": bool(manual_session),
             "loaded_fit": bool(fit_entry is not None),
+            "camera_roll_deg": float(camera_roll_deg),
             "manual_path": str(manual_path),
             "fit_path": str(fit_path),
         }
@@ -6141,6 +6156,30 @@ class GoToWorker(BaseWorker):
             f"tot={float(rep['model_fit_rms_arcsec']):.2f}arcsec]",
         )
 
+    def _pointing_snapshot_from_model(self) -> Optional[Dict[str, float]]:
+        az_alt = self._goto.model.current_az_alt_deg()
+        if az_alt is None:
+            return None
+        az = float(az_alt[0]) % 360.0
+        alt = float(np.clip(float(az_alt[1]), -90.0, 90.0))
+        if (not np.isfinite(az)) or (not np.isfinite(alt)):
+            return None
+        coord_icrs = parse_target_to_icrs(
+            {"az_deg": az, "alt_deg": alt},
+            observer=self._get_observer(),
+            obstime=Time.now(),
+        ).icrs
+        ra = float(coord_icrs.ra.deg) % 360.0
+        dec = float(coord_icrs.dec.deg)
+        if (not np.isfinite(ra)) or (not np.isfinite(dec)):
+            return None
+        return {
+            "az_deg": az,
+            "alt_deg": alt,
+            "ra_deg": ra,
+            "dec_deg": dec,
+        }
+
     def _handle_request(self, request: Dict[str, Any]) -> None:
         kind = str(request.get("kind", "goto"))
         target = request.get("target", None)
@@ -6466,14 +6505,41 @@ class GoToWorker(BaseWorker):
                 ok = bool(out.get("ok", False))
                 status = str(out.get("status", "UNKNOWN"))
                 n_manual = int(out.get("manual_samples", len(getattr(model, "_manual_steps_abs", []))))
+                camera_roll = float(out.get("camera_roll_deg", float("nan")))
+                if np.isfinite(camera_roll):
+                    try:
+                        self._apply_camera_param("roll_deg", float(camera_roll))
+                    except Exception as exc:
+                        log_error(self._out_log, "GoTo: failed to apply restored camera roll", exc)
+                        self._publish_state({"camera": {"roll_deg": float(camera_roll)}})
+
+                pointing = None
+                try:
+                    pointing = self._pointing_snapshot_from_model()
+                except Exception as exc:
+                    log_error(self._out_log, "GoTo: failed to compute restored pointing", exc)
+
+                goto_patch: Dict[str, Any] = {
+                    "manual_samples": int(n_manual),
+                    "synced": bool(getattr(model, "synced", False)),
+                    "status": GotoStatus.OK if ok else GotoStatus.FAIL,
+                    "reason": f"RESTORE_{status}",
+                }
+                if pointing is not None:
+                    goto_patch.update(
+                        {
+                            "pointing_valid": True,
+                            "pointing_az_deg": float(pointing["az_deg"]),
+                            "pointing_alt_deg": float(pointing["alt_deg"]),
+                            "pointing_ra_deg": float(pointing["ra_deg"]),
+                            "pointing_dec_deg": float(pointing["dec_deg"]),
+                        }
+                    )
+                elif ok:
+                    goto_patch["pointing_valid"] = False
                 self._publish_state(
                     {
-                        "goto": {
-                            "manual_samples": int(n_manual),
-                            "synced": bool(getattr(model, "synced", False)),
-                            "status": GotoStatus.OK if ok else GotoStatus.FAIL,
-                            "reason": f"RESTORE_{status}",
-                        }
+                        "goto": goto_patch,
                     }
                 )
                 log_info(
@@ -6482,6 +6548,7 @@ class GoToWorker(BaseWorker):
                     f"status={status} ok={ok} "
                     f"manual_samples={n_manual} "
                     f"synced={bool(getattr(model, 'synced', False))} "
+                    f"camera_roll={camera_roll:+.3f}deg "
                     f"loaded_manual={bool(out.get('loaded_manual', False))} "
                     f"loaded_fit={bool(out.get('loaded_fit', False))}",
                 )

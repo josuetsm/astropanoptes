@@ -871,6 +871,7 @@ class AppRunner:
 
     def _apply_camera_param(self, name: str, value: Any) -> None:
         n = (name or "").strip()
+        needs_restart = True
 
         if n in ("exp_ms", "exposure_ms"):
             self.cfg.camera.exp_ms = float(value)
@@ -900,11 +901,21 @@ class AppRunner:
             self.cfg.preview.stretch_plo = float(value)
         elif n in ("preview_stretch_phi",):
             self.cfg.preview.stretch_phi = float(value)
+        elif n in ("roll_deg", "camera_roll_deg"):
+            roll = float(value)
+            if not np.isfinite(roll):
+                log_info(self.out_log, f"Camera: roll inválido ignorado: {value}")
+                return
+            self.cfg.camera.roll_deg = float(roll)
+            self.cfg.platesolving.rotation_prior_roll_offset_deg = float(roll)
+            self._update_state({"camera": {"roll_deg": float(roll)}})
+            needs_restart = False
         else:
             log_info(self.out_log, f"Camera: param ignorado (no soportado aún): {n}={value}")
             return
 
-        self._restart_camera_stream_if_active(reason=f"{n} change")
+        if needs_restart:
+            self._restart_camera_stream_if_active(reason=f"{n} change")
 
     def _restart_camera_stream_if_active(self, *, reason: str) -> None:
         if self._cam_dev is None or self._cam_stream is None:

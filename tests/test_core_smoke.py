@@ -291,6 +291,7 @@ class CoreSmokeTests(unittest.TestCase):
                 self.assertTrue(bool(out.get("ok", False)))
                 self.assertEqual(str(out.get("status")), "OK")
                 self.assertEqual(int(out.get("manual_samples", -1)), 2)
+                self.assertAlmostEqual(float(out.get("camera_roll_deg", float("nan"))), 6.5, places=9)
                 self.assertTrue(restored.synced)
                 self.assertEqual(len(restored._manual_steps_abs), 2)
                 np.testing.assert_allclose(
@@ -324,6 +325,31 @@ class CoreSmokeTests(unittest.TestCase):
                 out = model.restore_from_latest_logs()
                 self.assertFalse(bool(out.get("ok", False)))
                 self.assertEqual(str(out.get("status")), "NO_LOGS")
+                self.assertFalse(np.isfinite(float(out.get("camera_roll_deg", float("nan")))))
+        finally:
+            if prev_log_dir is None:
+                os.environ.pop("ASTROPANOPTES_GOTO_LOG_DIR", None)
+            else:
+                os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = prev_log_dir
+
+    def test_goto_model_restore_last_log_uses_latest_manual_roll_when_no_fit(self) -> None:
+        prev_log_dir = os.environ.get("ASTROPANOPTES_GOTO_LOG_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = tmpdir
+
+                source_model = GoToModel()
+                source_model.init_from_mechanics()
+                source_model.steps_est = np.array([10.0, 20.0], dtype=np.float64)
+                source_model.add_manual_sample(np.array([100.0, 30.0], dtype=np.float64), theta_deg=11.0)
+                source_model.steps_est = np.array([15.0, 22.0], dtype=np.float64)
+                source_model.add_manual_sample(np.array([100.2, 30.1], dtype=np.float64), theta_deg=12.0)
+
+                restored = GoToModel()
+                restored.init_from_mechanics()
+                out = restored.restore_from_latest_logs()
+                self.assertTrue(bool(out.get("ok", False)))
+                self.assertAlmostEqual(float(out.get("camera_roll_deg", float("nan"))), 12.0, places=9)
         finally:
             if prev_log_dir is None:
                 os.environ.pop("ASTROPANOPTES_GOTO_LOG_DIR", None)
