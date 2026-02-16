@@ -16,7 +16,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 - `LICENSE`: licencia del proyecto.
 - `app.ipynb`: notebook de ejemplo para levantar UI y ejecutar el runner.
 - `app_runner.py`: orquestador principal de runtime; loop de control, captura, preview y tracking.
-- `ui.py`: wrapper para construir/mostrar la UI PyQt6.
+- `app.py`: entrypoint principal para iniciar la UI PyQt6.
 - `ui/pyqt6_app.py`: implementación principal de la UI de escritorio.
 - `actions.py`: definición de acciones y factories (connect, set params, tracking, stacking, platesolving, goto).
 - `ap_types.py`: tipos compartidos (ejes, modos, `Frame`, `AppState`).
@@ -39,7 +39,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
   - Ejecuta el loop de control a `control_hz`, genera previews y aplica tracking.
   - Mantiene el estado global (`AppState`) para la UI.
 
-- **`ui.py` + `ui/pyqt6_app.py`**
+- **`app.py` + `ui/pyqt6_app.py`**
   - Construye la UI en PyQt6 (botones de conexión, estados, live view).
   - Incluye controles manuales de montura (microsteps, move, stop).
   - Refleja métricas de tracking cuando está activo.
@@ -93,7 +93,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 
 1) **Stacking (apilado)**
   - `actions.py` define `STACKING_*` y `AppState` tiene métricas de stacking.
-   - En `ui.py` hay botones/estados deshabilitados para stacking.
+   - En `ui/pyqt6_app.py` hay botones/estados para stacking.
    - Falta un módulo que: alinee frames, integre/guarde resultados, y exponga métricas.
 
 2) **Gestión de calibraciones persistentes**

@@ -1791,7 +1791,19 @@ class AppRunner:
             log_info(self.out_log, "Mount: RESET_DEFAULTS")
             return
 
-        # ---- Tracking ----
+        if self._handle_tracking_action(t, p):
+            return
+        if self._handle_stacking_action(t, p):
+            return
+        if self._handle_platesolving_action(t, p):
+            return
+        if self._handle_goto_action(t, p):
+            return
+
+        # ---- Otros ----
+        log_info(self.out_log, f"Unknown or unhandled action type: {t}")
+
+    def _handle_tracking_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
         if t == ActionType.TRACKING_START:
             if not self._tracking_state.auto.ok or self._tracking_state.auto.A_pinv is None:
                 auto_reset(self._tracking_state, src="auto")
@@ -1810,7 +1822,7 @@ class AppRunner:
             self._mount_rate_safe(0.0, 0.0)
             self._tracking_keyframe_reset()
             log_info(self.out_log, "Tracking: START")
-            return
+            return True
 
         if t == ActionType.TRACKING_STOP:
             self._update_state(
@@ -1831,7 +1843,7 @@ class AppRunner:
             self._reset_rate_emulation()
             self._mount_rate_safe(0.0, 0.0)
             log_info(self.out_log, "Tracking: STOP")
-            return
+            return True
 
         if t == ActionType.TRACKING_SET_PARAMS:
             if isinstance(p, dict):
@@ -1879,56 +1891,58 @@ class AppRunner:
                     }
                 )
                 log_info(self.out_log, f"Tracking: SET_PARAMS {_format_params(updates)}")
-            return
+            return True
 
         if t == ActionType.RESET_TRACKING_DEFAULTS:
             self._reset_tracking_defaults()
             log_info(self.out_log, "Tracking: RESET_DEFAULTS")
-            return
+            return True
 
         if t == ActionType.TRACKING_CALIB_RESET:
             auto_reset(self._tracking_state, src="auto")
             self._tracking_keyframe_reset()
             log_info(self.out_log, "Tracking: CALIB_RESET (autocal only)")
-            return
+            return True
 
         if t == ActionType.TRACKING_AUTO_RESET:
             auto_reset(self._tracking_state, src="auto")
             self._tracking_keyframe_reset()
             log_info(self.out_log, "Tracking: AUTO_RESET")
-            return
+            return True
 
         if t == ActionType.TRACKING_CALIB_AZ:
             log_info(self.out_log, "Tracking: CALIB_AZ ignored (autocalibration only)")
-            return
+            return True
 
         if t == ActionType.TRACKING_CALIB_ALT:
             log_info(self.out_log, "Tracking: CALIB_ALT ignored (autocalibration only)")
-            return
+            return True
 
         if t == ActionType.TRACKING_BOOTSTRAP:
             log_info(self.out_log, "Tracking: BOOTSTRAP ignored (autocalibration only)")
-            return
+            return True
 
-        # ---- Stacking ----
+        return False
+
+    def _handle_stacking_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
         if t == ActionType.STACKING_START:
             self._stacking_enabled = True
             self._stacking.start()
             self._update_state({"stacking": {"enabled": True, "status": StackingStatus.RUNNING}})
             log_info(self.out_log, "Stacking: START")
-            return
+            return True
 
         if t == ActionType.STACKING_STOP:
             self._stacking_enabled = False
             self._stacking.stop()
             self._update_state({"stacking": {"enabled": False, "status": StackingStatus.OFF}})
             log_info(self.out_log, "Stacking: STOP")
-            return
+            return True
 
         if t == ActionType.STACKING_RESET:
             self._stacking.reset()
             log_info(self.out_log, "Stacking: RESET")
-            return
+            return True
 
         if t == ActionType.STACKING_SET_PARAMS:
             if isinstance(p, dict):
@@ -1945,33 +1959,27 @@ class AppRunner:
                 if align_updates:
                     tracking_set_params(self._tracking_state, **align_updates)
                 log_info(self.out_log, f"Stacking: SET_PARAMS {list(p.keys())}")
-            return
+            return True
 
         if t == ActionType.RESET_STACKING_DEFAULTS:
             self._reset_stacking_defaults()
             log_info(self.out_log, "Stacking: RESET_DEFAULTS")
-            return
+            return True
 
-        # Save stacked mosaic (raw + png)
         if t == ActionType.STACKING_SAVE:
-            # Payload should contain out_dir, basename, fmt; defaults provided
             if isinstance(p, dict):
                 out_dir = str(p.get("out_dir", "stack_output"))
                 basename = str(p.get("basename", "stack"))
                 fmt = str(p.get("fmt", "png"))
                 self._save_stacking(out_dir, basename, fmt)
             else:
-                # Fallback to default directory and basename
-                out_dir = "stack_output"
-                basename = "stack"
-                fmt = "png"
-                self._save_stacking(out_dir, basename, fmt)
-            return
+                self._save_stacking("stack_output", "stack", "png")
+            return True
 
-        # ---- Platesolving ----
+        return False
+
+    def _handle_platesolving_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
         if t == ActionType.PLATESOLVING_SET_PARAMS:
-            # Permite actualizar PlatesolvingConfig desde UI sin reimportar
-            # Ej: {'pixel_size_m': 2.9e-6, 'focal_m': 0.9, 'gmax': 14.5, ...}
             if isinstance(p, dict):
                 payload = dict(p)
                 if "auto_target" in payload:
@@ -1990,7 +1998,6 @@ class AppRunner:
                     if key in payload:
                         observer_payload[observer_field] = payload.pop(key)
 
-                # Rebuild dataclass con campos existentes
                 with self._platesolving_cfg_lock:
                     d = dict(self.cfg.platesolving.__dict__)
                     for k, v in payload.items():
@@ -2020,14 +2027,13 @@ class AppRunner:
                     log_info(self.out_log, "Platesolving: params updated")
                 if observer_payload:
                     log_info(self.out_log, "Platesolving: observer updated")
-            return
+            return True
 
         if t == ActionType.RESET_PLATESOLVING_DEFAULTS:
             self._reset_platesolving_defaults()
             log_info(self.out_log, "Platesolving: RESET_DEFAULTS")
-            return
+            return True
 
-        # ---- Live SEP overlay ----
         if t == ActionType.LIVE_SEP_SET_PARAMS:
             if isinstance(p, dict):
                 enabled = p.get("enabled", self._live_sep_overlay_enabled)
@@ -2056,32 +2062,26 @@ class AppRunner:
                     sep_max_sources=int(self.cfg.platesolving.max_det),
                 )
                 log_info(self.out_log, "Live SEP: params updated")
-            return
-
+            return True
 
         if t == ActionType.PLATESOLVING_RUN:
-            # Payload esperado:
-            #  - target: str|tuple|dict (ver platesolving.py)
-            #  - (opcional) gaia_username / gaia_password (persistir)
             target = p.get("target", None)
-
-            # Si vienen credenciales, persistirlas
             user = str(p.get("gaia_username", "")).strip()
             pw = str(p.get("gaia_password", "")).strip()
             if user and pw:
                 save_gaia_auth(user, pw)
                 log_info(self.out_log, "Platesolving: Gaia credentials saved")
-
             self._platesolving_request(target=target)
             log_info(self.out_log, "Platesolving: RUN source=live")
-            return
+            return True
 
-        # ---- GoTo ----
+        return False
+
+    def _handle_goto_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
         if t == ActionType.MOUNT_SYNC:
-            # Sync usando el último platesolving OK
-            sol = getattr(self, '_last_platesolving_result', None)
-            if sol is None or not bool(getattr(sol, 'success', False)):
-                log_info(self.out_log, 'GoTo: sync failed (no successful platesolving cached)')
+            sol = getattr(self, "_last_platesolving_result", None)
+            if sol is None or not bool(getattr(sol, "success", False)):
+                log_info(self.out_log, "GoTo: sync failed (no successful platesolving cached)")
                 self._update_state(
                     {
                         "goto": {
@@ -2091,12 +2091,12 @@ class AppRunner:
                         }
                     }
                 )
-                return
+                return True
             ok = False
             try:
                 ok = bool(self._goto.sync_from_platesolving(sol))
             except Exception as exc:
-                log_error(self.out_log, 'GoTo: sync exception', exc)
+                log_error(self.out_log, "GoTo: sync exception", exc)
             self._update_state(
                 {
                     "goto": {
@@ -2107,56 +2107,55 @@ class AppRunner:
                 }
             )
             log_info(self.out_log, f"GoTo: sync {'OK' if ok else 'ERR'}")
-            return
+            return True
 
         if t == ActionType.MOUNT_GOTO:
-            target = p.get('target', {})
-            self._goto_worker.request(kind='goto', target=target, params=p)
-            return
+            target = p.get("target", {})
+            self._goto_worker.request(kind="goto", target=target, params=p)
+            return True
 
         if t == ActionType.GOTO_CALIBRATE:
-            params = p.get('params', {})
-            self._goto_worker.request(kind='calibrate', target=None, params=params)
-            return
+            params = p.get("params", {})
+            self._goto_worker.request(kind="calibrate", target=None, params=params)
+            return True
 
         if t == ActionType.GOTO_AUTOCALIBRATE:
-            params = p.get('params', {})
-            self._goto_worker.request(kind='autocal', target=None, params=params)
-            return
+            params = p.get("params", {})
+            self._goto_worker.request(kind="autocal", target=None, params=params)
+            return True
 
         if t == ActionType.GOTO_ESTIMATE_ROLL:
-            params = p.get('params', {})
-            self._goto_worker.request(kind='roll', target=None, params=params)
-            return
+            params = p.get("params", {})
+            self._goto_worker.request(kind="roll", target=None, params=params)
+            return True
 
         if t == ActionType.GOTO_FIT_MODEL:
-            params = p.get('params', {})
-            self._goto_worker.request(kind='fit_model', target=None, params=params)
-            return
+            params = p.get("params", {})
+            self._goto_worker.request(kind="fit_model", target=None, params=params)
+            return True
 
         if t == ActionType.GOTO_LIST_SAMPLES:
-            params = p.get('params', {})
-            self._goto_worker.request(kind='list_samples', target=None, params=params)
-            return
+            params = p.get("params", {})
+            self._goto_worker.request(kind="list_samples", target=None, params=params)
+            return True
 
         if t == ActionType.GOTO_PRUNE_OUTLIERS:
-            params = p.get('params', {})
-            self._goto_worker.request(kind='prune_outliers', target=None, params=params)
-            return
+            params = p.get("params", {})
+            self._goto_worker.request(kind="prune_outliers", target=None, params=params)
+            return True
 
         if t == ActionType.GOTO_RESET:
-            self._goto_worker.request(kind='reset', target=None, params={})
-            return
+            self._goto_worker.request(kind="reset", target=None, params={})
+            return True
 
         if t == ActionType.GOTO_RESTORE_LAST_LOG:
-            self._goto_worker.request(kind='restore_last_log', target=None, params={})
-            return
+            self._goto_worker.request(kind="restore_last_log", target=None, params={})
+            return True
 
         if t == ActionType.GOTO_CANCEL:
             self._goto_worker.cancel()
             self._mount_stop()
             self._update_state({"goto": {"busy": False, "status": GotoStatus.CANCELLED, "reason": "CANCELLED"}})
-            return
+            return True
 
-        # ---- Otros ----        # ---- Otros ----
-        log_info(self.out_log, f"Unknown or unhandled action type: {t}")
+        return False
