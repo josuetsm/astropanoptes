@@ -72,6 +72,10 @@ class MountConfig:
 @dataclass
 class TrackingConfig:
     resp_min: float = 0.06
+    sidereal_ff_enabled: bool = True
+    sidereal_ff_gain: float = 1.0
+    sidereal_ff_dt_s: float = 1.0
+    sidereal_ff_cond_max: float = 5_000.0
 
 
 @dataclass
@@ -91,7 +95,7 @@ class StackingConfig:
     use_subpixel: bool = True
 
     # drizzle / mosaic
-    drizzle_scale: float = 2.0     # 1.5,2.0,2.5,3.0
+    drizzle_scale: float = 2.0     # UI presets: 2.0, 3.0
     pixfrac: float = 0.8
     tile_size_out: int = 512
     max_tiles: int = 64

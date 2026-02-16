@@ -824,8 +824,9 @@ def tracking_step(
         ey = float(state.y_hat)
 
         upd = float(state.cfg.rate.update_s)
-        state.eint_x = clamp(state.eint_x + ex * upd, -float(state.cfg.pi.eint_clamp), +float(state.cfg.pi.eint_clamp))
-        state.eint_y = clamp(state.eint_y + ey * upd, -float(state.cfg.pi.eint_clamp), +float(state.cfg.pi.eint_clamp))
+        dt_ctrl = clamp(dt, 0.0, max(4.0 * upd, 0.05))
+        state.eint_x = clamp(state.eint_x + ex * dt_ctrl, -float(state.cfg.pi.eint_clamp), +float(state.cfg.pi.eint_clamp))
+        state.eint_y = clamp(state.eint_y + ey * dt_ctrl, -float(state.cfg.pi.eint_clamp), +float(state.cfg.pi.eint_clamp))
 
         Kp = float(state.cfg.pi.kp)
         Ki = float(state.cfg.pi.ki)
@@ -844,8 +845,10 @@ def tracking_step(
         rate_az_t = clamp(float(u_dot[0]), -float(state.cfg.rate.rate_max), +float(state.cfg.rate.rate_max))
         rate_alt_t = clamp(float(u_dot[1]), -float(state.cfg.rate.rate_max), +float(state.cfg.rate.rate_max))
 
-        state.rate_az = rate_ramp(float(state.rate_az), rate_az_t, float(state.cfg.rate.rate_slew_per_update))
-        state.rate_alt = rate_ramp(float(state.rate_alt), rate_alt_t, float(state.cfg.rate.rate_slew_per_update))
+        slew_scale = clamp(dt_ctrl / max(upd, 1e-6), 0.1, 4.0)
+        slew_per_step = float(state.cfg.rate.rate_slew_per_update) * slew_scale
+        state.rate_az = rate_ramp(float(state.rate_az), rate_az_t, slew_per_step)
+        state.rate_alt = rate_ramp(float(state.rate_alt), rate_alt_t, slew_per_step)
 
         if good_inc:
             auto_rls_update(

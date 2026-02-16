@@ -45,6 +45,7 @@ OBSERVER_PRESETS = (
     ("Estación Central (Santiago)", {"lat_deg": -33.4569, "lon_deg": -70.6990, "height_m": 520.0}),
 )
 BARLOW_FACTORS = (1, 2, 3, 4, 5)
+STACKING_DRIZZLE_SCALES = (2.0, 3.0)
 
 from actions import tracking_keyframe_reset
 from ap_types import Axis
@@ -792,6 +793,13 @@ class AstroPanoptesWindow(QMainWindow):
         self.cb_st_color = QCheckBox("Stacking a color (RGB, Bayer RGGB)")
         self.cb_st_color.setChecked(str(self.cfg.stacking.color_mode).lower() == "rgb")
         self.cb_st_color.toggled.connect(self._stacking_color_toggled)
+        self.dd_st_drizzle = QComboBox()
+        self.dd_st_drizzle.addItem("x2", 2.0)
+        self.dd_st_drizzle.addItem("x3", 3.0)
+        drizzle_cfg = float(getattr(self.cfg.stacking, "drizzle_scale", 2.0))
+        drizzle_idx = 1 if drizzle_cfg >= 2.5 else 0
+        self.dd_st_drizzle.setCurrentIndex(drizzle_idx)
+        self.dd_st_drizzle.currentIndexChanged.connect(self._stacking_drizzle_changed)
 
         row = QHBoxLayout()
         for button in [self.btn_st_start, self.btn_st_stop, self.btn_st_reset, self.btn_st_save]:
@@ -804,6 +812,7 @@ class AstroPanoptesWindow(QMainWindow):
         self.btn_st_save.clicked.connect(self._stacking_save)
 
         form.addRow(row)
+        form.addRow("Drizzle:", self.dd_st_drizzle)
         form.addRow(self.cb_st_color)
         box.setLayout(form)
 
@@ -1369,6 +1378,17 @@ class AstroPanoptesWindow(QMainWindow):
         color_mode = "rgb" if bool(checked) else "mono"
         self.runner.request_stacking_params(color_mode=color_mode, bayer_pattern="RGGB")
         self._log(f"[stacking] color_mode={color_mode} (stack RGB RGGB, alignment mono)")
+
+    def _stacking_drizzle_changed(self, _: int) -> None:
+        data = self.dd_st_drizzle.currentData()
+        try:
+            drizzle_scale = float(data)
+        except Exception:
+            drizzle_scale = 2.0
+        if drizzle_scale not in STACKING_DRIZZLE_SCALES:
+            drizzle_scale = 2.0
+        self.runner.request_stacking_params(drizzle_scale=drizzle_scale)
+        self._log(f"[stacking] drizzle=x{int(drizzle_scale)}")
 
     def _platesolve_start(self) -> None:
         target = self.ed_ps_target.text().strip()

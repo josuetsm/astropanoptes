@@ -1094,6 +1094,7 @@ class GoToModel:
     _manual_steps_abs: List[np.ndarray] = field(default_factory=list, repr=False)
     _manual_az_alt_abs: List[np.ndarray] = field(default_factory=list, repr=False)
     _manual_roll_deg_abs: List[float] = field(default_factory=list, repr=False)
+    _manual_fit_inlier_mask: Optional[np.ndarray] = field(default=None, repr=False)
 
     # History of commanded steps (AZ, ALT) during the session
     steps_history: List[np.ndarray] = field(default_factory=list, repr=False)
@@ -1419,6 +1420,7 @@ class GoToModel:
         self._manual_steps_abs.clear()
         self._manual_az_alt_abs.clear()
         self._manual_roll_deg_abs.clear()
+        self._manual_fit_inlier_mask = None
         self.steps_history.clear()
 
         self.synced = False
@@ -1587,6 +1589,164 @@ class GoToModel:
         if not self.synced:
             return None
         return self.predict_az_alt_deg()
+
+    def _world_deg_per_step_matrix(
+        self,
+        *,
+        az_deg: float,
+        alt_deg: float,
+        deriv_step: float = 64.0,
+    ) -> Optional[np.ndarray]:
+        J = np.asarray(self.J_deg_per_step, dtype=np.float64)
+        if J.shape != (2, 2) or (not np.all(np.isfinite(J))):
+            return None
+
+        az0 = _wrap_deg_360(float(az_deg))
+        alt0 = float(np.clip(float(alt_deg), -89.5, 89.5))
+        if (not np.isfinite(az0)) or (not np.isfinite(alt0)):
+            return None
+
+        base_world = np.array([az0, alt0], dtype=np.float64)
+        base_mount = self._world_to_mount_altaz(base_world)
+        eps = max(1.0, abs(float(deriv_step)))
+        cols: List[np.ndarray] = []
+
+        for axis_idx in range(2):
+            dsteps = np.zeros(2, dtype=np.float64)
+            dsteps[axis_idx] = eps
+            dmount = J @ dsteps
+
+            mount_p = np.array(
+                [
+                    _wrap_deg_360(float(base_mount[0]) + float(dmount[0])),
+                    float(np.clip(float(base_mount[1]) + float(dmount[1]), -89.5, 89.5)),
+                ],
+                dtype=np.float64,
+            )
+            mount_m = np.array(
+                [
+                    _wrap_deg_360(float(base_mount[0]) - float(dmount[0])),
+                    float(np.clip(float(base_mount[1]) - float(dmount[1]), -89.5, 89.5)),
+                ],
+                dtype=np.float64,
+            )
+
+            world_p = self._mount_to_world_altaz(mount_p)
+            world_m = self._mount_to_world_altaz(mount_m)
+            daz = _wrap_deg_180(float(world_p[0]) - float(world_m[0]))
+            dalt = float(world_p[1]) - float(world_m[1])
+            cols.append(np.array([daz / (2.0 * eps), dalt / (2.0 * eps)], dtype=np.float64))
+
+        J_world_step = np.column_stack(cols)
+        if J_world_step.shape != (2, 2) or (not np.all(np.isfinite(J_world_step))):
+            return None
+        return J_world_step
+
+    def world_altaz_rate_to_step_rate_deg_s(
+        self,
+        *,
+        az_deg: float,
+        alt_deg: float,
+        world_rate_deg_s: Sequence[float],
+        deriv_step: float = 64.0,
+        cond_max: float = 5_000.0,
+    ) -> Optional[np.ndarray]:
+        v_world = _as_array2(world_rate_deg_s)
+        if not np.all(np.isfinite(v_world)):
+            return None
+
+        J_world_step = self._world_deg_per_step_matrix(
+            az_deg=float(az_deg),
+            alt_deg=float(alt_deg),
+            deriv_step=float(deriv_step),
+        )
+        if J_world_step is None:
+            return None
+
+        try:
+            cond = float(np.linalg.cond(J_world_step))
+        except np.linalg.LinAlgError:
+            return None
+        if (not np.isfinite(cond)) or cond > float(cond_max):
+            return None
+
+        try:
+            rate_steps = np.linalg.solve(J_world_step, v_world)
+        except np.linalg.LinAlgError:
+            rate_steps, *_ = np.linalg.lstsq(J_world_step, v_world, rcond=None)
+
+        if not np.all(np.isfinite(rate_steps)):
+            return None
+        return np.asarray(rate_steps, dtype=np.float64).reshape(2,)
+
+    def sidereal_world_rate_deg_s(
+        self,
+        *,
+        az_deg: float,
+        alt_deg: float,
+        observer: ObserverConfig,
+        obstime: Optional[Time] = None,
+        dt_s: float = 1.0,
+    ) -> Optional[np.ndarray]:
+        dt = float(dt_s)
+        if (not np.isfinite(dt)) or dt <= 1e-6:
+            return None
+
+        az0 = _wrap_deg_360(float(az_deg))
+        alt0 = float(np.clip(float(alt_deg), -89.5, 89.5))
+        if (not np.isfinite(az0)) or (not np.isfinite(alt0)):
+            return None
+
+        t0 = obstime if obstime is not None else _now_time()
+        try:
+            coord_icrs = resolve_target_icrs(
+                {"az_deg": az0, "alt_deg": alt0},
+                observer=observer,
+                obstime=t0,
+            )
+            altaz_1 = icrs_to_altaz_deg(
+                coord_icrs,
+                observer=observer,
+                obstime=t0 + dt * u.s,
+            )
+        except Exception as exc:
+            log_error(None, "GoTo: sidereal world-rate prediction failed", exc, throttle_s=5.0, throttle_key="goto_sidereal_world_rate")
+            return None
+
+        daz = _wrap_deg_180(float(altaz_1[0]) - az0)
+        dalt = float(altaz_1[1]) - alt0
+        rate = np.array([daz / dt, dalt / dt], dtype=np.float64)
+        if not np.all(np.isfinite(rate)):
+            return None
+        return rate
+
+    def sidereal_step_rate_deg_s(
+        self,
+        *,
+        az_deg: float,
+        alt_deg: float,
+        observer: ObserverConfig,
+        obstime: Optional[Time] = None,
+        dt_s: float = 1.0,
+        deriv_step: float = 64.0,
+        cond_max: float = 5_000.0,
+    ) -> Optional[np.ndarray]:
+        world_rate = self.sidereal_world_rate_deg_s(
+            az_deg=float(az_deg),
+            alt_deg=float(alt_deg),
+            observer=observer,
+            obstime=obstime,
+            dt_s=float(dt_s),
+        )
+        if world_rate is None:
+            return None
+        return self.world_altaz_rate_to_step_rate_deg_s(
+            az_deg=float(az_deg),
+            alt_deg=float(alt_deg),
+            world_rate_deg_s=world_rate,
+            deriv_step=float(deriv_step),
+            cond_max=float(cond_max),
+        )
 
     def apply_plate_solve(self, az_alt_deg: np.ndarray) -> bool:
         """Update last solve and reconcile steps_est with the solved AltAz.
@@ -1806,6 +1966,8 @@ class GoToModel:
                 roll_store = _wrap_deg_180(roll)
         # Keep one roll slot per sample (NaN when missing) so index-based pruning is safe.
         self._manual_roll_deg_abs.append(float(roll_store))
+        # New sample invalidates the previous inlier mask.
+        self._manual_fit_inlier_mask = None
         self.last_solve_az_alt_deg = az_alt.copy()
         self.last_solve_steps_est = self.steps_est.copy()
         self.last_solve_time = time.time()
@@ -1835,6 +1997,7 @@ class GoToModel:
         self._manual_steps_abs.clear()
         self._manual_az_alt_abs.clear()
         self._manual_roll_deg_abs.clear()
+        self._manual_fit_inlier_mask = None
 
         self.synced = False
         self.ref_steps = self.steps_est.copy()
@@ -1924,6 +2087,7 @@ class GoToModel:
         *,
         J_model: np.ndarray,
         R_mount_to_world: np.ndarray,
+        reference_mask: Optional[np.ndarray] = None,
     ) -> Optional[Dict[str, Any]]:
         n = int(len(self._manual_steps_abs))
         if n <= 0:
@@ -1945,7 +2109,14 @@ class GoToModel:
         A_world = np.stack(self._manual_az_alt_abs, axis=0).astype(np.float64)
 
         idx_all = np.arange(n, dtype=int)
-        ref_idx = self._manual_reference_index_from_steps(S_abs, idx_all)
+        idx_ref = idx_all
+        if reference_mask is not None:
+            ref_mask = np.asarray(reference_mask, dtype=bool).reshape(-1)
+            if int(ref_mask.size) == n:
+                idx_ref_cand = np.flatnonzero(ref_mask)
+                if int(idx_ref_cand.size) > 0:
+                    idx_ref = idx_ref_cand.astype(int)
+        ref_idx = self._manual_reference_index_from_steps(S_abs, idx_ref)
         s_ref = S_abs[ref_idx, :]
         S_rel = S_abs - s_ref
 
@@ -2010,6 +2181,7 @@ class GoToModel:
         resid = self._manual_residuals_against_model(
             J_model=J,
             R_mount_to_world=self._rotation_mount_to_world(),
+            reference_mask=self._manual_fit_inlier_mask,
         )
         if resid is None:
             return []
@@ -2107,6 +2279,9 @@ class GoToModel:
             if roll_aligned and 0 <= int(idx) < len(self._manual_roll_deg_abs):
                 del self._manual_roll_deg_abs[int(idx)]
 
+        # Sample set changed; previous fit mask is no longer aligned.
+        self._manual_fit_inlier_mask = None
+
         if not roll_aligned:
             # Legacy sessions may have compressed roll history without per-sample alignment.
             self._manual_roll_deg_abs.clear()
@@ -2132,6 +2307,8 @@ class GoToModel:
         R_mount_to_world is estimated with Wahba/Kabsch and constrained with hard
         NS/OE tilt limits (|tilt| <= max_tilt_ns_oe_deg).
         """
+        self._manual_fit_inlier_mask = None
+
         if len(self._manual_steps_abs) < int(min_samples):
             self._log_fit_csv(
                 fit_kind="manual",
@@ -2177,108 +2354,124 @@ class GoToModel:
             if n_use < int(min_samples):
                 return None
 
-            ref_idx = self._manual_reference_index_from_steps(S_abs, idx)
-            s_ref = S_abs[ref_idx, :]
-            a_ref = A_abs[ref_idx, :]
-            S_rel = S_abs - s_ref  # (N,2)
-            d_az = np.array(
-                [_wrap_deg_180(float(A_abs[i, 0]) - float(a_ref[0])) for i in range(n)],
-                dtype=np.float64,
-            )
-            d_alt = (A_abs[:, 1] - float(a_ref[1])).astype(np.float64)
-            D = np.column_stack((d_az, d_alt)).astype(np.float64)  # (N,2)
+            best_fit: Optional[Dict[str, Any]] = None
+            best_obj = float("inf")
 
-            S_use = S_rel[idx, :]
-            D_use = D[idx, :]
+            # Try all masked samples as potential references.
+            # This avoids anchoring the model to a high-leverage outlier.
+            for ref_idx in idx.tolist():
+                s_ref = S_abs[int(ref_idx), :]
+                a_ref = A_abs[int(ref_idx), :]
+                S_rel = S_abs - s_ref  # (N,2)
+                d_az = np.array(
+                    [_wrap_deg_180(float(A_abs[i, 0]) - float(a_ref[0])) for i in range(n)],
+                    dtype=np.float64,
+                )
+                d_alt = (A_abs[:, 1] - float(a_ref[1])).astype(np.float64)
+                D = np.column_stack((d_az, d_alt)).astype(np.float64)  # (N,2)
 
-            # Solve only for excited columns to avoid collapsing unobserved axes.
-            col_energy = np.linalg.norm(S_use, axis=0)
-            active_cols = [j for j in range(2) if float(col_energy[j]) > 1e-9]
-            if not active_cols:
-                return None
-            S_active = S_use[:, active_cols]
-            p = int(S_active.shape[1])
-            if n_use < max(int(min_samples), p + 1):
-                return None
+                S_use = S_rel[idx, :]
+                D_use = D[idx, :]
 
-            reg = np.eye(p, dtype=np.float64)
-            lam = max(0.0, float(ridge))
-            if lam > 0.0:
-                S_aug = np.vstack((S_active, math.sqrt(lam) * reg))
-                D_aug = np.vstack((D_use, np.zeros((p, 2), dtype=np.float64)))
-            else:
-                S_aug = S_active
-                D_aug = D_use
+                # Solve only for excited columns to avoid collapsing unobserved axes.
+                col_energy = np.linalg.norm(S_use, axis=0)
+                active_cols = [j for j in range(2) if float(col_energy[j]) > 1e-9]
+                if not active_cols:
+                    continue
+                S_active = S_use[:, active_cols]
+                p = int(S_active.shape[1])
+                if n_use < max(int(min_samples), p + 1):
+                    continue
 
-            B_active, *_ = np.linalg.lstsq(S_aug, D_aug, rcond=None)  # (p,2)
-            if not np.all(np.isfinite(B_active)):
-                return None
+                reg = np.eye(p, dtype=np.float64)
+                lam = max(0.0, float(ridge))
+                if lam > 0.0:
+                    S_aug = np.vstack((S_active, math.sqrt(lam) * reg))
+                    D_aug = np.vstack((D_use, np.zeros((p, 2), dtype=np.float64)))
+                else:
+                    S_aug = S_active
+                    D_aug = D_use
 
-            J_new = J_prev.copy()
-            for ridx, cidx in enumerate(active_cols):
-                J_new[0, cidx] = float(B_active[ridx, 0])
-                J_new[1, cidx] = float(B_active[ridx, 1])
+                B_active, *_ = np.linalg.lstsq(S_aug, D_aug, rcond=None)  # (p,2)
+                if not np.all(np.isfinite(B_active)):
+                    continue
 
-            # If a non-excited column was already invalid/near-zero, restore mechanical baseline.
-            if 0 not in active_cols and float(np.linalg.norm(J_new[:, 0])) < 1e-12:
-                J_new[:, 0] = np.array([float(self.kin.deg_per_step(Axis.AZ)), 0.0], dtype=np.float64)
-            if 1 not in active_cols and float(np.linalg.norm(J_new[:, 1])) < 1e-12:
-                J_new[:, 1] = np.array([0.0, float(self.kin.deg_per_step(Axis.ALT))], dtype=np.float64)
+                J_new = J_prev.copy()
+                for ridx, cidx in enumerate(active_cols):
+                    J_new[0, cidx] = float(B_active[ridx, 0])
+                    J_new[1, cidx] = float(B_active[ridx, 1])
 
-            if not np.all(np.isfinite(J_new)):
-                return None
-            det_J = float(np.linalg.det(J_new))
-            if (not np.isfinite(det_J)) or abs(det_J) < 1e-12:
-                return None
-            try:
-                cond_J = float(np.linalg.cond(J_new))
-            except np.linalg.LinAlgError:
-                return None
-            if (not np.isfinite(cond_J)) or cond_J > 1e10:
-                return None
+                # If a non-excited column was already invalid/near-zero, restore mechanical baseline.
+                if 0 not in active_cols and float(np.linalg.norm(J_new[:, 0])) < 1e-12:
+                    J_new[:, 0] = np.array([float(self.kin.deg_per_step(Axis.AZ)), 0.0], dtype=np.float64)
+                if 1 not in active_cols and float(np.linalg.norm(J_new[:, 1])) < 1e-12:
+                    J_new[:, 1] = np.array([0.0, float(self.kin.deg_per_step(Axis.ALT))], dtype=np.float64)
 
-            pred_use = S_use @ J_new.T
-            res_az_use = np.array(
-                [_wrap_deg_180(float(D_use[i, 0]) - float(pred_use[i, 0])) for i in range(n_use)],
-                dtype=np.float64,
-            )
-            res_alt_use = (D_use[:, 1] - pred_use[:, 1]).astype(np.float64)
-            sse_az = float(np.dot(res_az_use, res_az_use))
-            sse_alt = float(np.dot(res_alt_use, res_alt_use))
-            dof = max(1, n_use - p)
+                if not np.all(np.isfinite(J_new)):
+                    continue
+                det_J = float(np.linalg.det(J_new))
+                if (not np.isfinite(det_J)) or abs(det_J) < 1e-12:
+                    continue
+                try:
+                    cond_J = float(np.linalg.cond(J_new))
+                except np.linalg.LinAlgError:
+                    continue
+                if (not np.isfinite(cond_J)) or cond_J > 1e10:
+                    continue
 
-            XtX = (S_active.T @ S_active) + (lam * (reg.T @ reg))
-            try:
-                XtX_inv = np.linalg.inv(XtX)
-            except np.linalg.LinAlgError:
-                XtX_inv = np.linalg.pinv(XtX)
+                pred_use = S_use @ J_new.T
+                res_az_use = np.array(
+                    [_wrap_deg_180(float(D_use[i, 0]) - float(pred_use[i, 0])) for i in range(n_use)],
+                    dtype=np.float64,
+                )
+                res_alt_use = (D_use[:, 1] - pred_use[:, 1]).astype(np.float64)
+                sse_az = float(np.dot(res_az_use, res_az_use))
+                sse_alt = float(np.dot(res_alt_use, res_alt_use))
+                dof = max(1, n_use - p)
 
-            sigma2_az = sse_az / float(dof)
-            sigma2_alt = sse_alt / float(dof)
-            std_beta_az_active = np.sqrt(np.maximum(np.diag(XtX_inv) * sigma2_az, 0.0))
-            std_beta_alt_active = np.sqrt(np.maximum(np.diag(XtX_inv) * sigma2_alt, 0.0))
+                XtX = (S_active.T @ S_active) + (lam * (reg.T @ reg))
+                try:
+                    XtX_inv = np.linalg.inv(XtX)
+                except np.linalg.LinAlgError:
+                    XtX_inv = np.linalg.pinv(XtX)
 
-            pred_all = S_rel @ J_new.T
-            res_az_all = np.array(
-                [_wrap_deg_180(float(D[i, 0]) - float(pred_all[i, 0])) for i in range(n)],
-                dtype=np.float64,
-            )
-            res_alt_all = (D[:, 1] - pred_all[:, 1]).astype(np.float64)
+                sigma2_az = sse_az / float(dof)
+                sigma2_alt = sse_alt / float(dof)
+                std_beta_az_active = np.sqrt(np.maximum(np.diag(XtX_inv) * sigma2_az, 0.0))
+                std_beta_alt_active = np.sqrt(np.maximum(np.diag(XtX_inv) * sigma2_alt, 0.0))
 
-            return {
-                "mask": mask.copy(),
-                "n_use": n_use,
-                "p": p,
-                "ref_idx": int(ref_idx),
-                "active_cols": active_cols,
-                "J_new": J_new,
-                "res_az_use": res_az_use,
-                "res_alt_use": res_alt_use,
-                "res_az_all": res_az_all,
-                "res_alt_all": res_alt_all,
-                "std_beta_az_active": std_beta_az_active,
-                "std_beta_alt_active": std_beta_alt_active,
-            }
+                pred_all = S_rel @ J_new.T
+                res_az_all = np.array(
+                    [_wrap_deg_180(float(D[i, 0]) - float(pred_all[i, 0])) for i in range(n)],
+                    dtype=np.float64,
+                )
+                res_alt_all = (D[:, 1] - pred_all[:, 1]).astype(np.float64)
+
+                res_norm_use = np.hypot(res_az_use, res_alt_use)
+                finite_use = np.isfinite(res_norm_use)
+                if int(np.sum(finite_use)) <= 0:
+                    continue
+                obj = float(np.mean(np.square(res_norm_use[finite_use])))
+                if (not np.isfinite(obj)) or obj >= best_obj:
+                    continue
+
+                best_obj = obj
+                best_fit = {
+                    "mask": mask.copy(),
+                    "n_use": n_use,
+                    "p": p,
+                    "ref_idx": int(ref_idx),
+                    "active_cols": active_cols,
+                    "J_new": J_new,
+                    "res_az_use": res_az_use,
+                    "res_alt_use": res_alt_use,
+                    "res_az_all": res_az_all,
+                    "res_alt_all": res_alt_all,
+                    "std_beta_az_active": std_beta_az_active,
+                    "std_beta_alt_active": std_beta_alt_active,
+                }
+
+            return best_fit
 
         mask = np.ones(n, dtype=bool)
         fit = _solve_with_mask(mask)
@@ -2410,6 +2603,7 @@ class GoToModel:
         resid_model = self._manual_residuals_against_model(
             J_model=self.J_deg_per_step,
             R_mount_to_world=self.R_mount_to_world,
+            reference_mask=np.asarray(fit["mask"], dtype=bool),
         )
         if resid_model is not None:
             idx_use = np.flatnonzero(np.asarray(fit["mask"], dtype=bool))
@@ -2420,6 +2614,7 @@ class GoToModel:
                 res_alt = res_alt_all[idx_use]
 
         self.model_fit_samples = int(fit["n_use"])
+        self._manual_fit_inlier_mask = np.asarray(fit["mask"], dtype=bool).copy()
         self.model_fit_rms_az_deg = float(np.sqrt(np.mean(np.square(res_az))))
         self.model_fit_rms_alt_deg = float(np.sqrt(np.mean(np.square(res_alt))))
         self.model_fit_rms_arcsec = float(

@@ -2,6 +2,7 @@ import unittest
 import time
 import os
 import tempfile
+from unittest.mock import patch
 
 import numpy as np
 import pandas as pd
@@ -49,6 +50,26 @@ class CoreSmokeTests(unittest.TestCase):
         out2 = tracking_step(state, raw2, now_t=1.0, tracking_enabled=False)
         self.assertIsNotNone(out2)
 
+    def test_tracking_pi_integrator_uses_frame_dt(self) -> None:
+        state = make_tracking_state()
+        state.auto.ok = True
+        state.auto.A_pinv = np.eye(2, dtype=np.float64)
+        state.auto.b = np.zeros(2, dtype=np.float64)
+        raw = np.zeros((32, 32), dtype=np.uint16)
+        objects = np.array([(10.0, 10.0, 1000.0)], dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
+
+        with (
+            patch("tracking.sep_detect_from_raw16", return_value=(None, None, objects, None)),
+            patch("tracking.estimate_shift_from_profile_alignment", return_value=(1.0, 0.0, 1.0)),
+            patch("tracking.auto_rls_update", return_value=None),
+        ):
+            tracking_step(state, raw, now_t=0.0, tracking_enabled=True)
+            out = tracking_step(state, raw, now_t=0.1, tracking_enabled=True)
+
+        self.assertTrue(np.isfinite(float(out.rate_az)))
+        self.assertAlmostEqual(float(state.eint_x), 0.1, places=2)
+        self.assertAlmostEqual(float(state.eint_y), 0.0, places=4)
+
     def test_stacking_engine_smoke(self) -> None:
         cfg = AppConfig()
         engine = StackEngine(cfg)
@@ -88,6 +109,53 @@ class CoreSmokeTests(unittest.TestCase):
         b_mean = float(np.mean(mean[..., 2]))
         self.assertLess(r_mean, g_mean)
         self.assertLess(g_mean, b_mean)
+
+    def test_stacking_engine_drizzle_x2_scales_mono_output(self) -> None:
+        cfg = AppConfig()
+        cfg.stacking.color_mode = "mono"
+        cfg.stacking.drizzle_scale = 2.0
+        cfg.stacking.bayer_pattern = "RGGB"
+        engine = StackEngine(cfg)
+        engine.configure_from_cfg()
+        engine.start()
+
+        raw = np.zeros((24, 40), dtype=np.uint16)
+        raw[10:14, 18:22] = 42000
+
+        engine.step_batch([{"raw16": raw, "t": 0.0}])
+        mean = engine.get_stack_mean(out_dtype=np.uint16)
+        engine.stop()
+
+        self.assertIsNotNone(mean)
+        if mean is None:
+            self.fail("mean stack should not be None in mono drizzle mode")
+        self.assertEqual(mean.ndim, 2)
+        self.assertEqual(mean.shape, (48, 80))
+
+    def test_stacking_engine_drizzle_x3_scales_rgb_output(self) -> None:
+        cfg = AppConfig()
+        cfg.stacking.color_mode = "rgb"
+        cfg.stacking.drizzle_scale = 3.0
+        cfg.stacking.bayer_pattern = "RGGB"
+        engine = StackEngine(cfg)
+        engine.configure_from_cfg()
+        engine.start()
+
+        raw = np.zeros((24, 40), dtype=np.uint16)
+        raw[0::2, 0::2] = 1000
+        raw[0::2, 1::2] = 2000
+        raw[1::2, 0::2] = 2000
+        raw[1::2, 1::2] = 3000
+
+        engine.step_batch([{"raw16": raw, "t": 0.0}])
+        mean = engine.get_stack_mean(out_dtype=np.uint16)
+        engine.stop()
+
+        self.assertIsNotNone(mean)
+        if mean is None:
+            self.fail("mean stack should not be None in rgb drizzle mode")
+        self.assertEqual(mean.ndim, 3)
+        self.assertEqual(mean.shape, (72, 120, 3))
 
     def test_platesolving_guides_smoke(self) -> None:
         df = pd.DataFrame({"phot_g_mean_mag": [10.0, 11.0, 9.0]})
@@ -395,6 +463,49 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(model.J_deg_per_step[1, 0], j_true[1, 0], places=4)
         self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_true[1, 1], places=4)
 
+    def test_goto_model_manual_fit_rejects_central_reference_outlier(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        j_true = np.array([[0.0012, 0.0003], [-0.0002, 0.0010]], dtype=np.float64)
+        base_steps = np.array([0.0, 0.0], dtype=np.float64)
+        base_az_alt = np.array([210.0, 40.0], dtype=np.float64)
+        deltas = np.array(
+            [
+                [0.0, 0.0],  # central outlier candidate (high leverage reference)
+                [10000.0, 0.0],
+                [-10000.0, 0.0],
+                [0.0, 10000.0],
+                [0.0, -10000.0],
+                [10000.0, 10000.0],
+            ],
+            dtype=np.float64,
+        )
+
+        for i, (d_az, d_alt) in enumerate(deltas):
+            d_steps = np.array([d_az, d_alt], dtype=np.float64)
+            model.steps_est = base_steps + d_steps
+            d_altaz = j_true @ d_steps
+            az = float(base_az_alt[0] + d_altaz[0])
+            alt = float(base_az_alt[1] + d_altaz[1])
+            if i == 0:
+                az += 2.0
+                alt -= 1.0
+            model.add_manual_sample(np.array([az % 360.0, alt], dtype=np.float64), theta_deg=0.0)
+
+        ok = model.fit_J_from_manual_samples(min_samples=5, ridge=1e-9)
+        self.assertTrue(ok)
+        self.assertEqual(model.model_fit_samples, 5)
+
+        report = model.manual_samples_deviation_report(sort_by_deviation=True)
+        self.assertEqual(len(report), len(deltas))
+        outliers = [row for row in report if bool(row.get("outlier_suggested", False))]
+        self.assertEqual(len(outliers), 1)
+        self.assertEqual(int(outliers[0]["sample_idx"]), 0)
+
+        inlier_devs = [float(row["dev_arcsec"]) for row in report if not bool(row.get("outlier_suggested", False))]
+        self.assertGreater(len(inlier_devs), 0)
+        self.assertLess(max(inlier_devs), 5.0)
+
     def test_goto_model_calibration_fit_rejects_outlier_sample(self) -> None:
         model = GoToModel()
         model.init_from_mechanics()
@@ -510,6 +621,44 @@ class CoreSmokeTests(unittest.TestCase):
         altaz_yes = icrs_to_altaz_deg(coord, observer=obs_yes, obstime=t)
         self.assertAlmostEqual(float(altaz_no[0]), float(altaz_yes[0]), places=9)
         self.assertAlmostEqual(float(altaz_no[1]), float(altaz_yes[1]), places=9)
+
+    def test_goto_model_sidereal_step_rate_is_finite_and_consistent(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        observer = ObserverConfig(lat_deg=-30.0, lon_deg=-70.0, height_m=1000.0)
+        obstime = Time("2026-02-13T03:00:00", format="isot", scale="utc")
+        az_deg = 140.0
+        alt_deg = 45.0
+
+        world_rate = model.sidereal_world_rate_deg_s(
+            az_deg=az_deg,
+            alt_deg=alt_deg,
+            observer=observer,
+            obstime=obstime,
+            dt_s=1.0,
+        )
+        self.assertIsNotNone(world_rate)
+        if world_rate is None:
+            self.fail("world sidereal rate should be available")
+
+        step_rate = model.world_altaz_rate_to_step_rate_deg_s(
+            az_deg=az_deg,
+            alt_deg=alt_deg,
+            world_rate_deg_s=world_rate,
+            cond_max=1.0e6,
+        )
+        self.assertIsNotNone(step_rate)
+        if step_rate is None:
+            self.fail("step sidereal rate should be available")
+        self.assertTrue(np.all(np.isfinite(step_rate)))
+        self.assertLess(float(np.max(np.abs(step_rate))), 2000.0)
+
+        J_world_step = model._world_deg_per_step_matrix(az_deg=az_deg, alt_deg=alt_deg)
+        self.assertIsNotNone(J_world_step)
+        if J_world_step is None:
+            self.fail("world/step Jacobian should be available")
+        world_rate_reconstructed = np.asarray(J_world_step, dtype=np.float64) @ np.asarray(step_rate, dtype=np.float64)
+        np.testing.assert_allclose(world_rate_reconstructed, np.asarray(world_rate, dtype=np.float64), rtol=0.02, atol=2.0e-5)
 
 
 if __name__ == "__main__":

@@ -116,11 +116,17 @@ class TrackingState:
     enabled: bool = False
     status: TrackingStatus = TrackingStatus.OFF
     mode: TrackingMode = TrackingMode.IDLE
+    ff_enabled: bool = False
+    ff_ready: bool = False
     resp: float = 0.0
     dx: float = 0.0
     dy: float = 0.0
     rate_az: float = 0.0
     rate_alt: float = 0.0
+    rate_fb_az: float = 0.0
+    rate_fb_alt: float = 0.0
+    rate_ff_az: float = 0.0
+    rate_ff_alt: float = 0.0
     vx: float = 0.0
     vy: float = 0.0
     abs_resp: float = 0.0

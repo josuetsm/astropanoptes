@@ -59,6 +59,16 @@ def _bayer_to_rgb_code(pattern: str) -> int:
     return _BAYER_TO_RGB_CODE.get(str(pattern).upper(), cv2.COLOR_BayerRG2BGR)
 
 
+def _normalize_drizzle_scale(v: Any) -> float:
+    try:
+        scale = float(v)
+    except Exception:
+        return 2.0
+    if not np.isfinite(scale):
+        return 2.0
+    return max(1.0, scale)
+
+
 # ============================================================
 # Live Mosaic Stacker (alignment in gray, stack in gray or RGB)
 # ============================================================
@@ -73,6 +83,7 @@ class LiveMosaicStackerGray:
         max_shift_px: int,
         use_subpixel: bool,
         preview_log_vmin: float,
+        drizzle_scale: float,
         bayer_to_gray_code: int,
         bayer_to_rgb_code: int,
     ):
@@ -82,6 +93,7 @@ class LiveMosaicStackerGray:
         self.max_shift_px = max(1, int(max_shift_px))
         self.use_subpixel = bool(use_subpixel)
         self.preview_log_vmin = float(preview_log_vmin)
+        self.drizzle_scale = _normalize_drizzle_scale(drizzle_scale)
         self.bayer_to_gray_code = int(bayer_to_gray_code)
         self.bayer_to_rgb_code = int(bayer_to_rgb_code)
         self.kernel = _smooth_kernel(self.smooth_k)
@@ -176,14 +188,23 @@ class LiveMosaicStackerGray:
             return float(shift_int)
         return out
 
+    def _apply_drizzle(self, img: np.ndarray) -> np.ndarray:
+        scale = float(self.drizzle_scale)
+        if scale <= 1.0:
+            return img
+        return cv2.resize(img, dsize=None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
+
     def _raw_to_gray_align(self, raw_u16: np.ndarray) -> np.ndarray:
         raw_f = cv2.medianBlur(raw_u16, self.align_median_k)
-        return cv2.cvtColor(raw_f, self.bayer_to_gray_code)
+        gray = cv2.cvtColor(raw_f, self.bayer_to_gray_code)
+        return self._apply_drizzle(gray)
 
     def _raw_to_stack(self, raw_u16: np.ndarray) -> np.ndarray:
         if self.color_mode == "rgb":
-            return cv2.cvtColor(raw_u16, self.bayer_to_rgb_code)
-        return cv2.cvtColor(raw_u16, self.bayer_to_gray_code)
+            rgb = cv2.cvtColor(raw_u16, self.bayer_to_rgb_code)
+            return self._apply_drizzle(rgb)
+        mono = cv2.cvtColor(raw_u16, self.bayer_to_gray_code)
+        return self._apply_drizzle(mono)
 
     @staticmethod
     def _warp_img(img: np.ndarray, tx: float, ty: float) -> np.ndarray:
@@ -437,6 +458,7 @@ class StackEngine:
                 max_shift_px=int(getattr(scfg, "max_shift_px", 50)),
                 use_subpixel=bool(getattr(scfg, "use_subpixel", True)),
                 preview_log_vmin=float(getattr(scfg, "preview_log_vmin", 5.0)),
+                drizzle_scale=_normalize_drizzle_scale(getattr(scfg, "drizzle_scale", 2.0)),
                 bayer_to_gray_code=_bayer_to_gray_code(str(scfg.bayer_pattern)),
                 bayer_to_rgb_code=_bayer_to_rgb_code(str(scfg.bayer_pattern)),
             )
@@ -483,6 +505,8 @@ class StackEngine:
             scfg = self.cfg.stacking
             for k, v in kwargs.items():
                 if hasattr(scfg, k):
+                    if k == "drizzle_scale":
+                        v = _normalize_drizzle_scale(v)
                     setattr(scfg, k, v)
             was_enabled = bool(self.enabled)
             self.configure_from_cfg()

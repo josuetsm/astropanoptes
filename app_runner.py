@@ -301,6 +301,8 @@ class AppRunner:
                     "enabled": False,
                     "status": TrackingStatus.OFF,
                     "mode": TrackingMode.IDLE,
+                    "ff_enabled": bool(self.cfg.tracking.sidereal_ff_enabled),
+                    "ff_ready": False,
                     "resp": 0.0,
                     "dx": 0.0,
                     "dy": 0.0,
@@ -309,6 +311,10 @@ class AppRunner:
                     "abs_resp": 0.0,
                     "rate_az": 0.0,
                     "rate_alt": 0.0,
+                    "rate_fb_az": 0.0,
+                    "rate_fb_alt": 0.0,
+                    "rate_ff_az": 0.0,
+                    "rate_ff_alt": 0.0,
                     "calib_src": "none",
                     "calib_det": 0.0,
                     "n_det": 0,
@@ -393,6 +399,72 @@ class AppRunner:
             return TrackingMode(str(mode))
         except ValueError:
             return TrackingMode.IDLE
+
+    def _clip_tracking_rate_pair(self, az: float, alt: float) -> Tuple[float, float]:
+        az_v = float(az) if np.isfinite(float(az)) else 0.0
+        alt_v = float(alt) if np.isfinite(float(alt)) else 0.0
+        rate_max = float(getattr(self.cfg.mount, "rate_max", 0.0))
+        if np.isfinite(rate_max) and rate_max > 0.0:
+            az_v = max(-rate_max, min(rate_max, az_v))
+            alt_v = max(-rate_max, min(rate_max, alt_v))
+        return float(az_v), float(alt_v)
+
+    def _tracking_pointing_altaz(self) -> Optional[Tuple[float, float]]:
+        az_alt = None
+        try:
+            az_alt = self._goto.model.current_az_alt_deg()
+        except Exception:
+            az_alt = None
+
+        if az_alt is not None and len(az_alt) >= 2:
+            az = float(az_alt[0]) % 360.0
+            alt = float(np.clip(float(az_alt[1]), -90.0, 90.0))
+            if np.isfinite(az) and np.isfinite(alt):
+                return float(az), float(alt)
+
+        st = self.get_state()
+        if bool(st.goto.pointing_valid):
+            az = float(st.goto.pointing_az_deg) % 360.0
+            alt = float(np.clip(float(st.goto.pointing_alt_deg), -90.0, 90.0))
+            if np.isfinite(az) and np.isfinite(alt):
+                return float(az), float(alt)
+        return None
+
+    def _tracking_feedforward_rate(self, *, now_t: Optional[float] = None) -> Tuple[float, float, bool]:
+        if not bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)):
+            return 0.0, 0.0, False
+
+        pointing = self._tracking_pointing_altaz()
+        if pointing is None:
+            return 0.0, 0.0, False
+        az_deg, alt_deg = pointing
+
+        dt_s = float(getattr(self.cfg.tracking, "sidereal_ff_dt_s", 1.0))
+        if (not np.isfinite(dt_s)) or dt_s <= 1e-3:
+            dt_s = 1.0
+        cond_max = float(getattr(self.cfg.tracking, "sidereal_ff_cond_max", 5_000.0))
+        if (not np.isfinite(cond_max)) or cond_max <= 1.0:
+            cond_max = 5_000.0
+        gain = float(getattr(self.cfg.tracking, "sidereal_ff_gain", 1.0))
+        if not np.isfinite(gain):
+            gain = 1.0
+
+        t_eval = Time(float(now_t), format="unix", scale="utc") if now_t is not None else Time.now()
+        rate_ff = self._goto.model.sidereal_step_rate_deg_s(
+            az_deg=float(az_deg),
+            alt_deg=float(alt_deg),
+            observer=self._platesolving_observer,
+            obstime=t_eval,
+            dt_s=float(dt_s),
+            cond_max=float(cond_max),
+        )
+        if rate_ff is None:
+            return 0.0, 0.0, False
+
+        az_ff = float(rate_ff[0]) * float(gain)
+        alt_ff = float(rate_ff[1]) * float(gain)
+        az_ff, alt_ff = self._clip_tracking_rate_pair(az_ff, alt_ff)
+        return float(az_ff), float(alt_ff), True
 
     def _get_fps_capture(self) -> float:
         if self._cam_stream is None:
@@ -708,7 +780,6 @@ class AppRunner:
             dt = float(now - float(self._rate_emul_last_t))
             if not np.isfinite(dt) or dt < 0.0:
                 dt = 0.0
-            dt = min(dt, 0.25)
             self._rate_emul_last_t = now
 
             az_cmd = float(az)
@@ -788,12 +859,30 @@ class AppRunner:
     def _pause_tracking_for_goto(self) -> bool:
         was_tracking = self._get_tracking_enabled()
         if was_tracking:
-            self._update_state({"tracking": {"enabled": False, "status": TrackingStatus.PAUSED}})
+            self._update_state(
+                {
+                    "tracking": {
+                        "enabled": False,
+                        "status": TrackingStatus.PAUSED,
+                        "ff_enabled": bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)),
+                        "ff_ready": False,
+                    }
+                }
+            )
             self._mount_rate_safe(0.0, 0.0)
         return was_tracking
 
     def _resume_tracking_after_goto(self) -> None:
-        self._update_state({"tracking": {"enabled": True, "status": TrackingStatus.RUNNING}})
+        self._update_state(
+            {
+                "tracking": {
+                    "enabled": True,
+                    "status": TrackingStatus.RUNNING,
+                    "ff_enabled": bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)),
+                    "ff_ready": False,
+                }
+            }
+        )
         self._tracking_keyframe_reset()
 
     def _pause_stacking_for_goto(self) -> bool:
@@ -989,6 +1078,16 @@ class AppRunner:
             sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
             sep_minarea=int(self.cfg.sep.minarea),
             sep_max_sources=int(self.cfg.platesolving.max_det),
+        )
+        self._update_state(
+            {
+                "tracking": {
+                    "ff_enabled": bool(self.cfg.tracking.sidereal_ff_enabled),
+                    "ff_ready": False,
+                    "rate_ff_az": 0.0,
+                    "rate_ff_alt": 0.0,
+                }
+            }
         )
         self._tracking_keyframe_reset()
 
@@ -1421,15 +1520,28 @@ class AppRunner:
                 if fr is not None:
                     # Tracking en RAW16 + SEP
                     raw16 = ensure_raw16_bayer(fr.raw)
+                    now_track = _now_s()
                     out = tracking_step(
                         self._tracking_state,
                         raw16,
-                        now_t=_now_s(),
+                        now_t=float(now_track),
                         tracking_enabled=bool(tracking_on),
                     )
 
+                    rate_fb_az = float(out.rate_az)
+                    rate_fb_alt = float(out.rate_alt)
+                    rate_ff_az = 0.0
+                    rate_ff_alt = 0.0
+                    ff_ready = False
+                    if bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)):
+                        rate_ff_az, rate_ff_alt, ff_ready = self._tracking_feedforward_rate(now_t=float(now_track))
+
+                    rate_cmd_az = float(rate_fb_az + rate_ff_az)
+                    rate_cmd_alt = float(rate_fb_alt + rate_ff_alt)
+                    rate_cmd_az, rate_cmd_alt = self._clip_tracking_rate_pair(rate_cmd_az, rate_cmd_alt)
+
                     try:
-                        self._mount_rate_safe(float(out.rate_az), float(out.rate_alt))
+                        self._mount_rate_safe(float(rate_cmd_az), float(rate_cmd_alt))
                     except Exception as exc:
                         self._update_state(
                             {
@@ -1452,8 +1564,14 @@ class AppRunner:
                                 "vx": float(out.vx),
                                 "vy": float(out.vy),
                                 "abs_resp": float(out.abs_resp),
-                                "rate_az": float(out.rate_az),
-                                "rate_alt": float(out.rate_alt),
+                                "ff_enabled": bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)),
+                                "ff_ready": bool(ff_ready),
+                                "rate_az": float(rate_cmd_az),
+                                "rate_alt": float(rate_cmd_alt),
+                                "rate_fb_az": float(rate_fb_az),
+                                "rate_fb_alt": float(rate_fb_alt),
+                                "rate_ff_az": float(rate_ff_az),
+                                "rate_ff_alt": float(rate_ff_alt),
                                 "calib_src": str(out.calib_src),
                                 "calib_det": float(out.detA),
                                 "n_det": int(out.n_det),
@@ -1471,8 +1589,14 @@ class AppRunner:
                             "enabled": False,
                             "status": TrackingStatus.OFF,
                             "mode": TrackingMode.IDLE,
+                            "ff_enabled": bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)),
+                            "ff_ready": False,
                             "rate_az": 0.0,
                             "rate_alt": 0.0,
+                            "rate_fb_az": 0.0,
+                            "rate_fb_alt": 0.0,
+                            "rate_ff_az": 0.0,
+                            "rate_ff_alt": 0.0,
                             "n_det": 0,
                             "last_error": None,
                         }
@@ -1671,7 +1795,17 @@ class AppRunner:
         if t == ActionType.TRACKING_START:
             if not self._tracking_state.auto.ok or self._tracking_state.auto.A_pinv is None:
                 auto_reset(self._tracking_state, src="auto")
-            self._update_state({"tracking": {"enabled": True, "status": TrackingStatus.RUNNING, "mode": TrackingMode.IDLE}})
+            self._update_state(
+                {
+                    "tracking": {
+                        "enabled": True,
+                        "status": TrackingStatus.RUNNING,
+                        "mode": TrackingMode.IDLE,
+                        "ff_enabled": bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)),
+                        "ff_ready": False,
+                    }
+                }
+            )
             self._reset_rate_emulation()
             self._mount_rate_safe(0.0, 0.0)
             self._tracking_keyframe_reset()
@@ -1679,7 +1813,21 @@ class AppRunner:
             return
 
         if t == ActionType.TRACKING_STOP:
-            self._update_state({"tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE}})
+            self._update_state(
+                {
+                    "tracking": {
+                        "enabled": False,
+                        "status": TrackingStatus.OFF,
+                        "mode": TrackingMode.IDLE,
+                        "ff_enabled": bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)),
+                        "ff_ready": False,
+                        "rate_ff_az": 0.0,
+                        "rate_ff_alt": 0.0,
+                        "rate_fb_az": 0.0,
+                        "rate_fb_alt": 0.0,
+                    }
+                }
+            )
             self._reset_rate_emulation()
             self._mount_rate_safe(0.0, 0.0)
             log_info(self.out_log, "Tracking: STOP")
@@ -1687,8 +1835,50 @@ class AppRunner:
 
         if t == ActionType.TRACKING_SET_PARAMS:
             if isinstance(p, dict):
-                tracking_set_params(self._tracking_state, **p)
-                log_info(self.out_log, f"Tracking: SET_PARAMS {_format_params(p)}")
+                updates = dict(p)
+                tracking_updates = dict(updates)
+
+                ff_enabled = updates.get("sidereal_ff_enabled", updates.get("ff_enabled", None))
+                if ff_enabled is not None:
+                    self.cfg.tracking.sidereal_ff_enabled = bool(ff_enabled)
+                    tracking_updates.pop("sidereal_ff_enabled", None)
+                    tracking_updates.pop("ff_enabled", None)
+
+                ff_gain = updates.get("sidereal_ff_gain", updates.get("ff_gain", None))
+                if ff_gain is not None:
+                    v = float(ff_gain)
+                    self.cfg.tracking.sidereal_ff_gain = float(v if np.isfinite(v) else 1.0)
+                    tracking_updates.pop("sidereal_ff_gain", None)
+                    tracking_updates.pop("ff_gain", None)
+
+                ff_dt_s = updates.get("sidereal_ff_dt_s", updates.get("ff_dt_s", None))
+                if ff_dt_s is not None:
+                    v = float(ff_dt_s)
+                    if (not np.isfinite(v)) or v <= 1e-3:
+                        v = 1.0
+                    self.cfg.tracking.sidereal_ff_dt_s = float(v)
+                    tracking_updates.pop("sidereal_ff_dt_s", None)
+                    tracking_updates.pop("ff_dt_s", None)
+
+                ff_cond_max = updates.get("sidereal_ff_cond_max", updates.get("ff_cond_max", None))
+                if ff_cond_max is not None:
+                    v = float(ff_cond_max)
+                    if (not np.isfinite(v)) or v <= 1.0:
+                        v = 5_000.0
+                    self.cfg.tracking.sidereal_ff_cond_max = float(v)
+                    tracking_updates.pop("sidereal_ff_cond_max", None)
+                    tracking_updates.pop("ff_cond_max", None)
+
+                if tracking_updates:
+                    tracking_set_params(self._tracking_state, **tracking_updates)
+                self._update_state(
+                    {
+                        "tracking": {
+                            "ff_enabled": bool(self.cfg.tracking.sidereal_ff_enabled),
+                        }
+                    }
+                )
+                log_info(self.out_log, f"Tracking: SET_PARAMS {_format_params(updates)}")
             return
 
         if t == ActionType.RESET_TRACKING_DEFAULTS:
