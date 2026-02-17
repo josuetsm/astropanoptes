@@ -8,6 +8,7 @@ import numpy as np
 import pandas as pd
 from astropy.coordinates import SkyCoord
 from astropy.time import Time
+from astropy.utils import iers
 
 from config import AppConfig
 from goto import (
@@ -21,12 +22,40 @@ from goto import (
     _rotate_altaz_deg,
     icrs_to_altaz_deg,
 )
-from platesolving import ObserverConfig, select_guide_star_indices
+from platesolving import ObserverConfig, expected_field_rotation_deg, select_guide_star_indices
 from stacking import StackEngine
 from tracking import make_tracking_state, tracking_step, tracking_set_params
 
 
 class CoreSmokeTests(unittest.TestCase):
+    @staticmethod
+    def _wrap_deg_180(angle_deg: float) -> float:
+        return float(((float(angle_deg) + 180.0) % 360.0) - 180.0)
+
+    @classmethod
+    def _theta_az_from_parallactic(
+        cls,
+        ra_deg: float,
+        dec_deg: float,
+        *,
+        observer: ObserverConfig,
+        obstime: Time,
+    ) -> float:
+        lst_deg = float(obstime.sidereal_time("apparent", longitude=observer.location().lon).deg)
+        H_deg = cls._wrap_deg_180(lst_deg - float(ra_deg))
+        H = np.deg2rad(H_deg)
+        phi = np.deg2rad(float(observer.lat_deg))
+        dec = np.deg2rad(float(dec_deg))
+        q_deg = float(
+            np.degrees(
+                np.arctan2(
+                    np.sin(H),
+                    (np.tan(phi) * np.cos(dec)) - (np.sin(dec) * np.cos(H)),
+                )
+            )
+        )
+        return cls._wrap_deg_180(180.0 - q_deg)
+
     def test_tracking_step_smoke(self) -> None:
         state = make_tracking_state()
         tracking_set_params(
@@ -132,6 +161,28 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertEqual(mean.ndim, 2)
         self.assertEqual(mean.shape, (48, 80))
 
+    def test_stacking_engine_drizzle_x1_keeps_native_size(self) -> None:
+        cfg = AppConfig()
+        cfg.stacking.color_mode = "mono"
+        cfg.stacking.drizzle_scale = 1.0
+        cfg.stacking.bayer_pattern = "RGGB"
+        engine = StackEngine(cfg)
+        engine.configure_from_cfg()
+        engine.start()
+
+        raw = np.zeros((24, 40), dtype=np.uint16)
+        raw[8:16, 16:24] = 30000
+
+        engine.step_batch([{"raw16": raw, "t": 0.0}])
+        mean = engine.get_stack_mean(out_dtype=np.uint16)
+        engine.stop()
+
+        self.assertIsNotNone(mean)
+        if mean is None:
+            self.fail("mean stack should not be None in drizzle off mode")
+        self.assertEqual(mean.ndim, 2)
+        self.assertEqual(mean.shape, (24, 40))
+
     def test_stacking_engine_drizzle_x3_scales_rgb_output(self) -> None:
         cfg = AppConfig()
         cfg.stacking.color_mode = "rgb"
@@ -161,6 +212,64 @@ class CoreSmokeTests(unittest.TestCase):
         df = pd.DataFrame({"phot_g_mean_mag": [10.0, 11.0, 9.0]})
         idx = select_guide_star_indices(df, 2)
         self.assertEqual(idx, [2, 0])
+
+    def test_expected_field_rotation_returns_finite(self) -> None:
+        iers.conf.auto_download = False
+        iers.conf.auto_max_age = None
+        observer = ObserverConfig(
+            lat_deg=-33.3667,
+            lon_deg=-71.6667,
+            height_m=28.0,
+            refraction_enable=False,
+        )
+        obstime = Time("2026-01-15T00:00:00", scale="utc")
+
+        theta = expected_field_rotation_deg(
+            120.0,
+            -20.0,
+            observer=observer,
+            obstime=obstime,
+            roll_offset_deg=0.0,
+        )
+        self.assertIsNotNone(theta)
+        self.assertTrue(np.isfinite(float(theta)))
+
+    def test_expected_field_rotation_matches_parallactic_relation(self) -> None:
+        iers.conf.auto_download = False
+        iers.conf.auto_max_age = None
+        observer = ObserverConfig(
+            lat_deg=-33.3667,
+            lon_deg=-71.6667,
+            height_m=28.0,
+            refraction_enable=False,
+        )
+        cases = (
+            (120.0, -20.0, "2026-01-15T00:00:00"),
+            (45.0, 10.0, "2026-02-01T06:00:00"),
+            (300.0, -45.0, "2026-03-20T03:30:00"),
+            (210.0, 30.0, "2026-04-10T12:00:00"),
+        )
+
+        for ra_deg, dec_deg, iso in cases:
+            obstime = Time(iso, scale="utc")
+            theta = expected_field_rotation_deg(
+                ra_deg,
+                dec_deg,
+                observer=observer,
+                obstime=obstime,
+                roll_offset_deg=0.0,
+            )
+            self.assertIsNotNone(theta)
+            if theta is None:
+                self.fail("expected field rotation must be finite for nominal targets")
+            theta_ref = self._theta_az_from_parallactic(
+                ra_deg,
+                dec_deg,
+                observer=observer,
+                obstime=obstime,
+            )
+            err_deg = abs(self._wrap_deg_180(float(theta) - float(theta_ref)))
+            self.assertLess(err_deg, 1.0)
 
     def test_goto_model_smoke(self) -> None:
         kin = MountKinematics(

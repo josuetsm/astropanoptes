@@ -95,7 +95,7 @@ class StackingConfig:
     use_subpixel: bool = True
 
     # drizzle / mosaic
-    drizzle_scale: float = 2.0     # UI presets: 2.0, 3.0
+    drizzle_scale: float = 1.0     # UI presets: 1.0 (off), 2.0, 3.0
     pixfrac: float = 0.8
     tile_size_out: int = 512
     max_tiles: int = 64

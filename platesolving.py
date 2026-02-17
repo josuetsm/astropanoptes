@@ -346,9 +346,10 @@ def expected_field_rotation_deg(
             observer=observer,
             obstime=obstime,
         ).icrs
-        d_lon, d_lat = center_icrs.spherical_offsets_to(next_icrs)
-        du = float(d_lon.to_value(u.arcsec))
-        dv = float(d_lat.to_value(u.arcsec))
+        off_frame = center_icrs.skyoffset_frame()
+        next_off = next_icrs.transform_to(off_frame)
+        du = float(next_off.lon.to_value(u.arcsec))
+        dv = float(next_off.lat.to_value(u.arcsec))
     except (RuntimeError, ValueError, TypeError):
         return None
 

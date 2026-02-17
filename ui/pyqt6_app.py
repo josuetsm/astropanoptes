@@ -1,14 +1,12 @@
 from __future__ import annotations
 
 import math
-import random
 import sys
 import time
 from pathlib import Path
 from dataclasses import dataclass
 from typing import Optional, Sequence
 
-import numpy as np
 from PyQt6.QtCore import QPointF, QRectF, QSize, Qt, QTimer, QObject, pyqtSignal
 from PyQt6.QtGui import QAction, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PyQt6.QtWidgets import (
@@ -257,11 +255,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         )
         self.renderer = OverlayRenderer()
 
-        self.base_w = 960
-        self.base_h = 600
-        self._rng = np.random.default_rng(7)
-        self._stars = self._init_star_catalog(n=120)
-
         self._build_central()
         self._log_sink = QtLogSink(self._log)
         set_global_log_sink(self._log_sink)
@@ -279,7 +272,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._frame_timer.timeout.connect(self._render_frame)
         self._frame_timer.start()
 
-        self._t_ms = 0.0
         self._log("PyQt6 UI ready.")
 
     def closeEvent(self, event) -> None:  # noqa: N802
@@ -637,9 +629,9 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         try:
             drizzle_scale = float(data)
         except Exception:
-            drizzle_scale = 2.0
+            drizzle_scale = 1.0
         if drizzle_scale not in STACKING_DRIZZLE_SCALES:
-            drizzle_scale = 2.0
+            drizzle_scale = 1.0
         self.runner.request_stacking_params(drizzle_scale=drizzle_scale)
         self._log(f"[stacking] drizzle=x{int(drizzle_scale)}")
 
@@ -772,7 +764,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._log("[manual] STOP")
 
     def _on_tick(self) -> None:
-        self._t_ms += 100.0
         state = self.runner.get_state()
 
         fps_max = max(0.1, 1000.0 / max(0.1, float(self.ds_exp_ms.value())))
@@ -804,55 +795,33 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
     def _render_frame(self) -> None:
         preview = self.runner.get_latest_preview_jpeg()
         live_pix = self._pixmap_from_jpeg(preview)
-        if live_pix is None:
-            live_pix = QPixmap.fromImage(self._render_mock_frame())
 
         stack_preview = self.runner.get_state().stacking.preview_jpeg
         stack_pix = self._pixmap_from_jpeg(stack_preview)
         if stack_pix is None:
             stack_pix = live_pix
 
-        self.live_view.setPixmap(
-            live_pix.scaled(
-                self.live_view.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+        if live_pix is not None:
+            self.live_view.setPixmap(
+                live_pix.scaled(
+                    self.live_view.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
             )
-        )
-        self.stacked_view.setPixmap(
-            stack_pix.scaled(
-                self.stacked_view.size(),
-                Qt.AspectRatioMode.KeepAspectRatio,
-                Qt.TransformationMode.SmoothTransformation,
+        else:
+            self.live_view.clear()
+
+        if stack_pix is not None:
+            self.stacked_view.setPixmap(
+                stack_pix.scaled(
+                    self.stacked_view.size(),
+                    Qt.AspectRatioMode.KeepAspectRatio,
+                    Qt.TransformationMode.SmoothTransformation,
+                )
             )
-        )
-
-    def _render_mock_frame(self) -> QImage:
-        img = QImage(self.base_w, self.base_h, QImage.Format.Format_RGB32)
-        img.fill(0x101014)
-
-        painter = QPainter(img)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-
-        dx = math.cos(self._t_ms / 1000.0) * 0.5
-        dy = math.sin(self._t_ms / 1000.0) * 0.5
-
-        for (x, y, amp) in self._stars:
-            xx = (x + dx) % self.base_w
-            yy = (y + dy) % self.base_h
-            c = int(min(255, 120 + amp))
-            painter.setPen(QPen(QColor(c, c, c), 1))
-            painter.drawPoint(int(xx), int(yy))
-
-        painter.end()
-
-        return self.renderer.render(
-            img,
-            toggles=self.overlay_toggles,
-            detections=[],
-            n_seeds=0,
-            drift=DriftInfo(0.0, 0.0),
-        )
+        else:
+            self.stacked_view.clear()
 
     def _pixmap_from_jpeg(self, data: Optional[bytes]) -> Optional[QPixmap]:
         if not data:
@@ -943,16 +912,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
                 return None
             return f"{ra} {dec}"
         return {"az_deg": float(self.ds_az.value()), "alt_deg": float(self.ds_alt.value())}
-
-    def _init_star_catalog(self, n: int = 100) -> list[tuple[float, float, float]]:
-        stars: list[tuple[float, float, float]] = []
-        for _ in range(n):
-            x = self._rng.uniform(0, self.base_w)
-            y = self._rng.uniform(0, self.base_h)
-            amp = self._rng.uniform(0, 140)
-            stars.append((x, y, amp))
-        stars.sort(key=lambda t: t[2], reverse=True)
-        return stars
 
     def _log(self, msg: str) -> None:
         self.log.append(msg)

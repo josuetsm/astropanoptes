@@ -25,7 +25,7 @@ OBSERVER_PRESETS = (
     ("Estación Central (Santiago)", {"lat_deg": -33.4569, "lon_deg": -70.6990, "height_m": 520.0}),
 )
 BARLOW_FACTORS = (1, 2, 3, 4, 5)
-STACKING_DRIZZLE_SCALES = (2.0, 3.0)
+STACKING_DRIZZLE_SCALES = (1.0, 2.0, 3.0)
 
 if TYPE_CHECKING:
     from ui.pyqt6_app import AstroPanoptesWindow
@@ -260,10 +260,16 @@ class StackingTabMixin:
         self.cb_st_color.setChecked(str(self.cfg.stacking.color_mode).lower() == "rgb")
         self.cb_st_color.toggled.connect(self._stacking_color_toggled)
         self.dd_st_drizzle = QComboBox()
+        self.dd_st_drizzle.addItem("x1 (off)", 1.0)
         self.dd_st_drizzle.addItem("x2", 2.0)
         self.dd_st_drizzle.addItem("x3", 3.0)
-        drizzle_cfg = float(getattr(self.cfg.stacking, "drizzle_scale", 2.0))
-        drizzle_idx = 1 if drizzle_cfg >= 2.5 else 0
+        drizzle_cfg = float(getattr(self.cfg.stacking, "drizzle_scale", 1.0))
+        if drizzle_cfg >= 2.5:
+            drizzle_idx = 2
+        elif drizzle_cfg >= 1.5:
+            drizzle_idx = 1
+        else:
+            drizzle_idx = 0
         self.dd_st_drizzle.setCurrentIndex(drizzle_idx)
         self.dd_st_drizzle.currentIndexChanged.connect(self._stacking_drizzle_changed)
 

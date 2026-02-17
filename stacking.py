@@ -63,9 +63,9 @@ def _normalize_drizzle_scale(v: Any) -> float:
     try:
         scale = float(v)
     except Exception:
-        return 2.0
+        return 1.0
     if not np.isfinite(scale):
-        return 2.0
+        return 1.0
     return max(1.0, scale)
 
 
@@ -458,7 +458,7 @@ class StackEngine:
                 max_shift_px=int(getattr(scfg, "max_shift_px", 50)),
                 use_subpixel=bool(getattr(scfg, "use_subpixel", True)),
                 preview_log_vmin=float(getattr(scfg, "preview_log_vmin", 5.0)),
-                drizzle_scale=_normalize_drizzle_scale(getattr(scfg, "drizzle_scale", 2.0)),
+                drizzle_scale=_normalize_drizzle_scale(getattr(scfg, "drizzle_scale", 1.0)),
                 bayer_to_gray_code=_bayer_to_gray_code(str(scfg.bayer_pattern)),
                 bayer_to_rgb_code=_bayer_to_rgb_code(str(scfg.bayer_pattern)),
             )
