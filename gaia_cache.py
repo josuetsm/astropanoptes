@@ -37,6 +37,7 @@ from typing import Optional, Sequence, Tuple, Union, List, Dict
 
 from logging_utils import log_error, log_info
 from astroquery.gaia import Gaia
+from astroquery.utils.tap import TapPlus
 from astropy.coordinates import SkyCoord, Angle
 import astropy.units as u
 from astropy.table import Table, vstack
@@ -251,6 +252,20 @@ def _load_table(path: Path) -> Table:
     return Table.read(path, format="ascii.ecsv")
 
 
+def _tap_login_only(user: str, password: str) -> None:
+    """
+    Login only against Gaia TAP endpoint.
+
+    Using Gaia.login() can hang while trying the separate Gaia data server.
+    """
+    TapPlus.login(Gaia, user=user, password=password, verbose=False)
+
+
+def _tap_logout_only() -> None:
+    """Logout only from Gaia TAP endpoint."""
+    TapPlus.logout(Gaia, verbose=False)
+
+
 # -------------------------
 # Cono único (async)
 # -------------------------
@@ -302,8 +317,8 @@ def gaia_cone_with_mag(
     try:
         if auth:
             if verbose:
-                log_info(None, "[gaia_cache] Login al Gaia Archive...")
-            Gaia.login(user=auth[0], password=auth[1])
+                log_info(None, "[gaia_cache] Login TAP-only al Gaia Archive...")
+            _tap_login_only(auth[0], auth[1])
             did_login = True
 
         for attempt in range(1, retries + 1):
@@ -322,9 +337,9 @@ def gaia_cone_with_mag(
     finally:
         if did_login:
             if verbose:
-                log_info(None, "[gaia_cache] Logout del Gaia Archive.")
+                log_info(None, "[gaia_cache] Logout TAP-only del Gaia Archive.")
             try:
-                Gaia.logout()
+                _tap_logout_only()
             except Exception as exc:
                 log_error(None, "Gaia cache: logout failed", exc)
 
@@ -500,8 +515,8 @@ def gaia_healpix_cone_with_mag(
         # Login SOLO si hay algo que descargar (y auth provisto)
         if auth and need_download:
             if verbose:
-                log_info(None, f"[gaia_healpix] Login único al Gaia Archive... (missing tiles={len(missing)})")
-            Gaia.login(user=auth[0], password=auth[1])
+                log_info(None, f"[gaia_healpix] Login TAP-only único al Gaia Archive... (missing tiles={len(missing)})")
+            _tap_login_only(auth[0], auth[1])
             did_login = True
         elif need_download and auth is None and getattr(Gaia, "login", None) is not None:
             # allow anonymous downloads; only error out if caller explicitly wants auth
@@ -541,9 +556,9 @@ def gaia_healpix_cone_with_mag(
     finally:
         if did_login:
             if verbose:
-                log_info(None, "[gaia_healpix] Logout del Gaia Archive.")
+                log_info(None, "[gaia_healpix] Logout TAP-only del Gaia Archive.")
             try:
-                Gaia.logout()
+                _tap_logout_only()
             except Exception as exc:
                 log_error(None, "Gaia healpix: logout failed", exc)
 

@@ -3820,6 +3820,9 @@ class GoToWorker(BaseWorker):
         skip_frames: int = 0,
         min_usable_frames: int = 0,
         min_usable_sources: int = 1,
+        rate_hold_axis: Optional[Axis] = None,
+        rate_hold_steps_s: float = 0.0,
+        rate_hold_hz: float = 20.0,
     ) -> List[_AutocalFrame]:
         frames: List[_AutocalFrame] = []
         deadline = _perf() + float(timeout_s)
@@ -3830,12 +3833,37 @@ class GoToWorker(BaseWorker):
         skip_remaining = max(0, int(skip_frames))
         min_usable_frames = max(0, int(min_usable_frames))
         min_usable_sources = max(1, int(min_usable_sources))
+        rate_hold_enabled = bool(
+            (self._rate_mount is not None)
+            and (rate_hold_axis is not None)
+            and np.isfinite(float(rate_hold_steps_s))
+            and (abs(float(rate_hold_steps_s)) > 1.0e-9)
+        )
+        rate_hold_axis_resolved: Optional[Axis] = None
+        if rate_hold_enabled:
+            rate_hold_axis_resolved = Axis(rate_hold_axis)
+        rate_hold_period_s = 1.0 / max(1.0, float(rate_hold_hz))
+        next_rate_hold_t = _perf()
         while (
             (len(frames) < int(n_frames) or (min_usable_frames > 0 and usable < min_usable_frames))
             and _perf() < deadline
         ):
             if self._op_cancel.is_set():
                 break
+            if rate_hold_enabled and (rate_hold_axis_resolved is not None) and _perf() >= next_rate_hold_t:
+                try:
+                    az_rate, alt_rate = self._autocal_axis_rates(rate_hold_axis_resolved, float(rate_hold_steps_s))
+                    self._rate_mount(az_rate, alt_rate)
+                except Exception as exc:
+                    log_error(
+                        self._out_log,
+                        "GoTo: failed to maintain autocal axis rate",
+                        exc,
+                        throttle_s=2.0,
+                        throttle_key="goto_autocal_rate_hold",
+                    )
+                finally:
+                    next_rate_hold_t = _perf() + rate_hold_period_s
             fr = self._get_frame()
             if fr is None:
                 time.sleep(0.01)
@@ -4451,6 +4479,9 @@ class GoToWorker(BaseWorker):
                     min_dt_s=float(roll_dt_min),
                     min_usable_frames=max(0, int(roll_frames)),
                     min_usable_sources=max(1, int(roll_min_sources)),
+                    rate_hold_axis=Axis.AZ,
+                    rate_hold_steps_s=float(rate_signed),
+                    rate_hold_hz=float(roll_ramp_hz),
                 )
             finally:
                 self._autocal_rate_ramp(
@@ -4740,6 +4771,9 @@ class GoToWorker(BaseWorker):
             timeout_s=float(plateau_s),
             min_dt_s=float(plateau_min_dt_s),
             skip_frames=int(plateau_skip_frames),
+            rate_hold_axis=axis,
+            rate_hold_steps_s=float(rate_steps_s),
+            rate_hold_hz=float(ramp_hz),
         )
 
         self._autocal_rate_ramp(
@@ -5752,6 +5786,34 @@ class GoToWorker(BaseWorker):
                     scale_arcsec_per_px=arcsec_per_px,
                 )
 
+            def _solve_drift_to_azalt_with_fallback(
+                v_xy: np.ndarray,
+            ) -> Tuple[str, np.ndarray, List[Tuple[float, float]]]:
+                v = np.asarray(v_xy, dtype=np.float64).reshape(2,)
+                vx = float(v[0])
+                vy = float(v[1])
+                variants: List[Tuple[str, np.ndarray]] = [
+                    ("direct", np.array([vx, vy], dtype=np.float64)),
+                    # Retry with alternate axis conventions when +y(up) does not
+                    # match camera coordinates or readout orientation.
+                    ("y_flip", np.array([vx, -vy], dtype=np.float64)),
+                    ("x_flip", np.array([-vx, vy], dtype=np.float64)),
+                    ("xy_flip", np.array([-vx, -vy], dtype=np.float64)),
+                    ("swap_xy", np.array([vy, vx], dtype=np.float64)),
+                    ("swap_xy_y_flip", np.array([vy, -vx], dtype=np.float64)),
+                    ("swap_xy_x_flip", np.array([-vy, vx], dtype=np.float64)),
+                    ("swap_xy_xy_flip", np.array([-vy, -vx], dtype=np.float64)),
+                ]
+                tried: List[np.ndarray] = []
+                for label, vv in variants:
+                    if any(np.allclose(vv, prev, atol=1e-9, rtol=0.0) for prev in tried):
+                        continue
+                    tried.append(vv)
+                    sols = _solve_drift_to_azalt(vv)
+                    if sols:
+                        return label, vv, sols
+                return "direct", v, []
+
             t_wall = float(getattr(best_drift_frame, "t_wall", 0.0))
             obstime = Time(t_wall, format="unix") if t_wall > 0.0 else Time.now()
 
@@ -5772,18 +5834,25 @@ class GoToWorker(BaseWorker):
                         "GoTo: AutoCal drift az/alt candidates none/failed with roll-corrected drift; retrying raw drift",
                     )
 
-                sols = _solve_drift_to_azalt(trial_vec)
+                conv_label, trial_vec_eff, sols = _solve_drift_to_azalt_with_fallback(trial_vec)
+                mode_label = trial_label if conv_label == "direct" else f"{trial_label}:{conv_label}"
+                if conv_label != "direct":
+                    log_info(
+                        self._out_log,
+                        "GoTo: AutoCal drift az/alt fallback convention "
+                        f"mode={mode_label} vec=[{float(trial_vec_eff[0]):.3f},{float(trial_vec_eff[1]):.3f}]",
+                    )
                 if not sols:
                     log_error(
                         self._out_log,
-                        f"GoTo: AutoCal drift az/alt candidates: none (mode={trial_label})",
+                        f"GoTo: AutoCal drift az/alt candidates: none (mode={mode_label})",
                     )
                     continue
 
                 sol_txt = ", ".join(f"az={az_deg:.3f} alt={alt_deg:.3f}" for az_deg, alt_deg in sols)
                 log_info(
                     self._out_log,
-                    f"GoTo: AutoCal drift az/alt candidates (mode={trial_label}): {sol_txt}",
+                    f"GoTo: AutoCal drift az/alt candidates (mode={mode_label}): {sol_txt}",
                 )
 
                 candidates: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
@@ -5802,11 +5871,11 @@ class GoToWorker(BaseWorker):
                 if not candidates:
                     log_error(
                         self._out_log,
-                        f"GoTo: AutoCal drift target parse produced no candidates (mode={trial_label})",
+                        f"GoTo: AutoCal drift target parse produced no candidates (mode={mode_label})",
                     )
                     continue
 
-                drift_pix = np.asarray(trial_vec, dtype=np.float64)
+                drift_pix = np.asarray(trial_vec_eff, dtype=np.float64)
                 out["drift_pix"] = drift_pix
                 self._publish_state(
                     {
@@ -5833,7 +5902,7 @@ class GoToWorker(BaseWorker):
                     log_info(
                         self._out_log,
                         "GoTo: AutoCal platesolve (drift) "
-                        f"mode={trial_label} cand={idx} az={azalt[0]:.3f} alt={azalt[1]:.3f}",
+                        f"mode={mode_label} cand={idx} az={azalt[0]:.3f} alt={azalt[1]:.3f}",
                     )
                     platesolving_result = self._autocal_run_platesolve(
                         best_drift_frame.raw16,

@@ -2,6 +2,7 @@ import unittest
 import time
 import os
 import tempfile
+from types import SimpleNamespace
 from unittest.mock import patch
 
 import numpy as np
@@ -12,9 +13,11 @@ from astropy.utils import iers
 
 from config import AppConfig
 from goto import (
+    Axis,
     GoToConfig,
     GoToController,
     GoToModel,
+    GoToWorker,
     MountKinematics,
     _roll_deg_from_drift_delta,
     _roll_equivalent_near_reference_deg,
@@ -22,6 +25,7 @@ from goto import (
     _rotate_altaz_deg,
     icrs_to_altaz_deg,
 )
+from mount_arduino import MountMoveWorker
 from platesolving import ObserverConfig, expected_field_rotation_deg, select_guide_star_indices
 from stacking import StackEngine
 from tracking import make_tracking_state, tracking_step, tracking_set_params
@@ -671,6 +675,46 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertLess(abs(calls[1][4] - calls[0][4]), 0.01)
         self.assertGreater(elapsed, 0.01)
 
+    def test_mount_manual_move_worker_uses_blocking_move(self) -> None:
+        class _FakeMount:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def is_connected(self) -> bool:
+                return True
+
+            def move_steps(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return "OK"
+
+        fake_mount = _FakeMount()
+        noted = []
+
+        worker = MountMoveWorker(
+            get_mount=lambda: fake_mount,
+            note_manual_move=lambda axis, direction, steps: noted.append((axis, direction, steps)),
+            publish_state=lambda _patch: None,
+            out_log=None,
+        )
+        worker._handle_request(
+            {
+                "axis": Axis.AZ,
+                "direction": +1,
+                "steps": 20000,
+                "delay_us": 1800,
+            }
+        )
+
+        self.assertEqual(len(fake_mount.calls), 1)
+        call = fake_mount.calls[0]
+        self.assertEqual(call.get("axis"), Axis.AZ)
+        self.assertEqual(int(call.get("direction", 0)), +1)
+        self.assertEqual(int(call.get("steps", 0)), 20000)
+        self.assertEqual(int(call.get("delay_us", 0)), 1800)
+        self.assertTrue(bool(call.get("blocking")))
+        self.assertFalse(bool(call.get("stop_before_move")))
+        self.assertEqual(noted, [(Axis.AZ, +1, 20000)])
+
     def test_goto_model_manual_fit_rotation_tilt_is_limited(self) -> None:
         model = GoToModel()
         model.init_from_mechanics()
@@ -768,6 +812,68 @@ class CoreSmokeTests(unittest.TestCase):
             self.fail("world/step Jacobian should be available")
         world_rate_reconstructed = np.asarray(J_world_step, dtype=np.float64) @ np.asarray(step_rate, dtype=np.float64)
         np.testing.assert_allclose(world_rate_reconstructed, np.asarray(world_rate, dtype=np.float64), rtol=0.02, atol=2.0e-5)
+
+    def test_goto_worker_autocal_capture_frames_keeps_axis_rate(self) -> None:
+        cfg = AppConfig()
+        state = SimpleNamespace(
+            camera=SimpleNamespace(connected=True),
+            mount=SimpleNamespace(connected=True),
+        )
+        rate_calls: list[tuple[float, float]] = []
+        seq = {"value": 0}
+
+        def _get_frame() -> SimpleNamespace:
+            seq["value"] += 1
+            raw = np.zeros((24, 24), dtype=np.uint16)
+            raw[12, 12] = 42000
+            return SimpleNamespace(
+                raw=raw,
+                t_capture=time.time(),
+                meta={"seq": int(seq["value"])},
+            )
+
+        worker = GoToWorker(
+            goto_controller=GoToController(cfg=GoToConfig(), model=GoToModel()),
+            get_state=lambda: state,
+            publish_state=lambda patch: None,
+            get_frame=_get_frame,
+            get_goto_cfg=lambda: cfg.goto,
+            get_mount_cfg=lambda: cfg.mount,
+            get_sep_cfg=lambda: cfg.sep,
+            get_camera_cfg=lambda: cfg.camera,
+            get_platesolving_cfg=lambda: cfg.platesolving,
+            get_observer=lambda: ObserverConfig(),
+            apply_camera_param=lambda name, value: None,
+            pause_tracking=lambda: False,
+            resume_tracking=lambda: None,
+            pause_stacking=lambda: False,
+            resume_stacking=lambda: None,
+            rate_mount=lambda az, alt: rate_calls.append((float(az), float(alt))),
+            move_steps=lambda axis, direction, steps, delay_us: None,
+            stop_mount=lambda: None,
+        )
+        worker._autocal_detect = lambda raw16: (
+            np.array([[12.0, 12.0]], dtype=np.float64),
+            1,
+            0.0,
+            (),
+        )
+
+        frames = worker._autocal_capture_frames(
+            n_frames=3,
+            timeout_s=0.8,
+            min_dt_s=0.08,
+            min_usable_frames=3,
+            min_usable_sources=1,
+            rate_hold_axis=Axis.AZ,
+            rate_hold_steps_s=6.0,
+            rate_hold_hz=25.0,
+        )
+
+        self.assertEqual(len(frames), 3)
+        self.assertGreaterEqual(len(rate_calls), 2)
+        self.assertTrue(all(abs(float(az)) > 0.0 for az, _ in rate_calls))
+        self.assertTrue(all(abs(float(alt)) <= 1e-9 for _, alt in rate_calls))
 
 
 if __name__ == "__main__":

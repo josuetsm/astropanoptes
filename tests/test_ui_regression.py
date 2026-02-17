@@ -59,3 +59,29 @@ class UiRegressionTests(unittest.TestCase):
         self.assertEqual(int(params["min_inliers"]), 7)
         self.assertEqual(int(params["stages"]), 3)
         self.assertTrue(bool(params["platesolving_feedback"]))
+
+    def test_goto_mode_switch_keeps_target_widgets_alive(self) -> None:
+        self.window.dd_goto_mode.setCurrentText("altaz")
+        self.window.ds_az.setValue(123.456)
+        self.window.ds_alt.setValue(45.678)
+
+        self.window.dd_goto_mode.setCurrentText("radec")
+        self.window.dd_radec_fmt.setCurrentText("deg")
+        self.window.ds_ra.setValue(210.123456)
+        self.window.ds_dec.setValue(-12.654321)
+
+        self.window.dd_radec_fmt.setCurrentText("HMS/DMS")
+        self.window.ed_ra_hms.setText("12:34:56")
+        self.window.ed_dec_dms.setText("-12:34:56")
+
+        self.window.dd_goto_mode.setCurrentText("name (SIMBAD)")
+        self.window.dd_goto_mode.setCurrentText("altaz")
+        self.window.dd_goto_mode.setCurrentText("radec")
+        self.window.dd_radec_fmt.setCurrentText("deg")
+
+        self.assertAlmostEqual(self.window.ds_az.value(), 123.456, places=6)
+        self.assertAlmostEqual(self.window.ds_alt.value(), 45.678, places=6)
+        self.assertAlmostEqual(self.window.ds_ra.value(), 210.123456, places=6)
+        self.assertAlmostEqual(self.window.ds_dec.value(), -12.654321, places=6)
+        self.assertEqual(self.window.ed_ra_hms.text(), "12:34:56")
+        self.assertEqual(self.window.ed_dec_dms.text(), "-12:34:56")

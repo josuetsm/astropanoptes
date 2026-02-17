@@ -466,7 +466,10 @@ class MountMoveWorker(BaseWorker):
                 direction=direction,
                 steps=steps,
                 delay_us=delay_us,
-                blocking=False,
+                # Keep manual commands serialized at the app layer.
+                # Firmware keeps only one active plan per axis, so sending a
+                # second MOVE too early can replace the previous one.
+                blocking=True,
                 stop_before_move=False,
             )
 

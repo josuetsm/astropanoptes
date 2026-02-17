@@ -33,3 +33,6 @@ myenv/
 
 # Stacking outputs
 stack_output/
+
+# Temporary test data
+tile_n16_ring_123.ecsv

@@ -1411,6 +1411,25 @@ def _build_platesolving_debug_info(result: Any) -> Dict[str, Any]:
     return info
 
 
+_GAIA_FAILURE_STATUSES = {
+    "NEED_GAIA_AUTH",
+    "GAIA_CACHE_MISS",
+    "GAIA_LOAD_ERROR",
+    "GAIA_TOO_SMALL",
+}
+_GENERIC_GAIA_ERROR_REASON = "GAIA_ERROR"
+_GENERIC_PLATESOLVING_ERROR_REASON = "PLATESOLVING_ERROR"
+
+
+def _public_platesolving_reason(status: str) -> str:
+    st = str(status or "").strip().upper()
+    if st in _GAIA_FAILURE_STATUSES:
+        return _GENERIC_GAIA_ERROR_REASON
+    if st in {"", "EXCEPTION"}:
+        return _GENERIC_PLATESOLVING_ERROR_REASON
+    return st
+
+
 class PlatesolvingWorker(BaseWorker):
     """
     Worker de plate solving desacoplado del AppRunner.
@@ -1495,7 +1514,7 @@ class PlatesolvingWorker(BaseWorker):
                     }
                 }
             )
-            log_info(self._out_log, "Platesolving: ERR_NO_TARGET")
+            log_error(self._out_log, "Platesolving: ERR_NO_TARGET")
             return
 
         frame = self._get_frame()
@@ -1512,7 +1531,7 @@ class PlatesolvingWorker(BaseWorker):
                     }
                 }
             )
-            log_info(self._out_log, "Platesolving: ERR_NO_FRAME")
+            log_error(self._out_log, "Platesolving: ERR_NO_FRAME")
             return
 
         raw16 = ensure_raw16_bayer(frame)
@@ -1540,7 +1559,7 @@ class PlatesolvingWorker(BaseWorker):
                     "platesolving": {
                         "busy": False,
                         "status": PlatesolvingStatus.FAIL,
-                        "reason": "EXCEPTION",
+                        "reason": _GENERIC_PLATESOLVING_ERROR_REASON,
                         "last_ok": False,
                     }
                 }
@@ -1556,12 +1575,13 @@ class PlatesolvingWorker(BaseWorker):
 
         result_ok = bool(getattr(result, "success", False))
         result_status = str(getattr(result, "status", "UNKNOWN"))
+        public_reason = _public_platesolving_reason(result_status)
         self._publish_state(
             {
                 "platesolving": {
                     "busy": False,
                     "status": PlatesolvingStatus.OK if result_ok else PlatesolvingStatus.FAIL,
-                    "reason": None if result_ok else result_status,
+                    "reason": None if result_ok else public_reason,
                     "last_ok": result_ok,
                     "theta_deg": float(getattr(result, "theta_deg", 0.0)),
                     "dx_px": float(getattr(result, "dx_px", 0.0)),
@@ -1599,7 +1619,14 @@ class PlatesolvingWorker(BaseWorker):
                 f"match_az={az_match:.4f}deg match_alt={alt_match:.4f}deg",
             )
         else:
-            log_info(
-                self._out_log,
-                f"Platesolving: ERR status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
-            )
+            if public_reason != status:
+                log_error(
+                    self._out_log,
+                    f"Platesolving: ERR reason={public_reason} status={status} "
+                    f"resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+                )
+            else:
+                log_error(
+                    self._out_log,
+                    f"Platesolving: ERR status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+                )
