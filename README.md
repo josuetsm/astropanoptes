@@ -117,4 +117,3 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 
 ---
 
-Si necesitas ampliar este README con pasos de instalación o documentación de la API, indícalo y lo agrego.
