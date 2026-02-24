@@ -27,7 +27,7 @@ from goto import (
 )
 from mount_arduino import MountMoveWorker
 from platesolving import ObserverConfig, expected_field_rotation_deg, select_guide_star_indices
-from stacking import StackEngine
+from stacking import StackEngine, StackingWorker
 from tracking import make_tracking_state, tracking_step, tracking_set_params
 
 
@@ -102,6 +102,71 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertTrue(np.isfinite(float(out.rate_az)))
         self.assertAlmostEqual(float(state.eint_x), 0.1, places=2)
         self.assertAlmostEqual(float(state.eint_y), 0.0, places=4)
+
+    def test_tracking_velocity_respects_min_meas_dt(self) -> None:
+        state = make_tracking_state()
+        state.auto.ok = True
+        state.auto.A_pinv = np.eye(2, dtype=np.float64)
+        state.auto.b = np.zeros(2, dtype=np.float64)
+        tracking_set_params(
+            state,
+            min_meas_dt_s=0.1,
+            max_meas_v_px_s=1e6,
+            lock_warmup_frames=1,
+        )
+        raw = np.zeros((32, 32), dtype=np.uint16)
+        objects = np.array([(10.0, 10.0, 1000.0)], dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
+
+        with (
+            patch("tracking.sep_detect_from_raw16", return_value=(None, None, objects, None)),
+            patch("tracking.estimate_shift_from_profile_alignment", return_value=(1.0, 0.0, 1.0)),
+            patch("tracking.auto_rls_update", return_value=None),
+        ):
+            tracking_step(state, raw, now_t=0.0, tracking_enabled=True)
+            out = tracking_step(state, raw, now_t=0.01, tracking_enabled=True)
+
+        self.assertAlmostEqual(float(out.vx), 10.0, places=3)
+        self.assertAlmostEqual(float(out.vy), 0.0, places=6)
+
+    def test_tracking_lock_warmup_and_bad_frame_decay_feedback(self) -> None:
+        state = make_tracking_state()
+        state.auto.ok = True
+        state.auto.A_pinv = np.eye(2, dtype=np.float64)
+        state.auto.b = np.zeros(2, dtype=np.float64)
+        tracking_set_params(
+            state,
+            lock_warmup_frames=4,
+            lock_drop_decay=0.5,
+            fb_max_frac=1.0,
+            resp_min=0.5,
+        )
+        raw = np.zeros((32, 32), dtype=np.uint16)
+        objects = np.array([(10.0, 10.0, 1000.0)], dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
+
+        with (
+            patch("tracking.sep_detect_from_raw16", return_value=(None, None, objects, None)),
+            patch(
+                "tracking.estimate_shift_from_profile_alignment",
+                side_effect=[
+                    (1.0, 0.0, 1.0),  # good -> lock ramp starts
+                    (1.0, 0.0, 1.0),  # good
+                    (1.0, 0.0, 1.0),  # good
+                    (1.0, 0.0, 1.0),  # good
+                    (0.0, 0.0, 0.0),  # bad -> decay
+                ],
+            ),
+            patch("tracking.auto_rls_update", return_value=None),
+        ):
+            tracking_step(state, raw, now_t=0.0, tracking_enabled=True)
+            out1 = tracking_step(state, raw, now_t=0.1, tracking_enabled=True)
+            tracking_step(state, raw, now_t=0.2, tracking_enabled=True)
+            tracking_step(state, raw, now_t=0.3, tracking_enabled=True)
+            out4 = tracking_step(state, raw, now_t=0.4, tracking_enabled=True)
+            out_bad = tracking_step(state, raw, now_t=0.5, tracking_enabled=True)
+
+        self.assertGreater(abs(float(out4.rate_az)), abs(float(out1.rate_az)))
+        self.assertLess(float(state.lock_conf), 1.0)
+        self.assertLess(abs(float(out_bad.rate_az)), abs(float(out4.rate_az)) + 0.05)
 
     def test_stacking_engine_smoke(self) -> None:
         cfg = AppConfig()
@@ -211,6 +276,39 @@ class CoreSmokeTests(unittest.TestCase):
             self.fail("mean stack should not be None in rgb drizzle mode")
         self.assertEqual(mean.ndim, 3)
         self.assertEqual(mean.shape, (72, 120, 3))
+
+    def test_stacking_worker_process_smoke(self) -> None:
+        cfg = AppConfig()
+        cfg.stacking.enabled_init = False
+        cfg.stacking.batch_size = 2
+        cfg.stacking.max_queue = 8
+
+        worker = StackingWorker(cfg)
+        try:
+            worker.start()
+            raw = np.zeros((32, 32), dtype=np.uint16)
+            raw[8:24, 8:24] = 12000
+
+            for i in range(4):
+                worker.enqueue_frame(raw.copy(), t=float(i))
+
+            t0 = time.time()
+            while (time.time() - t0) < 2.0:
+                if int(worker.metrics.frames_used) >= 1:
+                    break
+                time.sleep(0.05)
+
+            mean, wgt = worker.get_stack_snapshot(mean_dtype=np.uint16, wgt_dtype=np.float32)
+            self.assertIsNotNone(mean)
+            self.assertIsNotNone(wgt)
+            if mean is None or wgt is None:
+                self.fail("stack snapshot should not be None in worker mode")
+            self.assertEqual(mean.ndim, 2)
+            self.assertEqual(mean.shape, (32, 32))
+            self.assertEqual(wgt.shape, (32, 32))
+        finally:
+            worker.stop()
+            worker.shutdown()
 
     def test_platesolving_guides_smoke(self) -> None:
         df = pd.DataFrame({"phot_g_mean_mag": [10.0, 11.0, 9.0]})

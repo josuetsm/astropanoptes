@@ -43,6 +43,14 @@ class RateLimiterConfig:
     observe_s: float = 5.0
     fail_reset_n: int = 12
     max_shift_per_frame_px: float = 25.0
+    min_meas_dt_s: float = 0.03
+    max_meas_v_px_s: float = 200.0
+    max_shift_scale_min: float = 0.20
+    lock_warmup_frames: int = 12
+    lock_drop_decay: float = 0.80
+    fb_max_frac: float = 0.60
+    eint_decay_on_bad: float = 0.96
+    rls_min_lock_conf: float = 0.70
 
 
 @dataclass
@@ -133,6 +141,7 @@ class TrackingState:
     vx_inst: float = 0.0
     vy_inst: float = 0.0
     resp_inc: float = 0.0
+    lock_conf: float = 0.0
 
     # keyframe & absolute correction
     key_obj_xy: Optional[np.ndarray] = None
@@ -556,6 +565,7 @@ def reset_tracker(state: TrackingState, *, now_t: float, mode: str = "STABILIZE"
     state.vx_inst = 0.0
     state.vy_inst = 0.0
     state.resp_inc = 0.0
+    state.lock_conf = 0.0
     state.rate_az = 0.0
     state.rate_alt = 0.0
 
@@ -635,6 +645,22 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
                 cfg.sep_track.max_sources = int(v)
             elif k == "sep_min_sources":
                 cfg.sep_track.min_sources = int(v)
+            elif k in ("min_meas_dt_s", "rate_min_meas_dt_s"):
+                cfg.rate.min_meas_dt_s = float(v)
+            elif k in ("max_meas_v_px_s", "rate_max_meas_v_px_s"):
+                cfg.rate.max_meas_v_px_s = float(v)
+            elif k in ("max_shift_scale_min", "rate_max_shift_scale_min"):
+                cfg.rate.max_shift_scale_min = float(v)
+            elif k in ("lock_warmup_frames", "rate_lock_warmup_frames"):
+                cfg.rate.lock_warmup_frames = int(v)
+            elif k in ("lock_drop_decay", "rate_lock_drop_decay"):
+                cfg.rate.lock_drop_decay = float(v)
+            elif k in ("fb_max_frac", "rate_fb_max_frac"):
+                cfg.rate.fb_max_frac = float(v)
+            elif k in ("eint_decay_on_bad", "rate_eint_decay_on_bad"):
+                cfg.rate.eint_decay_on_bad = float(v)
+            elif k in ("rls_min_lock_conf", "rate_rls_min_lock_conf"):
+                cfg.rate.rls_min_lock_conf = float(v)
             else:
                 log_error(None, f"Tracking: unknown param {k}", ValueError(f"unknown param {k}"), throttle_s=5.0, throttle_key=f"tracking_param_unknown_{k}")
         except Exception as exc:
@@ -712,10 +738,17 @@ def tracking_step(
     dt = float(now_t - float(state.prev_t))
     if dt <= 1e-6:
         dt = 1e-6
+    min_meas_dt = float(state.cfg.rate.min_meas_dt_s)
+    if (not np.isfinite(min_meas_dt)) or min_meas_dt <= 1e-6:
+        min_meas_dt = 0.03
+    dt_meas = max(dt, min_meas_dt)
 
+    shift_scale_min = float(state.cfg.rate.max_shift_scale_min)
+    if (not np.isfinite(shift_scale_min)) or shift_scale_min <= 0.0:
+        shift_scale_min = 0.20
     max_shift_inc = float(state.cfg.rate.max_shift_per_frame_px) * clamp(
         dt / float(state.cfg.rate.update_s),
-        1.0,
+        shift_scale_min,
         4.0,
     )
     max_shift_inc = min(max_shift_inc, float(state.cfg.align.max_shift_px))
@@ -742,14 +775,27 @@ def tracking_step(
     )
 
     state.resp_inc = float(resp_inc)
+    meas_clipped = False
 
     if good_inc:
         state.fail = 0
         state.x_hat += float(dx_inc)
         state.y_hat += float(dy_inc)
 
-        vx = float(dx_inc) / dt
-        vy = float(dy_inc) / dt
+        vx_raw = float(dx_inc) / dt_meas
+        vy_raw = float(dy_inc) / dt_meas
+        vmax = float(state.cfg.rate.max_meas_v_px_s)
+        if (not np.isfinite(vmax)) or vmax <= 1e-6:
+            vmax = 200.0
+        speed_raw = float(np.hypot(vx_raw, vy_raw))
+        if speed_raw > vmax:
+            s = float(vmax / max(speed_raw, 1e-9))
+            vx = float(vx_raw * s)
+            vy = float(vy_raw * s)
+            meas_clipped = True
+        else:
+            vx = float(vx_raw)
+            vy = float(vy_raw)
         state.vx_inst = vx
         state.vy_inst = vy
 
@@ -759,6 +805,18 @@ def tracking_step(
         state.vpy = (1.0 - a) * state.vpy + a * vy
     else:
         state.fail += 1
+        decay = clamp(float(state.cfg.rate.lock_drop_decay), 0.0, 1.0)
+        state.vpx *= decay
+        state.vpy *= decay
+        state.vx_inst = 0.0
+        state.vy_inst = 0.0
+
+    warmup_frames = max(1, int(state.cfg.rate.lock_warmup_frames))
+    lock_drop = clamp(float(state.cfg.rate.lock_drop_decay), 0.0, 1.0)
+    if good_inc:
+        state.lock_conf = clamp(float(state.lock_conf) + (1.0 / float(warmup_frames)), 0.0, 1.0)
+    else:
+        state.lock_conf = clamp(float(state.lock_conf) * lock_drop, 0.0, 1.0)
 
     if good_inc:
         state.prev_obj_xy = obj_xy
@@ -825,8 +883,13 @@ def tracking_step(
 
         upd = float(state.cfg.rate.update_s)
         dt_ctrl = clamp(dt, 0.0, max(4.0 * upd, 0.05))
-        state.eint_x = clamp(state.eint_x + ex * dt_ctrl, -float(state.cfg.pi.eint_clamp), +float(state.cfg.pi.eint_clamp))
-        state.eint_y = clamp(state.eint_y + ey * dt_ctrl, -float(state.cfg.pi.eint_clamp), +float(state.cfg.pi.eint_clamp))
+        if good_inc:
+            state.eint_x = clamp(state.eint_x + ex * dt_ctrl, -float(state.cfg.pi.eint_clamp), +float(state.cfg.pi.eint_clamp))
+            state.eint_y = clamp(state.eint_y + ey * dt_ctrl, -float(state.cfg.pi.eint_clamp), +float(state.cfg.pi.eint_clamp))
+        else:
+            eint_decay = clamp(float(state.cfg.rate.eint_decay_on_bad), 0.0, 1.0)
+            state.eint_x *= eint_decay
+            state.eint_y *= eint_decay
 
         Kp = float(state.cfg.pi.kp)
         Ki = float(state.cfg.pi.ki)
@@ -842,15 +905,18 @@ def tracking_step(
                              [v_cmd_y - float(b_use[1])]], dtype=np.float64)
         u_dot = (calib_pinv @ v_target).reshape(-1)
 
-        rate_az_t = clamp(float(u_dot[0]), -float(state.cfg.rate.rate_max), +float(state.cfg.rate.rate_max))
-        rate_alt_t = clamp(float(u_dot[1]), -float(state.cfg.rate.rate_max), +float(state.cfg.rate.rate_max))
+        rate_fb_max = float(state.cfg.rate.rate_max) * clamp(float(state.cfg.rate.fb_max_frac), 0.05, 1.0)
+        lock_gain = clamp(float(state.lock_conf), 0.0, 1.0)
+        rate_az_t = clamp(float(u_dot[0]), -rate_fb_max, +rate_fb_max) * lock_gain
+        rate_alt_t = clamp(float(u_dot[1]), -rate_fb_max, +rate_fb_max) * lock_gain
 
         slew_scale = clamp(dt_ctrl / max(upd, 1e-6), 0.1, 4.0)
         slew_per_step = float(state.cfg.rate.rate_slew_per_update) * slew_scale
         state.rate_az = rate_ramp(float(state.rate_az), rate_az_t, slew_per_step)
         state.rate_alt = rate_ramp(float(state.rate_alt), rate_alt_t, slew_per_step)
 
-        if good_inc:
+        rls_min_lock = clamp(float(state.cfg.rate.rls_min_lock_conf), 0.0, 1.0)
+        if good_inc and (not meas_clipped) and (float(state.lock_conf) >= rls_min_lock):
             auto_rls_update(
                 state,
                 u_az=float(state.rate_az),

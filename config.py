@@ -1,6 +1,7 @@
 # config.py
 from __future__ import annotations
 
+import os
 from dataclasses import dataclass, field
 from typing import Literal
 
@@ -53,8 +54,10 @@ class PreviewConfig:
 
 @dataclass
 class MountConfig:
-    port: str = "/dev/cu.usbserial-1130"
-    baudrate: int = 115200
+    # Use AUTO for ESP32 Bluetooth SPP auto-discovery (recommended on macOS).
+    # You can override with ASTROPANOPTES_MOUNT_PORT, e.g. /dev/cu.AstroPanoptes-ESP32
+    port: str = os.environ.get("ASTROPANOPTES_MOUNT_PORT", "AUTO")
+    baudrate: int = int(os.environ.get("ASTROPANOPTES_MOUNT_BAUDRATE", "115200"))
 
     rate_max: float = 600.0
     default_rate: float = 80.0
@@ -76,6 +79,8 @@ class TrackingConfig:
     sidereal_ff_gain: float = 1.0
     sidereal_ff_dt_s: float = 1.0
     sidereal_ff_cond_max: float = 5_000.0
+    sidereal_ff_hold_s: float = 8.0
+    sidereal_ff_slew_per_s: float = 120.0
 
 
 @dataclass

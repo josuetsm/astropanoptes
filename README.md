@@ -2,7 +2,7 @@
 
 Astropanoptes es un prototipo de control para astrofotografía que integra:
 - Captura desde cámaras Player One (SDK vía `pyPOACamera`).
-- Control de montura con firmware Arduino (comandos de microsteps, rate y move).
+- Control de montura con firmware ESP32 (Bluetooth Classic SPP) para TMC2209 STEP/DIR.
 - Tracking por correlación de fase (OpenCV) en un loop de control en tiempo real.
 - Una UI en PyQt6 para operación básica.
 
@@ -27,8 +27,8 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 - `PlayerOneCamera.h`: header del SDK (referencia de API).
 - `imaging.py`: utilidades de imagen (stretch rápido, preview JPEG, canal verde de Bayer).
 - `tracking.py`: pipeline de tracking (preprocesado, correlación de fase, control PI, auto-calibración, rate limiter).
-- `mount_arduino.py`: driver de montura vía serial (protocolo Arduino, comandos RATE/MOVE/MS/STOP).
-- `mount_firmware.ino`: firmware Arduino para la montura (lado microcontrolador).
+- `mount_arduino.py`: driver de montura vía serial (puerto SPP), comandos `PING/ENABLE/STOP/MS/MOVE/STATUS`.
+- `mount_firmware/mount_firmware.ino`: firmware ESP32 para la montura (lado microcontrolador).
 - `logging_utils.py`: logging liviano a stdout o sink global de la UI.
 
 ## Módulos actuales (qué hacen)
@@ -77,11 +77,13 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
   - Soporte de calibración manual + auto-cal (RLS) y bootstrap.
 
 - **`mount_arduino.py`**
-  - Conexión serial y protocolo con el firmware Arduino.
-  - Comandos: `PING`, `ENABLE`, `STOP`, `RATE`, `MS`, `MOVE`, `STATUS`.
+  - Conexión serial y protocolo con firmware ESP32 vía Bluetooth Classic SPP.
+  - Comandos: `PING`, `ENABLE`, `STOP`, `MS`, `MOVE`, `STATUS`, `DEBUG`.
+  - `MS` es común para ambos ejes (MS1/MS2 compartidos en hardware).
 
-- **`mount_firmware.ino`**
-  - Firmware del microcontrolador compatible con el protocolo anterior.
+- **`mount_firmware/mount_firmware.ino`**
+  - Firmware actual de ESP32 (nombre BT: `AstroPanoptes-ESP32`).
+  - Pines PCB: `EN=21`, `MS1=19`, `MS2=18`, `AZ STEP/DIR=33/25`, `ALT STEP/DIR=26/27`.
 
 ### 5) Logging
 - **`logging_utils.py`**
@@ -111,7 +113,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 
 - Python con `numpy`, `opencv-python`, `PyQt6`, `pyserial`.
 - SDK de Player One Camera disponible en la plataforma (binarios `.dll/.so/.dylib`).
-- Arduino con firmware de `mount_firmware.ino` cargado.
+- ESP32 con firmware de `mount_firmware/mount_firmware.ino` cargado.
 
 ---
 
