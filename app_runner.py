@@ -937,6 +937,7 @@ class AppRunner:
         was_stacking = bool(self._stacking_enabled)
         if was_stacking:
             self._stacking_enabled = False
+            self._stacking.stop()
             self._update_state({"stacking": {"enabled": False, "status": StackingStatus.OFF}})
         return was_stacking
 

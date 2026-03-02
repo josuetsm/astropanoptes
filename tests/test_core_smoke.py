@@ -277,7 +277,7 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertEqual(mean.ndim, 3)
         self.assertEqual(mean.shape, (72, 120, 3))
 
-    def test_stacking_worker_process_smoke(self) -> None:
+    def test_stacking_worker_smoke(self) -> None:
         cfg = AppConfig()
         cfg.stacking.enabled_init = False
         cfg.stacking.batch_size = 2
@@ -306,6 +306,26 @@ class CoreSmokeTests(unittest.TestCase):
             self.assertEqual(mean.ndim, 2)
             self.assertEqual(mean.shape, (32, 32))
             self.assertEqual(wgt.shape, (32, 32))
+        finally:
+            worker.stop()
+            worker.shutdown()
+
+    def test_stacking_worker_reset_clears_pending_queue(self) -> None:
+        cfg = AppConfig()
+        cfg.stacking.enabled_init = False
+        cfg.stacking.batch_size = 2
+        cfg.stacking.max_queue = 8
+
+        worker = StackingWorker(cfg)
+        try:
+            raw = np.zeros((16, 16), dtype=np.uint16)
+            gen = worker._current_generation()
+            for i in range(5):
+                worker._q.put_nowait({"raw16": raw.copy(), "t": float(i), "gen": int(gen)})
+
+            self.assertGreater(worker._q.qsize(), 0)
+            worker.reset()
+            self.assertEqual(worker._q.qsize(), 0)
         finally:
             worker.stop()
             worker.shutdown()
