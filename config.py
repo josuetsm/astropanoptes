@@ -51,6 +51,10 @@ class PreviewConfig:
     # sleep para polling de ready (si aplica)
     ready_sleep_s: float = 0.0005
 
+    # Optional live overlay projected from the fitted GoTo pointing model.
+    expected_stars_mag_limit: float = 15.0
+    expected_stars_max: int = 300
+
 
 @dataclass
 class MountConfig:
@@ -155,6 +159,8 @@ class PlatesolvingConfig:
     gmax: float = 15.0
     nside: int = 16
     order: str = "ring"
+    bright_catalog_enabled: bool = True
+    bright_catalog_margin_deg: float = 0.15
     prefer_parquet: bool = True
     row_limit: int = -1
     retries: int = 3
@@ -194,13 +200,13 @@ class PlatesolvingConfig:
 class GoToConfig:
     # GoTo defaults
     tol_arcsec: float = 10.0
-    max_iters: int = 6
-    gain: float = 0.85
+    max_iters: int = 1
+    gain: float = 1.0
     settle_s: float = 0.25
-    max_step_per_iter: int = 150000
+    max_step_per_iter: int = 0
     slew_delay_us: int = 1800
-    stages: int = 6
-    platesolving_feedback: bool = True
+    stages: int = 1
+    platesolving_feedback: bool = False
 
     # Safe operating window
     alt_min_deg: float = 10.0
@@ -209,6 +215,38 @@ class GoToConfig:
     # Calibration defaults (random samples within radius)
     calib_samples: int = 3
     calib_max_radius_deg: float = 1.0
+
+
+@dataclass
+class SimulationConfig:
+    # Demo mode replaces the physical camera/mount with deterministic simulators.
+    enabled: bool = False
+    seed: int | None = None
+
+    # Initial nominal pointing. The true pointing starts with a small random
+    # mechanical offset around this position.
+    initial_az_deg: float = 180.0
+    initial_alt_deg: float = 45.0
+    random_mount_tilt_deg: float = 1.0
+    random_camera_roll_deg: float = 1.0
+
+    # Simulated camera frame. A smaller frame keeps the demo responsive while
+    # preserving the same plate scale convention used by platesolving.py.
+    frame_w: int = 1280
+    frame_h: int = 720
+    fps: float = 8.0
+    background_adu: float = 700.0
+    noise_adu: float = 18.0
+    star_sigma_px: float = 1.25
+    star_flux_adu: float = 18000.0
+    max_render_stars: int = 240
+
+    # Gaia catalog reuse. Missing cache tiles are not downloaded by the camera
+    # simulator; the real plate solver can still download them if configured.
+    # Keep synthetic fallback opt-in so demo sessions do not hide missing Gaia data.
+    catalog_radius_deg: float = 1.2
+    catalog_reload_margin_deg: float = 0.35
+    allow_synthetic_fallback: bool = False
 
 
 @dataclass
@@ -221,6 +259,7 @@ class AppConfig:
     sep: SepConfig = field(default_factory=SepConfig)
     platesolving: PlatesolvingConfig = field(default_factory=PlatesolvingConfig)
     goto: GoToConfig = field(default_factory=GoToConfig)
+    simulation: SimulationConfig = field(default_factory=SimulationConfig)
     
     control_hz: float = 120.0
 

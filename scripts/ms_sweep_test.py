@@ -106,8 +106,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def _drain(ctrl: ArduinoController, *, max_lines: int = 60, max_time_s: float = 0.20) -> None:
     try:
         ctrl._drain_lines(max_lines=max_lines, max_time_s=max_time_s)  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"warning: failed to drain serial input: {exc}", file=sys.stderr)
 
 
 def tx(ctrl: ArduinoController, cmd: str, *, timeout_s: float = 1.0) -> str:
@@ -256,8 +256,8 @@ def main(argv: list[str]) -> int:
     finally:
         try:
             tx(ctrl, "ENABLE 0", timeout_s=1.0)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"warning: failed to disable mount before close: {exc}", file=sys.stderr)
         ctrl.close()
 
 

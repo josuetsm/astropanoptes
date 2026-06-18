@@ -82,6 +82,8 @@ class Frame:
     Frame lógico del sistema.
 
     - raw: frame full-res (uint16 Bayer) para todo el pipeline geométrico
+    - t_capture: timestamp monotónico (`time.perf_counter`) para deltas/control
+    - meta["t_wall"]: timestamp Unix (`time.time`) para nombres, logs y astrometría
     - u8_view: vista opcional para preview
     - meta: metadatos varios (seq, exp_ms, gain, binning, roi, etc.)
     """
@@ -218,6 +220,10 @@ class GotoState:
     model_fit_rms_az_deg: float = 0.0
     model_fit_rms_alt_deg: float = 0.0
     model_fit_rms_arcsec: float = 0.0
+    expected_stars_overlay_enabled: bool = False
+    expected_stars_overlay_count: int = 0
+    expected_stars_overlay_source: str = ""
+    expected_stars_overlay_reason: Optional[str] = None
     autocal_status: GotoAutocalStatus = GotoAutocalStatus.IDLE
     autocal_reason: Optional[str] = None
     autocal_last_ok: bool = False

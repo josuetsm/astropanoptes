@@ -1,0 +1,12 @@
+numpy
+opencv-python
+PyQt6
+pyserial
+sep
+pandas
+astropy
+astroquery
+astropy-healpix
+scikit-learn
+pyarrow
+pytest

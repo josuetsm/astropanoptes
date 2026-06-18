@@ -340,14 +340,22 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         top.setFrameShape(QFrame.Shape.StyledPanel)
         top.setStyleSheet("QFrame { border:1px solid #2a2a2a; border-radius:10px; background:#161616; }")
 
+        self.cb_demo = QCheckBox("Demo")
+        self.cb_demo.setChecked(bool(getattr(self.cfg.simulation, "enabled", False)))
+        self.cb_demo.setToolTip("Usa cámara y montura simuladas para probar sin hardware")
+        self.cb_demo.toggled.connect(self._simulation_toggled)
+
         self.btn_connect_camera = QPushButton("Connect camera")
         self.btn_disconnect_camera = QPushButton("Disconnect camera")
         self.btn_connect_mount = QPushButton("Connect mount")
         self.btn_disconnect_mount = QPushButton("Disconnect mount")
+        self.btn_download_gaia = QPushButton("Download Gaia field")
+        self.btn_download_gaia.setToolTip("Descarga en cache las teselas Gaia del campo actual")
         self.btn_connect_camera.clicked.connect(self._connect_camera)
         self.btn_disconnect_camera.clicked.connect(self._disconnect_camera)
         self.btn_connect_mount.clicked.connect(self._connect_mount)
         self.btn_disconnect_mount.clicked.connect(self._disconnect_mount)
+        self.btn_download_gaia.clicked.connect(self._download_gaia_current_field)
 
         self.ch_cam = Chip("Camera")
         self.ch_mount = Chip("Mount")
@@ -375,10 +383,13 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         row = QHBoxLayout()
         row.setContentsMargins(10, 8, 10, 8)
         row.setSpacing(10)
+        row.addWidget(self.cb_demo)
+        row.addSpacing(8)
         row.addWidget(self.btn_connect_camera)
         row.addWidget(self.btn_disconnect_camera)
         row.addWidget(self.btn_connect_mount)
         row.addWidget(self.btn_disconnect_mount)
+        row.addWidget(self.btn_download_gaia)
         row.addSpacing(8)
         for widget in [
             self.ch_cam,
@@ -558,6 +569,13 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.runner.request_camera_record_raw(duration_s=20.0, out_dir="raw_output", basename=basename)
         self._log(f"[camera] Record 20s RAW -> raw_output/{basename}.npy")
 
+    def _simulation_toggled(self, enabled: bool) -> None:
+        enabled_b = bool(enabled)
+        self.cfg.simulation.enabled = enabled_b
+        self.runner.set_simulation_enabled(enabled_b)
+        suffix = "ON" if enabled_b else "OFF"
+        self._log(f"[top] Demo mode {suffix}; reconnect camera/mount to apply")
+
     def _connect_camera(self) -> None:
         self.runner.request_camera_connect(self.cfg.camera.camera_index)
         self._log("[top] Connect camera")
@@ -573,6 +591,10 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
     def _disconnect_mount(self) -> None:
         self.runner.request_mount_disconnect()
         self._log("[top] Disconnect mount")
+
+    def _download_gaia_current_field(self) -> None:
+        self.runner.request_platesolving_download_current_field()
+        self._log("[gaia] Download current field")
 
     def _od_start(self) -> None:
         self.od_enabled = True
@@ -676,17 +698,8 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         if target is None:
             self._log("[goto] missing target; ignored")
             return
-        params = {
-            "platesolving_feedback": bool(self.cb_fb.isChecked()),
-            "stages": int(self.sb_stages.value()),
-            "N_seed": int(self.sb_goto_ps_nseeds.value()),
-            "min_inliers": int(self.sb_goto_ps_mininl.value()),
-        }
-        self.runner.request_mount_goto(target, **params)
-        self._log(
-            f"[goto] GoTo target={target} "
-            f"(N_seed={params['N_seed']} min_inliers={params['min_inliers']})"
-        )
+        self.runner.request_mount_goto(target)
+        self._log(f"[goto] GoTo target={target} (modelo, sin plate solving)")
 
     def _goto_cancel(self) -> None:
         self.runner.request_goto_cancel()
@@ -774,6 +787,8 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.lbl_drift.setText(f"drift vx/vy: {state.tracking.vx:.2f}/{state.tracking.vy:.2f} px/s")
         if hasattr(self, "lbl_goto_samples"):
             self.lbl_goto_samples.setText(str(getattr(state.goto, "manual_samples", 0)))
+        if hasattr(self, "cb_expected_stars"):
+            self._update_expected_stars_controls(state)
 
         if state.goto.pointing_valid:
             ra_str = self._format_ra_deg(state.goto.pointing_ra_deg)
@@ -791,6 +806,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._update_chips_from_state(state)
         self._update_ps_outputs(state)
         self._update_error_banner(state)
+        self._gaia_maybe_refresh(state)
 
     def _render_frame(self) -> None:
         preview = self.runner.get_latest_preview_jpeg()

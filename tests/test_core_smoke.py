@@ -17,8 +17,10 @@ from goto import (
     GoToConfig,
     GoToController,
     GoToModel,
+    GoToStatus,
     GoToWorker,
     MountKinematics,
+    _AutocalFrame,
     _roll_deg_from_drift_delta,
     _roll_equivalent_near_reference_deg,
     _rotvec_deg_to_rotation_matrix,
@@ -793,6 +795,128 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertLess(abs(calls[1][4] - calls[0][4]), 0.01)
         self.assertGreater(elapsed, 0.01)
 
+    def test_goto_blocking_executes_one_model_move_without_platesolving(self) -> None:
+        model = GoToModel()
+        model.J_deg_per_step = np.eye(2, dtype=np.float64)
+        model.synced = True
+        model.ref_steps = np.zeros(2, dtype=np.float64)
+        model.ref_az_alt_deg = np.array([100.0, 30.0], dtype=np.float64)
+        ctrl = GoToController(
+            cfg=GoToConfig(
+                alt_min_deg=0.0,
+                alt_max_deg=90.0,
+                tol_arcsec=0.01,
+                max_iters=1,
+                gain=1.0,
+                max_step_per_iter=0,
+                slew_delay_us_az=1,
+                slew_delay_us_alt=1,
+                settle_s=0.0,
+            ),
+            model=model,
+        )
+        ctrl.model.J_deg_per_step = np.eye(2, dtype=np.float64)
+        moves: list[tuple[Axis, int, int]] = []
+
+        with (
+            patch("goto.resolve_target_icrs", return_value=object()),
+            patch(
+                "goto.icrs_to_altaz_deg",
+                return_value=np.array([108.0, 38.0], dtype=np.float64),
+            ),
+            patch.object(
+                ctrl,
+                "_platesolving_live",
+                side_effect=AssertionError("GoTo must not plate-solve"),
+            ),
+        ):
+            status = ctrl.goto_blocking(
+                "target",
+                get_live_frame=lambda: None,
+                platesolving_cfg=AppConfig().platesolving,
+                move_steps=lambda axis, direction, steps, delay_us: moves.append(
+                    (axis, int(direction), int(steps))
+                ),
+                stages=6,
+                platesolving_feedback=True,
+            )
+
+        self.assertTrue(status.ok)
+        self.assertEqual(status.status, "OK")
+        self.assertEqual(status.iters, 1)
+        self.assertEqual(len(moves), 2)
+        np.testing.assert_allclose(model.steps_est, [8.0, 8.0])
+
+    def test_goto_worker_forces_single_model_only_move(self) -> None:
+        cfg = AppConfig()
+        controller = GoToController(cfg=GoToConfig(), model=GoToModel())
+        captured: dict[str, object] = {}
+
+        def _goto_blocking(target, **kwargs):
+            captured["target"] = target
+            captured.update(kwargs)
+            return GoToStatus(ok=True, status="OK", iters=2)
+
+        controller.goto_blocking = _goto_blocking
+        worker = GoToWorker(
+            goto_controller=controller,
+            get_state=lambda: SimpleNamespace(),
+            publish_state=lambda patch: None,
+            get_frame=lambda: None,
+            get_goto_cfg=lambda: cfg.goto,
+            get_mount_cfg=lambda: cfg.mount,
+            get_sep_cfg=lambda: cfg.sep,
+            get_camera_cfg=lambda: cfg.camera,
+            get_platesolving_cfg=lambda: cfg.platesolving,
+            get_observer=lambda: ObserverConfig(),
+            apply_camera_param=lambda name, value: None,
+            pause_tracking=lambda: False,
+            resume_tracking=lambda: None,
+            pause_stacking=lambda: False,
+            resume_stacking=lambda: None,
+            rate_mount=lambda az, alt: None,
+            move_steps=lambda axis, direction, steps, delay_us: None,
+            stop_mount=lambda: None,
+        )
+
+        worker._handle_request(
+            {
+                "kind": "goto",
+                "target": "M42",
+                "params": {"stages": 4, "platesolving_feedback": True},
+            }
+        )
+
+        self.assertEqual(captured["target"], "M42")
+        self.assertEqual(int(captured["stages"]), 1)
+        self.assertFalse(bool(captured["platesolving_feedback"]))
+        self.assertEqual(controller.cfg.max_iters, 1)
+        self.assertEqual(controller.cfg.stages, 1)
+        self.assertFalse(controller.cfg.platesolving_feedback)
+        self.assertEqual(
+            controller.cfg.max_step_per_iter,
+            cfg.goto.max_step_per_iter,
+        )
+
+    def test_goto_target_resolution_failure_returns_status(self) -> None:
+        model = GoToModel()
+        model.synced = True
+        ctrl = GoToController(cfg=GoToConfig(), model=model)
+
+        with patch("goto.resolve_target_icrs", side_effect=ValueError("unknown target")):
+            status = ctrl.goto_blocking(
+                "Arturo",
+                get_live_frame=lambda: None,
+                platesolving_cfg=AppConfig().platesolving,
+                move_steps=lambda axis, direction, steps, delay_us: None,
+                stages=3,
+                platesolving_feedback=False,
+            )
+
+        self.assertFalse(status.ok)
+        self.assertEqual(status.status, "ERR_TARGET_RESOLVE")
+        self.assertEqual(status.iters, 0)
+
     def test_mount_manual_move_worker_uses_blocking_move(self) -> None:
         class _FakeMount:
             def __init__(self) -> None:
@@ -992,6 +1116,79 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(len(rate_calls), 2)
         self.assertTrue(all(abs(float(az)) > 0.0 for az, _ in rate_calls))
         self.assertTrue(all(abs(float(alt)) <= 1e-9 for _, alt in rate_calls))
+
+    def test_goto_roll_estimate_accounts_emitted_rate_steps(self) -> None:
+        cfg = AppConfig()
+        state = SimpleNamespace(
+            camera=SimpleNamespace(connected=True, roll_deg=0.0),
+            mount=SimpleNamespace(connected=True),
+        )
+        controller = GoToController(cfg=GoToConfig(), model=GoToModel())
+
+        def _rate_mount(az: float, alt: float) -> tuple[int, int]:
+            if abs(float(az)) > 1e-9:
+                return (-4 if az < 0.0 else 4), 0
+            return 0, 0
+
+        worker = GoToWorker(
+            goto_controller=controller,
+            get_state=lambda: state,
+            publish_state=lambda patch: None,
+            get_frame=lambda: None,
+            get_goto_cfg=lambda: cfg.goto,
+            get_mount_cfg=lambda: cfg.mount,
+            get_sep_cfg=lambda: cfg.sep,
+            get_camera_cfg=lambda: cfg.camera,
+            get_platesolving_cfg=lambda: cfg.platesolving,
+            get_observer=lambda: ObserverConfig(),
+            apply_camera_param=lambda name, value: None,
+            pause_tracking=lambda: False,
+            resume_tracking=lambda: None,
+            pause_stacking=lambda: False,
+            resume_stacking=lambda: None,
+            rate_mount=_rate_mount,
+            move_steps=lambda axis, direction, steps, delay_us: None,
+            stop_mount=lambda: None,
+        )
+        frame = _AutocalFrame(
+            raw16=np.zeros((8, 8), dtype=np.uint16),
+            t_capture=0.0,
+            t_wall=time.time(),
+            t_mono=0.0,
+            obj_xy=np.array([[4.0, 4.0]], dtype=np.float64),
+            star_count=1,
+            saturation_frac=0.0,
+            top_sources=(),
+        )
+        worker._autocal_capture_frames = lambda **kwargs: [frame, frame]
+
+        drift_results = [
+            {
+                "vx_mean": -1.0,
+                "vy_mean": 0.0,
+                "vx_std": 0.0,
+                "vy_std": 0.0,
+            },
+            {
+                "vx_mean": 2.0,
+                "vy_mean": 0.0,
+                "vx_std": 0.0,
+                "vy_std": 0.0,
+            },
+        ]
+        with patch("goto.estimate_sensor_drift_from_stack", side_effect=drift_results):
+            out = worker._goto_estimate_roll_blocking(
+                {
+                    "roll_frames": 2,
+                    "roll_window": 1,
+                    "roll_rate_attempts": 1,
+                    "roll_ramp_s": 0.0,
+                    "roll_settle_s": 0.0,
+                }
+            )
+
+        self.assertTrue(out["ok"])
+        np.testing.assert_allclose(controller.model.steps_est, [-4.0, 0.0])
 
 
 if __name__ == "__main__":

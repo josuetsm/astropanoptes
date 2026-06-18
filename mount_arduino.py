@@ -220,8 +220,14 @@ class ArduinoController:
                         if nm == name:
                             addr = str((row or {}).get("address", "")).strip()
                             return addr or name
-            except Exception:
-                pass
+            except Exception as exc:
+                log_error(
+                    None,
+                    "Mount: failed to parse blueutil paired-device JSON",
+                    exc,
+                    throttle_s=10.0,
+                    throttle_key="mount_blueutil_json",
+                )
         return name
 
     def _refresh_bt_pairing(self) -> None:

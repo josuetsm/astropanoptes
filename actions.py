@@ -51,6 +51,7 @@ class ActionType(str, Enum):
     # platesolving (OBLIGATORIO)
     PLATESOLVING_RUN = "PLATESOLVING_RUN"
     PLATESOLVING_SET_PARAMS = "PLATESOLVING_SET_PARAMS"
+    PLATESOLVING_DOWNLOAD_CURRENT_FIELD = "PLATESOLVING_DOWNLOAD_CURRENT_FIELD"
     RESET_PLATESOLVING_DEFAULTS = "RESET_PLATESOLVING_DEFAULTS"
     MOUNT_SYNC = "MOUNT_SYNC"
     MOUNT_GOTO = "MOUNT_GOTO"
@@ -68,6 +69,7 @@ class ActionType(str, Enum):
 
     # live overlay
     LIVE_SEP_SET_PARAMS = "LIVE_SEP_SET_PARAMS"
+    EXPECTED_STARS_SET_PARAMS = "EXPECTED_STARS_SET_PARAMS"
 
 
 @dataclass(frozen=True)
@@ -250,6 +252,13 @@ def platesolving_set_params(**kwargs: Any) -> Action:
     return Action(ActionType.PLATESOLVING_SET_PARAMS, dict(kwargs), _now())
 
 
+def platesolving_download_current_field(radius_deg: float | None = None) -> Action:
+    payload: Dict[str, Any] = {}
+    if radius_deg is not None:
+        payload["radius_deg"] = float(radius_deg)
+    return Action(ActionType.PLATESOLVING_DOWNLOAD_CURRENT_FIELD, payload, _now())
+
+
 def platesolving_reset_defaults() -> Action:
     return Action(ActionType.RESET_PLATESOLVING_DEFAULTS, {}, _now())
 
@@ -302,3 +311,7 @@ def goto_restore_last_log() -> Action:
 # -------------------------
 def live_sep_set_params(**kwargs: Any) -> Action:
     return Action(ActionType.LIVE_SEP_SET_PARAMS, dict(kwargs), _now())
+
+
+def expected_stars_set_params(**kwargs: Any) -> Action:
+    return Action(ActionType.EXPECTED_STARS_SET_PARAMS, dict(kwargs), _now())

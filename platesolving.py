@@ -44,6 +44,7 @@ __all__ = [
     "PlatesolvingResult",
     "TargetParseError",
     "expected_field_rotation_deg",
+    "project_catalog_to_pixels",
     "solve_plate",
     "PlatesolvingWorker",
     "pixel_to_radec",
@@ -188,6 +189,7 @@ class PlatesolvingResult:
     overlay: List[OverlayItem]
     guides: List[GuideStar]
     metrics: Dict[str, float]
+    obstime_unix: float = float("nan")
 
 
 # ============================================================
@@ -544,6 +546,43 @@ def apply_similarity(Pxy: np.ndarray, s: float, R: np.ndarray, t: np.ndarray) ->
 
 def inverse_similarity(Qxy: np.ndarray, s: float, R: np.ndarray, t: np.ndarray) -> np.ndarray:
     return ((Qxy - t) / float(s)) @ R
+
+
+def project_catalog_to_pixels(
+    coords: SkyCoord,
+    *,
+    center_icrs: SkyCoord,
+    scale_arcsec_per_px: float,
+    theta_deg: float,
+    image_width: int,
+    image_height: int,
+) -> np.ndarray:
+    """Project catalog coordinates onto a centered camera frame."""
+    scale = float(scale_arcsec_per_px)
+    if not np.isfinite(scale) or scale <= 0.0:
+        raise ValueError("scale_arcsec_per_px must be positive")
+    center = center_icrs.icrs
+    catalog = coords.icrs
+    offset = catalog.transform_to(center.skyoffset_frame())
+    q_arcsec = np.column_stack(
+        [
+            np.asarray(offset.lon.to_value(u.arcsec), dtype=np.float64),
+            np.asarray(offset.lat.to_value(u.arcsec), dtype=np.float64),
+        ]
+    )
+    theta = np.deg2rad(float(theta_deg))
+    rotation = np.array(
+        [
+            [float(np.cos(theta)), -float(np.sin(theta))],
+            [float(np.sin(theta)), float(np.cos(theta))],
+        ],
+        dtype=np.float64,
+    )
+    center_px = np.array(
+        [float(image_width) * 0.5, float(image_height) * 0.5],
+        dtype=np.float64,
+    )
+    return (q_arcsec / scale) @ rotation + center_px
 
 
 def one_to_one_match(pred_xy: np.ndarray, cat_xy: np.ndarray, radius_arcsec: float) -> List[Tuple[int, int, float]]:
@@ -1231,6 +1270,19 @@ def solve_plate(
     s = float(best_fit["s"])
     R = np.asarray(best_fit["R"], dtype=np.float64)
     t_arcsec = np.asarray(best_fit["t"], dtype=np.float64)
+    solution_center = pixel_to_radec(
+        float(w) * 0.5,
+        float(h) * 0.5,
+        center_icrs=best_center_icrs,
+        s_arcsec_per_px=s,
+        R=R,
+        t_arcsec=t_arcsec,
+    ).icrs
+    solution_center_icrs = SkyCoord(
+        ra=solution_center.ra,
+        dec=solution_center.dec,
+        frame="icrs",
+    )
 
     # convert Gaia arcsec -> pixels for overlay
     gaia_xy_px = inverse_similarity(gaia_xy_arcsec, s, R, t_arcsec)
@@ -1265,7 +1317,7 @@ def solve_plate(
     min_inliers = int(getattr(cfg, "min_inliers", 3))
     success_inliers = bool(best["num_inliers"] >= min_inliers)
 
-    offset_lon, offset_lat = best_center_icrs.spherical_offsets_to(center_icrs_ref)
+    offset_lon, offset_lat = solution_center_icrs.spherical_offsets_to(center_icrs_ref)
     offset_arcsec = np.array([offset_lon.to_value(u.arcsec), offset_lat.to_value(u.arcsec)], dtype=np.float64)
     offset_px = (offset_arcsec / max(1e-9, float(s))) @ R
     theta_deg = float(np.degrees(np.arctan2(R[1, 0], R[0, 0])))
@@ -1318,11 +1370,12 @@ def solve_plate(
         n_inliers=int(best["num_inliers"]),
         rms_arcsec=float(best["rms_inliers"]),
         rms_px=rms_px,
-        center_ra_deg=float(best_center.ra.deg),
-        center_dec_deg=float(best_center.dec.deg),
+        center_ra_deg=float(solution_center_icrs.ra.deg),
+        center_dec_deg=float(solution_center_icrs.dec.deg),
         overlay=overlay,
         guides=guides,
         metrics=metrics,
+        obstime_unix=float(obstime.unix),
     )
 
 
@@ -1534,14 +1587,29 @@ class PlatesolvingWorker(BaseWorker):
             log_error(self._out_log, "Platesolving: ERR_NO_FRAME")
             return
 
-        raw16 = ensure_raw16_bayer(frame)
-        cfg = self._get_cfg()
-        sep_cfg = self._get_sep_cfg()
-        observer = self._get_observer()
-        obstime = Time.now()
-        debug_stats = bool(getattr(cfg, "debug_input_stats", False))
-
-        self._log_input_stats(raw16, "frame(raw16)", debug_stats)
+        try:
+            raw16 = ensure_raw16_bayer(frame).copy()
+            cfg = self._get_cfg()
+            sep_cfg = self._get_sep_cfg()
+            observer = self._get_observer()
+            obstime = Time.now()
+            debug_stats = bool(getattr(cfg, "debug_input_stats", False))
+            self._log_input_stats(raw16, "frame(raw16)", debug_stats)
+        except Exception as exc:
+            self._publish_state(
+                {
+                    "platesolving": {
+                        "busy": False,
+                        "status": PlatesolvingStatus.FAIL,
+                        "reason": _GENERIC_PLATESOLVING_ERROR_REASON,
+                        "last_ok": False,
+                        "debug_jpeg": None,
+                        "debug_info": {"status": "FRAME_OR_CONFIG_ERROR"},
+                    }
+                }
+            )
+            log_error(self._out_log, "Platesolving: frame/config preparation failed", exc)
+            return
 
         try:
             result = solve_plate(
@@ -1553,7 +1621,7 @@ class PlatesolvingWorker(BaseWorker):
                 obstime=obstime,
                 progress_cb=None,
             )
-        except (RuntimeError, ValueError, TypeError) as exc:
+        except Exception as exc:
             self._publish_state(
                 {
                     "platesolving": {
@@ -1567,15 +1635,20 @@ class PlatesolvingWorker(BaseWorker):
             log_error(self._out_log, "Platesolving: failed", exc)
             return
 
-        debug_jpeg = _render_platesolving_debug_jpeg(
-            raw16,
-            list(getattr(result, "overlay", []) or []),
-        )
-        debug_info = _build_platesolving_debug_info(result)
-
         result_ok = bool(getattr(result, "success", False))
         result_status = str(getattr(result, "status", "UNKNOWN"))
         public_reason = _public_platesolving_reason(result_status)
+        try:
+            debug_jpeg = _render_platesolving_debug_jpeg(
+                raw16,
+                list(getattr(result, "overlay", []) or []),
+            )
+            debug_info = _build_platesolving_debug_info(result)
+        except Exception as exc:
+            debug_jpeg = None
+            debug_info = {"status": result_status, "debug_error": type(exc).__name__}
+            log_error(self._out_log, "Platesolving: debug output failed", exc)
+
         self._publish_state(
             {
                 "platesolving": {

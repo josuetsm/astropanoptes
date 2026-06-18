@@ -4,6 +4,8 @@ import threading
 import time
 from typing import Any, Dict, Optional
 
+from logging_utils import log_error
+
 
 class BaseWorker:
     """
@@ -68,6 +70,14 @@ class BaseWorker:
             self._set_busy(True)
             try:
                 self._handle_request(req)
+            except Exception as exc:
+                log_error(
+                    None,
+                    f"{self._name}: unhandled worker error",
+                    exc,
+                    throttle_s=2.0,
+                    throttle_key=f"worker_unhandled_{self._name}",
+                )
             finally:
                 self._set_busy(False)
 

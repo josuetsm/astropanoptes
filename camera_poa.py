@@ -30,6 +30,10 @@ def _perf() -> float:
     return time.perf_counter()
 
 
+def _now_s() -> float:
+    return time.time()
+
+
 def _sleep_s(s: float) -> None:
     # sleep mínimo para no quemar CPU en polling
     if s <= 0:
@@ -269,14 +273,27 @@ class POACameraDevice:
     def bytes_per_px(self) -> int:
         return self._bytes_per_px
 
-    def wait_ready(self, ready_sleep_s: float = 0.0005) -> None:
+    def wait_ready(
+        self,
+        ready_sleep_s: float = 0.0005,
+        *,
+        stop_event: Optional[threading.Event] = None,
+        timeout_s: Optional[float] = None,
+    ) -> bool:
         """
         Poll de ImageReady. Mantener sleep mínimo para no saturar CPU.
+
+        Returns False when stop_event is set or timeout_s expires.
         """
+        t0 = _perf()
         while True:
+            if stop_event is not None and stop_event.is_set():
+                return False
             _, ready = pyPOACamera.ImageReady(self.cam_id)
             if ready:
-                return
+                return True
+            if timeout_s is not None and (_perf() - t0) >= float(timeout_s):
+                return False
             _sleep_s(ready_sleep_s)
 
     def read_into(self, buf_u8: np.ndarray, timeout_ms: int = 1000) -> None:
@@ -420,10 +437,36 @@ class CameraStream:
 
         while not self._stop.is_set():
             # esperar ready y leer
-            dev.wait_ready(ready_sleep_s=ready_sleep_s)
+            try:
+                ready = dev.wait_ready(
+                    ready_sleep_s=ready_sleep_s,
+                    stop_event=self._stop,
+                    timeout_s=2.0,
+                )
+            except Exception as exc:
+                log_error(None, "CameraStream: wait_ready failed", exc, throttle_s=5.0, throttle_key="camera_wait_ready")
+                self._dropped += 1
+                if self._stop.is_set():
+                    break
+                _sleep_s(max(0.001, ready_sleep_s))
+                continue
+
+            if not ready:
+                if self._stop.is_set():
+                    break
+                self._dropped += 1
+                log_error(
+                    None,
+                    "CameraStream: image ready timeout",
+                    TimeoutError("ImageReady timed out after 2.0s"),
+                    throttle_s=5.0,
+                    throttle_key="camera_ready_timeout",
+                )
+                continue
 
             buf = self._bufs[ring_i]
             t_cap = _perf()
+            t_wall = _now_s()
             try:
                 dev.read_into(buf, timeout_ms=1000)
             except Exception as exc:
@@ -437,7 +480,14 @@ class CameraStream:
 
             # construir vistas sin copias grandes cuando se puede
             if fmt != pyPOACamera.POAImgFormat.POA_RAW16:
-                raise RuntimeError(f"CameraStream: unexpected format {fmt} (RAW16 required)")
+                log_error(
+                    None,
+                    "CameraStream: unexpected format",
+                    RuntimeError(f"unexpected format {fmt} (RAW16 required)"),
+                    throttle_s=5.0,
+                    throttle_key="camera_unexpected_format",
+                )
+                break
 
             # reinterpretación little-endian
             u16 = buf[: w * h * 2].view("<u2").reshape(h, w)
@@ -453,6 +503,8 @@ class CameraStream:
                     "width": int(w),
                     "height": int(h),
                     "fmt": str(fmt.name),
+                    "t_capture_mono": float(t_cap),
+                    "t_wall": float(t_wall),
                 }
             )
             fr = Frame(

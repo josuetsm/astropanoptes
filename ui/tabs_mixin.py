@@ -1,7 +1,14 @@
 from __future__ import annotations
 
+import datetime as _dt
+import math
+import time
 from typing import TYPE_CHECKING
 
+import numpy as np
+
+from PyQt6.QtCore import QPointF, QRectF, Qt
+from PyQt6.QtGui import QColor, QPainter, QPen
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -29,6 +36,319 @@ STACKING_DRIZZLE_SCALES = (1.0, 2.0, 3.0)
 
 if TYPE_CHECKING:
     from ui.pyqt6_app import AstroPanoptesWindow
+
+
+class GaiaCoverageMap(QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self._coverage: dict[str, object] = {}
+        self.setMinimumHeight(260)
+        self.setToolTip("Mapa horizontal local: azimut 0°=N, 90°=E; altitud respecto del horizonte")
+
+    def set_coverage(self, coverage: dict[str, object]) -> None:
+        self._coverage = dict(coverage)
+        self.update()
+
+    @staticmethod
+    def _map_point(plot: QRectF, az_deg: float, alt_deg: float) -> QPointF:
+        x = plot.left() + ((float(az_deg) % 360.0) / 360.0) * plot.width()
+        y = plot.top() + ((90.0 - float(alt_deg)) / 180.0) * plot.height()
+        return QPointF(x, y)
+
+    def paintEvent(self, event) -> None:  # noqa: N802
+        del event
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        painter.fillRect(self.rect(), QColor("#101317"))
+
+        plot = QRectF(self.rect()).adjusted(42.0, 20.0, -18.0, -32.0)
+        if plot.width() <= 0.0 or plot.height() <= 0.0:
+            painter.end()
+            return
+
+        horizon_y = plot.top() + plot.height() * 0.5
+        painter.fillRect(
+            QRectF(plot.left(), horizon_y, plot.width(), plot.bottom() - horizon_y),
+            QColor("#17191d"),
+        )
+
+        painter.setPen(QPen(QColor("#303944"), 1))
+        painter.drawRect(plot)
+        for az in (0.0, 90.0, 180.0, 270.0, 360.0):
+            x = plot.left() + (az / 360.0) * plot.width()
+            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
+        for alt in (-60.0, -30.0, 0.0, 30.0, 60.0):
+            y = plot.top() + ((90.0 - alt) / 180.0) * plot.height()
+            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
+
+        painter.setPen(QPen(QColor("#8f9aa6"), 2))
+        painter.drawLine(QPointF(plot.left(), horizon_y), QPointF(plot.right(), horizon_y))
+
+        painter.setPen(QColor("#89939e"))
+        for az, label in (
+            (0.0, "N 0°"),
+            (90.0, "E 90°"),
+            (180.0, "S 180°"),
+            (270.0, "W 270°"),
+            (360.0, "N 360°"),
+        ):
+            x = plot.left() + (az / 360.0) * plot.width()
+            painter.drawText(QPointF(x - 18.0, plot.bottom() + 18.0), label)
+        for alt in (-60.0, 0.0, 60.0):
+            y = plot.top() + ((90.0 - alt) / 180.0) * plot.height()
+            painter.drawText(QPointF(4.0, y + 4.0), f"{alt:+.0f}°")
+
+        az_values = np.asarray(self._coverage.get("tile_az_deg", []), dtype=np.float64)
+        alt_values = np.asarray(self._coverage.get("tile_alt_deg", []), dtype=np.float64)
+        cached = {int(pix) for pix in self._coverage.get("cached_tiles", [])}
+        required = {int(pix) for pix in self._coverage.get("field_required_tiles", [])}
+
+        painter.setPen(Qt.PenStyle.NoPen)
+        painter.setBrush(QColor("#26303a"))
+        for az, alt in zip(az_values, alt_values):
+            point = self._map_point(plot, float(az), float(alt))
+            painter.drawEllipse(point, 0.8, 0.8)
+
+        tile_radius = max(1.6, min(4.0, plot.width() / 360.0 * 1.7))
+        for pix in cached:
+            if pix < 0 or pix >= len(az_values):
+                continue
+            color = QColor("#2aa876") if alt_values[pix] >= 0.0 else QColor("#245b48")
+            painter.setBrush(color)
+            point = self._map_point(plot, az_values[pix], alt_values[pix])
+            painter.drawEllipse(point, tile_radius, tile_radius)
+
+        for pix in required:
+            if pix < 0 or pix >= len(az_values):
+                continue
+            color = QColor("#73e2a7") if pix in cached else QColor("#ff6b6b")
+            painter.setPen(QPen(color, 2))
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            point = self._map_point(plot, az_values[pix], alt_values[pix])
+            painter.drawEllipse(point, tile_radius + 3.0, tile_radius + 3.0)
+
+        center_az = self._coverage.get("center_az_deg")
+        center_alt = self._coverage.get("center_alt_deg")
+        radius_deg = self._coverage.get("field_radius_deg")
+        if center_az is not None and center_alt is not None:
+            point = self._map_point(plot, float(center_az), float(center_alt))
+            painter.setPen(QPen(QColor("#ffd166"), 2))
+            painter.drawLine(QPointF(point.x() - 6.0, point.y()), QPointF(point.x() + 6.0, point.y()))
+            painter.drawLine(QPointF(point.x(), point.y() - 6.0), QPointF(point.x(), point.y() + 6.0))
+
+            if radius_deg is not None and float(radius_deg) > 0.0:
+                cos_alt = max(0.15, abs(math.cos(math.radians(float(center_alt)))))
+                rx = float(radius_deg) / cos_alt / 360.0 * plot.width()
+                ry = float(radius_deg) / 180.0 * plot.height()
+                painter.setPen(QPen(QColor("#ffd166"), 1, Qt.PenStyle.DashLine))
+                painter.drawEllipse(point, rx, ry)
+
+        painter.end()
+
+
+class GaiaTabMixin:
+    def _tab_gaia(self: "AstroPanoptesWindow") -> QWidget:
+        self.gaia_tab = QWidget()
+        layout = QVBoxLayout(self.gaia_tab)
+        layout.setSpacing(10)
+
+        summary = QGroupBox("Cobertura Gaia local")
+        form = QFormLayout(summary)
+
+        self.lbl_gaia_field_status = QLabel("Campo actual: sin posición")
+        self.lbl_gaia_field_status.setStyleSheet(
+            "QLabel { padding:6px 10px; border-radius:8px; "
+            "background:#24282d; border:1px solid #444b53; color:#e5e7eb; font-weight:600; }"
+        )
+        self.lbl_gaia_tiles = QLabel("--")
+        self.lbl_gaia_area = QLabel("--")
+        self.lbl_gaia_disk = QLabel("--")
+        self.lbl_gaia_field = QLabel("--")
+        self.lbl_gaia_center = QLabel("--")
+        self.lbl_gaia_projection = QLabel("--")
+        self.lbl_gaia_config = QLabel("--")
+        self.lbl_gaia_cache_dir = QLabel("--")
+        self.lbl_gaia_cache_dir.setWordWrap(True)
+
+        self.btn_gaia_refresh = QPushButton("Actualizar cobertura")
+        self.btn_gaia_download = QPushButton("Descargar campo actual")
+        self.btn_gaia_refresh.clicked.connect(lambda: self._refresh_gaia_coverage(force=True))
+        self.btn_gaia_download.clicked.connect(self._gaia_download_current_field)
+
+        actions = QHBoxLayout()
+        actions.addWidget(self.btn_gaia_refresh)
+        actions.addWidget(self.btn_gaia_download)
+        actions.addStretch(1)
+
+        form.addRow(self.lbl_gaia_field_status)
+        form.addRow("Teselas en caché:", self.lbl_gaia_tiles)
+        form.addRow("Área del cielo:", self.lbl_gaia_area)
+        form.addRow("Tamaño en disco:", self.lbl_gaia_disk)
+        form.addRow("Campo actual:", self.lbl_gaia_field)
+        form.addRow("Az/Alt / radio:", self.lbl_gaia_center)
+        form.addRow("Proyección local:", self.lbl_gaia_projection)
+        form.addRow("Configuración:", self.lbl_gaia_config)
+        form.addRow("Directorio:", self.lbl_gaia_cache_dir)
+        form.addRow(actions)
+
+        self.gaia_coverage_map = GaiaCoverageMap()
+        legend = QLabel(
+            "<span style='color:#2aa876'>●</span> tesela cacheada &nbsp;&nbsp; "
+            "<span style='color:#73e2a7'>○</span> requerida y disponible &nbsp;&nbsp; "
+            "<span style='color:#ff6b6b'>○</span> requerida y faltante &nbsp;&nbsp; "
+            "<span style='color:#ffd166'>＋</span> campo actual"
+        )
+        legend.setTextFormat(Qt.TextFormat.RichText)
+
+        layout.addWidget(summary)
+        layout.addWidget(self.gaia_coverage_map, stretch=1)
+        layout.addWidget(legend)
+        self._gaia_last_refresh_t = 0.0
+        self._gaia_last_download_status = None
+        return self.gaia_tab
+
+    @staticmethod
+    def _gaia_format_bytes(value: object) -> str:
+        size = float(value or 0.0)
+        units = ("B", "KiB", "MiB", "GiB", "TiB")
+        unit = units[0]
+        for unit in units:
+            if size < 1024.0 or unit == units[-1]:
+                break
+            size /= 1024.0
+        return f"{size:.1f} {unit}"
+
+    def _gaia_download_current_field(self: "AstroPanoptesWindow") -> None:
+        self._download_gaia_current_field()
+        self.lbl_gaia_field_status.setText("Campo actual: descarga solicitada")
+
+    def _gaia_tab_selected(self: "AstroPanoptesWindow", index: int) -> None:
+        is_gaia = self.modules_tabs.widget(index) is self.gaia_tab
+        dock_manual = getattr(self, "dock_manual", None)
+        if dock_manual is not None:
+            if is_gaia:
+                manual_visible = not bool(dock_manual.isHidden())
+                self._manual_visible_before_gaia = manual_visible
+                self._manual_hidden_for_gaia = manual_visible
+                if manual_visible:
+                    dock_manual.setVisible(False)
+            elif bool(getattr(self, "_manual_hidden_for_gaia", False)):
+                dock_manual.setVisible(
+                    bool(getattr(self, "_manual_visible_before_gaia", True))
+                )
+                self._manual_hidden_for_gaia = False
+
+        if is_gaia:
+            self._refresh_gaia_coverage(force=True)
+
+    def _gaia_maybe_refresh(self: "AstroPanoptesWindow", state) -> None:
+        if not hasattr(self, "gaia_tab") or self.modules_tabs.currentWidget() is not self.gaia_tab:
+            return
+        debug = state.platesolving.debug_info or {}
+        download_status = debug.get("status") if isinstance(debug, dict) else None
+        force = (
+            download_status != self._gaia_last_download_status
+            and download_status in {"GAIA_DOWNLOAD_OK", "GAIA_DOWNLOAD_FAILED"}
+        )
+        self._gaia_last_download_status = download_status
+        self.btn_gaia_download.setEnabled(not bool(state.platesolving.busy))
+        self._refresh_gaia_coverage(force=force)
+
+    def _refresh_gaia_coverage(self: "AstroPanoptesWindow", *, force: bool = False) -> None:
+        now = time.monotonic()
+        if not force and (now - self._gaia_last_refresh_t) < 5.0:
+            return
+        self._gaia_last_refresh_t = now
+        try:
+            coverage = self.runner.get_gaia_coverage()
+        except Exception as exc:
+            self.lbl_gaia_field_status.setText(f"No se pudo inspeccionar el caché: {type(exc).__name__}")
+            self.lbl_gaia_field_status.setStyleSheet(
+                "QLabel { padding:6px 10px; border-radius:8px; "
+                "background:#3a1515; border:1px solid #7a2a2a; color:#ffecec; font-weight:600; }"
+            )
+            self._log(f"[gaia] coverage inspection failed: {exc}")
+            return
+
+        cached_count = int(coverage.get("cached_tile_count", 0))
+        total_tiles = int(coverage.get("total_tiles", 0))
+        fraction = float(coverage.get("coverage_fraction", 0.0))
+        area = float(coverage.get("covered_area_sq_deg", 0.0))
+        required = list(coverage.get("field_required_tiles", []))
+        field_cached = list(coverage.get("field_cached_tiles", []))
+        field_missing = list(coverage.get("field_missing_tiles", []))
+
+        tiles_text = f"{cached_count:,} / {total_tiles:,} ({fraction * 100.0:.2f}%)"
+        if bool(coverage.get("bright_catalog_enabled", False)):
+            tiles_text += (
+                f" · Gaia {int(coverage.get('gaia_cached_tile_count', 0)):,}"
+                f" · Hip/Tycho {int(coverage.get('bright_cached_tile_count', 0)):,}"
+            )
+        self.lbl_gaia_tiles.setText(tiles_text)
+        self.lbl_gaia_area.setText(f"{area:,.1f} deg²")
+        disk_text = self._gaia_format_bytes(coverage.get("cached_bytes", 0))
+        newest = coverage.get("newest_mtime")
+        if newest is not None:
+            updated = _dt.datetime.fromtimestamp(float(newest)).strftime("%Y-%m-%d %H:%M")
+            disk_text += f" · última tesela {updated}"
+        self.lbl_gaia_disk.setText(disk_text)
+
+        if required:
+            field_fraction = len(field_cached) / len(required)
+            self.lbl_gaia_field.setText(
+                f"{len(field_cached)} / {len(required)} teselas ({field_fraction * 100.0:.0f}%)"
+                + (f" · faltan {len(field_missing)}" if field_missing else "")
+            )
+            if field_missing:
+                self.lbl_gaia_field_status.setText("Campo actual: cobertura incompleta")
+                status_style = (
+                    "background:#3a1515; border:1px solid #7a2a2a; color:#ffecec;"
+                )
+            else:
+                self.lbl_gaia_field_status.setText("Campo actual: cubierto")
+                status_style = (
+                    "background:#16321a; border:1px solid #2f6b38; color:#e8ffe8;"
+                )
+        else:
+            self.lbl_gaia_field.setText("Sin posición actual")
+            self.lbl_gaia_field_status.setText("Campo actual: sin posición")
+            status_style = "background:#24282d; border:1px solid #444b53; color:#e5e7eb;"
+        self.lbl_gaia_field_status.setStyleSheet(
+            f"QLabel {{ padding:6px 10px; border-radius:8px; {status_style} font-weight:600; }}"
+        )
+
+        center_az = coverage.get("center_az_deg")
+        center_alt = coverage.get("center_alt_deg")
+        radius_deg = coverage.get("field_radius_deg")
+        source = coverage.get("field_source")
+        if center_az is None or center_alt is None or radius_deg is None:
+            self.lbl_gaia_center.setText("--")
+        else:
+            source_text = f" · {source}" if source else ""
+            self.lbl_gaia_center.setText(
+                f"Az {float(center_az):.2f}° · Alt {float(center_alt):+.2f}° · "
+                f"r={float(radius_deg):.3f}°{source_text}"
+            )
+
+        projection_time = str(coverage.get("projection_time_utc", "--")).replace("T", " ")
+        self.lbl_gaia_projection.setText(
+            f"{projection_time} UTC · "
+            f"{float(coverage.get('observer_lat_deg', 0.0)):+.4f}°, "
+            f"{float(coverage.get('observer_lon_deg', 0.0)):+.4f}°"
+        )
+        catalog_text = (
+            f"{coverage.get('table_name', '--')} · G≤{float(coverage.get('gmax', 0.0)):.1f}"
+        )
+        if bool(coverage.get("bright_catalog_enabled", False)):
+            catalog_text += (
+                f" + Hipparcos/Tycho-2 V≤{float(coverage.get('gmax', 0.0)):.1f}"
+            )
+        self.lbl_gaia_config.setText(
+            f"{catalog_text} · NSIDE {int(coverage.get('nside', 0))} · "
+            f"{coverage.get('order', '--')}"
+        )
+        self.lbl_gaia_cache_dir.setText(str(coverage.get("cache_dir", "--")))
+        self.gaia_coverage_map.set_coverage(coverage)
 
 
 class ObserverTabMixin:
@@ -426,14 +746,6 @@ class GoToTabMixin:
         row_altaz.addWidget(self.ds_alt)
         row_altaz.addStretch(1)
 
-        self.cb_fb = QCheckBox("Platesolve feedback")
-        self.sb_stages = QSpinBox()
-        self.sb_stages.setRange(0, 20)
-        self.sb_stages.setValue(self.cfg.goto.stages)
-        self.sb_stages.setEnabled(self.cfg.goto.platesolving_feedback)
-        self.cb_fb.setChecked(self.cfg.goto.platesolving_feedback)
-        self.cb_fb.toggled.connect(self.sb_stages.setEnabled)
-
         self.sb_goto_ps_nseeds = QSpinBox()
         self.sb_goto_ps_nseeds.setRange(0, 10)
         self.sb_goto_ps_nseeds.setValue(self.cfg.platesolving.N_seed)
@@ -479,11 +791,6 @@ class GoToTabMixin:
         row_manual.addStretch(1)
 
         rowfb = QHBoxLayout()
-        rowfb.addWidget(self.cb_fb)
-        rowfb.addSpacing(10)
-        rowfb.addWidget(QLabel("Stages:"))
-        rowfb.addWidget(self.sb_stages)
-        rowfb.addSpacing(12)
         rowfb.addWidget(QLabel("AutoCal radius:"))
         rowfb.addWidget(self.ds_autocal_ps_radius)
         rowfb.addSpacing(8)
@@ -509,6 +816,21 @@ class GoToTabMixin:
         self.btn_restore_last_log = QPushButton("Cargar Último Registro")
         self.btn_reset_goto = QPushButton("Reset")
         self.btn_home = QPushButton("Home")
+        self.cb_expected_stars = QCheckBox("Estrellas esperadas según modelo")
+        self.cb_expected_stars.setChecked(False)
+        self.cb_expected_stars.setEnabled(False)
+        self.ds_expected_stars_mag = QDoubleSpinBox()
+        self.ds_expected_stars_mag.setRange(-2.0, float(self.cfg.platesolving.gmax))
+        self.ds_expected_stars_mag.setDecimals(1)
+        self.ds_expected_stars_mag.setValue(
+            float(self.cfg.preview.expected_stars_mag_limit)
+        )
+        self.ds_expected_stars_mag.setPrefix("mag≤")
+        self.sb_expected_stars_max = QSpinBox()
+        self.sb_expected_stars_max.setRange(1, 5000)
+        self.sb_expected_stars_max.setValue(int(self.cfg.preview.expected_stars_max))
+        self.sb_expected_stars_max.setPrefix("máx ")
+        self.lbl_expected_stars = QLabel("Requiere Fit GoTo Model")
 
         rowb_top = QHBoxLayout()
         for button in [
@@ -546,6 +868,13 @@ class GoToTabMixin:
         self.btn_restore_last_log.clicked.connect(self._goto_restore_last_log)
         self.btn_reset_goto.clicked.connect(self._goto_reset)
         self.btn_home.clicked.connect(self._home)
+        self.cb_expected_stars.toggled.connect(self._expected_stars_params_changed)
+        self.ds_expected_stars_mag.valueChanged.connect(
+            self._expected_stars_params_changed
+        )
+        self.sb_expected_stars_max.valueChanged.connect(
+            self._expected_stars_params_changed
+        )
 
         self.lbl_goto_samples = QLabel("0")
 
@@ -557,6 +886,13 @@ class GoToTabMixin:
         form.addRow(rowps)
         form.addRow(rowb)
         form.addRow("manual samples:", self.lbl_goto_samples)
+        expected_row = QHBoxLayout()
+        expected_row.addWidget(self.cb_expected_stars)
+        expected_row.addWidget(self.ds_expected_stars_mag)
+        expected_row.addWidget(self.sb_expected_stars_max)
+        expected_row.addStretch(1)
+        form.addRow("Overlay modelo:", expected_row)
+        form.addRow("Estado overlay:", self.lbl_expected_stars)
 
         box.setLayout(form)
         layout.addWidget(box)
@@ -568,6 +904,37 @@ class GoToTabMixin:
         self._goto_mode_switch()
         self._autocal_ps_mode_switch()
         return widget
+
+    def _expected_stars_params_changed(self: "AstroPanoptesWindow", *_args) -> None:
+        self.runner.request_expected_stars_params(
+            enabled=bool(self.cb_expected_stars.isChecked()),
+            mag_limit=float(self.ds_expected_stars_mag.value()),
+            max_stars=int(self.sb_expected_stars_max.value()),
+        )
+
+    def _update_expected_stars_controls(self: "AstroPanoptesWindow", state) -> None:
+        ready = bool(
+            int(getattr(state.goto, "model_fit_samples", 0)) > 0
+            and bool(getattr(state.goto, "synced", False))
+        )
+        self.cb_expected_stars.setEnabled(ready)
+        self.ds_expected_stars_mag.setEnabled(ready)
+        self.sb_expected_stars_max.setEnabled(ready)
+
+        if not ready:
+            self.lbl_expected_stars.setText("Requiere Fit GoTo Model sincronizado")
+            return
+        reason = getattr(state.goto, "expected_stars_overlay_reason", None)
+        if reason:
+            self.lbl_expected_stars.setText(str(reason))
+            return
+        if bool(getattr(state.goto, "expected_stars_overlay_enabled", False)):
+            count = int(getattr(state.goto, "expected_stars_overlay_count", 0))
+            source = str(getattr(state.goto, "expected_stars_overlay_source", "") or "")
+            suffix = f" · {source}" if source else ""
+            self.lbl_expected_stars.setText(f"{count} estrellas proyectadas{suffix}")
+        else:
+            self.lbl_expected_stars.setText("Desactivado")
 
     def _goto_mode_switch(self: "AstroPanoptesWindow") -> None:
         while self.tgt_v.count():
@@ -612,6 +979,7 @@ class ModulesTabsMixin(
     StackingTabMixin,
     ObjectDetectionTabMixin,
     GoToTabMixin,
+    GaiaTabMixin,
 ):
     def _build_modules_tabs(self: "AstroPanoptesWindow") -> QWidget:
         tabs = QTabWidget()
@@ -621,6 +989,7 @@ class ModulesTabsMixin(
         tabs.addTab(self._tab_stacking(), "Stacking")
         tabs.addTab(self._tab_od(), "Object Detection")
         tabs.addTab(self._tab_goto(), "GoTo")
+        tabs.addTab(self._tab_gaia(), "Gaia")
 
         wrap = QWidget()
         layout = QVBoxLayout(wrap)
@@ -629,4 +998,5 @@ class ModulesTabsMixin(
         layout.addWidget(tabs)
 
         self.modules_tabs = tabs
+        tabs.currentChanged.connect(self._gaia_tab_selected)
         return wrap
