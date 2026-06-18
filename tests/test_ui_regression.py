@@ -1,11 +1,9 @@
 import os
 import unittest
 
-import numpy as np
-
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication
+from PyQt6.QtWidgets import QApplication, QLabel
 
 from app_runner import AppRunner
 from config import AppConfig
@@ -31,7 +29,7 @@ class UiRegressionTests(unittest.TestCase):
             for i in range(self.window.modules_tabs.count())
         ]
         self.assertIn("GoTo", labels)
-        self.assertIn("Gaia", labels)
+        self.assertNotIn("Gaia", labels)
         self.assertNotIn("Plate Solving", labels)
 
     def test_on_tick_without_plate_solving_widgets(self) -> None:
@@ -59,58 +57,88 @@ class UiRegressionTests(unittest.TestCase):
         self.assertTrue(calls[-1]["enabled"])
         self.assertEqual(calls[-1]["mag_limit"], 15.0)
 
-    def test_download_gaia_field_button_calls_runner(self) -> None:
+    def test_download_gaia_field_button_is_removed(self) -> None:
+        self.assertFalse(hasattr(self.window, "btn_download_gaia"))
+
+    def test_tracking_tab_applies_exposed_parameters(self) -> None:
         calls: list[dict] = []
+        self.runner.request_tracking_params = lambda **kwargs: calls.append(dict(kwargs))
 
-        def _capture(**kwargs):
-            calls.append(dict(kwargs))
+        self.window.ds_tr_resp_min.setValue(0.123)
+        self.window.cb_tr_ff.setChecked(False)
+        self.window.ds_tr_ff_gain.setValue(0.75)
+        self.window.ds_tr_ff_dt.setValue(2.5)
+        self.window.ds_tr_ff_cond.setValue(1234.0)
+        self.window.ds_tr_ff_hold.setValue(4.5)
+        self.window.ds_tr_ff_slew.setValue(88.0)
+        self.window.sb_tr_sep_minarea.setValue(7)
+        self.window.ds_tr_sep_sigma.setValue(4.25)
+        self.window.sb_tr_sep_max_sources.setValue(123)
+        self.window.sb_tr_sep_min_sources.setValue(3)
+        self.window.sb_tr_sep_bw.setValue(32)
+        self.window.sb_tr_sep_bh.setValue(48)
 
-        self.runner.request_platesolving_download_current_field = _capture
+        self.window.btn_tr_apply.click()
 
-        self.window.btn_download_gaia.click()
+        self.assertTrue(calls)
+        params = calls[-1]
+        self.assertAlmostEqual(params["resp_min"], 0.123, places=3)
+        self.assertFalse(params["sidereal_ff_enabled"])
+        self.assertAlmostEqual(params["sidereal_ff_gain"], 0.75)
+        self.assertAlmostEqual(params["sidereal_ff_dt_s"], 2.5)
+        self.assertEqual(params["sep_minarea"], 7)
+        self.assertAlmostEqual(params["sep_thresh_sigma"], 4.25)
+        self.assertEqual(params["sep_max_sources"], 123)
+        self.assertEqual(params["sep_min_sources"], 3)
+        self.assertEqual(params["sep_bw"], 32)
+        self.assertEqual(params["sep_bh"], 48)
 
-        self.assertEqual(len(calls), 1)
+    def test_stacking_tab_applies_exposed_parameters(self) -> None:
+        calls: list[dict] = []
+        self.runner.request_stacking_params = lambda **kwargs: calls.append(dict(kwargs))
 
-    def test_gaia_panel_displays_cache_and_current_field_coverage(self) -> None:
-        self.runner.get_gaia_coverage = lambda: {
-            "cache_dir": "/tmp/gaia",
-            "table_name": "gaiadr3.gaia_source",
-            "gmax": 15.0,
-            "nside": 1,
-            "order": "ring",
-            "total_tiles": 12,
-            "cached_tiles": [4],
-            "cached_tile_count": 1,
-            "coverage_fraction": 1.0 / 12.0,
-            "covered_area_sq_deg": 3437.75,
-            "cached_bytes": 2048,
-            "newest_mtime": None,
-            "tile_az_deg": np.linspace(0.0, 330.0, 12),
-            "tile_alt_deg": np.linspace(-60.0, 60.0, 12),
-            "field_available": False,
-            "field_required_tiles": [4, 5],
-            "field_cached_tiles": [4],
-            "field_missing_tiles": [5],
-            "field_radius_deg": 2.0,
-            "center_az_deg": 120.0,
-            "center_alt_deg": 30.0,
-            "projection_time_utc": "2026-06-05T12:00:00.000",
-            "observer_lat_deg": -33.3667,
-            "observer_lon_deg": -71.6667,
-            "field_source": "simulation",
-        }
+        self.window.cb_st_color.setChecked(True)
+        self.window.dd_st_bayer.setCurrentText("BGGR")
+        self.window.dd_st_drizzle.setCurrentIndex(1)
+        self.window.sb_st_batch.setValue(4)
+        self.window.sb_st_max_queue.setValue(16)
+        self.window.sb_st_align_median.setValue(6)
+        self.window.sb_st_smooth.setValue(12)
+        self.window.sb_st_max_shift.setValue(42)
+        self.window.cb_st_subpixel.setChecked(False)
+        self.window.ds_st_preview_hz.setValue(2.5)
+        self.window.ds_st_preview_vmin.setValue(9.5)
+
+        self.window.btn_st_apply.click()
+
+        self.assertTrue(calls)
+        params = calls[-1]
+        self.assertEqual(params["color_mode"], "rgb")
+        self.assertEqual(params["bayer_pattern"], "BGGR")
+        self.assertEqual(params["drizzle_scale"], 2.0)
+        self.assertEqual(params["batch_size"], 4)
+        self.assertEqual(params["max_queue"], 16)
+        self.assertEqual(params["align_median_k"], 7)
+        self.assertEqual(params["smooth_k"], 12)
+        self.assertEqual(params["max_shift_px"], 42)
+        self.assertFalse(params["use_subpixel"])
+        self.assertAlmostEqual(params["preview_hz"], 2.5)
+        self.assertAlmostEqual(params["preview_log_vmin"], 9.5)
+
+    def test_tracking_and_stacking_options_have_tooltips(self) -> None:
+        self.assertIn("Respuesta mínima", self.window.ds_tr_resp_min.toolTip())
+        self.assertIn("movimiento sideral", self.window.cb_tr_ff.toolTip())
+        self.assertIn("malla de fondo", self.window.sb_tr_sep_bw.toolTip())
+        self.assertIn("mosaico Bayer", self.window.dd_st_bayer.toolTip())
+        self.assertIn("desplazamientos fraccionales", self.window.cb_st_subpixel.toolTip())
+
         labels = [
-            self.window.modules_tabs.tabText(i)
-            for i in range(self.window.modules_tabs.count())
+            label
+            for label in self.window.findChildren(QLabel)
+            if label.text() == "resp_min:"
         ]
-        self.window.modules_tabs.setCurrentIndex(labels.index("Gaia"))
-
-        self.assertIn("1 / 12", self.window.lbl_gaia_tiles.text())
-        self.assertIn("1 / 2", self.window.lbl_gaia_field.text())
-        self.assertIn("incompleta", self.window.lbl_gaia_field_status.text())
-        self.assertIn("Az 120.00", self.window.lbl_gaia_center.text())
-        self.assertIn("Alt +30.00", self.window.lbl_gaia_center.text())
-        self.assertIn("simulation", self.window.lbl_gaia_center.text())
+        self.assertTrue(labels)
+        self.assertIn("Respuesta mínima", labels[0].toolTip())
 
     def test_goto_uses_model_without_platesolving_parameters(self) -> None:
         calls: list[tuple[object, dict]] = []
@@ -131,23 +159,6 @@ class UiRegressionTests(unittest.TestCase):
         self.assertEqual(params, {})
         self.assertFalse(hasattr(self.window, "cb_fb"))
         self.assertFalse(hasattr(self.window, "sb_stages"))
-
-    def test_gaia_panel_temporarily_hides_manual_controls(self) -> None:
-        labels = [
-            self.window.modules_tabs.tabText(i)
-            for i in range(self.window.modules_tabs.count())
-        ]
-        goto_index = labels.index("GoTo")
-        gaia_index = labels.index("Gaia")
-        self.window.modules_tabs.setCurrentIndex(goto_index)
-        self.window.dock_manual.show()
-        self.assertFalse(self.window.dock_manual.isHidden())
-
-        self.window.modules_tabs.setCurrentIndex(gaia_index)
-        self.assertTrue(self.window.dock_manual.isHidden())
-
-        self.window.modules_tabs.setCurrentIndex(goto_index)
-        self.assertFalse(self.window.dock_manual.isHidden())
 
     def test_goto_mode_switch_keeps_target_widgets_alive(self) -> None:
         self.window.dd_goto_mode.setCurrentText("altaz")

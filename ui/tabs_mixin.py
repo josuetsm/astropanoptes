@@ -38,6 +38,22 @@ if TYPE_CHECKING:
     from ui.pyqt6_app import AstroPanoptesWindow
 
 
+def _set_option_tooltip(widget: QWidget, text: str) -> None:
+    widget.setToolTip(text)
+    widget.setToolTipDuration(12_000)
+
+
+def _option_label(text: str, tooltip: str) -> QLabel:
+    label = QLabel(text)
+    _set_option_tooltip(label, tooltip)
+    return label
+
+
+def _add_option_row(form: QFormLayout, label: str, widget: QWidget, tooltip: str) -> None:
+    _set_option_tooltip(widget, tooltip)
+    form.addRow(_option_label(label, tooltip), widget)
+
+
 class GaiaCoverageMap(QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -538,27 +554,180 @@ class TrackingTabMixin:
         layout = QVBoxLayout(widget)
         layout.setSpacing(10)
 
-        box = QGroupBox("Tracking")
-        form = QFormLayout()
-
         self.btn_tr_start = QPushButton("Start")
         self.btn_tr_stop = QPushButton("Stop")
-        self.btn_tr_reset = QPushButton("Reset")
+        self.btn_tr_reset = QPushButton("Reset keyframe")
+        self.btn_tr_apply = QPushButton("Apply")
 
-        row = QHBoxLayout()
-        row.addWidget(self.btn_tr_start)
-        row.addWidget(self.btn_tr_stop)
-        row.addWidget(self.btn_tr_reset)
-        row.addStretch(1)
+        actions = QHBoxLayout()
+        actions.addWidget(self.btn_tr_start)
+        actions.addWidget(self.btn_tr_stop)
+        actions.addWidget(self.btn_tr_reset)
+        actions.addWidget(self.btn_tr_apply)
+        actions.addStretch(1)
 
         self.btn_tr_start.clicked.connect(self._tracking_start)
         self.btn_tr_stop.clicked.connect(self._tracking_stop)
         self.btn_tr_reset.clicked.connect(self._tracking_reset)
+        self.btn_tr_apply.clicked.connect(self._tracking_apply)
 
-        form.addRow(row)
-        box.setLayout(form)
+        self.ds_tr_resp_min = QDoubleSpinBox()
+        self.ds_tr_resp_min.setRange(0.0, 1.0)
+        self.ds_tr_resp_min.setDecimals(3)
+        self.ds_tr_resp_min.setSingleStep(0.01)
+        self.ds_tr_resp_min.setValue(float(self.cfg.tracking.resp_min))
 
-        layout.addWidget(box)
+        self.cb_tr_ff = QCheckBox("Feed-forward sideral")
+        self.cb_tr_ff.setChecked(bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)))
+
+        self.ds_tr_ff_gain = QDoubleSpinBox()
+        self.ds_tr_ff_gain.setRange(0.0, 5.0)
+        self.ds_tr_ff_gain.setDecimals(3)
+        self.ds_tr_ff_gain.setSingleStep(0.05)
+        self.ds_tr_ff_gain.setValue(float(getattr(self.cfg.tracking, "sidereal_ff_gain", 1.0)))
+
+        self.ds_tr_ff_dt = QDoubleSpinBox()
+        self.ds_tr_ff_dt.setRange(0.01, 30.0)
+        self.ds_tr_ff_dt.setDecimals(2)
+        self.ds_tr_ff_dt.setSingleStep(0.1)
+        self.ds_tr_ff_dt.setSuffix(" s")
+        self.ds_tr_ff_dt.setValue(float(getattr(self.cfg.tracking, "sidereal_ff_dt_s", 1.0)))
+
+        self.ds_tr_ff_cond = QDoubleSpinBox()
+        self.ds_tr_ff_cond.setRange(1.0, 1_000_000.0)
+        self.ds_tr_ff_cond.setDecimals(0)
+        self.ds_tr_ff_cond.setSingleStep(100.0)
+        self.ds_tr_ff_cond.setValue(float(getattr(self.cfg.tracking, "sidereal_ff_cond_max", 5_000.0)))
+
+        self.ds_tr_ff_hold = QDoubleSpinBox()
+        self.ds_tr_ff_hold.setRange(0.0, 120.0)
+        self.ds_tr_ff_hold.setDecimals(1)
+        self.ds_tr_ff_hold.setSingleStep(0.5)
+        self.ds_tr_ff_hold.setSuffix(" s")
+        self.ds_tr_ff_hold.setValue(float(getattr(self.cfg.tracking, "sidereal_ff_hold_s", 8.0)))
+
+        self.ds_tr_ff_slew = QDoubleSpinBox()
+        self.ds_tr_ff_slew.setRange(1.0, 10_000.0)
+        self.ds_tr_ff_slew.setDecimals(1)
+        self.ds_tr_ff_slew.setSingleStep(10.0)
+        self.ds_tr_ff_slew.setSuffix(" steps/s²")
+        self.ds_tr_ff_slew.setValue(float(getattr(self.cfg.tracking, "sidereal_ff_slew_per_s", 120.0)))
+
+        self.sb_tr_sep_minarea = QSpinBox()
+        self.sb_tr_sep_minarea.setRange(1, 500)
+        self.sb_tr_sep_minarea.setValue(int(self.cfg.sep.minarea))
+
+        self.ds_tr_sep_sigma = QDoubleSpinBox()
+        self.ds_tr_sep_sigma.setRange(0.1, 20.0)
+        self.ds_tr_sep_sigma.setDecimals(2)
+        self.ds_tr_sep_sigma.setSingleStep(0.1)
+        self.ds_tr_sep_sigma.setValue(float(self.cfg.sep.thresh_sigma))
+
+        self.sb_tr_sep_max_sources = QSpinBox()
+        self.sb_tr_sep_max_sources.setRange(1, 5000)
+        self.sb_tr_sep_max_sources.setValue(int(self.cfg.platesolving.max_det))
+
+        self.sb_tr_sep_min_sources = QSpinBox()
+        self.sb_tr_sep_min_sources.setRange(1, 100)
+        self.sb_tr_sep_min_sources.setValue(1)
+
+        self.sb_tr_sep_bw = QSpinBox()
+        self.sb_tr_sep_bw.setRange(4, 512)
+        self.sb_tr_sep_bw.setValue(int(self.cfg.sep.bw))
+
+        self.sb_tr_sep_bh = QSpinBox()
+        self.sb_tr_sep_bh.setRange(4, 512)
+        self.sb_tr_sep_bh.setValue(int(self.cfg.sep.bh))
+
+        control_box = QGroupBox("Control")
+        control_form = QFormLayout(control_box)
+        _add_option_row(
+            control_form,
+            "resp_min:",
+            self.ds_tr_resp_min,
+            "Respuesta mínima para aceptar la medición de alineación. Más alto rechaza frames dudosos; más bajo tolera señal débil.",
+        )
+        _set_option_tooltip(
+            self.cb_tr_ff,
+            "Activa una corrección anticipada por movimiento sideral usando el modelo de apuntado actual.",
+        )
+        control_form.addRow(self.cb_tr_ff)
+        _add_option_row(
+            control_form,
+            "FF gain:",
+            self.ds_tr_ff_gain,
+            "Multiplicador de la velocidad feed-forward. 1.0 usa la predicción completa; valores menores la suavizan.",
+        )
+        _add_option_row(
+            control_form,
+            "FF dt:",
+            self.ds_tr_ff_dt,
+            "Intervalo usado para estimar la deriva sideral futura desde el modelo de apuntado.",
+        )
+        _add_option_row(
+            control_form,
+            "FF cond max:",
+            self.ds_tr_ff_cond,
+            "Condición máxima permitida para la geometría del modelo. Si se supera, el feed-forward se considera poco confiable.",
+        )
+        _add_option_row(
+            control_form,
+            "FF hold:",
+            self.ds_tr_ff_hold,
+            "Tiempo durante el cual se conserva la última velocidad feed-forward válida si el modelo queda temporalmente sin geometría confiable.",
+        )
+        _add_option_row(
+            control_form,
+            "FF slew:",
+            self.ds_tr_ff_slew,
+            "Límite de cambio por segundo de la velocidad feed-forward para evitar saltos bruscos en la montura.",
+        )
+
+        sep_box = QGroupBox("Detección SEP")
+        sep_form = QFormLayout(sep_box)
+        _add_option_row(
+            sep_form,
+            "minarea:",
+            self.sb_tr_sep_minarea,
+            "Cantidad mínima de píxeles conectados sobre el umbral para aceptar una fuente.",
+        )
+        _add_option_row(
+            sep_form,
+            "thresh_sigma:",
+            self.ds_tr_sep_sigma,
+            "Umbral de detección en sigmas sobre el fondo local. Más alto detecta menos fuentes, pero más limpias.",
+        )
+        _add_option_row(
+            sep_form,
+            "max sources:",
+            self.sb_tr_sep_max_sources,
+            "Máximo de fuentes detectadas que se usan para medir deriva y emparejar movimientos.",
+        )
+        _add_option_row(
+            sep_form,
+            "min sources:",
+            self.sb_tr_sep_min_sources,
+            "Mínimo de fuentes requeridas para confiar en una medición de tracking.",
+        )
+        _add_option_row(
+            sep_form,
+            "bw:",
+            self.sb_tr_sep_bw,
+            "Ancho de la malla de fondo usada por SEP para estimar el fondo local.",
+        )
+        _add_option_row(
+            sep_form,
+            "bh:",
+            self.sb_tr_sep_bh,
+            "Alto de la malla de fondo usada por SEP para estimar el fondo local.",
+        )
+
+        columns = QHBoxLayout()
+        columns.addWidget(control_box, stretch=1)
+        columns.addWidget(sep_box, stretch=1)
+
+        layout.addLayout(actions)
+        layout.addLayout(columns)
         layout.addStretch(1)
         return widget
 
@@ -569,14 +738,12 @@ class StackingTabMixin:
         layout = QVBoxLayout(widget)
         layout.setSpacing(10)
 
-        box = QGroupBox("Stacking")
-        form = QFormLayout()
-
         self.btn_st_start = QPushButton("Start")
         self.btn_st_stop = QPushButton("Stop")
         self.btn_st_reset = QPushButton("Reset")
         self.btn_st_save = QPushButton("Save Stack")
-        self.cb_st_color = QCheckBox("Stacking a color (RGB, Bayer RGGB)")
+        self.btn_st_apply = QPushButton("Apply")
+        self.cb_st_color = QCheckBox("Stacking a color (RGB)")
         self.cb_st_color.setChecked(str(self.cfg.stacking.color_mode).lower() == "rgb")
         self.cb_st_color.toggled.connect(self._stacking_color_toggled)
         self.dd_st_drizzle = QComboBox()
@@ -593,22 +760,138 @@ class StackingTabMixin:
         self.dd_st_drizzle.setCurrentIndex(drizzle_idx)
         self.dd_st_drizzle.currentIndexChanged.connect(self._stacking_drizzle_changed)
 
-        row = QHBoxLayout()
-        for button in [self.btn_st_start, self.btn_st_stop, self.btn_st_reset, self.btn_st_save]:
-            row.addWidget(button)
-        row.addStretch(1)
+        self.dd_st_bayer = QComboBox()
+        for pattern in ("RGGB", "BGGR", "GRBG", "GBRG"):
+            self.dd_st_bayer.addItem(pattern, pattern)
+        bayer = str(getattr(self.cfg.stacking, "bayer_pattern", "RGGB")).upper()
+        idx = self.dd_st_bayer.findText(bayer)
+        self.dd_st_bayer.setCurrentIndex(max(0, idx))
+
+        self.sb_st_batch = QSpinBox()
+        self.sb_st_batch.setRange(1, 200)
+        self.sb_st_batch.setValue(int(self.cfg.stacking.batch_size))
+
+        self.sb_st_max_queue = QSpinBox()
+        self.sb_st_max_queue.setRange(1, 1000)
+        self.sb_st_max_queue.setValue(int(self.cfg.stacking.max_queue))
+
+        self.sb_st_align_median = QSpinBox()
+        self.sb_st_align_median.setRange(1, 31)
+        self.sb_st_align_median.setSingleStep(2)
+        self.sb_st_align_median.setValue(int(self.cfg.stacking.align_median_k))
+
+        self.sb_st_smooth = QSpinBox()
+        self.sb_st_smooth.setRange(1, 300)
+        self.sb_st_smooth.setValue(int(self.cfg.stacking.smooth_k))
+
+        self.sb_st_max_shift = QSpinBox()
+        self.sb_st_max_shift.setRange(1, 500)
+        self.sb_st_max_shift.setSuffix(" px")
+        self.sb_st_max_shift.setValue(int(self.cfg.stacking.max_shift_px))
+
+        self.cb_st_subpixel = QCheckBox("Subpixel alignment")
+        self.cb_st_subpixel.setChecked(bool(self.cfg.stacking.use_subpixel))
+
+        self.ds_st_preview_hz = QDoubleSpinBox()
+        self.ds_st_preview_hz.setRange(0.1, 30.0)
+        self.ds_st_preview_hz.setDecimals(1)
+        self.ds_st_preview_hz.setSingleStep(0.5)
+        self.ds_st_preview_hz.setSuffix(" Hz")
+        self.ds_st_preview_hz.setValue(float(self.cfg.stacking.preview_hz))
+
+        self.ds_st_preview_vmin = QDoubleSpinBox()
+        self.ds_st_preview_vmin.setRange(0.0, 65_535.0)
+        self.ds_st_preview_vmin.setDecimals(1)
+        self.ds_st_preview_vmin.setSingleStep(1.0)
+        self.ds_st_preview_vmin.setValue(float(self.cfg.stacking.preview_log_vmin))
+
+        actions = QHBoxLayout()
+        for button in [self.btn_st_start, self.btn_st_stop, self.btn_st_reset, self.btn_st_save, self.btn_st_apply]:
+            actions.addWidget(button)
+        actions.addStretch(1)
 
         self.btn_st_start.clicked.connect(self._stacking_start)
         self.btn_st_stop.clicked.connect(self._stacking_stop)
         self.btn_st_reset.clicked.connect(self._stacking_reset)
         self.btn_st_save.clicked.connect(self._stacking_save)
+        self.btn_st_apply.clicked.connect(self._stacking_apply)
 
-        form.addRow(row)
-        form.addRow("Drizzle:", self.dd_st_drizzle)
-        form.addRow(self.cb_st_color)
-        box.setLayout(form)
+        stack_box = QGroupBox("Stack")
+        stack_form = QFormLayout(stack_box)
+        _add_option_row(
+            stack_form,
+            "Drizzle:",
+            self.dd_st_drizzle,
+            "Escala de salida del apilado. x1 conserva tamaño nativo; x2/x3 aumentan resolución a costa de memoria y CPU.",
+        )
+        _add_option_row(
+            stack_form,
+            "Bayer:",
+            self.dd_st_bayer,
+            "Patrón del mosaico Bayer del sensor. Debe coincidir con la cámara para que el color RGB salga correcto.",
+        )
+        _set_option_tooltip(
+            self.cb_st_color,
+            "Apila en RGB usando el patrón Bayer seleccionado. Si está apagado, el stack se mantiene monocromo.",
+        )
+        stack_form.addRow(self.cb_st_color)
+        _add_option_row(
+            stack_form,
+            "Batch size:",
+            self.sb_st_batch,
+            "Cantidad de frames que procesa el worker por ciclo. Más alto puede rendir mejor, pero agrega latencia.",
+        )
+        _add_option_row(
+            stack_form,
+            "Max queue:",
+            self.sb_st_max_queue,
+            "Máximo de frames esperando en la cola. Más grande tolera ráfagas, pero puede acumular frames viejos.",
+        )
 
-        layout.addWidget(box)
+        align_box = QGroupBox("Alineación y preview")
+        align_form = QFormLayout(align_box)
+        _set_option_tooltip(
+            self.cb_st_subpixel,
+            "Permite estimar desplazamientos fraccionales de píxel durante la alineación del stack.",
+        )
+        align_form.addRow(self.cb_st_subpixel)
+        _add_option_row(
+            align_form,
+            "Median k:",
+            self.sb_st_align_median,
+            "Tamaño del filtro mediano previo a la alineación. Debe ser impar; ayuda a remover píxeles calientes y ruido impulsivo.",
+        )
+        _add_option_row(
+            align_form,
+            "Smooth k:",
+            self.sb_st_smooth,
+            "Suavizado de perfiles usado para estimar desplazamiento. Más alto estabiliza, pero responde menos a cambios finos.",
+        )
+        _add_option_row(
+            align_form,
+            "Max shift:",
+            self.sb_st_max_shift,
+            "Desplazamiento máximo aceptado entre frames. Si se supera, el frame puede rechazarse para evitar contaminar el stack.",
+        )
+        _add_option_row(
+            align_form,
+            "Preview Hz:",
+            self.ds_st_preview_hz,
+            "Frecuencia de actualización de la vista apilada. Más alta consume más CPU.",
+        )
+        _add_option_row(
+            align_form,
+            "Preview vmin:",
+            self.ds_st_preview_vmin,
+            "Piso de brillo usado para el estiramiento logarítmico del preview del stack.",
+        )
+
+        columns = QHBoxLayout()
+        columns.addWidget(stack_box, stretch=1)
+        columns.addWidget(align_box, stretch=1)
+
+        layout.addLayout(actions)
+        layout.addLayout(columns)
         layout.addStretch(1)
         return widget
 
@@ -989,7 +1272,6 @@ class ModulesTabsMixin(
         tabs.addTab(self._tab_stacking(), "Stacking")
         tabs.addTab(self._tab_od(), "Object Detection")
         tabs.addTab(self._tab_goto(), "GoTo")
-        tabs.addTab(self._tab_gaia(), "Gaia")
 
         wrap = QWidget()
         layout = QVBoxLayout(wrap)
@@ -998,5 +1280,4 @@ class ModulesTabsMixin(
         layout.addWidget(tabs)
 
         self.modules_tabs = tabs
-        tabs.currentChanged.connect(self._gaia_tab_selected)
         return wrap

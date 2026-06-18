@@ -349,13 +349,10 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.btn_disconnect_camera = QPushButton("Disconnect camera")
         self.btn_connect_mount = QPushButton("Connect mount")
         self.btn_disconnect_mount = QPushButton("Disconnect mount")
-        self.btn_download_gaia = QPushButton("Download Gaia field")
-        self.btn_download_gaia.setToolTip("Descarga en cache las teselas Gaia del campo actual")
         self.btn_connect_camera.clicked.connect(self._connect_camera)
         self.btn_disconnect_camera.clicked.connect(self._disconnect_camera)
         self.btn_connect_mount.clicked.connect(self._connect_mount)
         self.btn_disconnect_mount.clicked.connect(self._disconnect_mount)
-        self.btn_download_gaia.clicked.connect(self._download_gaia_current_field)
 
         self.ch_cam = Chip("Camera")
         self.ch_mount = Chip("Mount")
@@ -389,7 +386,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         row.addWidget(self.btn_disconnect_camera)
         row.addWidget(self.btn_connect_mount)
         row.addWidget(self.btn_disconnect_mount)
-        row.addWidget(self.btn_download_gaia)
         row.addSpacing(8)
         for widget in [
             self.ch_cam,
@@ -625,6 +621,36 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.runner.enqueue(tracking_keyframe_reset())
         self._log("[tracking] Reset")
 
+    def _tracking_apply(self) -> None:
+        params = {
+            "resp_min": float(self.ds_tr_resp_min.value()),
+            "sidereal_ff_enabled": bool(self.cb_tr_ff.isChecked()),
+            "sidereal_ff_gain": float(self.ds_tr_ff_gain.value()),
+            "sidereal_ff_dt_s": float(self.ds_tr_ff_dt.value()),
+            "sidereal_ff_cond_max": float(self.ds_tr_ff_cond.value()),
+            "sidereal_ff_hold_s": float(self.ds_tr_ff_hold.value()),
+            "sidereal_ff_slew_per_s": float(self.ds_tr_ff_slew.value()),
+            "sep_minarea": int(self.sb_tr_sep_minarea.value()),
+            "sep_thresh_sigma": float(self.ds_tr_sep_sigma.value()),
+            "sep_max_sources": int(self.sb_tr_sep_max_sources.value()),
+            "sep_min_sources": int(self.sb_tr_sep_min_sources.value()),
+            "sep_bw": int(self.sb_tr_sep_bw.value()),
+            "sep_bh": int(self.sb_tr_sep_bh.value()),
+        }
+        self.runner.request_tracking_params(**params)
+        self.cfg.tracking.resp_min = float(params["resp_min"])
+        self.cfg.tracking.sidereal_ff_enabled = bool(params["sidereal_ff_enabled"])
+        self.cfg.tracking.sidereal_ff_gain = float(params["sidereal_ff_gain"])
+        self.cfg.tracking.sidereal_ff_dt_s = float(params["sidereal_ff_dt_s"])
+        self.cfg.tracking.sidereal_ff_cond_max = float(params["sidereal_ff_cond_max"])
+        self.cfg.tracking.sidereal_ff_hold_s = float(params["sidereal_ff_hold_s"])
+        self.cfg.tracking.sidereal_ff_slew_per_s = float(params["sidereal_ff_slew_per_s"])
+        self._log(
+            "[tracking] Apply "
+            f"resp_min={params['resp_min']:.3f} ff={int(params['sidereal_ff_enabled'])} "
+            f"gain={params['sidereal_ff_gain']:.3f} sep_sigma={params['sep_thresh_sigma']:.2f}"
+        )
+
     def _stacking_start(self) -> None:
         self.runner.request_stacking_start()
         self._log("[stacking] Start")
@@ -643,8 +669,11 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
 
     def _stacking_color_toggled(self, checked: bool) -> None:
         color_mode = "rgb" if bool(checked) else "mono"
-        self.runner.request_stacking_params(color_mode=color_mode, bayer_pattern="RGGB")
-        self._log(f"[stacking] color_mode={color_mode} (stack RGB RGGB, alignment mono)")
+        bayer_pattern = str(self.dd_st_bayer.currentData()) if hasattr(self, "dd_st_bayer") else "RGGB"
+        self.runner.request_stacking_params(color_mode=color_mode, bayer_pattern=bayer_pattern)
+        self.cfg.stacking.color_mode = color_mode
+        self.cfg.stacking.bayer_pattern = bayer_pattern
+        self._log(f"[stacking] color_mode={color_mode} bayer={bayer_pattern} (alignment mono)")
 
     def _stacking_drizzle_changed(self, _: int) -> None:
         data = self.dd_st_drizzle.currentData()
@@ -655,7 +684,51 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         if drizzle_scale not in STACKING_DRIZZLE_SCALES:
             drizzle_scale = 1.0
         self.runner.request_stacking_params(drizzle_scale=drizzle_scale)
+        self.cfg.stacking.drizzle_scale = drizzle_scale
         self._log(f"[stacking] drizzle=x{int(drizzle_scale)}")
+
+    def _stacking_apply(self) -> None:
+        drizzle_scale = float(self.dd_st_drizzle.currentData() or 1.0)
+        if drizzle_scale not in STACKING_DRIZZLE_SCALES:
+            drizzle_scale = 1.0
+
+        align_median_k = int(self.sb_st_align_median.value())
+        if align_median_k % 2 == 0:
+            align_median_k += 1
+            self.sb_st_align_median.setValue(align_median_k)
+
+        color_mode = "rgb" if bool(self.cb_st_color.isChecked()) else "mono"
+        bayer_pattern = str(self.dd_st_bayer.currentData() or "RGGB")
+        params = {
+            "color_mode": color_mode,
+            "bayer_pattern": bayer_pattern,
+            "drizzle_scale": drizzle_scale,
+            "batch_size": int(self.sb_st_batch.value()),
+            "max_queue": int(self.sb_st_max_queue.value()),
+            "align_median_k": align_median_k,
+            "smooth_k": int(self.sb_st_smooth.value()),
+            "max_shift_px": int(self.sb_st_max_shift.value()),
+            "use_subpixel": bool(self.cb_st_subpixel.isChecked()),
+            "preview_hz": float(self.ds_st_preview_hz.value()),
+            "preview_log_vmin": float(self.ds_st_preview_vmin.value()),
+        }
+        self.runner.request_stacking_params(**params)
+        self.cfg.stacking.color_mode = color_mode
+        self.cfg.stacking.bayer_pattern = bayer_pattern
+        self.cfg.stacking.drizzle_scale = drizzle_scale
+        self.cfg.stacking.batch_size = int(params["batch_size"])
+        self.cfg.stacking.max_queue = int(params["max_queue"])
+        self.cfg.stacking.align_median_k = int(params["align_median_k"])
+        self.cfg.stacking.smooth_k = int(params["smooth_k"])
+        self.cfg.stacking.max_shift_px = int(params["max_shift_px"])
+        self.cfg.stacking.use_subpixel = bool(params["use_subpixel"])
+        self.cfg.stacking.preview_hz = float(params["preview_hz"])
+        self.cfg.stacking.preview_log_vmin = float(params["preview_log_vmin"])
+        self._log(
+            "[stacking] Apply "
+            f"mode={color_mode} drizzle=x{int(drizzle_scale)} batch={params['batch_size']} "
+            f"median={align_median_k} smooth={params['smooth_k']} max_shift={params['max_shift_px']}"
+        )
 
     def _platesolve_start(self) -> None:
         if not hasattr(self, "ed_ps_target"):
