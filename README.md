@@ -26,8 +26,9 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 - `libPlayerOneCamera.3.9.0.dylib`: binario del SDK (macOS). En Linux/Windows se esperan `.so`/`.dll`.
 - `PlayerOneCamera.h`: header del SDK (referencia de API).
 - `imaging.py`: utilidades de imagen (stretch rápido, preview JPEG, canal verde de Bayer).
-- `tracking.py`: pipeline de tracking (preprocesado, correlación de fase, control PI, auto-calibración, rate limiter).
-- `stacking.py`: live stacking con alineación, drizzle opcional, salida mono/RGB y preview JPEG.
+- `tracking.py`: pipeline de tracking (firma RAW16, control PI, auto-calibración y rate limiter).
+- `raw_alignment.py`: alineación rápida directamente sobre Bayer RAW16, compartida por tracking y stacking.
+- `stacking.py`: live stacking con alineación RAW16, drizzle opcional, salida mono/RGB y preview JPEG.
 - `platesolving.py`: plate solving contra Gaia/SIMBAD, overlay/debug y worker asíncrono.
 - `goto.py`: modelo de apuntado, sync, GoTo y rutinas de calibración/autocalibración.
 - `gaia_cache.py`: catálogo combinado Gaia DR3 + Hipparcos/Tycho-2, caché HEALPix,
@@ -42,7 +43,8 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 ### 1) Orquestación, UI y terminal
 - **`app_runner.py`**
   - Controla el lifecycle de cámara, stream y montura.
-  - Ejecuta el loop de control a `control_hz`, genera previews y aplica tracking.
+  - Ejecuta el loop de control a `control_hz`; el cálculo de tracking y preview corre en workers con política “último frame gana”.
+  - Encola stacking sólo cuando cambia la secuencia de cámara y mantiene las transformaciones astronómicas en cadencias independientes.
   - Mantiene el estado global (`AppState`) para la UI.
 
 - **`app.py` + `ui/pyqt6_app.py`**
@@ -54,6 +56,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
   - Controla el mismo `AppRunner` sin cargar PyQt6 mediante `python app.py --cli`.
   - Ofrece consola interactiva, comandos repetibles con `-c` y archivos de sesión con `--script`.
   - Expone estado/configuración JSON, esperas por campos del estado e inyección avanzada de acciones.
+  - `health` incluye percentiles p50/p95/p99 por sección del loop para localizar pausas.
   - Guarda Live, Stack y debug de Plate Solve como JPEG en `terminal_output/images/`, junto a un JSON con el estado exacto de la captura.
 
 ### 2) Tipos, acciones y configuración
@@ -84,7 +87,7 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 
 ### 4) Tracking y control de montura
 - **`tracking.py`**
-  - Tracking incremental por correlación de fase.
+  - Tracking incremental por perfiles RAW16 de precisión y detalle, sin ejecutar SEP.
   - Control PI y rate limiter para generar velocidades de montura (µsteps/s).
   - Soporte de calibración manual + auto-cal (RLS) y bootstrap.
 
@@ -100,8 +103,21 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 
 ### 5) Stacking, plate solving y GoTo
 - **`stacking.py`**
-  - Alinea frames en vivo, acumula mosaico mono/RGB, genera preview y guarda `.npy` + `.png`.
+  - Usa el mismo alineador RAW16 de tracking, acumula mosaico mono/RGB, genera preview y guarda `.npy` + `.png`.
   - Soporta drizzle x1/x2/x3 desde la UI.
+  - Las grabaciones de prueba se pueden apilar a color sin cargar el `.npy`
+    completo en memoria:
+
+```bash
+source /Users/josue/myenv/bin/activate
+python scripts/stack_raw_recordings.py raw_output/raw_*.npy \
+  --scale 3 --output-dir stack_output/raw_drizzle_x3
+```
+
+  - `scripts/combine_raw_stacks.py` registra stacks de varias grabaciones del
+    mismo campo, normaliza su respuesta fotométrica y pondera cada sesión por
+    el ruido medido. Conserva PNG de 16 bits, JPEG a resolución completa,
+    preview, datos lineales y mapa de cobertura.
 
 - **`platesolving.py` + `gaia_cache.py`**
   - Detecta fuentes con SEP, consulta/carga Gaia, resuelve por tripletas y publica overlays/debug.

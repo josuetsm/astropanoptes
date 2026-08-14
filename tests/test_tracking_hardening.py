@@ -12,6 +12,7 @@ from goto import MountKinematics
 from platesolving import ObserverConfig
 from simulation import SimulatedCameraStream, SimulationState, restore_iers_after_demo
 from tracking import (
+    _AlignmentMeasurement,
     estimate_shift_from_source_matches,
     make_tracking_state,
     tracking_set_params,
@@ -19,30 +20,22 @@ from tracking import (
 )
 
 
-EMPTY_OBJECTS = np.zeros((0,), dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
+def _star_frame(*, shift_x: int = 0, size: int = 32) -> np.ndarray:
+    raw = np.zeros((size, size), dtype=np.uint16)
+    for x, y, value in ((7, 8, 60_000), (17, 13, 52_000), (24, 23, 48_000)):
+        x0 = x + int(shift_x)
+        if 1 <= x0 < (size - 1):
+            raw[y - 1 : y + 2, x0 - 1 : x0 + 2] = value
+    return raw
 
 
-def _objects(points: list[tuple[float, float]]) -> np.ndarray:
-    out = np.zeros((len(points),), dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
-    for i, (x, y) in enumerate(points):
-        out["x"][i] = x
-        out["y"][i] = y
-        out["flux"][i] = float(len(points) - i) * 1000.0
-    return out
-
-
-def test_tracking_rejects_noise_correlation_when_sep_has_no_detections() -> None:
+def test_tracking_rejects_flat_frames_without_sep() -> None:
     state = make_tracking_state()
     raw0 = np.zeros((32, 32), dtype=np.uint16)
     raw1 = np.ones((32, 32), dtype=np.uint16)
 
-    with (
-        patch("tracking.sep_detect_from_raw16", return_value=(None, None, EMPTY_OBJECTS, np.zeros((0, 2)))),
-        patch("tracking.estimate_shift_from_phase_alignment", return_value=(3.0, 0.0, 1.0)),
-        patch("tracking.estimate_shift_from_profile_alignment", return_value=(3.0, 0.0, 1.0)),
-    ):
-        tracking_step(state, raw0, now_t=0.0, tracking_enabled=True)
-        out = tracking_step(state, raw1, now_t=0.1, tracking_enabled=True)
+    tracking_step(state, raw0, now_t=0.0, tracking_enabled=True)
+    out = tracking_step(state, raw1, now_t=0.1, tracking_enabled=True)
 
     assert not out.ok
     assert out.n_det == 0
@@ -52,85 +45,51 @@ def test_tracking_rejects_noise_correlation_when_sep_has_no_detections() -> None
 
 def test_tracking_bad_frame_keeps_last_good_incremental_reference() -> None:
     state = make_tracking_state()
-    raw0 = np.zeros((16, 16), dtype=np.uint16)
-    raw1 = np.ones((16, 16), dtype=np.uint16) * 100
-    objs = _objects([(5.0, 5.0), (10.0, 8.0), (12.0, 12.0)])
-
-    with (
-        patch("tracking.sep_detect_from_raw16", return_value=(None, None, objs, np.zeros((3, 2)))),
-        patch("tracking.estimate_shift_from_phase_alignment", return_value=(20.0, 0.0, 0.0)),
-        patch("tracking.estimate_shift_from_profile_alignment", return_value=(20.0, 0.0, 0.0)),
-        patch("tracking.estimate_shift_from_source_matches", return_value=(20.0, 0.0, 0.0, 0)),
-    ):
-        tracking_step(state, raw0, now_t=0.0, tracking_enabled=True)
-        out = tracking_step(state, raw1, now_t=0.1, tracking_enabled=True)
+    raw0 = _star_frame()
+    raw1 = np.ones((32, 32), dtype=np.uint16) * 100
+    tracking_step(state, raw0, now_t=0.0, tracking_enabled=True)
+    reference = state.prev_signature
+    out = tracking_step(state, raw1, now_t=0.1, tracking_enabled=True)
 
     assert not out.ok
     assert state.prev_t == 0.0
-    assert state.prev_align_u16 is not None
-    assert np.array_equal(state.prev_align_u16, raw0)
+    assert state.prev_signature is reference
     assert state.last_dx_inc == 0.0
     assert state.last_dy_inc == 0.0
 
 
 def test_tracking_invalid_measurement_does_not_report_a_fake_zero_velocity() -> None:
     state = make_tracking_state()
-    raw = np.zeros((16, 16), dtype=np.uint16)
-    objs0 = _objects([(5.0, 5.0), (10.0, 8.0), (12.0, 12.0)])
-    objs1 = _objects([(6.0, 5.0), (11.0, 8.0), (13.0, 12.0)])
-    detections = iter([objs0, objs1, EMPTY_OBJECTS])
-
-    with (
-        patch(
-            "tracking.sep_detect_from_raw16",
-            side_effect=lambda *args, **kwargs: (None, None, next(detections), np.zeros((0, 2))),
-        ),
-        patch("tracking.estimate_shift_from_phase_alignment", return_value=(1.0, 0.0, 1.0)),
-        patch("tracking.estimate_shift_from_profile_alignment", return_value=(1.0, 0.0, 1.0)),
-    ):
-        first = tracking_step(state, raw, now_t=0.0, tracking_enabled=False)
-        good = tracking_step(state, raw, now_t=0.1, tracking_enabled=False)
-        bad = tracking_step(state, raw, now_t=0.2, tracking_enabled=False)
+    first = tracking_step(state, _star_frame(), now_t=0.0, tracking_enabled=False)
+    good = tracking_step(state, _star_frame(shift_x=1), now_t=0.1, tracking_enabled=False)
+    bad = tracking_step(
+        state,
+        np.zeros((32, 32), dtype=np.uint16),
+        now_t=0.2,
+        tracking_enabled=False,
+    )
 
     assert not first.ok
     assert first.measurement_reason == "initializing"
     assert good.ok
     assert good.vx > 0.0
     assert not bad.ok
-    assert bad.measurement_reason == "no_sources"
+    assert bad.measurement_reason == "no_signal"
     assert bad.vx == good.vx
     assert state.prev_t == 0.1
 
 
 def test_tracking_recovers_incremental_lock_from_target_keyframe() -> None:
     state = make_tracking_state()
-    raw = np.zeros((16, 16), dtype=np.uint16)
-    objs0 = _objects([(5.0, 5.0), (10.0, 8.0), (12.0, 12.0)])
-    objs1 = _objects([(6.0, 5.0), (11.0, 8.0), (13.0, 12.0)])
-    objs2 = _objects([(7.0, 5.0), (12.0, 8.0), (14.0, 12.0)])
-    detections = iter([objs0, objs1, objs2])
-
-    with (
-        patch(
-            "tracking.sep_detect_from_raw16",
-            side_effect=lambda *args, **kwargs: (None, None, next(detections), np.zeros((0, 2))),
-        ),
-        patch(
-            "tracking.estimate_shift_from_phase_alignment",
-            side_effect=[(1.0, 0.0, 1.0), (20.0, 0.0, 0.0), (2.0, 0.0, 1.0)],
-        ),
-        patch(
-            "tracking.estimate_shift_from_profile_alignment",
-            side_effect=[(1.0, 0.0, 1.0), (20.0, 0.0, 0.0), (2.0, 0.0, 1.0)],
-        ),
-        patch(
-            "tracking.estimate_shift_from_source_matches",
-            side_effect=[(1.0, 0.0, 1.0, 3), (20.0, 0.0, 0.0, 0), (2.0, 0.0, 1.0, 3)],
-        ),
-    ):
-        tracking_step(state, raw, now_t=0.0, tracking_enabled=False)
-        good = tracking_step(state, raw, now_t=0.1, tracking_enabled=False)
-        recovered = tracking_step(state, raw, now_t=0.2, tracking_enabled=False)
+    measurements = [
+        _AlignmentMeasurement(True, 1.0, 0.0, 1.0, "raw_profile", "ok"),
+        _AlignmentMeasurement(False, 20.0, 0.0, 0.0, "raw_profile", "low_confidence"),
+        _AlignmentMeasurement(True, 2.0, 0.0, 1.0, "raw_profile", "ok"),
+    ]
+    with patch("tracking._estimate_alignment", side_effect=measurements):
+        tracking_step(state, _star_frame(), now_t=0.0, tracking_enabled=False)
+        good = tracking_step(state, _star_frame(shift_x=1), now_t=0.1, tracking_enabled=False)
+        recovered = tracking_step(state, _star_frame(shift_x=2), now_t=0.2, tracking_enabled=False)
 
     assert good.ok
     assert recovered.ok
@@ -183,12 +142,7 @@ def test_real_alignment_rejects_noise_frame_and_reacquires_original_target() -> 
     state = make_tracking_state()
     tracking_set_params(
         state,
-        sep_bw=16,
-        sep_bh=16,
-        sep_thresh_sigma=2.5,
-        sep_minarea=3,
-        sep_min_sources=3,
-        resp_min=0.06,
+        resp_min=0.25,
     )
 
     outputs = []
@@ -213,25 +167,17 @@ def test_real_alignment_rejects_noise_frame_and_reacquires_original_target() -> 
 def test_tracking_rls_ignores_small_applied_rates() -> None:
     state = make_tracking_state()
     state.lock_conf = 1.0
-    raw0 = np.zeros((16, 16), dtype=np.uint16)
-    raw1 = np.zeros((16, 16), dtype=np.uint16)
-    objs0 = _objects([(5.0, 5.0), (10.0, 8.0), (12.0, 12.0)])
-    objs1 = _objects([(5.2, 5.0), (10.2, 8.0), (12.2, 12.0)])
-
-    calls = {"n": 0}
-
-    def _detect(raw, **kwargs):
-        return (None, None, objs0 if calls["n"] == 0 else objs1, np.zeros((3, 2)))
+    raw0 = _star_frame()
+    raw1 = _star_frame(shift_x=1)
 
     with (
-        patch("tracking.sep_detect_from_raw16", side_effect=_detect),
-        patch("tracking.estimate_shift_from_phase_alignment", return_value=(0.2, 0.0, 1.0)),
-        patch("tracking.estimate_shift_from_profile_alignment", return_value=(0.2, 0.0, 1.0)),
+        patch(
+            "tracking._estimate_alignment",
+            return_value=_AlignmentMeasurement(True, 0.2, 0.0, 1.0, "raw_profile", "ok"),
+        ),
         patch("tracking.auto_rls_update") as mocked_rls,
     ):
-        calls["n"] = 0
         tracking_step(state, raw0, now_t=0.0, tracking_enabled=True)
-        calls["n"] = 1
         tracking_step(
             state,
             raw1,

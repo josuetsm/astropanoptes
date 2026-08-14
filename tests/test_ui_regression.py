@@ -135,6 +135,21 @@ class UiRegressionTests(unittest.TestCase):
         self.window.btn_camera_connection.click()
         self.assertEqual(calls, ["connect", "disconnect"])
 
+    def test_camera_apply_batches_settings_and_log_is_bounded(self) -> None:
+        calls: list[dict] = []
+        self.runner.request_camera_params = lambda params: calls.append(dict(params))
+        self.window.ds_exp_ms.setValue(250.0)
+        self.window.sb_gain.setValue(320)
+        self.window.sb_offset.setValue(24)
+
+        self.window._camera_apply()
+
+        self.assertEqual(
+            calls,
+            [{"exp_ms": 250.0, "gain": 320, "offset": 24}],
+        )
+        self.assertEqual(self.window.log.document().maximumBlockCount(), 3000)
+
     def test_mount_connection_button_toggles_from_runner_state(self) -> None:
         calls: list[str] = []
         self.runner.request_mount_connect = lambda _port, _baud: calls.append("connect")

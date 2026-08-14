@@ -14,6 +14,7 @@ from config import AppConfig
 from imaging import ensure_raw16_bayer
 from logging_utils import log_error
 from preview import stretch_to_u8
+from raw_alignment import build_raw_alignment_signature, estimate_raw_translation
 from workers import BaseWorker
 
 # ============================================================
@@ -46,11 +47,6 @@ def _odd_ksize(v: int, *, minimum: int = 1) -> int:
     return k
 
 
-def _smooth_kernel(k: int) -> np.ndarray:
-    x = np.ones(max(1, int(k)), dtype=np.float64)
-    return x / x.sum()
-
-
 def _bayer_to_gray_code(pattern: str) -> int:
     return _BAYER_TO_GRAY_CODE.get(str(pattern).upper(), cv2.COLOR_BAYER_RG2GRAY)
 
@@ -78,6 +74,7 @@ class LiveMosaicStackerGray:
         self,
         *,
         color_mode: ColorMode,
+        resp_min: float,
         align_median_k: int,
         smooth_k: int,
         max_shift_px: int,
@@ -88,6 +85,7 @@ class LiveMosaicStackerGray:
         bayer_to_rgb_code: int,
     ):
         self.color_mode: ColorMode = "rgb" if str(color_mode).lower() == "rgb" else "mono"
+        self.resp_min = float(resp_min)
         self.align_median_k = _odd_ksize(align_median_k, minimum=1)
         self.smooth_k = max(1, int(smooth_k))
         self.max_shift_px = max(1, int(max_shift_px))
@@ -96,8 +94,6 @@ class LiveMosaicStackerGray:
         self.drizzle_scale = _normalize_drizzle_scale(drizzle_scale)
         self.bayer_to_gray_code = int(bayer_to_gray_code)
         self.bayer_to_rgb_code = int(bayer_to_rgb_code)
-        self.kernel = _smooth_kernel(self.smooth_k)
-
         self.sum: Optional[np.ndarray] = None
         self.wgt: Optional[np.ndarray] = None
         self.canvas_h = 0
@@ -109,6 +105,7 @@ class LiveMosaicStackerGray:
         self.pos_y = 0.0
         self.last_dx = 0.0
         self.last_dy = 0.0
+        self.last_resp = 0.0
         self.n = 0
 
     def reset(self) -> None:
@@ -122,71 +119,11 @@ class LiveMosaicStackerGray:
         self.pos_y = 0.0
         self.last_dx = 0.0
         self.last_dy = 0.0
+        self.last_resp = 0.0
         self.n = 0
 
     def has_data(self) -> bool:
         return self.sum is not None and self.wgt is not None and self.n > 0
-
-    def _profile_1d(self, img_u16: np.ndarray, which: str) -> np.ndarray:
-        img = cv2.medianBlur(img_u16, self.align_median_k)
-        if which == "dx":
-            p = img.max(axis=0).astype(np.float64, copy=False)
-        elif which == "dy":
-            p = img.max(axis=1).astype(np.float64, copy=False)
-        else:
-            raise ValueError("which must be dx or dy")
-        return np.convolve(p, self.kernel, mode="same")
-
-    @staticmethod
-    def _shift_1d_centered(
-        p_ref: np.ndarray,
-        p_cur: np.ndarray,
-        *,
-        center: float,
-        max_shift: int,
-        subpixel: bool,
-    ) -> float:
-        if not np.isfinite(center):
-            center = 0.0
-
-        a = p_cur - p_cur.mean()
-        b = p_ref - p_ref.mean()
-
-        corr = np.correlate(a, b, mode="full")
-        if not np.any(np.isfinite(corr)):
-            return 0.0
-
-        L = len(p_cur)
-        shifts = np.arange(-(L - 1), L, dtype=np.float64)
-
-        lo = float(center) - float(max_shift)
-        hi = float(center) + float(max_shift)
-        mask = (shifts >= lo) & (shifts <= hi)
-        if np.any(mask):
-            corr[~mask] = -np.inf
-
-        i0 = int(np.argmax(corr))
-        if not np.isfinite(corr[i0]):
-            return 0.0
-        shift_int = i0 - (L - 1)
-
-        if not subpixel:
-            return float(shift_int)
-
-        delta = 0.0
-        if 1 <= i0 < (len(corr) - 1):
-            y0, y1, y2 = float(corr[i0 - 1]), float(corr[i0]), float(corr[i0 + 1])
-            if np.isfinite(y0) and np.isfinite(y1) and np.isfinite(y2):
-                denom = y0 - 2.0 * y1 + y2
-                if np.isfinite(denom) and abs(denom) > 1e-12:
-                    cand = 0.5 * (y0 - y2) / denom
-                    if np.isfinite(cand):
-                        delta = cand
-
-        out = float(shift_int + delta)
-        if not np.isfinite(out):
-            return float(shift_int)
-        return out
 
     def _apply_drizzle(self, img: np.ndarray) -> np.ndarray:
         scale = float(self.drizzle_scale)
@@ -195,9 +132,10 @@ class LiveMosaicStackerGray:
         return cv2.resize(img, dsize=None, fx=scale, fy=scale, interpolation=cv2.INTER_LINEAR)
 
     def _raw_to_gray_align(self, raw_u16: np.ndarray) -> np.ndarray:
-        raw_f = cv2.medianBlur(raw_u16, self.align_median_k)
-        gray = cv2.cvtColor(raw_f, self.bayer_to_gray_code)
-        return self._apply_drizzle(gray)
+        # Alignment stays at the sensor resolution.  Upscaling before measuring
+        # translation adds no information and makes drizzle x3 roughly 9x more
+        # expensive for this step.
+        return cv2.cvtColor(raw_u16, self.bayer_to_gray_code)
 
     def _raw_to_stack(self, raw_u16: np.ndarray) -> np.ndarray:
         if self.color_mode == "rgb":
@@ -233,13 +171,13 @@ class LiveMosaicStackerGray:
             new_w = self.canvas_w + pad_l + pad_r
 
             if self.sum.ndim == 2:
-                new_sum = np.zeros((new_h, new_w), np.float64)
+                new_sum = np.zeros((new_h, new_w), np.float32)
                 new_sum[pad_t : pad_t + self.canvas_h, pad_l : pad_l + self.canvas_w] = self.sum
             else:
                 channels = int(self.sum.shape[2])
-                new_sum = np.zeros((new_h, new_w, channels), np.float64)
+                new_sum = np.zeros((new_h, new_w, channels), np.float32)
                 new_sum[pad_t : pad_t + self.canvas_h, pad_l : pad_l + self.canvas_w, :] = self.sum
-            new_wgt = np.zeros((new_h, new_w), np.float64)
+            new_wgt = np.zeros((new_h, new_w), np.float32)
 
             new_wgt[pad_t : pad_t + self.canvas_h, pad_l : pad_l + self.canvas_w] = self.wgt
 
@@ -256,35 +194,56 @@ class LiveMosaicStackerGray:
 
         return x0, y0
 
-    def _build_ref_gray_u16(self, y0: int, x0: int, h: int, w: int) -> np.ndarray:
+    def _build_ref_gray_u16(
+        self,
+        y0: int,
+        x0: int,
+        h: int,
+        w: int,
+        *,
+        align_shape: Optional[tuple[int, int]] = None,
+    ) -> np.ndarray:
         if self.sum is None or self.wgt is None:
-            return np.zeros((h, w), np.uint16)
+            target_shape = align_shape or (h, w)
+            return np.zeros(target_shape, np.uint16)
 
         W = self.wgt[y0 : y0 + h, x0 : x0 + w]
         S = self.sum[y0 : y0 + h, x0 : x0 + w]
-        m = W > 0
+
+        # A drizzle stack is stored at the enlarged output resolution, while
+        # alignment deliberately runs at native sensor resolution. Downsample
+        # sums and weights before division so the reference keeps the correct
+        # weighted mean without materializing a full-resolution RGB mean.
+        if align_shape is not None and tuple(W.shape) != tuple(align_shape):
+            align_h, align_w = align_shape
+            W = cv2.resize(W, (align_w, align_h), interpolation=cv2.INTER_AREA)
+            S = cv2.resize(S, (align_w, align_h), interpolation=cv2.INTER_AREA)
+
+        m = W > 0.0
 
         if self.color_mode == "rgb" and S.ndim == 3:
-            ref_rgb = np.zeros((h, w, 3), np.uint16)
-            if np.any(m):
-                ref_vals = np.clip(S[m] / W[m, None], 0.0, 65535.0)
-                ref_rgb[m] = ref_vals.astype(np.uint16, copy=False)
-            return cv2.cvtColor(ref_rgb, cv2.COLOR_RGB2GRAY)
+            ref_gray = cv2.cvtColor(S, cv2.COLOR_RGB2GRAY)
+        else:
+            ref_gray = np.array(S, dtype=np.float32, copy=True)
 
-        ref = np.zeros((h, w), np.uint16)
         if np.any(m):
-            ref_vals = np.clip(S[m] / W[m], 0.0, 65535.0)
-            ref[m] = ref_vals.astype(np.uint16, copy=False)
-        return ref
+            np.divide(ref_gray, W, out=ref_gray, where=m)
+        ref_gray[~m] = 0.0
+        return np.clip(ref_gray, 0.0, 65535.0).astype(np.uint16)
 
-    def add_frame(self, raw_u16: np.ndarray) -> None:
+    def add_frame(self, raw_u16: np.ndarray) -> bool:
         gray_align = self._raw_to_gray_align(raw_u16)
+        current_signature = build_raw_alignment_signature(
+            gray_align,
+            median_k=int(self.align_median_k),
+            smooth_k=int(self.smooth_k),
+        )
         stack_img = self._raw_to_stack(raw_u16)
         h, w = stack_img.shape[:2]
 
         if self.sum is None or self.wgt is None:
-            self.sum = stack_img.astype(np.float64, copy=False)
-            self.wgt = np.ones((h, w), np.float64)
+            self.sum = stack_img.astype(np.float32, copy=False)
+            self.wgt = np.ones((h, w), np.float32)
             self.canvas_h = h
             self.canvas_w = w
             self.frame_h = h
@@ -292,48 +251,65 @@ class LiveMosaicStackerGray:
             self.n = 1
             self.last_dx = 0.0
             self.last_dy = 0.0
-            return
+            self.last_resp = 1.0
+            return True
+
+        if not current_signature.has_signal:
+            self.last_resp = 0.0
+            return False
 
         if (h != self.frame_h) or (w != self.frame_w):
             # ROI/binning changed while stacking: reinitialize to keep state consistent.
             self.reset()
-            self.sum = stack_img.astype(np.float64, copy=False)
-            self.wgt = np.ones((h, w), np.float64)
+            self.sum = stack_img.astype(np.float32, copy=False)
+            self.wgt = np.ones((h, w), np.float32)
             self.canvas_h = h
             self.canvas_w = w
             self.frame_h = h
             self.frame_w = w
             self.n = 1
-            return
+            self.last_resp = 1.0
+            return True
 
         x_ref = int(np.floor(self.pos_x))
         y_ref = int(np.floor(self.pos_y))
         x_ref, y_ref = self._ensure_canvas(x_ref, y_ref, w, h)
-        ref = self._build_ref_gray_u16(y_ref, x_ref, h, w)
+        ref = self._build_ref_gray_u16(
+            y_ref,
+            x_ref,
+            h,
+            w,
+            align_shape=tuple(gray_align.shape),
+        )
+        reference_signature = build_raw_alignment_signature(
+            ref,
+            median_k=int(self.align_median_k),
+            smooth_k=int(self.smooth_k),
+        )
+        alignment = estimate_raw_translation(
+            reference_signature,
+            current_signature,
+            center_dx=float(self.last_dx),
+            center_dy=float(self.last_dy),
+            search_radius_px=float(self.max_shift_px),
+            max_displacement_px=None,
+            min_response=float(self.resp_min),
+            use_subpixel=bool(self.use_subpixel),
+        )
+        self.last_resp = float(alignment.response)
+        if not alignment.ok:
+            # Keep the last trusted motion estimate as the prediction center.
+            # A rejected/noisy frame must not steer the following search window.
+            return False
 
-        dx = self._shift_1d_centered(
-            self._profile_1d(ref, "dx"),
-            self._profile_1d(gray_align, "dx"),
-            center=self.last_dx,
-            max_shift=self.max_shift_px,
-            subpixel=self.use_subpixel,
-        )
-        dy = self._shift_1d_centered(
-            self._profile_1d(ref, "dy"),
-            self._profile_1d(gray_align, "dy"),
-            center=self.last_dy,
-            max_shift=self.max_shift_px,
-            subpixel=self.use_subpixel,
-        )
-        if not np.isfinite(dx):
-            dx = 0.0
-        if not np.isfinite(dy):
-            dy = 0.0
+        self.last_dx = float(alignment.dx)
+        self.last_dy = float(alignment.dy)
+
+        dx = float(alignment.dx) * float(self.drizzle_scale)
+        dy = float(alignment.dy) * float(self.drizzle_scale)
 
         self.pos_x -= dx
         self.pos_y -= dy
-        self.last_dx = float(dx)
-        self.last_dy = float(dy)
 
         x0 = int(np.floor(self.pos_x))
         y0 = int(np.floor(self.pos_y))
@@ -344,15 +320,21 @@ class LiveMosaicStackerGray:
 
         if self.use_subpixel:
             warped = self._warp_img(stack_img, fx, fy)
+            warped_wgt = self._warp_img(np.ones((h, w), np.float32), fx, fy)
         else:
             warped = stack_img
+            warped_wgt = None
 
         if warped.ndim == 2:
-            self.sum[y0 : y0 + h, x0 : x0 + w] += warped.astype(np.float64, copy=False)
+            self.sum[y0 : y0 + h, x0 : x0 + w] += warped.astype(np.float32, copy=False)
         else:
-            self.sum[y0 : y0 + h, x0 : x0 + w, :] += warped.astype(np.float64, copy=False)
-        self.wgt[y0 : y0 + h, x0 : x0 + w] += 1.0
+            self.sum[y0 : y0 + h, x0 : x0 + w, :] += warped.astype(np.float32, copy=False)
+        if warped_wgt is None:
+            self.wgt[y0 : y0 + h, x0 : x0 + w] += 1.0
+        else:
+            self.wgt[y0 : y0 + h, x0 : x0 + w] += warped_wgt
         self.n += 1
+        return True
 
     def get_mean_u16(self) -> Optional[np.ndarray]:
         if self.sum is None or self.wgt is None:
@@ -363,11 +345,11 @@ class LiveMosaicStackerGray:
         src_wgt = self.wgt[:h, :w]
         if self.sum.ndim == 2:
             src_sum = self.sum[:h, :w]
-            mean = np.zeros_like(src_sum, dtype=np.float64)
+            mean = np.zeros_like(src_sum, dtype=np.float32)
             np.divide(src_sum, src_wgt, out=mean, where=src_wgt > 0)
         else:
             src_sum = self.sum[:h, :w, :]
-            mean = np.zeros_like(src_sum, dtype=np.float64)
+            mean = np.zeros_like(src_sum, dtype=np.float32)
             np.divide(src_sum, src_wgt[..., None], out=mean, where=src_wgt[..., None] > 0)
         mean = np.nan_to_num(mean, nan=0.0, posinf=65535.0, neginf=0.0)
         return np.clip(mean, 0.0, 65535.0).astype(np.uint16)
@@ -453,6 +435,7 @@ class StackEngine:
             self.canvas = None
             self._live_gray = LiveMosaicStackerGray(
                 color_mode=self.color_mode,
+                resp_min=float(getattr(scfg, "resp_min", 0.25)),
                 align_median_k=int(getattr(scfg, "align_median_k", 3)),
                 smooth_k=int(getattr(scfg, "smooth_k", 30)),
                 max_shift_px=int(getattr(scfg, "max_shift_px", 50)),
@@ -616,8 +599,10 @@ class StackEngine:
             for item in batch:
                 try:
                     raw16_work = ensure_raw16_bayer(item["raw16"])
-                    self._live_gray.add_frame(raw16_work)
-                    used += 1
+                    if self._live_gray.add_frame(raw16_work):
+                        used += 1
+                    else:
+                        rejected += 1
                 except Exception as exc:
                     rejected += 1
                     log_error(
@@ -632,7 +617,7 @@ class StackEngine:
             self.metrics.frames_rejected += rejected
             self.metrics.tiles_used = 1 if self._live_gray.has_data() else 0
             self.metrics.tiles_evicted = 0
-            self.metrics.last_resp = 1.0 if used > 0 else 0.0
+            self.metrics.last_resp = float(self._live_gray.last_resp)
             self.metrics.last_dx = float(self._live_gray.last_dx)
             self.metrics.last_dy = float(self._live_gray.last_dy)
             self.metrics.last_theta_deg = 0.0

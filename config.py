@@ -81,8 +81,9 @@ class MountConfig:
 
 @dataclass
 class TrackingConfig:
-    resp_min: float = 0.06
+    resp_min: float = 0.25
     sidereal_ff_enabled: bool = True
+    sidereal_ff_update_hz: float = 2.0
     sidereal_ff_gain: float = 1.0
     sidereal_ff_dt_s: float = 1.0
     sidereal_ff_cond_max: float = 5_000.0
@@ -99,7 +100,7 @@ class StackingConfig:
     max_queue: int = 80  # >= batch_size*4 recomendado
 
     # alignment
-    resp_min: float = 0.08
+    resp_min: float = 0.25
     outlier_k_mad: float = 3.0
     align_median_k: int = 3
     smooth_k: int = 30
@@ -352,6 +353,8 @@ class AppConfig:
     simulation: SimulationConfig = field(default_factory=SimulationConfig)
     
     control_hz: float = 120.0
+    state_publish_hz: float = 10.0
+    pointing_hz: float = 2.0
 
     log_to_file: bool = False
     log_path: str = "./astropanoptes.log"

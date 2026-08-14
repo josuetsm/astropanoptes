@@ -14,14 +14,11 @@ from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
     QDockWidget,
-    QDoubleSpinBox,
-    QFormLayout,
     QFrame,
     QGridLayout,
     QGroupBox,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
     QMainWindow,
     QPushButton,
     QSpinBox,
@@ -316,7 +313,13 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        self.log.document().setMaximumBlockCount(3000)
         _set_option_tooltip(self.log, "Registro de eventos, errores y acciones ejecutadas por la aplicación.")
+
+        self._render_cache: dict[str, dict[str, object]] = {
+            "live": {"data": None, "pixmap": None, "size": QSize()},
+            "stack": {"data": None, "pixmap": None, "size": QSize()},
+        }
 
         self.logs_frame = QGroupBox("Logs")
         logs_layout = QVBoxLayout(self.logs_frame)
@@ -615,9 +618,9 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         exp_ms = float(self.ds_exp_ms.value())
         gain = int(self.sb_gain.value())
         offset = int(self.sb_offset.value())
-        self.runner.request_camera_param("exp_ms", exp_ms)
-        self.runner.request_camera_param("gain", gain)
-        self.runner.request_camera_param("offset", offset)
+        self.runner.request_camera_params(
+            {"exp_ms": exp_ms, "gain": gain, "offset": offset}
+        )
         self._log(f"[camera] apply exposure={exp_ms:.1f} ms gain={gain} offset={offset}")
 
     def _camera_record_raw(self) -> None:
@@ -626,8 +629,12 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             return
         ts = time.strftime("%Y%m%d_%H%M%S")
         basename = f"raw_{ts}"
-        self.runner.request_camera_record_raw(duration_s=20.0, out_dir="raw_output", basename=basename)
-        self._log(f"[camera] Record 20s RAW -> raw_output/{basename}.npy")
+        self.runner.request_camera_record_raw(duration_s=None, out_dir="raw_output", basename=basename)
+        self._log(f"[camera] Recording RAW started -> raw_output/{basename}.npy")
+
+    def _camera_stop_record_raw(self) -> None:
+        self.runner.request_camera_stop_record_raw()
+        self._log("[camera] Recording RAW stop requested")
 
     def _simulation_toggled(self, enabled: bool) -> None:
         enabled_b = bool(enabled)
@@ -950,6 +957,11 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
     def _on_tick(self) -> None:
         state = self.runner.get_state()
 
+        if hasattr(self, "btn_record_raw"):
+            recording = bool(self.runner.camera_recording_active())
+            self.btn_record_raw.setEnabled(not recording and bool(state.camera.connected))
+            self.btn_stop_record_raw.setEnabled(recording)
+
         fps_max = max(0.1, 1000.0 / max(0.1, float(self.ds_exp_ms.value())))
         self.lbl_fps.setText(
             f"FPS cap/max: {state.camera.fps_capture:.2f}/"
@@ -972,9 +984,9 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         else:
             reason_labels = {
                 "initializing": "acquiring reference",
-                "no_sources": "no sources",
-                "detection_failed": "detection failed",
+                "no_signal": "no usable signal",
                 "low_confidence": "low confidence",
+                "ambiguous_alignment": "ambiguous match",
                 "estimator_disagreement": "ambiguous match",
                 "shift_out_of_range": "shift out of range",
                 "lost_lock": "lock lost; reacquiring",
@@ -984,7 +996,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             reason_text = reason_labels.get(reason, reason.replace("_", " "))
             self.lbl_drift.setText(
                 f"tracking: invalid measurement ({reason_text}) | "
-                f"detections: {int(tracking.n_det)} | lock: {100.0 * float(tracking.lock_conf):.0f}%"
+                f"features: {int(tracking.n_det)} | lock: {100.0 * float(tracking.lock_conf):.0f}%"
             )
         if hasattr(self, "lbl_goto_samples"):
             manual_samples = int(getattr(state.goto, "manual_samples", 0))
@@ -1031,35 +1043,47 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._gaia_maybe_refresh(state)
 
     def _render_frame(self) -> None:
-        preview = self.runner.get_latest_preview_jpeg()
-        live_pix = self._pixmap_from_jpeg(preview)
+        if self.view_tabs.currentIndex() == 0:
+            self._render_jpeg_if_changed(
+                "live",
+                self.live_view,
+                self.runner.get_latest_preview_jpeg(),
+            )
+            return
 
         stack_preview = self.runner.get_state().stacking.preview_jpeg
-        stack_pix = self._pixmap_from_jpeg(stack_preview)
-        if stack_pix is None:
-            stack_pix = live_pix
+        data = stack_preview or self.runner.get_latest_preview_jpeg()
+        self._render_jpeg_if_changed("stack", self.stacked_view, data)
 
-        if live_pix is not None:
-            self.live_view.setPixmap(
-                live_pix.scaled(
-                    self.live_view.size(),
+    def _render_jpeg_if_changed(
+        self,
+        cache_key: str,
+        target: QLabel,
+        data: Optional[bytes],
+    ) -> None:
+        cache = self._render_cache[cache_key]
+        data_changed = data is not cache["data"]
+        if data_changed:
+            cache["data"] = data
+            cache["pixmap"] = self._pixmap_from_jpeg(data)
+
+        target_size = target.size()
+        size_changed = target_size != cache["size"]
+        if not data_changed and not size_changed:
+            return
+        cache["size"] = target_size
+
+        pixmap = cache["pixmap"]
+        if isinstance(pixmap, QPixmap) and not pixmap.isNull():
+            target.setPixmap(
+                pixmap.scaled(
+                    target_size,
                     Qt.AspectRatioMode.KeepAspectRatio,
                     Qt.TransformationMode.SmoothTransformation,
                 )
             )
         else:
-            self.live_view.clear()
-
-        if stack_pix is not None:
-            self.stacked_view.setPixmap(
-                stack_pix.scaled(
-                    self.stacked_view.size(),
-                    Qt.AspectRatioMode.KeepAspectRatio,
-                    Qt.TransformationMode.SmoothTransformation,
-                )
-            )
-        else:
-            self.stacked_view.clear()
+            target.clear()
 
     def _pixmap_from_jpeg(self, data: Optional[bytes]) -> Optional[QPixmap]:
         if not data:

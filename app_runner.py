@@ -4,13 +4,14 @@ from __future__ import annotations
 import os
 import json
 import queue
+import collections
 import threading
 import time
 from pathlib import Path
 import datetime as _dt
 
-from dataclasses import dataclass, replace
-from typing import Optional, Any, Dict, List, Tuple, Sequence
+from dataclasses import replace
+from typing import Optional, Any, Callable, Dict, List, Tuple, Sequence
 
 import cv2
 import numpy as np
@@ -39,7 +40,9 @@ from actions import (
     camera_connect,
     camera_disconnect,
     camera_record_raw,
+    camera_stop_record_raw,
     camera_set_param,
+    camera_set_params,
     goto_autocalibrate,
     goto_estimate_roll,
     goto_calibrate,
@@ -67,7 +70,7 @@ from actions import (
     stacking_set_params,
     stacking_start,
     stacking_stop,
-    tracking_set_params,
+    tracking_set_params as tracking_set_params_action,
     tracking_start,
     tracking_stop,
 )
@@ -90,6 +93,7 @@ from mount_arduino import (
 from simulation import SimulatedCameraStream, SimulatedMount, SimulationState, restore_iers_after_demo
 
 from tracking import (
+    TrackingOutput,
     auto_reset,
     make_tracking_state,
     reset_tracker,
@@ -122,6 +126,7 @@ from goto import (
     roll_axis_distance_deg,
 )
 from mount_arduino import MountMoveWorker
+from workers import BaseWorker, SaveWorker
 
 
 def _perf() -> float:
@@ -156,6 +161,15 @@ def _axis_sign_from_invert(invert_flag: bool) -> int:
     # invert=True means user-facing +direction maps to opposite physical motion.
     # Use the same sign in kinematics so model Alt/Az evolves in physical direction.
     return -1 if bool(invert_flag) else +1
+
+
+class _CoalescingCallbackWorker(BaseWorker):
+    def __init__(self, *, name: str, callback: Callable[[Dict[str, Any]], None]) -> None:
+        super().__init__(name=name, idle_sleep_s=0.005)
+        self._callback = callback
+
+    def _handle_request(self, request: Dict[str, Any]) -> None:
+        self._callback(request)
 
 
 class AppRunner:
@@ -198,6 +212,7 @@ class AppRunner:
         self._raw_record_lock = threading.Lock()
         self._raw_record_active = False
         self._raw_record_thread: Optional[threading.Thread] = None
+        self._raw_record_stop = threading.Event()
 
         # Subsystems
         self._cam_dev: Optional[POACameraDevice] = None
@@ -206,6 +221,10 @@ class AppRunner:
         self._simulation_state: Optional[SimulationState] = None
 
         # Tracking subsystem
+        self._tracking_state_lock = threading.RLock()
+        self._tracking_result_lock = threading.Lock()
+        self._tracking_generation = 0
+        self._tracking_worker_error: Optional[Exception] = None
         self._tracking_state = make_tracking_state()
         tracking_set_params(
             self._tracking_state,
@@ -214,17 +233,12 @@ class AppRunner:
             align_smooth_k=int(self.cfg.stacking.smooth_k),
             align_max_shift_px=float(self.cfg.stacking.max_shift_px),
             align_use_subpixel=bool(self.cfg.stacking.use_subpixel),
-            sep_bw=int(self.cfg.sep.bw),
-            sep_bh=int(self.cfg.sep.bh),
-            sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
-            sep_minarea=int(self.cfg.sep.minarea),
-            sep_max_sources=int(self.cfg.platesolving.max_det),
-            sep_min_sources=3,
         )
 
         # Stacking subsystem
         self._stacking = StackingWorker(self.cfg)
         self._stacking_enabled = bool(self.cfg.stacking.enabled_init)
+        self._save_worker = SaveWorker(self._handle_save_request)
 
         # Platesolving subsystem
         self._platesolving_cfg_lock = threading.Lock()
@@ -232,6 +246,12 @@ class AppRunner:
         self._platesolving_auto_target: str = ""
         self._gaia_download_lock = threading.Lock()
         self._gaia_download_thread: Optional[threading.Thread] = None
+        self._gaia_coverage_lock = threading.Lock()
+        self._gaia_coverage_thread: Optional[threading.Thread] = None
+        self._gaia_coverage_pending = False
+        self._gaia_coverage_version = 0
+        self._gaia_coverage_cache: Optional[Dict[str, object]] = None
+        self._gaia_coverage_error: Optional[str] = None
 
         # Config platesolving (runtime copy, actualizable desde UI por action)
         self._platesolving_observer = ObserverConfig()  # San Carlos por defecto.
@@ -307,6 +327,13 @@ class AppRunner:
         self._tracking_ff_hold_az: float = 0.0
         self._tracking_ff_hold_alt: float = 0.0
         self._tracking_ff_last_valid_t: Optional[float] = None
+        self._tracking_ff_last_compute_t: Optional[float] = None
+        self._tracking_ff_cached: Tuple[float, float, bool] = (0.0, 0.0, False)
+        self._stacking_last_frame_token: Optional[float] = None
+        self._tracking_worker = _CoalescingCallbackWorker(
+            name="TrackingWorker",
+            callback=self._process_tracking_request,
+        )
         self._goto_worker = GoToWorker(
             goto_controller=self._goto,
             get_state=self.get_state,
@@ -347,15 +374,40 @@ class AppRunner:
 
         self._latest_preview_jpeg: Optional[bytes] = None
         self._preview_lock = threading.Lock()
+        self._preview_config_lock = threading.RLock()
+        self._preview_generation = 0
+        self._preview_last_frame_token: Optional[float] = None
+        self._preview_worker = _CoalescingCallbackWorker(
+            name="PreviewWorker",
+            callback=self._render_preview_request,
+        )
 
         # Preview stats
         self._t_last_preview = 0.0
+        self._t_last_pointing = 0.0
+        self._t_last_state_publish = 0.0
         self._t_fps_view0 = _perf()
         self._n_view = 0
 
         # Control loop stats
         self._t_fps_loop0 = _perf()
         self._n_loop = 0
+        profile_samples = max(300, int(max(1.0, float(self.cfg.control_hz)) * 30.0))
+        self._performance_lock = threading.Lock()
+        self._performance_samples = {
+            name: collections.deque(maxlen=profile_samples)
+            for name in (
+                "actions_ms",
+                "state_ms",
+                "tracking_ms",
+                "stacking_ms",
+                "autosolve_ms",
+                "pointing_ms",
+                "preview_ms",
+                "total_ms",
+            )
+        }
+        self._last_stall_log_t = 0.0
 
         # Parámetros de overlay en vivo (SEP)
         self._live_sep_overlay_enabled = False
@@ -549,6 +601,10 @@ class AppRunner:
             return float(value)
         return float(_perf())
 
+    def _frame_token(self, fr: Frame) -> float:
+        seq = self._frame_seq(fr)
+        return float(seq) if seq is not None else float(self._frame_mono_t(fr))
+
     def _frame_wall_t(self, fr: Frame) -> Optional[float]:
         for key in ("t_wall", "capture_time_unix", "unix_time"):
             try:
@@ -667,6 +723,32 @@ class AppRunner:
         self._reset_tracking_feedforward_cache()
         return 0.0, 0.0, False
 
+    def _cached_tracking_feedforward_rate(
+        self,
+        *,
+        now_t: Optional[float] = None,
+    ) -> Tuple[float, float, bool]:
+        """Refresh the astronomical model slowly; the fast loop reuses it."""
+        t_eval = float(now_t) if now_t is not None else float(_now_s())
+        if not bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)):
+            self._reset_tracking_feedforward_cache()
+            return 0.0, 0.0, False
+
+        update_hz = _finite_float(
+            getattr(self.cfg.tracking, "sidereal_ff_update_hz", 2.0),
+            2.0,
+        )
+        update_hz = max(0.1, min(20.0, float(update_hz)))
+        due = (
+            self._tracking_ff_last_compute_t is None
+            or t_eval < float(self._tracking_ff_last_compute_t)
+            or (t_eval - float(self._tracking_ff_last_compute_t)) >= (1.0 / update_hz)
+        )
+        if due:
+            self._tracking_ff_cached = self._tracking_feedforward_rate(now_t=t_eval)
+            self._tracking_ff_last_compute_t = float(t_eval)
+        return self._tracking_ff_cached
+
     def _tracking_seed_calibration_from_pointing(self) -> bool:
         try:
             if self._simulation_state is not None:
@@ -734,7 +816,8 @@ class AppRunner:
             if (not np.isfinite(det)) or abs(det) < 1e-6:
                 return False
             theta_cal = np.column_stack([A, np.zeros(2, dtype=np.float64)])
-            auto_reset(self._tracking_state, src="geometry", theta=theta_cal)
+            with self._tracking_state_lock:
+                auto_reset(self._tracking_state, src="geometry", theta=theta_cal)
             log_info(
                 self.out_log,
                 (
@@ -869,6 +952,18 @@ class AppRunner:
             }
         )
 
+    def _maybe_update_goto_pointing_state(self, *, now: Optional[float] = None) -> bool:
+        t_now = float(_perf() if now is None else now)
+        update_hz = max(
+            0.1,
+            min(20.0, _finite_float(getattr(self.cfg, "pointing_hz", 2.0), 2.0)),
+        )
+        if (t_now - float(self._t_last_pointing)) < (1.0 / update_hz):
+            return False
+        self._t_last_pointing = t_now
+        self._update_goto_pointing_state()
+        return True
+
     # -------------------------
     # Lifecycle
     # -------------------------
@@ -899,6 +994,17 @@ class AppRunner:
                     RuntimeError("gaia download still running"),
                 )
 
+        with self._gaia_coverage_lock:
+            coverage_thr = self._gaia_coverage_thread
+        if coverage_thr is not None and coverage_thr.is_alive():
+            coverage_thr.join(timeout=2.0)
+            if coverage_thr.is_alive():
+                log_error(
+                    self.out_log,
+                    "Gaia coverage: worker did not stop within timeout",
+                    RuntimeError("Gaia coverage still running"),
+                )
+
         # detener GoTo worker
         self._goto_worker.stop()
         self._goto_worker.join(timeout=2.0)
@@ -912,8 +1018,15 @@ class AppRunner:
             thr.join(timeout=2.0)
         self._thr = None
 
+        self._preview_worker.stop()
+        self._preview_worker.join(timeout=2.0)
+        self._tracking_worker.stop()
+        self._tracking_worker.join(timeout=2.0)
+        self._save_worker.stop(timeout=5.0)
+
         with self._raw_record_lock:
             raw_thr = self._raw_record_thread
+        self._raw_record_stop.set()
         if raw_thr is not None and raw_thr.is_alive():
             raw_thr.join(timeout=2.0)
             if raw_thr.is_alive():
@@ -996,6 +1109,45 @@ class AppRunner:
         coverage["field_source"] = source
         return coverage
 
+    def request_gaia_coverage_refresh(self) -> bool:
+        """Schedule the expensive coverage projection outside the Qt thread."""
+        with self._gaia_coverage_lock:
+            if self._gaia_coverage_pending:
+                return False
+            self._gaia_coverage_pending = True
+
+        def _worker() -> None:
+            coverage: Optional[Dict[str, object]] = None
+            error: Optional[str] = None
+            try:
+                coverage = self.get_gaia_coverage()
+            except Exception as exc:
+                error = f"{type(exc).__name__}: {exc}"
+                log_error(self.out_log, "Gaia coverage: refresh failed", exc)
+            finally:
+                with self._gaia_coverage_lock:
+                    if coverage is not None:
+                        self._gaia_coverage_cache = coverage
+                        self._gaia_coverage_version += 1
+                    self._gaia_coverage_error = error
+                    self._gaia_coverage_pending = False
+                    self._gaia_coverage_thread = None
+
+        thread = threading.Thread(target=_worker, name="GaiaCoverage", daemon=True)
+        with self._gaia_coverage_lock:
+            self._gaia_coverage_thread = thread
+        thread.start()
+        return True
+
+    def get_gaia_coverage_snapshot(self) -> Dict[str, object]:
+        with self._gaia_coverage_lock:
+            return {
+                "version": int(self._gaia_coverage_version),
+                "pending": bool(self._gaia_coverage_pending),
+                "error": self._gaia_coverage_error,
+                "coverage": self._gaia_coverage_cache,
+            }
+
     def get_operation_counters(self) -> Dict[str, Dict[str, int]]:
         """Monotonic operation counters used by terminal automation.
 
@@ -1010,6 +1162,53 @@ class AppRunner:
                 }
                 for name in self._operation_started
             }
+
+    def _record_loop_performance(self, sections: Dict[str, float]) -> None:
+        with self._performance_lock:
+            for name, value in sections.items():
+                samples = self._performance_samples.get(name)
+                if samples is not None:
+                    samples.append(float(value))
+
+        total_ms = float(sections.get("total_ms", 0.0))
+        now = _perf()
+        if total_ms > 50.0 and (now - self._last_stall_log_t) >= 2.0:
+            self._last_stall_log_t = now
+            breakdown = ", ".join(
+                f"{name.removesuffix('_ms')}={float(value):.1f}ms"
+                for name, value in sections.items()
+                if name != "total_ms"
+            )
+            log_info(
+                self.out_log,
+                f"Runner: slow loop total={total_ms:.1f}ms ({breakdown})",
+            )
+
+    def get_performance_metrics(self) -> Dict[str, object]:
+        with self._performance_lock:
+            copied = {
+                name: np.asarray(tuple(values), dtype=np.float64)
+                for name, values in self._performance_samples.items()
+            }
+
+        sections: Dict[str, Dict[str, float]] = {}
+        sample_count = 0
+        for name, values in copied.items():
+            if values.size == 0:
+                continue
+            sample_count = max(sample_count, int(values.size))
+            p50, p95, p99 = np.percentile(values, [50.0, 95.0, 99.0])
+            sections[name] = {
+                "p50": float(p50),
+                "p95": float(p95),
+                "p99": float(p99),
+                "max": float(np.max(values)),
+            }
+        return {
+            "sample_count": int(sample_count),
+            "window_s": 30.0,
+            "sections": sections,
+        }
 
     def _start_operation(self, name: str) -> None:
         with self._operation_lock:
@@ -1028,14 +1227,24 @@ class AppRunner:
     def request_camera_param(self, name: str, value: Any) -> None:
         self.enqueue(camera_set_param(name, value))
 
+    def request_camera_params(self, params: Dict[str, Any]) -> None:
+        self.enqueue(camera_set_params(params))
+
     def request_camera_record_raw(
         self,
         *,
-        duration_s: float = 20.0,
+        duration_s: Optional[float] = 20.0,
         out_dir: str = "raw_output",
         basename: Optional[str] = None,
     ) -> None:
         self.enqueue(camera_record_raw(duration_s=duration_s, out_dir=out_dir, basename=basename))
+
+    def request_camera_stop_record_raw(self) -> None:
+        self.enqueue(camera_stop_record_raw())
+
+    def camera_recording_active(self) -> bool:
+        with self._raw_record_lock:
+            return bool(self._raw_record_active)
 
     def request_mount_connect(self, port: str, baudrate: int) -> None:
         self.enqueue(mount_connect(port, baudrate))
@@ -1111,7 +1320,7 @@ class AppRunner:
         self.enqueue(tracking_stop())
 
     def request_tracking_params(self, **kwargs: Any) -> None:
-        self.enqueue(tracking_set_params(**kwargs))
+        self.enqueue(tracking_set_params_action(**kwargs))
 
     def request_stacking_start(self) -> None:
         self.enqueue(stacking_start())
@@ -1154,15 +1363,161 @@ class AppRunner:
         with self._state_lock:
             return bool(self._state.tracking.enabled)
 
+    def _invalidate_tracking_pipeline(self) -> None:
+        with self._tracking_result_lock:
+            self._tracking_generation += 1
+            self._tracking_last_frame_token = None
+            self._tracking_last_output = None
+            self._tracking_worker_error = None
+
+    def _submit_tracking_frame(
+        self,
+        *,
+        raw16: np.ndarray,
+        frame_token: float,
+        frame_t: float,
+        tracking_enabled: bool,
+    ) -> None:
+        with self._tracking_result_lock:
+            generation = int(self._tracking_generation)
+            self._tracking_last_frame_token = float(frame_token)
+        self._tracking_worker.request(
+            generation=generation,
+            raw16=raw16,
+            frame_t=float(frame_t),
+            tracking_enabled=bool(tracking_enabled),
+            applied_rate_az=float(self._tracking_last_cmd_az),
+            applied_rate_alt=float(self._tracking_last_cmd_alt),
+        )
+
+    def _process_tracking_request(self, request: Dict[str, Any]) -> None:
+        generation = int(request.get("generation", -1))
+        try:
+            with self._tracking_state_lock:
+                out = tracking_step(
+                    self._tracking_state,
+                    ensure_raw16_bayer(request["raw16"]),
+                    now_t=float(request["frame_t"]),
+                    tracking_enabled=bool(request.get("tracking_enabled", True)),
+                    applied_rate_az=float(request.get("applied_rate_az", 0.0)),
+                    applied_rate_alt=float(request.get("applied_rate_alt", 0.0)),
+                )
+        except Exception as exc:
+            with self._tracking_result_lock:
+                if generation == int(self._tracking_generation):
+                    self._tracking_worker_error = exc
+            return
+
+        with self._tracking_result_lock:
+            if generation != int(self._tracking_generation):
+                return
+            self._tracking_last_output = out
+            self._tracking_worker_error = None
+
+    def _tracking_result_snapshot(self) -> Tuple[Optional[Any], Optional[Exception]]:
+        with self._tracking_result_lock:
+            return self._tracking_last_output, self._tracking_worker_error
+
+    def _publish_tracking_output(
+        self,
+        out: TrackingOutput,
+        *,
+        tracking_on: bool,
+        ff_ready: bool,
+        rate_cmd_az: float,
+        rate_cmd_alt: float,
+        rate_fb_az: float,
+        rate_fb_alt: float,
+        rate_ff_az: float,
+        rate_ff_alt: float,
+    ) -> None:
+        tracking_mode = self._tracking_mode_from_output(out.mode)
+        self._update_state(
+            {
+                "tracking": {
+                    "enabled": bool(tracking_on),
+                    "status": TrackingStatus.RUNNING,
+                    "mode": tracking_mode,
+                    "resp": float(out.resp),
+                    "dx": float(out.dx),
+                    "dy": float(out.dy),
+                    "vx": float(out.vx),
+                    "vy": float(out.vy),
+                    "abs_resp": float(out.abs_resp),
+                    "ff_enabled": bool(
+                        getattr(self.cfg.tracking, "sidereal_ff_enabled", True)
+                    ),
+                    "ff_ready": bool(ff_ready),
+                    "rate_az": float(rate_cmd_az),
+                    "rate_alt": float(rate_cmd_alt),
+                    "rate_fb_az": float(rate_fb_az),
+                    "rate_fb_alt": float(rate_fb_alt),
+                    "rate_ff_az": float(rate_ff_az),
+                    "rate_ff_alt": float(rate_ff_alt),
+                    "calib_src": str(out.calib_src),
+                    "calib_det": float(out.detA),
+                    "n_det": int(out.n_det),
+                    "measurement_valid": bool(out.ok),
+                    "measurement_reason": str(out.measurement_reason),
+                    "measurement_source": str(out.measurement_source),
+                    "error_x_px": float(out.x_hat),
+                    "error_y_px": float(out.y_hat),
+                    "error_px": float(np.hypot(out.x_hat, out.y_hat)),
+                    "lock_conf": float(out.lock_conf),
+                    "fail_count": int(out.fail_count),
+                    "last_error": (
+                        f"measurement invalid: {out.measurement_reason}"
+                        if (not out.ok and int(out.fail_count) >= 2)
+                        else (
+                            "feedback calibration unavailable"
+                            if (out.ok and str(out.calib_src) == "none")
+                            else None
+                        )
+                    ),
+                }
+            }
+        )
+
+    def _publish_tracking_off(self) -> None:
+        self._update_state(
+            {
+                "tracking": {
+                    "enabled": False,
+                    "status": TrackingStatus.OFF,
+                    "mode": TrackingMode.IDLE,
+                    "ff_enabled": bool(
+                        getattr(self.cfg.tracking, "sidereal_ff_enabled", True)
+                    ),
+                    "ff_ready": False,
+                    "rate_az": 0.0,
+                    "rate_alt": 0.0,
+                    "rate_fb_az": 0.0,
+                    "rate_fb_alt": 0.0,
+                    "rate_ff_az": 0.0,
+                    "rate_ff_alt": 0.0,
+                    "n_det": 0,
+                    "measurement_valid": False,
+                    "measurement_reason": "off",
+                    "measurement_source": "none",
+                    "error_x_px": 0.0,
+                    "error_y_px": 0.0,
+                    "error_px": 0.0,
+                    "lock_conf": 0.0,
+                    "fail_count": 0,
+                    "last_error": None,
+                }
+            }
+        )
+
     def _tracking_keyframe_reset(self) -> None:
         try:
             # Reset both the absolute target and the incremental reference.
             # Keeping the old incremental frame after a GoTo/manual movement
             # made the first new frame look like a tracking jump and could send
             # the controller toward the previous field.
-            reset_tracker(self._tracking_state, now_t=float(_perf()), mode="STABILIZE")
-            self._tracking_last_frame_token = None
-            self._tracking_last_output = None
+            with self._tracking_state_lock:
+                reset_tracker(self._tracking_state, now_t=float(_perf()), mode="STABILIZE")
+            self._invalidate_tracking_pipeline()
         except Exception as exc:
             log_error(self.out_log, "Tracking: failed to reset keyframe", exc)
 
@@ -1170,6 +1525,8 @@ class AppRunner:
         self._tracking_ff_hold_az = 0.0
         self._tracking_ff_hold_alt = 0.0
         self._tracking_ff_last_valid_t = None
+        self._tracking_ff_last_compute_t = None
+        self._tracking_ff_cached = (0.0, 0.0, False)
 
     def _estimate_manual_move_runtime_s(
         self,
@@ -1397,6 +1754,7 @@ class AppRunner:
         return was_stacking
 
     def _resume_stacking_after_goto(self) -> None:
+        self._stacking_last_frame_token = None
         self._stacking_enabled = True
         self._stacking.start()
         self._update_state({"stacking": {"enabled": True, "status": StackingStatus.RUNNING}})
@@ -1411,11 +1769,15 @@ class AppRunner:
             except Exception as exc:
                 log_error(self.out_log, "Camera: stream stop failed", exc)
             self._cam_stream = None
-            self._tracking_last_frame_token = None
-            self._tracking_last_output = None
+            self._invalidate_tracking_pipeline()
             self._tracking_last_cmd_az = 0.0
             self._tracking_last_cmd_alt = 0.0
+            self._stacking_last_frame_token = None
             self._reset_tracking_feedforward_cache()
+
+        self._invalidate_preview_pipeline()
+        with self._preview_lock:
+            self._latest_preview_jpeg = None
 
         if self._cam_dev is not None:
             try:
@@ -1501,9 +1863,9 @@ class AppRunner:
             )
             log_error(self.out_log, "Camera: connect failed (is it open in another app?)", exc)
 
-    def _apply_camera_param(self, name: str, value: Any) -> None:
+    def _set_camera_param_value(self, name: str, value: Any) -> Optional[bool]:
+        """Apply one runtime value and report whether capture must restart."""
         n = (name or "").strip()
-        needs_restart = True
 
         if n in ("exp_ms", "exposure_ms"):
             self.cfg.camera.exp_ms = float(value)
@@ -1529,27 +1891,52 @@ class AppRunner:
             self.cfg.camera.binning = int(value)
         elif n in ("preview_view_hz",):
             self.cfg.preview.view_hz = float(value)
+            return False
         elif n in ("preview_jpeg_quality",):
             self.cfg.preview.jpeg_quality = int(value)
+            return False
         elif n in ("preview_stretch_plo",):
             self.cfg.preview.stretch_plo = float(value)
+            return False
         elif n in ("preview_stretch_phi",):
             self.cfg.preview.stretch_phi = float(value)
+            return False
         elif n in ("roll_deg", "camera_roll_deg"):
             roll = float(value)
             if not np.isfinite(roll):
                 log_info(self.out_log, f"Camera: roll inválido ignorado: {value}")
-                return
+                return None
             self.cfg.camera.roll_deg = float(roll)
             self.cfg.platesolving.rotation_prior_roll_offset_deg = float(roll)
             self._update_state({"camera": {"roll_deg": float(roll)}})
-            needs_restart = False
+            return False
         else:
             log_info(self.out_log, f"Camera: param ignorado (no soportado aún): {n}={value}")
-            return
+            return None
 
-        if needs_restart:
-            self._restart_camera_stream_if_active(reason=f"{n} change")
+        return True
+
+    def _apply_camera_params(self, params: Dict[str, Any]) -> None:
+        restart_names: List[str] = []
+        applied_names: List[str] = []
+        for name, value in dict(params).items():
+            needs_restart = self._set_camera_param_value(str(name), value)
+            if needs_restart is None:
+                continue
+            applied_names.append(str(name))
+            if needs_restart:
+                restart_names.append(str(name))
+
+        if restart_names:
+            self._restart_camera_stream_if_active(
+                reason=f"batched change: {', '.join(restart_names)}"
+            )
+        if applied_names:
+            self._invalidate_preview_pipeline()
+            log_info(self.out_log, f"Camera: SET_PARAMS {', '.join(applied_names)}")
+
+    def _apply_camera_param(self, name: str, value: Any) -> None:
+        self._apply_camera_params({str(name): value})
 
     def _restart_camera_stream_if_active(self, *, reason: str) -> None:
         if self._cam_stream is None:
@@ -1572,7 +1959,7 @@ class AppRunner:
         self._expected_stars_mag_limit = float(self.cfg.preview.expected_stars_mag_limit)
         self._expected_stars_max = int(self.cfg.preview.expected_stars_max)
         self._invalidate_expected_stars_catalog()
-        self._restart_camera_stream_if_active(reason="preview defaults reset")
+        self._invalidate_preview_pipeline()
 
     def _reset_mount_defaults(self) -> None:
         self.cfg.mount = replace(self.default_cfg.mount)
@@ -1621,20 +2008,15 @@ class AppRunner:
 
     def _reset_tracking_defaults(self) -> None:
         self.cfg.tracking = replace(self.default_cfg.tracking)
-        tracking_set_params(
-            self._tracking_state,
-            resp_min=self.cfg.tracking.resp_min,
-            align_median_k=int(self.cfg.stacking.align_median_k),
-            align_smooth_k=int(self.cfg.stacking.smooth_k),
-            align_max_shift_px=float(self.cfg.stacking.max_shift_px),
-            align_use_subpixel=bool(self.cfg.stacking.use_subpixel),
-            sep_bw=int(self.cfg.sep.bw),
-            sep_bh=int(self.cfg.sep.bh),
-            sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
-            sep_minarea=int(self.cfg.sep.minarea),
-            sep_max_sources=int(self.cfg.platesolving.max_det),
-            sep_min_sources=3,
-        )
+        with self._tracking_state_lock:
+            tracking_set_params(
+                self._tracking_state,
+                resp_min=self.cfg.tracking.resp_min,
+                align_median_k=int(self.cfg.stacking.align_median_k),
+                align_smooth_k=int(self.cfg.stacking.smooth_k),
+                align_max_shift_px=float(self.cfg.stacking.max_shift_px),
+                align_use_subpixel=bool(self.cfg.stacking.use_subpixel),
+            )
         self._update_state(
             {
                 "tracking": {
@@ -1651,13 +2033,14 @@ class AppRunner:
     def _reset_stacking_defaults(self) -> None:
         self.cfg.stacking = replace(self.default_cfg.stacking)
         self._stacking.configure_from_cfg()
-        tracking_set_params(
-            self._tracking_state,
-            align_median_k=int(self.cfg.stacking.align_median_k),
-            align_smooth_k=int(self.cfg.stacking.smooth_k),
-            align_max_shift_px=float(self.cfg.stacking.max_shift_px),
-            align_use_subpixel=bool(self.cfg.stacking.use_subpixel),
-        )
+        with self._tracking_state_lock:
+            tracking_set_params(
+                self._tracking_state,
+                align_median_k=int(self.cfg.stacking.align_median_k),
+                align_smooth_k=int(self.cfg.stacking.smooth_k),
+                align_max_shift_px=float(self.cfg.stacking.max_shift_px),
+                align_use_subpixel=bool(self.cfg.stacking.use_subpixel),
+            )
 
     def _reset_platesolving_defaults(self) -> None:
         with self._platesolving_cfg_lock:
@@ -1676,9 +2059,7 @@ class AppRunner:
         if self._cam_stream is None:
             return
 
-        view_hz = float(self.cfg.preview.view_hz)
-        if view_hz <= 0.1:
-            view_hz = 0.1
+        view_hz = max(0.1, float(self.cfg.preview.view_hz))
 
         now = _perf()
         if (now - self._t_last_preview) < (1.0 / view_hz):
@@ -1688,7 +2069,36 @@ class AppRunner:
         if fr is None:
             return
 
+        token = self._frame_token(fr)
+        if (
+            self._preview_last_frame_token is not None
+            and token == float(self._preview_last_frame_token)
+        ):
+            return
+
         try:
+            raw16 = ensure_raw16_bayer(fr.raw).copy()
+            with self._preview_config_lock:
+                generation = int(self._preview_generation)
+            self._preview_worker.request(
+                generation=generation,
+                token=float(token),
+                raw16=raw16,
+                wall_t=self._frame_wall_t(fr),
+            )
+            self._preview_last_frame_token = float(token)
+            self._t_last_preview = now
+        except Exception as exc:
+            log_error(self.out_log, "Preview: enqueue failed", exc)
+
+    def _render_preview_request(self, request: Dict[str, Any]) -> None:
+        try:
+            raw16_work = ensure_raw16_bayer(request["raw16"])
+            with self._preview_config_lock:
+                generation = int(request.get("generation", -1))
+                if generation != int(self._preview_generation):
+                    return
+
             state_snapshot = self.get_state()
             platesolving_overlay = list(
                 getattr(state_snapshot.platesolving, "overlay", None) or []
@@ -1698,9 +2108,6 @@ class AppRunner:
                 or self._expected_stars_overlay_enabled
                 or platesolving_overlay
             )
-
-            raw16 = ensure_raw16_bayer(fr.raw)
-            raw16_work = raw16
 
             if overlay_enabled:
                 _, u8_preview = make_preview_jpeg(
@@ -1718,7 +2125,7 @@ class AppRunner:
                         platesolving_overlay,
                     )
                 if self._expected_stars_overlay_enabled:
-                    wall_t = self._frame_wall_t(fr)
+                    wall_t = request.get("wall_t")
                     obstime = (
                         Time(float(wall_t), format="unix", scale="utc")
                         if wall_t is not None
@@ -1729,7 +2136,10 @@ class AppRunner:
                         u8_preview,
                         obstime=obstime,
                     )
-                jpg = encode_jpeg(u8_preview, quality=int(self.cfg.preview.jpeg_quality))
+                jpg = encode_jpeg(
+                    u8_preview,
+                    quality=int(self.cfg.preview.jpeg_quality),
+                )
             else:
                 jpg, _ = make_preview_jpeg(
                     raw16_work,
@@ -1739,20 +2149,46 @@ class AppRunner:
                     sample_stride=4,
                 )
 
+            with self._preview_config_lock:
+                if generation != int(self._preview_generation):
+                    return
+
             with self._preview_lock:
                 self._latest_preview_jpeg = jpg
 
-            self._t_last_preview = now
-
+            now = _perf()
             self._n_view += 1
             if (now - self._t_fps_view0) >= 1.0:
                 fps_view = self._n_view / (now - self._t_fps_view0)
                 self._t_fps_view0 = now
                 self._n_view = 0
                 self._update_state({"camera": {"fps_view": float(fps_view)}})
-
         except Exception as exc:
             log_error(self.out_log, "Preview: failed", exc)
+
+    def _invalidate_preview_pipeline(self) -> None:
+        with self._preview_config_lock:
+            self._preview_generation += 1
+            self._preview_last_frame_token = None
+
+    def _maybe_enqueue_stacking_frame(self) -> bool:
+        if not self._stacking_enabled or self._cam_stream is None:
+            return False
+        fr = self._cam_stream.latest()
+        if fr is None:
+            return False
+
+        token = self._frame_token(fr)
+        if (
+            self._stacking_last_frame_token is not None
+            and token == float(self._stacking_last_frame_token)
+        ):
+            return False
+
+        raw16 = ensure_raw16_bayer(fr.raw)
+        self._stacking.enqueue_frame(raw16.copy(), t=_now_s())
+        self._stacking_last_frame_token = float(token)
+        return True
 
     def _apply_live_sep_overlay(self, raw16: np.ndarray, u8_preview: np.ndarray) -> np.ndarray:
         try:
@@ -2535,13 +2971,20 @@ class AppRunner:
             self._update_state({"stacking": {"status": StackingStatus.ERROR, "last_error": "save failed"}})
             log_error(self.out_log, "Stacking: save failed", exc)
 
+    def _handle_save_request(self, request: Dict[str, Any]) -> None:
+        self._save_stacking(
+            str(request.get("out_dir", "stack_output")),
+            str(request.get("basename", "stack")),
+            str(request.get("fmt", "png")),
+        )
+
     # -------------------------
     # Raw recording helper
     # -------------------------
     def _start_raw_recording(
         self,
         *,
-        duration_s: float,
+        duration_s: Optional[float],
         out_dir: str,
         basename: Optional[str] = None,
     ) -> None:
@@ -2554,9 +2997,10 @@ class AppRunner:
                 log_info(self.out_log, "Raw record: already running")
                 return
             self._raw_record_active = True
+            self._raw_record_stop.clear()
         self._start_operation("camera_record")
 
-        duration_s = max(0.1, float(duration_s))
+        duration_s = None if duration_s is None else max(0.1, float(duration_s))
         if not basename:
             basename = _dt.datetime.now().strftime("raw_%Y%m%d_%H%M%S")
 
@@ -2572,8 +3016,15 @@ class AppRunner:
                 t0 = _perf()
                 last_token: Optional[float] = None
 
-                log_info(self.out_log, f"Raw record: start duration={duration_s:.1f}s")
-                while (_perf() - t0) < duration_s and not self._stop.is_set():
+                if duration_s is None:
+                    log_info(self.out_log, "Raw record: started; waiting for Stop")
+                else:
+                    log_info(self.out_log, f"Raw record: start duration={duration_s:.1f}s")
+                while (
+                    not self._raw_record_stop.is_set()
+                    and not self._stop.is_set()
+                    and (duration_s is None or (_perf() - t0) < duration_s)
+                ):
                     fr = stream.latest()
                     if fr is None:
                         time.sleep(0.001)
@@ -2624,7 +3075,9 @@ class AppRunner:
                             "raw_file": str(Path(out_path).resolve()),
                             "shape": [int(value) for value in stack.shape],
                             "dtype": str(stack.dtype),
-                            "duration_requested_s": float(duration_s),
+                            "duration_requested_s": None if duration_s is None else float(duration_s),
+                            "duration_actual_s": float(max(0.0, _perf() - t0)),
+                            "stopped_by_user": bool(self._raw_record_stop.is_set()),
                             "camera": {
                                 "exp_ms": float(self.cfg.camera.exp_ms),
                                 "gain": int(self.cfg.camera.gain),
@@ -2653,6 +3106,13 @@ class AppRunner:
         self._raw_record_thread = threading.Thread(target=_worker, name="RawRecord", daemon=True)
         self._raw_record_thread.start()
 
+    def _stop_raw_recording(self) -> None:
+        with self._raw_record_lock:
+            active = bool(self._raw_record_active)
+        if active:
+            self._raw_record_stop.set()
+            log_info(self.out_log, "Raw record: stop requested")
+
 
     # -------------------------
     # Main loop
@@ -2663,75 +3123,116 @@ class AppRunner:
 
         while not self._stop.is_set():
             t0 = _perf()
+            perf_sections: Dict[str, float] = {}
+            section_t = t0
+            state_publish_hz = max(
+                0.5,
+                min(
+                    60.0,
+                    _finite_float(getattr(self.cfg, "state_publish_hz", 10.0), 10.0),
+                ),
+            )
+            publish_state = (
+                t0 - float(self._t_last_state_publish)
+            ) >= (1.0 / state_publish_hz)
+            if publish_state:
+                self._t_last_state_publish = t0
 
             # 1) actions
             self._drain_actions(max_n=50)
+            section_end = _perf()
+            perf_sections["actions_ms"] = (section_end - section_t) * 1000.0
+            section_t = section_end
 
             # 2) stats capture
-            if self._cam_stream is not None:
+            if publish_state and self._cam_stream is not None:
                 st = self._cam_stream.stats()
                 camera_patch = {"fps_capture": float(st.get("fps_capture", 0.0))}
                 if "last_error" in st:
                     camera_patch["last_error"] = st.get("last_error")
                 self._update_state({"camera": camera_patch})
+            section_end = _perf()
+            perf_sections["state_ms"] = (section_end - section_t) * 1000.0
+            section_t = section_end
 
             # 2b) tracking
             tracking_on = self._get_tracking_enabled()
             if tracking_on and (self._cam_stream is not None) and (self._mount is not None):
                 fr = self._cam_stream.latest()
                 if fr is not None:
-                    seq = self._frame_seq(fr)
                     frame_t = self._frame_mono_t(fr)
-                    frame_token = float(seq) if seq is not None else float(frame_t)
-                    is_new_frame = (self._tracking_last_frame_token is None) or (frame_token != float(self._tracking_last_frame_token))
+                    frame_token = self._frame_token(fr)
+                    with self._tracking_result_lock:
+                        last_token = self._tracking_last_frame_token
+                    is_new_frame = (
+                        last_token is None
+                        or frame_token != float(last_token)
+                    )
 
-                    if is_new_frame or self._tracking_last_output is None:
-                        # Tracking en RAW16 + SEP (solo en frames nuevos).
+                    if is_new_frame:
                         try:
-                            raw16 = ensure_raw16_bayer(fr.raw)
-                            out = tracking_step(
-                                self._tracking_state,
-                                raw16,
-                                now_t=float(frame_t),
+                            self._submit_tracking_frame(
+                                raw16=ensure_raw16_bayer(fr.raw).copy(),
+                                frame_token=float(frame_token),
+                                frame_t=float(frame_t),
                                 tracking_enabled=bool(tracking_on),
-                                applied_rate_az=float(self._tracking_last_cmd_az),
-                                applied_rate_alt=float(self._tracking_last_cmd_alt),
                             )
-                            self._tracking_last_frame_token = float(frame_token)
-                            self._tracking_last_output = out
                         except Exception as exc:
-                            self._tracking_last_frame_token = None
-                            self._tracking_last_output = None
-                            self._update_state(
-                                {
-                                    "tracking": {
-                                        "enabled": False,
-                                        "status": TrackingStatus.ERROR,
-                                        "mode": TrackingMode.IDLE,
-                                        "last_error": "tracking step failed",
-                                    }
+                            with self._tracking_result_lock:
+                                self._tracking_worker_error = exc
+
+                    out, tracking_error = self._tracking_result_snapshot()
+                    if tracking_error is not None:
+                        self._invalidate_tracking_pipeline()
+                        self._update_state(
+                            {
+                                "tracking": {
+                                    "enabled": False,
+                                    "status": TrackingStatus.ERROR,
+                                    "mode": TrackingMode.IDLE,
+                                    "last_error": "tracking step failed",
                                 }
-                            )
-                            try:
-                                self._mount_rate_safe(0.0, 0.0)
-                            except Exception as stop_exc:
-                                log_error(
-                                    self.out_log,
-                                    "Tracking: failed to stop mount after tracking error",
-                                    stop_exc,
-                                    throttle_s=2.0,
-                                    throttle_key="tracking_stop_after_error",
-                                )
+                            }
+                        )
+                        try:
+                            self._mount_rate_safe(0.0, 0.0)
+                        except Exception as stop_exc:
                             log_error(
                                 self.out_log,
-                                "Tracking: step failed",
-                                exc,
+                                "Tracking: failed to stop mount after tracking error",
+                                stop_exc,
                                 throttle_s=2.0,
-                                throttle_key="tracking_step",
+                                throttle_key="tracking_stop_after_error",
                             )
-                            continue
-                    else:
-                        out = self._tracking_last_output
+                        log_error(
+                            self.out_log,
+                            "Tracking: step failed",
+                            tracking_error,
+                            throttle_s=2.0,
+                            throttle_key="tracking_step",
+                        )
+                        continue
+
+                    if out is None:
+                        out = TrackingOutput(
+                            ok=False,
+                            mode="IDLE",
+                            resp=0.0,
+                            dx=0.0,
+                            dy=0.0,
+                            vx=0.0,
+                            vy=0.0,
+                            abs_resp=0.0,
+                            x_hat=0.0,
+                            y_hat=0.0,
+                            rate_az=0.0,
+                            rate_alt=0.0,
+                            calib_src="none",
+                            detA=0.0,
+                            n_det=0,
+                            measurement_reason="processing",
+                            measurement_source="none",
+                        )
 
                     rate_fb_az = float(out.rate_az)
                     rate_fb_alt = float(out.rate_alt)
@@ -2739,7 +3240,9 @@ class AppRunner:
                     rate_ff_alt = 0.0
                     ff_ready = False
                     if bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)):
-                        rate_ff_az, rate_ff_alt, ff_ready = self._tracking_feedforward_rate(now_t=float(_now_s()))
+                        rate_ff_az, rate_ff_alt, ff_ready = self._cached_tracking_feedforward_rate(
+                            now_t=float(_now_s())
+                        )
 
                     rate_cmd_az = float(rate_fb_az + rate_ff_az)
                     rate_cmd_alt = float(rate_fb_alt + rate_ff_alt)
@@ -2760,145 +3263,96 @@ class AppRunner:
                         )
                         log_error(self.out_log, "Tracking: mount MOVE failed", exc, throttle_s=2.0, throttle_key="tracking_mount_move")
 
-                    tracking_mode = self._tracking_mode_from_output(out.mode)
-                    self._update_state(
-                        {
-                            "tracking": {
-                                "enabled": bool(tracking_on),
-                                "status": TrackingStatus.RUNNING,
-                                "mode": tracking_mode,
-                                "resp": float(out.resp),
-                                "dx": float(out.dx),
-                                "dy": float(out.dy),
-                                "vx": float(out.vx),
-                                "vy": float(out.vy),
-                                "abs_resp": float(out.abs_resp),
-                                "ff_enabled": bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)),
-                                "ff_ready": bool(ff_ready),
-                                "rate_az": float(rate_cmd_az),
-                                "rate_alt": float(rate_cmd_alt),
-                                "rate_fb_az": float(rate_fb_az),
-                                "rate_fb_alt": float(rate_fb_alt),
-                                "rate_ff_az": float(rate_ff_az),
-                                "rate_ff_alt": float(rate_ff_alt),
-                                "calib_src": str(out.calib_src),
-                                "calib_det": float(out.detA),
-                                "n_det": int(out.n_det),
-                                "measurement_valid": bool(out.ok),
-                                "measurement_reason": str(out.measurement_reason),
-                                "measurement_source": str(out.measurement_source),
-                                "error_x_px": float(out.x_hat),
-                                "error_y_px": float(out.y_hat),
-                                "error_px": float(np.hypot(out.x_hat, out.y_hat)),
-                                "lock_conf": float(out.lock_conf),
-                                "fail_count": int(out.fail_count),
-                                "last_error": (
-                                    "SEP: detection failed"
-                                    if str(out.measurement_reason) == "detection_failed"
-                                    else (
-                                        "SEP: no detections"
-                                        if str(out.measurement_reason) == "no_sources"
-                                        else (
-                                            f"measurement invalid: {out.measurement_reason}"
-                                            if (not out.ok and int(out.fail_count) >= 2)
-                                            else (
-                                                "feedback calibration unavailable"
-                                                if (out.ok and str(out.calib_src) == "none")
-                                                else None
-                                            )
-                                        )
-                                    )
-                                ),
-                            }
-                        }
-                    )
+                    if publish_state:
+                        self._publish_tracking_output(
+                            out,
+                            tracking_on=bool(tracking_on),
+                            ff_ready=bool(ff_ready),
+                            rate_cmd_az=float(rate_cmd_az),
+                            rate_cmd_alt=float(rate_cmd_alt),
+                            rate_fb_az=float(rate_fb_az),
+                            rate_fb_alt=float(rate_fb_alt),
+                            rate_ff_az=float(rate_ff_az),
+                            rate_ff_alt=float(rate_ff_alt),
+                        )
             else:
                 goto_busy = bool(self.get_state().goto.busy)
                 if self._mount is not None and not goto_busy:
                     self._mount_rate_safe(0.0, 0.0)
                 self._tracking_last_cmd_az = 0.0
                 self._tracking_last_cmd_alt = 0.0
-                self._update_state(
-                    {
-                        "tracking": {
-                            "enabled": False,
-                            "status": TrackingStatus.OFF,
-                            "mode": TrackingMode.IDLE,
-                            "ff_enabled": bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)),
-                            "ff_ready": False,
-                            "rate_az": 0.0,
-                            "rate_alt": 0.0,
-                            "rate_fb_az": 0.0,
-                            "rate_fb_alt": 0.0,
-                            "rate_ff_az": 0.0,
-                            "rate_ff_alt": 0.0,
-                            "n_det": 0,
-                            "measurement_valid": False,
-                            "measurement_reason": "off",
-                            "measurement_source": "none",
-                            "error_x_px": 0.0,
-                            "error_y_px": 0.0,
-                            "error_px": 0.0,
-                            "lock_conf": 0.0,
-                            "fail_count": 0,
-                            "last_error": None,
-                        }
-                    }
-                )
+                if publish_state:
+                    self._publish_tracking_off()
+
+            section_end = _perf()
+            perf_sections["tracking_ms"] = (section_end - section_t) * 1000.0
+            section_t = section_end
 
             # 2c) stacking
             if self._stacking_enabled and (self._cam_stream is not None):
-                fr = self._cam_stream.latest()
-                if fr is not None:
-                    try:
-                        raw16 = ensure_raw16_bayer(fr.raw)
-                        self._stacking.enqueue_frame(raw16.copy(), t=_now_s())
-                    except Exception as exc:
-                        self._update_state({"stacking": {"last_error": "enqueue failed"}})
-                        log_error(
-                            self.out_log,
-                            "Stacking: enqueue failed",
-                            exc,
-                            throttle_s=2.0,
-                            throttle_key="stacking_enqueue",
-                        )
+                try:
+                    self._maybe_enqueue_stacking_frame()
+                except Exception as exc:
+                    self._update_state({"stacking": {"last_error": "enqueue failed"}})
+                    log_error(
+                        self.out_log,
+                        "Stacking: enqueue failed",
+                        exc,
+                        throttle_s=2.0,
+                        throttle_key="stacking_enqueue",
+                    )
 
             # 2d) publish stacking metrics
-            m = self._stacking.metrics
-            self._update_state(
-                {
-                    "stacking": {
-                        "enabled": bool(m.enabled),
-                        "status": StackingStatus.RUNNING if m.enabled else StackingStatus.OFF,
-                        "fps": float(getattr(m, "stacking_fps", 0.0)),
-                        "tiles_used": int(getattr(m, "tiles_used", 0)),
-                        "tiles_evicted": int(getattr(m, "tiles_evicted", 0)),
-                        "frames_in": int(getattr(m, "frames_in", 0)),
-                        "frames_used": int(getattr(m, "frames_used", 0)),
-                        "frames_dropped": int(getattr(m, "frames_dropped", 0)),
-                        "frames_rejected": int(getattr(m, "frames_rejected", 0)),
-                        "last_resp": float(getattr(m, "last_resp", 0.0)),
-                        "last_dx": float(getattr(m, "last_dx", 0.0)),
-                        "last_dy": float(getattr(m, "last_dy", 0.0)),
-                        "last_theta_deg": float(getattr(m, "last_theta_deg", 0.0)),
-                        "preview_jpeg": self._stacking.get_preview_jpeg(),
+            if publish_state:
+                m = self._stacking.metrics
+                self._update_state(
+                    {
+                        "stacking": {
+                            "enabled": bool(m.enabled),
+                            "status": StackingStatus.RUNNING if m.enabled else StackingStatus.OFF,
+                            "fps": float(getattr(m, "stacking_fps", 0.0)),
+                            "tiles_used": int(getattr(m, "tiles_used", 0)),
+                            "tiles_evicted": int(getattr(m, "tiles_evicted", 0)),
+                            "frames_in": int(getattr(m, "frames_in", 0)),
+                            "frames_used": int(getattr(m, "frames_used", 0)),
+                            "frames_dropped": int(getattr(m, "frames_dropped", 0)),
+                            "frames_rejected": int(getattr(m, "frames_rejected", 0)),
+                            "last_resp": float(getattr(m, "last_resp", 0.0)),
+                            "last_dx": float(getattr(m, "last_dx", 0.0)),
+                            "last_dy": float(getattr(m, "last_dy", 0.0)),
+                            "last_theta_deg": float(getattr(m, "last_theta_deg", 0.0)),
+                            "preview_jpeg": self._stacking.get_preview_jpeg(),
+                        }
                     }
-                }
-            )
+                )
+            section_end = _perf()
+            perf_sections["stacking_ms"] = (section_end - section_t) * 1000.0
+            section_t = section_end
 
             # 2e) platesolving autosolve scheduling (if enabled)
             self._maybe_autosolve()
+            section_end = _perf()
+            perf_sections["autosolve_ms"] = (section_end - section_t) * 1000.0
+            section_t = section_end
 
             # 2f) live pointing readout (Az/Alt + RA/Dec updated with current time)
-            self._update_goto_pointing_state()
+            self._maybe_update_goto_pointing_state(now=t0)
+            section_end = _perf()
+            perf_sections["pointing_ms"] = (section_end - section_t) * 1000.0
+            section_t = section_end
 
             # 3) preview
             self._maybe_update_preview()
+            section_end = _perf()
+            perf_sections["preview_ms"] = (section_end - section_t) * 1000.0
 
             # 4) loop stats
             t1 = _perf()
             frame_ms = (t1 - t0) * 1000.0
-            self._update_state({"camera": {"frame_ms": float(frame_ms)}})
+            perf_sections["total_ms"] = frame_ms
+            self._record_loop_performance(perf_sections)
+            if publish_state:
+                self._update_state({"camera": {"frame_ms": float(frame_ms)}})
 
             self._n_loop += 1
             if (t1 - self._t_fps_loop0) >= 1.0:
@@ -2928,7 +3382,11 @@ class AppRunner:
             try:
                 self._handle_action(act)
             except Exception as exc:
-                if act.type in (ActionType.CAMERA_CONNECT, ActionType.CAMERA_SET_PARAM):
+                if act.type in (
+                    ActionType.CAMERA_CONNECT,
+                    ActionType.CAMERA_SET_PARAM,
+                    ActionType.CAMERA_SET_PARAMS,
+                ):
                     self._update_state({"camera": {"status": CameraStatus.ERROR, "connected": False, "last_error": "action failed"}})
 
                 if act.type in (
@@ -3033,12 +3491,21 @@ class AppRunner:
             self._apply_camera_param(name, value)
             return
 
+        if t == ActionType.CAMERA_SET_PARAMS:
+            self._apply_camera_params(p if isinstance(p, dict) else {})
+            return
+
         if t == ActionType.CAMERA_RECORD_RAW:
             if isinstance(p, dict):
-                duration_s = float(p.get("duration_s", 20.0))
+                raw_duration = p.get("duration_s", 20.0)
+                duration_s = None if raw_duration is None else float(raw_duration)
                 out_dir = str(p.get("out_dir", "raw_output"))
                 basename = p.get("basename", None)
                 self._start_raw_recording(duration_s=duration_s, out_dir=out_dir, basename=basename)
+            return
+
+        if t == ActionType.CAMERA_STOP_RECORD_RAW:
+            self._stop_raw_recording()
             return
 
         if t == ActionType.RESET_CAMERA_DEFAULTS:
@@ -3141,10 +3608,14 @@ class AppRunner:
     def _handle_tracking_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
         if t == ActionType.TRACKING_START:
             seeded = self._tracking_seed_calibration_from_pointing()
-            if (not seeded) and (not self._tracking_state.auto.ok or self._tracking_state.auto.A_pinv is None):
-                auto_reset(self._tracking_state, src="auto")
-            self._tracking_last_frame_token = None
-            self._tracking_last_output = None
+            with self._tracking_state_lock:
+                auto_ready = bool(
+                    self._tracking_state.auto.ok
+                    and self._tracking_state.auto.A_pinv is not None
+                )
+                if (not seeded) and (not auto_ready):
+                    auto_reset(self._tracking_state, src="auto")
+            self._invalidate_tracking_pipeline()
             self._tracking_last_cmd_az = 0.0
             self._tracking_last_cmd_alt = 0.0
             self._reset_tracking_feedforward_cache()
@@ -3172,8 +3643,7 @@ class AppRunner:
             return True
 
         if t == ActionType.TRACKING_STOP:
-            self._tracking_last_frame_token = None
-            self._tracking_last_output = None
+            self._invalidate_tracking_pipeline()
             self._reset_tracking_feedforward_cache()
             self._update_state(
                 {
@@ -3210,6 +3680,10 @@ class AppRunner:
             if isinstance(p, dict):
                 updates = dict(p)
                 tracking_updates = dict(updates)
+                ff_update_requested = any(
+                    str(key).startswith("sidereal_ff_") or str(key).startswith("ff_")
+                    for key in updates
+                )
 
                 ff_enabled = updates.get("sidereal_ff_enabled", updates.get("ff_enabled", None))
                 if ff_enabled is not None:
@@ -3218,6 +3692,18 @@ class AppRunner:
                     tracking_updates.pop("ff_enabled", None)
                     if not bool(self.cfg.tracking.sidereal_ff_enabled):
                         self._reset_tracking_feedforward_cache()
+
+                ff_update_hz = updates.get(
+                    "sidereal_ff_update_hz",
+                    updates.get("ff_update_hz", None),
+                )
+                if ff_update_hz is not None:
+                    v = _finite_float(ff_update_hz, 2.0)
+                    self.cfg.tracking.sidereal_ff_update_hz = float(
+                        max(0.1, min(20.0, v))
+                    )
+                    tracking_updates.pop("sidereal_ff_update_hz", None)
+                    tracking_updates.pop("ff_update_hz", None)
 
                 ff_gain = updates.get("sidereal_ff_gain", updates.get("ff_gain", None))
                 if ff_gain is not None:
@@ -3263,7 +3749,10 @@ class AppRunner:
                     tracking_updates.pop("ff_slew_per_s", None)
 
                 if tracking_updates:
-                    tracking_set_params(self._tracking_state, **tracking_updates)
+                    with self._tracking_state_lock:
+                        tracking_set_params(self._tracking_state, **tracking_updates)
+                if ff_update_requested:
+                    self._reset_tracking_feedforward_cache()
                 self._update_state(
                     {
                         "tracking": {
@@ -3280,13 +3769,15 @@ class AppRunner:
             return True
 
         if t == ActionType.TRACKING_CALIB_RESET:
-            auto_reset(self._tracking_state, src="auto")
+            with self._tracking_state_lock:
+                auto_reset(self._tracking_state, src="auto")
             self._tracking_keyframe_reset()
             log_info(self.out_log, "Tracking: CALIB_RESET (autocal only)")
             return True
 
         if t == ActionType.TRACKING_AUTO_RESET:
-            auto_reset(self._tracking_state, src="auto")
+            with self._tracking_state_lock:
+                auto_reset(self._tracking_state, src="auto")
             self._tracking_keyframe_reset()
             log_info(self.out_log, "Tracking: AUTO_RESET")
             return True
@@ -3307,6 +3798,7 @@ class AppRunner:
 
     def _handle_stacking_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
         if t == ActionType.STACKING_START:
+            self._stacking_last_frame_token = None
             self._stacking_enabled = True
             self._stacking.start()
             self._update_state({"stacking": {"enabled": True, "status": StackingStatus.RUNNING, "last_error": None}})
@@ -3314,6 +3806,7 @@ class AppRunner:
             return True
 
         if t == ActionType.STACKING_STOP:
+            self._stacking_last_frame_token = None
             self._stacking_enabled = False
             self._stacking.stop()
             self._update_state({"stacking": {"enabled": False, "status": StackingStatus.OFF, "last_error": None}})
@@ -3321,6 +3814,7 @@ class AppRunner:
             return True
 
         if t == ActionType.STACKING_RESET:
+            self._stacking_last_frame_token = None
             self._stacking.reset()
             self._update_state({"stacking": {"last_error": None}})
             log_info(self.out_log, "Stacking: RESET")
@@ -3339,7 +3833,8 @@ class AppRunner:
                 if "use_subpixel" in p:
                     align_updates["align_use_subpixel"] = bool(self.cfg.stacking.use_subpixel)
                 if align_updates:
-                    tracking_set_params(self._tracking_state, **align_updates)
+                    with self._tracking_state_lock:
+                        tracking_set_params(self._tracking_state, **align_updates)
                 log_info(self.out_log, f"Stacking: SET_PARAMS {list(p.keys())}")
             return True
 
@@ -3353,9 +3848,18 @@ class AppRunner:
                 out_dir = str(p.get("out_dir", "stack_output"))
                 basename = str(p.get("basename", "stack"))
                 fmt = str(p.get("fmt", "png"))
-                self._save_stacking(out_dir, basename, fmt)
+                self._save_worker.request(
+                    out_dir=out_dir,
+                    basename=basename,
+                    fmt=fmt,
+                )
             else:
-                self._save_stacking("stack_output", "stack", "png")
+                self._save_worker.request(
+                    out_dir="stack_output",
+                    basename="stack",
+                    fmt="png",
+                )
+            log_info(self.out_log, "Stacking: save queued")
             return True
 
         return False
@@ -3452,14 +3956,7 @@ class AppRunner:
                     self.cfg.platesolving.max_det = int(p.get("max_det"))
                     self._live_sep_params["max_det"] = int(p.get("max_det"))
                 self._goto.cfg.sep = self.cfg.sep
-                tracking_set_params(
-                    self._tracking_state,
-                    sep_bw=int(self.cfg.sep.bw),
-                    sep_bh=int(self.cfg.sep.bh),
-                    sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
-                    sep_minarea=int(self.cfg.sep.minarea),
-                    sep_max_sources=int(self.cfg.platesolving.max_det),
-                )
+                self._invalidate_preview_pipeline()
                 log_info(self.out_log, "Live SEP: params updated")
             return True
 
@@ -3488,6 +3985,7 @@ class AppRunner:
                 if enabled and int(getattr(self._goto.model, "model_fit_samples", 0)) <= 0:
                     reason = "Se requiere un fit GoTo"
                 self._set_expected_stars_status(reason=reason)
+                self._invalidate_preview_pipeline()
                 log_info(
                     self.out_log,
                     "Expected stars overlay: "

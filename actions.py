@@ -14,7 +14,9 @@ class ActionType(str, Enum):
     CAMERA_CONNECT = "CAMERA_CONNECT"
     CAMERA_DISCONNECT = "CAMERA_DISCONNECT"
     CAMERA_SET_PARAM = "CAMERA_SET_PARAM"
+    CAMERA_SET_PARAMS = "CAMERA_SET_PARAMS"
     CAMERA_RECORD_RAW = "CAMERA_RECORD_RAW"
+    CAMERA_STOP_RECORD_RAW = "CAMERA_STOP_RECORD_RAW"
     RESET_CAMERA_DEFAULTS = "RESET_CAMERA_DEFAULTS"
     RESET_PREVIEW_DEFAULTS = "RESET_PREVIEW_DEFAULTS"
 
@@ -99,14 +101,22 @@ def camera_set_param(name: str, value: Any) -> Action:
     return Action(ActionType.CAMERA_SET_PARAM, {"name": str(name), "value": value}, _now())
 
 
-def camera_record_raw(duration_s: float = 20.0, out_dir: str = "raw_output", basename: str | None = None) -> Action:
+def camera_set_params(params: Dict[str, Any]) -> Action:
+    return Action(ActionType.CAMERA_SET_PARAMS, dict(params), _now())
+
+
+def camera_record_raw(duration_s: float | None = 20.0, out_dir: str = "raw_output", basename: str | None = None) -> Action:
     payload: Dict[str, Any] = {
-        "duration_s": float(duration_s),
+        "duration_s": None if duration_s is None else float(duration_s),
         "out_dir": str(out_dir),
     }
     if basename:
         payload["basename"] = str(basename)
     return Action(ActionType.CAMERA_RECORD_RAW, payload, _now())
+
+
+def camera_stop_record_raw() -> Action:
+    return Action(ActionType.CAMERA_STOP_RECORD_RAW, {}, _now())
 
 
 def camera_reset_defaults() -> Action:

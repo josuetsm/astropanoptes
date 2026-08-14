@@ -6,7 +6,11 @@ from typing import Optional, Tuple, Any
 
 import numpy as np
 from logging_utils import log_error
-from sep_utils import sep_detect_from_raw16
+from raw_alignment import (
+    RawAlignmentSignature,
+    build_raw_alignment_signature,
+    estimate_raw_translation,
+)
 
 try:
     import cv2
@@ -53,17 +57,7 @@ class RateLimiterConfig:
     rls_min_lock_conf: float = 0.70
     rls_min_rate_steps_s: float = 50.0
     source_resp_min: float = 0.35
-    source_profile_disagree_px: float = 1.25
-
-
-@dataclass
-class SepTrackingConfig:
-    bw: int = 64
-    bh: int = 64
-    thresh_sigma: float = 3.0
-    minarea: int = 5
-    max_sources: int = 50
-    min_sources: int = 3
+    source_profile_disagree_px: float = 3.0
 
 
 @dataclass
@@ -71,7 +65,7 @@ class AlignmentConfig:
     median_k: int = 3
     smooth_k: int = 30
     max_shift_px: float = 50.0
-    use_subpixel: bool = False
+    use_subpixel: bool = True
 
 
 @dataclass
@@ -80,7 +74,7 @@ class CalibrationConfig:
     Modelo: v_pxps = A * u + b
 
     - u: [u_az, u_alt] en µsteps/s (señal de control; AppRunner la discretiza a MOVE)
-    - v: [vx, vy] en px/s (medido por SEP: centroides/flux)
+    - v: [vx, vy] en px/s (medido directamente desde perfiles RAW16)
     """
     lambda_dls: float = 0.05               # DLS para pinv
 
@@ -95,12 +89,11 @@ class AutoCalConfig:
 
 @dataclass
 class TrackingConfig:
-    resp_min: float = 0.06
+    resp_min: float = 0.25
     align: AlignmentConfig = field(default_factory=AlignmentConfig)
     keyframe: KeyframeConfig = field(default_factory=KeyframeConfig)
     pi: PIConfig = field(default_factory=PIConfig)
     rate: RateLimiterConfig = field(default_factory=RateLimiterConfig)
-    sep_track: SepTrackingConfig = field(default_factory=SepTrackingConfig)
     calib: CalibrationConfig = field(default_factory=CalibrationConfig)
     autocal: AutoCalConfig = field(default_factory=AutoCalConfig)
 
@@ -131,8 +124,7 @@ class TrackingState:
     cfg: TrackingConfig = field(default_factory=TrackingConfig)
 
     # incremental tracking
-    prev_obj_xy: Optional[np.ndarray] = None
-    prev_align_u16: Optional[np.ndarray] = None
+    prev_signature: Optional[RawAlignmentSignature] = None
     prev_t: Optional[float] = None
     fail: int = 0
     last_dx_inc: float = 0.0
@@ -147,8 +139,7 @@ class TrackingState:
     lock_conf: float = 0.0
 
     # keyframe & absolute correction
-    key_obj_xy: Optional[np.ndarray] = None
-    key_align_u16: Optional[np.ndarray] = None
+    key_signature: Optional[RawAlignmentSignature] = None
     key_t: Optional[float] = None
     x_hat: float = 0.0
     y_hat: float = 0.0
@@ -664,103 +655,32 @@ def _choose_consistent_alignment(
 def _estimate_alignment(
     state: TrackingState,
     *,
-    ref_align_u16: np.ndarray,
-    cur_align_u16: np.ndarray,
-    ref_obj_xy: Optional[np.ndarray],
-    cur_obj_xy: np.ndarray,
+    reference: RawAlignmentSignature,
+    current: RawAlignmentSignature,
     center_dx: float,
     center_dy: float,
     search_radius_px: float,
     max_displacement_px: float,
-    min_sources: int,
 ) -> _AlignmentMeasurement:
-    n_det = int(cur_obj_xy.shape[0])
-    if n_det < int(min_sources):
-        return _AlignmentMeasurement(ok=False, reason="no_sources")
-
-    dx_phase, dy_phase, resp_phase = estimate_shift_from_phase_alignment(
-        ref_align_u16,
-        cur_align_u16,
-        max_shift_px=float(max_displacement_px),
-        median_k=int(state.cfg.align.median_k),
-    )
-    dx_profile, dy_profile, resp_profile = estimate_shift_from_profile_alignment(
-        ref_align_u16,
-        cur_align_u16,
+    result = estimate_raw_translation(
+        reference,
+        current,
         center_dx=float(center_dx),
         center_dy=float(center_dy),
-        max_shift_px=float(search_radius_px),
-        median_k=int(state.cfg.align.median_k),
-        smooth_k=int(state.cfg.align.smooth_k),
+        search_radius_px=float(search_radius_px),
+        max_displacement_px=float(max_displacement_px),
+        min_response=float(state.cfg.resp_min),
         use_subpixel=bool(state.cfg.align.use_subpixel),
+        max_profile_disagreement_px=float(state.cfg.rate.source_profile_disagree_px),
     )
-
-    dx_src = 0.0
-    dy_src = 0.0
-    resp_src = 0.0
-    source_matches = 0
-    if ref_obj_xy is not None and len(ref_obj_xy) > 0:
-        try:
-            dx_src, dy_src, resp_src, source_matches = estimate_shift_from_source_matches(
-                ref_obj_xy,
-                cur_obj_xy,
-                center_dx=float(center_dx),
-                center_dy=float(center_dy),
-                max_shift_px=float(search_radius_px),
-                min_sources=max(2, int(min_sources)),
-            )
-        except Exception as exc:
-            log_error(None, "Tracking: source matching failed", exc, throttle_s=2.0, throttle_key="tracking_source_match")
-
-    resp_min = float(state.cfg.resp_min)
-    max_disp = max(0.5, float(max_displacement_px))
-
-    def _finite_in_range(dx: float, dy: float) -> bool:
-        mag = float(np.hypot(dx, dy))
-        return bool(np.isfinite(mag) and mag <= max_disp)
-
-    candidates: list[tuple[str, float, float, float]] = []
-    if float(resp_phase) >= resp_min and _finite_in_range(dx_phase, dy_phase):
-        candidates.append(("phase", float(dx_phase), float(dy_phase), float(resp_phase)))
-    if (
-        int(source_matches) >= max(2, int(min_sources))
-        and float(resp_src) >= max(float(state.cfg.rate.source_resp_min), resp_min)
-        and _finite_in_range(dx_src, dy_src)
-    ):
-        candidates.append(("source", float(dx_src), float(dy_src), float(resp_src)))
-    if float(resp_profile) >= resp_min and _finite_in_range(dx_profile, dy_profile):
-        candidates.append(("profile", float(dx_profile), float(dy_profile), float(resp_profile)))
-
-    agree_limit = max(
-        float(state.cfg.rate.source_profile_disagree_px),
-        min(3.0, 0.10 * max(1.0, float(search_radius_px))),
+    return _AlignmentMeasurement(
+        ok=bool(result.ok),
+        dx=float(result.dx),
+        dy=float(result.dy),
+        resp=float(result.response),
+        source="raw_profile",
+        reason=str(result.reason),
     )
-    selected = _choose_consistent_alignment(
-        candidates,
-        center_dx=float(center_dx),
-        center_dy=float(center_dy),
-        agree_px=float(agree_limit),
-        lock_conf=float(state.lock_conf),
-    )
-    if selected.ok:
-        return selected
-
-    raw_mags = [
-        float(np.hypot(dx_phase, dy_phase)),
-        float(np.hypot(dx_profile, dy_profile)),
-    ]
-    if source_matches > 0:
-        raw_mags.append(float(np.hypot(dx_src, dy_src)))
-    if any(np.isfinite(mag) and mag > max_disp for mag in raw_mags):
-        return _AlignmentMeasurement(
-            ok=False,
-            dx=float(selected.dx),
-            dy=float(selected.dy),
-            resp=float(selected.resp),
-            source=str(selected.source),
-            reason="shift_out_of_range",
-        )
-    return selected
 
 
 # ============================================================
@@ -899,8 +819,7 @@ def make_tracking_state(cfg: Optional[TrackingConfig] = None) -> TrackingState:
 
 
 def reset_tracker(state: TrackingState, *, now_t: float, mode: str = "STABILIZE") -> None:
-    state.prev_obj_xy = None
-    state.prev_align_u16 = None
+    state.prev_signature = None
     state.prev_t = None
     state.fail = 0
     state.last_dx_inc = 0.0
@@ -917,8 +836,7 @@ def reset_tracker(state: TrackingState, *, now_t: float, mode: str = "STABILIZE"
     state.current_mode = str(mode)
     state.t_mode = float(now_t)
 
-    state.key_obj_xy = None
-    state.key_align_u16 = None
+    state.key_signature = None
     state.key_t = None
     state.x_hat = 0.0
     state.y_hat = 0.0
@@ -930,16 +848,11 @@ def reset_tracker(state: TrackingState, *, now_t: float, mode: str = "STABILIZE"
 
 def reset_keyframe(
     state: TrackingState,
-    obj_xy: Optional[np.ndarray],
     *,
-    align_u16: Optional[np.ndarray],
+    signature: Optional[RawAlignmentSignature],
     now_t: float,
 ) -> None:
-    state.key_obj_xy = obj_xy
-    if align_u16 is None:
-        state.key_align_u16 = None
-    else:
-        state.key_align_u16 = np.asarray(align_u16, dtype=np.uint16).copy()
+    state.key_signature = signature
     state.key_t = float(now_t)
     state.x_hat = 0.0
     state.y_hat = 0.0
@@ -978,18 +891,16 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
                 _auto_recompute_pinv(state)
             elif k == "rls_forget":
                 cfg.autocal.rls_forget = float(v)
-            elif k == "sep_bw":
-                cfg.sep_track.bw = int(v)
-            elif k == "sep_bh":
-                cfg.sep_track.bh = int(v)
-            elif k == "sep_thresh_sigma":
-                cfg.sep_track.thresh_sigma = float(v)
-            elif k == "sep_minarea":
-                cfg.sep_track.minarea = int(v)
-            elif k == "sep_max_sources":
-                cfg.sep_track.max_sources = int(v)
-            elif k == "sep_min_sources":
-                cfg.sep_track.min_sources = int(v)
+            elif k in {
+                "sep_bw",
+                "sep_bh",
+                "sep_thresh_sigma",
+                "sep_minarea",
+                "sep_max_sources",
+                "sep_min_sources",
+            }:
+                # Accepted as no-op for old saved CLI/UI configurations.
+                continue
             elif k in ("min_meas_dt_s", "rate_min_meas_dt_s"):
                 cfg.rate.min_meas_dt_s = float(v)
             elif k in ("max_meas_v_px_s", "rate_max_meas_v_px_s"):
@@ -1030,9 +941,8 @@ def tracking_step(
 ) -> TrackingOutput:
     """
     Un paso de tracking puro (sin tocar hardware):
-    - SEP sobre RAW16 con median blur k=3 para hotpixels.
-    - Alineación por perfiles 1D (misma estrategia que stacking):
-      max por eje + suavizado + correlación cruzada centrada.
+    - Construye una firma compacta directamente desde RAW16 Bayer.
+    - Alinea perfiles 1D de precisión y valida contra perfiles de detalle.
       Se usa tanto para incremental (v) como para corrección absoluta contra keyframe.
     - Si tracking_enabled y hay A_pinv (auto), computa targets de velocidad (µsteps/s) (pero NO envía).
       AppRunner discretiza esa velocidad en comandos MOVE al Arduino.
@@ -1040,43 +950,19 @@ def tracking_step(
     raw16 debe ser un frame Bayer RAW16 uint16.
     """
     raw_align = _ensure_raw16_bayer(raw16)
-
-    cfg_sep = state.cfg.sep_track
-    sep_failed = False
-    try:
-        _, _, objects, _ = sep_detect_from_raw16(
-            raw_align,
-            sep_bw=int(cfg_sep.bw),
-            sep_bh=int(cfg_sep.bh),
-            sep_thresh_sigma=float(cfg_sep.thresh_sigma),
-            sep_minarea=int(cfg_sep.minarea),
-            max_sources=int(cfg_sep.max_sources),
-        )
-    except Exception as exc:
-        # A single malformed/saturated frame must not disable tracking for the
-        # rest of the session.  Treat it as an invalid measurement and retain
-        # the last trustworthy references for the next frame.
-        sep_failed = True
-        objects = np.zeros((0,), dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
-        log_error(None, "Tracking: SEP detection failed", exc, throttle_s=2.0, throttle_key="tracking_sep")
-
-    obj_xy, _ = _extract_obj_xy_and_flux(objects)
-    n_det = int(obj_xy.shape[0])
-    min_sources = max(1, int(state.cfg.sep_track.min_sources))
-
-    # Do not anchor either reference to a frame where SEP failed.  Doing so
-    # made the next good frame compare against noise/blur and often caused a
-    # second loss immediately after a transient bad exposure.
-    keyframe_pending = state.key_obj_xy is None or (
-        isinstance(state.key_obj_xy, str) and state.key_obj_xy == "PENDING"
+    signature = build_raw_alignment_signature(
+        raw_align,
+        median_k=int(state.cfg.align.median_k),
+        smooth_k=int(state.cfg.align.smooth_k),
     )
-    if keyframe_pending and n_det >= min_sources:
-        reset_keyframe(state, obj_xy, align_u16=raw_align, now_t=now_t)
+    n_det = int(signature.feature_count)
+
+    if state.key_signature is None and signature.has_signal:
+        reset_keyframe(state, signature=signature, now_t=now_t)
 
     # first frame
-    if state.prev_align_u16 is None or state.prev_t is None:
-        state.prev_obj_xy = obj_xy
-        state.prev_align_u16 = raw_align.copy()
+    if state.prev_signature is None or state.prev_t is None:
+        state.prev_signature = signature
         state.prev_t = now_t
         return TrackingOutput(
             ok=False,
@@ -1094,18 +980,14 @@ def tracking_step(
             calib_src="none",
             detA=0.0,
             n_det=int(n_det),
-            measurement_reason=(
-                "detection_failed" if sep_failed else ("initializing" if n_det >= min_sources else "no_sources")
-            ),
+            measurement_reason="initializing" if signature.has_signal else "no_signal",
             measurement_source="none",
             lock_conf=float(state.lock_conf),
             fail_count=int(state.fail),
         )
 
-    prev_n_det = int(state.prev_obj_xy.shape[0]) if isinstance(state.prev_obj_xy, np.ndarray) else 0
-    if prev_n_det < min_sources and n_det >= min_sources:
-        state.prev_obj_xy = obj_xy
-        state.prev_align_u16 = raw_align.copy()
+    if not state.prev_signature.has_signal and signature.has_signal:
+        state.prev_signature = signature
         state.prev_t = now_t
         state.last_dx_inc = 0.0
         state.last_dy_inc = 0.0
@@ -1162,15 +1044,12 @@ def tracking_step(
 
     inc = _estimate_alignment(
         state,
-        ref_align_u16=state.prev_align_u16,
-        cur_align_u16=raw_align,
-        ref_obj_xy=state.prev_obj_xy,
-        cur_obj_xy=obj_xy,
+        reference=state.prev_signature,
+        current=signature,
         center_dx=float(center_dx),
         center_dy=float(center_dy),
         search_radius_px=float(max_shift_inc),
         max_displacement_px=float(max_shift_inc),
-        min_sources=int(min_sources),
     )
     dx_inc = float(inc.dx)
     dy_inc = float(inc.dy)
@@ -1178,8 +1057,6 @@ def tracking_step(
     good_inc = bool(inc.ok)
     measurement_reason = str(inc.reason)
     measurement_source = str(inc.source)
-    if sep_failed:
-        measurement_reason = "detection_failed"
 
     # Periodically validate accumulated error against the original target
     # keyframe.  Also attempt it immediately on an incremental failure; a valid
@@ -1189,22 +1066,19 @@ def tracking_step(
     abs_due = state.abs_last_t is None or (
         (now_t - float(state.abs_last_t)) >= float(state.cfg.keyframe.abs_corr_every_s)
     )
-    if state.key_align_u16 is not None and (abs_due or not good_inc):
+    if state.key_signature is not None and (abs_due or not good_inc):
         abs_search = min(
             float(state.cfg.keyframe.abs_max_px),
             max(float(max_shift_inc), 2.0 * float(state.cfg.rate.source_profile_disagree_px)),
         )
         abs_measurement = _estimate_alignment(
             state,
-            ref_align_u16=state.key_align_u16,
-            cur_align_u16=raw_align,
-            ref_obj_xy=state.key_obj_xy if isinstance(state.key_obj_xy, np.ndarray) else None,
-            cur_obj_xy=obj_xy,
+            reference=state.key_signature,
+            current=signature,
             center_dx=float(state.x_hat + center_dx),
             center_dy=float(state.y_hat + center_dy),
             search_radius_px=float(abs_search),
             max_displacement_px=float(state.cfg.keyframe.abs_max_px),
-            min_sources=int(min_sources),
         )
         state.abs_last_t = now_t
         state.abs_resp_last = float(abs_measurement.resp)
@@ -1266,8 +1140,7 @@ def tracking_step(
         state.lock_conf = clamp(float(state.lock_conf) * lock_drop, 0.0, 1.0)
 
     if good_inc:
-        state.prev_obj_xy = obj_xy
-        state.prev_align_u16 = raw_align.copy()
+        state.prev_signature = signature
         state.prev_t = now_t
 
     # fail reset
@@ -1394,7 +1267,7 @@ def tracking_step(
         # keyframe refresh when stable
         e_mag = float(np.hypot(ex, ey))
         if (e_mag <= float(state.cfg.keyframe.keyframe_refresh_px)) and (float(state.abs_resp_last) >= float(state.cfg.keyframe.abs_resp_min)):
-            reset_keyframe(state, obj_xy, align_u16=raw_align, now_t=now_t)
+            reset_keyframe(state, signature=signature, now_t=now_t)
 
     else:
         # no calib -> hold rates at 0

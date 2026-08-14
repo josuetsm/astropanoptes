@@ -386,7 +386,7 @@ HELP_TEXT = """Comandos principales:
 
   demo on|off
   camera connect [ÍNDICE] | disconnect | set NOMBRE VALOR
-  camera record [SEG] [CARPETA] [NOMBRE]
+  camera record [SEG] [CARPETA] [NOMBRE] | stop
   mount connect [PUERTO] [BAUD] | disconnect | stop | sync
   mount move az|alt DIRECCIÓN PASOS [DELAY_US] [smooth|direct]
   tracking start|stop | set nombre=valor ...
@@ -484,7 +484,24 @@ class TerminalApp:
             "platesolving": bool(state.platesolving.busy),
             "goto": bool(state.goto.busy),
         }
-        self._print(json.dumps({"active": active, "errors": errors}, ensure_ascii=False, indent=2, sort_keys=True))
+        performance_getter = getattr(self.runner, "get_performance_metrics", None)
+        performance = (
+            performance_getter()
+            if callable(performance_getter)
+            else None
+        )
+        self._print(
+            json.dumps(
+                {
+                    "active": active,
+                    "errors": errors,
+                    "performance": performance,
+                },
+                ensure_ascii=False,
+                indent=2,
+                sort_keys=True,
+            )
+        )
 
     def _wait(self, args: list[str]) -> None:
         if len(args) < 2:
@@ -747,8 +764,10 @@ class TerminalApp:
                 out_dir=out_dir,
                 basename=basename,
             )
+        elif operation == "stop":
+            self.runner.request_camera_stop_record_raw()
         else:
-            raise CommandError("uso: camera connect [ÍNDICE] | disconnect | set NOMBRE VALOR | record [SEG] [DIR] [NOMBRE]")
+            raise CommandError("uso: camera connect [ÍNDICE] | disconnect | set NOMBRE VALOR | record [SEG] [DIR] [NOMBRE] | stop")
         self._print("OK")
 
     def _mount(self, args: list[str]) -> None:

@@ -225,6 +225,7 @@ class GaiaTabMixin:
         layout.addWidget(legend)
         self._gaia_last_refresh_t = 0.0
         self._gaia_last_download_status = None
+        self._gaia_coverage_version = -1
         return self.gaia_tab
 
     @staticmethod
@@ -276,19 +277,33 @@ class GaiaTabMixin:
 
     def _refresh_gaia_coverage(self: "AstroPanoptesWindow", *, force: bool = False) -> None:
         now = time.monotonic()
-        if not force and (now - self._gaia_last_refresh_t) < 5.0:
-            return
-        self._gaia_last_refresh_t = now
-        try:
-            coverage = self.runner.get_gaia_coverage()
-        except Exception as exc:
-            self.lbl_gaia_field_status.setText(f"No se pudo inspeccionar el caché: {type(exc).__name__}")
+        if force or (now - self._gaia_last_refresh_t) >= 5.0:
+            self._gaia_last_refresh_t = now
+            self.runner.request_gaia_coverage_refresh()
+
+        snapshot = self.runner.get_gaia_coverage_snapshot()
+        coverage = snapshot.get("coverage")
+        if coverage is None:
+            error = snapshot.get("error")
+            if error:
+                self.lbl_gaia_field_status.setText(
+                    f"No se pudo inspeccionar el caché: {error}"
+                )
+            else:
+                self.lbl_gaia_field_status.setText("Calculando cobertura…")
+            if not error:
+                return
             self.lbl_gaia_field_status.setStyleSheet(
                 "QLabel { padding:6px 10px; border-radius:8px; "
                 "background:#3a1515; border:1px solid #7a2a2a; color:#ffecec; font-weight:600; }"
             )
-            self._log(f"[gaia] coverage inspection failed: {exc}")
+            self._log(f"[gaia] coverage inspection failed: {error}")
             return
+
+        version = int(snapshot.get("version", 0))
+        if version == int(self._gaia_coverage_version):
+            return
+        self._gaia_coverage_version = version
 
         cached_count = int(coverage.get("cached_tile_count", 0))
         total_tiles = int(coverage.get("total_tiles", 0))
@@ -579,12 +594,19 @@ class CameraTabMixin:
             "Aplica exposición, ganancia y offset a la cámara activa.",
         )
         self.btn_apply_cam.clicked.connect(self._camera_apply)
-        self.btn_record_raw = QPushButton("Record 20s RAW (.npy)")
+        self.btn_record_raw = QPushButton("Start recording")
         _set_option_tooltip(
             self.btn_record_raw,
-            "Graba 20 segundos de frames RAW en raw_output para diagnóstico o análisis offline.",
+            "Comienza a guardar frames RAW en raw_output. Pulsa Stop recording cuando quieras terminar.",
         )
         self.btn_record_raw.clicked.connect(self._camera_record_raw)
+        self.btn_stop_record_raw = QPushButton("Stop recording")
+        self.btn_stop_record_raw.setEnabled(False)
+        _set_option_tooltip(
+            self.btn_stop_record_raw,
+            "Detiene la grabación y guarda inmediatamente los frames capturados.",
+        )
+        self.btn_stop_record_raw.clicked.connect(self._camera_stop_record_raw)
 
         _add_option_row(
             form,
@@ -605,7 +627,10 @@ class CameraTabMixin:
             "Nivel negro que evita recortar el ruido en cero. Para gain 360, la Mars-C requiere aproximadamente 350.",
         )
         form.addRow(self.btn_apply_cam)
-        form.addRow(self.btn_record_raw)
+        record_actions = QHBoxLayout()
+        record_actions.addWidget(self.btn_record_raw)
+        record_actions.addWidget(self.btn_stop_record_raw)
+        form.addRow(record_actions)
         box.setLayout(form)
 
         layout.addWidget(box)
@@ -1446,7 +1471,7 @@ class ModulesTabsMixin(
         tabs.addTab(self._tab_goto(), "GoTo")
         tabs.setTabToolTip(0, "Ubicación, escala óptica y prior de rotación para plate solving.")
         tabs.setTabToolTip(1, "Exposición, ganancia y captura RAW de diagnóstico.")
-        tabs.setTabToolTip(2, "Control de tracking, feed-forward sideral y detección SEP para deriva.")
+        tabs.setTabToolTip(2, "Control de tracking y alineación RAW16 directa con feed-forward sideral.")
         tabs.setTabToolTip(3, "Live stacking, color, drizzle, alineación y preview del stack.")
         tabs.setTabToolTip(4, "Overlay de detección SEP sobre la vista live.")
         tabs.setTabToolTip(5, "Plate Solving y toma manual de muestras, ajuste del modelo GoTo y estrellas esperadas.")

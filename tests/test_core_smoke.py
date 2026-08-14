@@ -30,7 +30,15 @@ from goto import (
 from mount_arduino import MountMoveWorker, firmware_move_period_us
 from platesolving import ObserverConfig, expected_field_rotation_deg, select_guide_star_indices
 from stacking import StackEngine, StackingWorker
-from tracking import make_tracking_state, tracking_step, tracking_set_params
+from tracking import _AlignmentMeasurement, make_tracking_state, tracking_step, tracking_set_params
+
+
+def _tracking_star_frame() -> np.ndarray:
+    raw = np.zeros((32, 32), dtype=np.uint16)
+    raw[6:9, 6:9] = 60_000
+    raw[14:17, 18:21] = 52_000
+    raw[23:26, 10:13] = 46_000
+    return raw
 
 
 class CoreSmokeTests(unittest.TestCase):
@@ -83,12 +91,6 @@ class CoreSmokeTests(unittest.TestCase):
         tracking_set_params(
             state,
             resp_min=0.0,
-            sep_bw=16,
-            sep_bh=16,
-            sep_thresh_sigma=0.5,
-            sep_minarea=1,
-            sep_max_sources=50,
-            sep_min_sources=2,
         )
         raw = np.zeros((32, 32), dtype=np.uint16)
         raw[8:11, 8:11] = 60000
@@ -108,14 +110,13 @@ class CoreSmokeTests(unittest.TestCase):
         state.auto.ok = True
         state.auto.A_pinv = np.eye(2, dtype=np.float64)
         state.auto.b = np.zeros(2, dtype=np.float64)
-        tracking_set_params(state, sep_min_sources=1)
-        raw = np.zeros((32, 32), dtype=np.uint16)
-        objects = np.array([(10.0, 10.0, 1000.0)], dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
+        raw = _tracking_star_frame()
 
         with (
-            patch("tracking.sep_detect_from_raw16", return_value=(None, None, objects, None)),
-            patch("tracking.estimate_shift_from_phase_alignment", return_value=(1.0, 0.0, 1.0)),
-            patch("tracking.estimate_shift_from_profile_alignment", return_value=(1.0, 0.0, 1.0)),
+            patch(
+                "tracking._estimate_alignment",
+                return_value=_AlignmentMeasurement(True, 1.0, 0.0, 1.0, "raw_profile", "ok"),
+            ),
             patch("tracking.auto_rls_update", return_value=None),
         ):
             tracking_step(state, raw, now_t=0.0, tracking_enabled=True)
@@ -135,15 +136,14 @@ class CoreSmokeTests(unittest.TestCase):
             min_meas_dt_s=0.1,
             max_meas_v_px_s=1e6,
             lock_warmup_frames=1,
-            sep_min_sources=1,
         )
-        raw = np.zeros((32, 32), dtype=np.uint16)
-        objects = np.array([(10.0, 10.0, 1000.0)], dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
+        raw = _tracking_star_frame()
 
         with (
-            patch("tracking.sep_detect_from_raw16", return_value=(None, None, objects, None)),
-            patch("tracking.estimate_shift_from_phase_alignment", return_value=(1.0, 0.0, 1.0)),
-            patch("tracking.estimate_shift_from_profile_alignment", return_value=(1.0, 0.0, 1.0)),
+            patch(
+                "tracking._estimate_alignment",
+                return_value=_AlignmentMeasurement(True, 1.0, 0.0, 1.0, "raw_profile", "ok"),
+            ),
             patch("tracking.auto_rls_update", return_value=None),
         ):
             tracking_step(state, raw, now_t=0.0, tracking_enabled=True)
@@ -163,33 +163,21 @@ class CoreSmokeTests(unittest.TestCase):
             lock_drop_decay=0.5,
             fb_max_frac=1.0,
             resp_min=0.5,
-            sep_min_sources=1,
         )
-        raw = np.zeros((32, 32), dtype=np.uint16)
-        objects = np.array([(10.0, 10.0, 1000.0)], dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
+        raw = _tracking_star_frame()
+        good = _AlignmentMeasurement(True, 1.0, 0.0, 1.0, "raw_profile", "ok")
+        bad = _AlignmentMeasurement(False, 0.0, 0.0, 0.0, "raw_profile", "low_confidence")
 
         with (
-            patch("tracking.sep_detect_from_raw16", return_value=(None, None, objects, None)),
             patch(
-                "tracking.estimate_shift_from_phase_alignment",
+                "tracking._estimate_alignment",
                 side_effect=[
-                    (1.0, 0.0, 1.0),
-                    (1.0, 0.0, 1.0),
-                    (1.0, 0.0, 1.0),
-                    (1.0, 0.0, 1.0),
-                    (0.0, 0.0, 0.0),
-                    (0.0, 0.0, 0.0),
-                ],
-            ),
-            patch(
-                "tracking.estimate_shift_from_profile_alignment",
-                side_effect=[
-                    (1.0, 0.0, 1.0),  # good -> lock ramp starts
-                    (1.0, 0.0, 1.0),  # good
-                    (1.0, 0.0, 1.0),  # good
-                    (1.0, 0.0, 1.0),  # good
-                    (0.0, 0.0, 0.0),  # bad -> decay
-                    (0.0, 0.0, 0.0),  # keyframe recovery also rejects it
+                    good,
+                    good,
+                    good,
+                    good,
+                    bad,
+                    bad,
                 ],
             ),
             patch("tracking.auto_rls_update", return_value=None),
@@ -313,6 +301,42 @@ class CoreSmokeTests(unittest.TestCase):
             self.fail("mean stack should not be None in rgb drizzle mode")
         self.assertEqual(mean.ndim, 3)
         self.assertEqual(mean.shape, (72, 120, 3))
+
+    def test_stacking_engine_drizzle_x3_aligns_at_native_scale_with_float32_accumulators(self) -> None:
+        cfg = AppConfig()
+        cfg.stacking.color_mode = "rgb"
+        cfg.stacking.drizzle_scale = 3.0
+        cfg.stacking.bayer_pattern = "RGGB"
+        cfg.stacking.smooth_k = 9
+        cfg.stacking.max_shift_px = 10
+        cfg.stacking.resp_min = 0.10
+        engine = StackEngine(cfg)
+        engine.configure_from_cfg()
+        engine.start()
+
+        raw = np.full((96, 128), 500, dtype=np.uint16)
+        for y, x, value in (
+            (20, 20, 60_000),
+            (35, 80, 50_000),
+            (70, 45, 55_000),
+            (65, 105, 45_000),
+        ):
+            raw[y - 2 : y + 3, x - 2 : x + 3] = value
+        shifted = np.zeros_like(raw)
+        shifted[3:, 2:] = raw[:-3, :-2]
+
+        engine.step_batch([{"raw16": raw, "t": 0.0}, {"raw16": shifted, "t": 1.0}])
+
+        self.assertEqual(engine.metrics.frames_used, 2)
+        self.assertEqual(engine.metrics.frames_rejected, 0)
+        self.assertAlmostEqual(engine.metrics.last_dx, 2.0, delta=0.35)
+        self.assertAlmostEqual(engine.metrics.last_dy, 3.0, delta=0.35)
+        self.assertIsNotNone(engine._live_gray)
+        if engine._live_gray is None:
+            self.fail("live stack should be configured")
+        self.assertEqual(engine._live_gray.sum.dtype, np.float32)
+        self.assertEqual(engine._live_gray.wgt.dtype, np.float32)
+        engine.stop()
 
     def test_stacking_worker_smoke(self) -> None:
         cfg = AppConfig()
