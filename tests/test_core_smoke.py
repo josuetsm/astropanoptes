@@ -17,21 +17,39 @@ from goto import (
     GoToConfig,
     GoToController,
     GoToModel,
+    GoToStatus,
     GoToWorker,
     MountKinematics,
+    _AutocalFrame,
     _roll_deg_from_drift_delta,
     _roll_equivalent_near_reference_deg,
     _rotvec_deg_to_rotation_matrix,
     _rotate_altaz_deg,
     icrs_to_altaz_deg,
 )
-from mount_arduino import MountMoveWorker
+from mount_arduino import MountMoveWorker, firmware_move_period_us
 from platesolving import ObserverConfig, expected_field_rotation_deg, select_guide_star_indices
 from stacking import StackEngine, StackingWorker
 from tracking import make_tracking_state, tracking_step, tracking_set_params
 
 
 class CoreSmokeTests(unittest.TestCase):
+    def setUp(self) -> None:
+        # GoTo model fits/manual-sample logging writes CSV rows to
+        # stack_output/goto_logs by default (see goto._goto_logs_dir).
+        # Without this override, running the test suite mixes synthetic test
+        # rows into the operator's real observing session logs.
+        self._prev_goto_log_dir = os.environ.get("ASTROPANOPTES_GOTO_LOG_DIR")
+        self._tmp_goto_log_dir = tempfile.TemporaryDirectory()
+        os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = self._tmp_goto_log_dir.name
+
+    def tearDown(self) -> None:
+        if self._prev_goto_log_dir is None:
+            os.environ.pop("ASTROPANOPTES_GOTO_LOG_DIR", None)
+        else:
+            os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = self._prev_goto_log_dir
+        self._tmp_goto_log_dir.cleanup()
+
     @staticmethod
     def _wrap_deg_180(angle_deg: float) -> float:
         return float(((float(angle_deg) + 180.0) % 360.0) - 180.0)
@@ -70,12 +88,14 @@ class CoreSmokeTests(unittest.TestCase):
             sep_thresh_sigma=0.5,
             sep_minarea=1,
             sep_max_sources=50,
+            sep_min_sources=2,
         )
         raw = np.zeros((32, 32), dtype=np.uint16)
         raw[8:11, 8:11] = 60000
         raw[20:23, 20:23] = 50000
         out = tracking_step(state, raw, now_t=0.0, tracking_enabled=False)
-        self.assertTrue(out.ok)
+        self.assertFalse(out.ok)
+        self.assertEqual(out.measurement_reason, "initializing")
 
         raw2 = np.zeros((32, 32), dtype=np.uint16)
         raw2[9:12, 9:12] = 60000
@@ -88,11 +108,13 @@ class CoreSmokeTests(unittest.TestCase):
         state.auto.ok = True
         state.auto.A_pinv = np.eye(2, dtype=np.float64)
         state.auto.b = np.zeros(2, dtype=np.float64)
+        tracking_set_params(state, sep_min_sources=1)
         raw = np.zeros((32, 32), dtype=np.uint16)
         objects = np.array([(10.0, 10.0, 1000.0)], dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
 
         with (
             patch("tracking.sep_detect_from_raw16", return_value=(None, None, objects, None)),
+            patch("tracking.estimate_shift_from_phase_alignment", return_value=(1.0, 0.0, 1.0)),
             patch("tracking.estimate_shift_from_profile_alignment", return_value=(1.0, 0.0, 1.0)),
             patch("tracking.auto_rls_update", return_value=None),
         ):
@@ -113,12 +135,14 @@ class CoreSmokeTests(unittest.TestCase):
             min_meas_dt_s=0.1,
             max_meas_v_px_s=1e6,
             lock_warmup_frames=1,
+            sep_min_sources=1,
         )
         raw = np.zeros((32, 32), dtype=np.uint16)
         objects = np.array([(10.0, 10.0, 1000.0)], dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
 
         with (
             patch("tracking.sep_detect_from_raw16", return_value=(None, None, objects, None)),
+            patch("tracking.estimate_shift_from_phase_alignment", return_value=(1.0, 0.0, 1.0)),
             patch("tracking.estimate_shift_from_profile_alignment", return_value=(1.0, 0.0, 1.0)),
             patch("tracking.auto_rls_update", return_value=None),
         ):
@@ -139,12 +163,24 @@ class CoreSmokeTests(unittest.TestCase):
             lock_drop_decay=0.5,
             fb_max_frac=1.0,
             resp_min=0.5,
+            sep_min_sources=1,
         )
         raw = np.zeros((32, 32), dtype=np.uint16)
         objects = np.array([(10.0, 10.0, 1000.0)], dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
 
         with (
             patch("tracking.sep_detect_from_raw16", return_value=(None, None, objects, None)),
+            patch(
+                "tracking.estimate_shift_from_phase_alignment",
+                side_effect=[
+                    (1.0, 0.0, 1.0),
+                    (1.0, 0.0, 1.0),
+                    (1.0, 0.0, 1.0),
+                    (1.0, 0.0, 1.0),
+                    (0.0, 0.0, 0.0),
+                    (0.0, 0.0, 0.0),
+                ],
+            ),
             patch(
                 "tracking.estimate_shift_from_profile_alignment",
                 side_effect=[
@@ -153,6 +189,7 @@ class CoreSmokeTests(unittest.TestCase):
                     (1.0, 0.0, 1.0),  # good
                     (1.0, 0.0, 1.0),  # good
                     (0.0, 0.0, 0.0),  # bad -> decay
+                    (0.0, 0.0, 0.0),  # keyframe recovery also rejects it
                 ],
             ),
             patch("tracking.auto_rls_update", return_value=None),
@@ -277,7 +314,7 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertEqual(mean.ndim, 3)
         self.assertEqual(mean.shape, (72, 120, 3))
 
-    def test_stacking_worker_process_smoke(self) -> None:
+    def test_stacking_worker_smoke(self) -> None:
         cfg = AppConfig()
         cfg.stacking.enabled_init = False
         cfg.stacking.batch_size = 2
@@ -306,6 +343,26 @@ class CoreSmokeTests(unittest.TestCase):
             self.assertEqual(mean.ndim, 2)
             self.assertEqual(mean.shape, (32, 32))
             self.assertEqual(wgt.shape, (32, 32))
+        finally:
+            worker.stop()
+            worker.shutdown()
+
+    def test_stacking_worker_reset_clears_pending_queue(self) -> None:
+        cfg = AppConfig()
+        cfg.stacking.enabled_init = False
+        cfg.stacking.batch_size = 2
+        cfg.stacking.max_queue = 8
+
+        worker = StackingWorker(cfg)
+        try:
+            raw = np.zeros((16, 16), dtype=np.uint16)
+            gen = worker._current_generation()
+            for i in range(5):
+                worker._q.put_nowait({"raw16": raw.copy(), "t": float(i), "gen": int(gen)})
+
+            self.assertGreater(worker._q.qsize(), 0)
+            worker.reset()
+            self.assertEqual(worker._q.qsize(), 0)
         finally:
             worker.stop()
             worker.shutdown()
@@ -373,6 +430,13 @@ class CoreSmokeTests(unittest.TestCase):
             err_deg = abs(self._wrap_deg_180(float(theta) - float(theta_ref)))
             self.assertLess(err_deg, 1.0)
 
+    def test_mount_kinematics_defaults_use_45_to_1_reduction(self) -> None:
+        kin = MountKinematics()
+        self.assertAlmostEqual(kin.gear_reduction(Axis.AZ), 45.0, places=9)
+        self.assertAlmostEqual(kin.gear_reduction(Axis.ALT), 45.0, places=9)
+        self.assertAlmostEqual(kin.steps_per_axis_rev(Axis.AZ), 200.0 * 64.0 * 45.0, places=6)
+        self.assertAlmostEqual(kin.steps_per_axis_rev(Axis.ALT), 200.0 * 64.0 * 45.0, places=6)
+
     def test_goto_model_smoke(self) -> None:
         kin = MountKinematics(
             motor_full_steps_per_rev=200,
@@ -388,7 +452,7 @@ class CoreSmokeTests(unittest.TestCase):
 
     def test_goto_model_manual_fit_reports_params_and_errors(self) -> None:
         model = GoToModel()
-        j_true = np.array([[0.0120, 0.0018], [0.0007, 0.0085]], dtype=np.float64)
+        j_true = np.array([[0.00068, 0.00002], [-0.000015, 0.00060]], dtype=np.float64)
         base_steps = np.array([5200.0, -2100.0], dtype=np.float64)
         base_az_alt = np.array([121.5, 38.25], dtype=np.float64)
         theta_true = 17.0
@@ -466,7 +530,7 @@ class CoreSmokeTests(unittest.TestCase):
 
         base_steps = np.array([1000.0, 500.0], dtype=np.float64)
         base_az_alt = np.array([220.0, 58.0], dtype=np.float64)
-        j_true_az_col = np.array([0.0012, -0.00005], dtype=np.float64)
+        j_true_az_col = np.array([0.00067, -0.00002], dtype=np.float64)
 
         for d_az in np.array([-600.0, -300.0, 0.0, 350.0, 700.0], dtype=np.float64):
             d_steps = np.array([d_az, 0.0], dtype=np.float64)  # no ALT excitation
@@ -481,6 +545,64 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertGreater(abs(float(np.linalg.det(model.J_deg_per_step))), 1e-12)
         self.assertAlmostEqual(model.J_deg_per_step[0, 1], j_before[0, 1], places=12)
         self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_before[1, 1], places=12)
+
+    def test_goto_model_manual_fit_cannot_invert_alt_axis(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        mechanical = model.mechanical_J()
+        bad_j = mechanical.copy()
+        bad_j[1, 1] *= -1.0
+        base_steps = np.array([2000.0, -1000.0], dtype=np.float64)
+        base_altaz = np.array([210.0, 45.0], dtype=np.float64)
+
+        deltas = np.array(
+            [
+                [-1200.0, -900.0],
+                [-700.0, 500.0],
+                [-200.0, -350.0],
+                [300.0, 400.0],
+                [850.0, -450.0],
+                [1300.0, 800.0],
+            ],
+            dtype=np.float64,
+        )
+        for dsteps in deltas:
+            model.steps_est = base_steps + dsteps
+            altaz = base_altaz + (bad_j @ dsteps)
+            model.add_manual_sample(altaz, theta_deg=0.0)
+
+        before = model.J_deg_per_step.copy()
+        self.assertFalse(model.fit_J_from_manual_samples(min_samples=5, ridge=1e-9))
+        np.testing.assert_allclose(model.J_deg_per_step, before, rtol=0.0, atol=0.0)
+        self.assertGreater(float(model.J_deg_per_step[1, 1]), 0.0)
+
+    def test_goto_model_manual_fit_rejects_moderate_plate_solve_outlier(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        mechanical = model.mechanical_J()
+        base_steps = np.array([3000.0, 1500.0], dtype=np.float64)
+        base_altaz = np.array([190.0, 50.0], dtype=np.float64)
+        deltas = np.array(
+            [
+                [-1500.0, -1000.0],
+                [-900.0, 600.0],
+                [-300.0, -450.0],
+                [100.0, 150.0],
+                [500.0, 700.0],
+                [1000.0, -600.0],
+                [1500.0, 1000.0],
+            ],
+            dtype=np.float64,
+        )
+        for i, dsteps in enumerate(deltas):
+            model.steps_est = base_steps + dsteps
+            altaz = base_altaz + (mechanical @ dsteps)
+            if i == 4:
+                altaz = altaz + np.array([35.0, -25.0], dtype=np.float64) / 3600.0
+            model.add_manual_sample(altaz, theta_deg=0.0)
+
+        self.assertTrue(model.fit_J_from_manual_samples(min_samples=5, ridge=1e-9))
+        self.assertLess(model.model_fit_samples, len(deltas))
 
     def test_goto_model_reset_manual_samples_and_sync(self) -> None:
         model = GoToModel()
@@ -531,7 +653,7 @@ class CoreSmokeTests(unittest.TestCase):
                 source_model.steps_est = np.array([1350.0, 1780.0], dtype=np.float64)
                 source_model.add_manual_sample(np.array([121.2, 44.7], dtype=np.float64), theta_deg=6.0)
 
-                J_restore = np.array([[0.00123, 0.00011], [-0.00007, 0.00101]], dtype=np.float64)
+                J_restore = np.array([[0.00067, 0.00002], [-0.000015, 0.00060]], dtype=np.float64)
                 R_restore = _rotvec_deg_to_rotation_matrix(np.array([0.3, -0.2, 0.7], dtype=np.float64))
 
                 source_model.J_deg_per_step = J_restore.copy()
@@ -611,6 +733,56 @@ class CoreSmokeTests(unittest.TestCase):
             else:
                 os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = prev_log_dir
 
+    def test_goto_model_restore_syncs_successful_fit_from_unsynced_samples(self) -> None:
+        prev_log_dir = os.environ.get("ASTROPANOPTES_GOTO_LOG_DIR")
+        try:
+            with tempfile.TemporaryDirectory() as tmpdir:
+                os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = tmpdir
+
+                source_model = GoToModel()
+                source_model.init_from_mechanics()
+                source_model.steps_est = np.array([100.0, 200.0], dtype=np.float64)
+                source_model.add_manual_sample(np.array([210.0, 15.0], dtype=np.float64))
+                source_model.steps_est = np.array([900.0, -400.0], dtype=np.float64)
+                source_model.add_manual_sample(np.array([210.5, 14.6], dtype=np.float64))
+                self.assertFalse(source_model.synced)
+
+                source_model.model_fit_samples = 2
+                source_model._log_fit_csv(
+                    fit_kind="manual",
+                    ok=True,
+                    reason="OK",
+                    min_samples=2,
+                    ridge=1e-12,
+                    total_samples=2,
+                    used_samples=2,
+                )
+
+                restored = GoToModel()
+                restored.init_from_mechanics()
+                out = restored.restore_from_latest_logs()
+
+                self.assertTrue(bool(out.get("ok", False)))
+                self.assertTrue(bool(out.get("synced_from_manual", False)))
+                self.assertTrue(restored.synced)
+                np.testing.assert_allclose(
+                    restored.ref_steps,
+                    np.array([900.0, -400.0], dtype=np.float64),
+                    rtol=0.0,
+                    atol=1e-12,
+                )
+                np.testing.assert_allclose(
+                    restored.predict_az_alt_deg(),
+                    np.array([210.5, 14.6], dtype=np.float64),
+                    rtol=0.0,
+                    atol=1e-9,
+                )
+        finally:
+            if prev_log_dir is None:
+                os.environ.pop("ASTROPANOPTES_GOTO_LOG_DIR", None)
+            else:
+                os.environ["ASTROPANOPTES_GOTO_LOG_DIR"] = prev_log_dir
+
     def test_goto_model_restore_last_log_uses_latest_manual_roll_when_no_fit(self) -> None:
         prev_log_dir = os.environ.get("ASTROPANOPTES_GOTO_LOG_DIR")
         try:
@@ -638,7 +810,7 @@ class CoreSmokeTests(unittest.TestCase):
     def test_goto_model_manual_fit_rejects_outlier_sample(self) -> None:
         model = GoToModel()
         model.init_from_mechanics()
-        j_true = np.array([[0.0013, 0.0004], [-0.0002, 0.0011]], dtype=np.float64)
+        j_true = np.array([[0.00068, 0.00003], [-0.000025, 0.00060]], dtype=np.float64)
         base_steps = np.array([4200.0, -1700.0], dtype=np.float64)
         base_az_alt = np.array([223.0, 58.5], dtype=np.float64)
         deltas = np.array(
@@ -663,7 +835,8 @@ class CoreSmokeTests(unittest.TestCase):
             if i == len(deltas) - 1:
                 az += 8.0
                 alt -= 5.0
-            model.add_manual_sample(np.array([az % 360.0, alt], dtype=np.float64), theta_deg=0.0)
+            roll = 105.0 if i == len(deltas) - 1 else 15.0
+            model.add_manual_sample(np.array([az % 360.0, alt], dtype=np.float64), theta_deg=roll)
 
         ok = model.fit_J_from_manual_samples(min_samples=5, ridge=1e-9)
         self.assertTrue(ok)
@@ -673,11 +846,13 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertAlmostEqual(model.J_deg_per_step[0, 1], j_true[0, 1], places=4)
         self.assertAlmostEqual(model.J_deg_per_step[1, 0], j_true[1, 0], places=4)
         self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_true[1, 1], places=4)
+        self.assertEqual(model.model_roll_samples, model.model_fit_samples)
+        self.assertAlmostEqual(model.model_roll_deg, 15.0, places=9)
 
     def test_goto_model_manual_fit_rejects_central_reference_outlier(self) -> None:
         model = GoToModel()
         model.init_from_mechanics()
-        j_true = np.array([[0.0012, 0.0003], [-0.0002, 0.0010]], dtype=np.float64)
+        j_true = np.array([[0.00068, 0.000025], [-0.00002, 0.00061]], dtype=np.float64)
         base_steps = np.array([0.0, 0.0], dtype=np.float64)
         base_az_alt = np.array([210.0, 40.0], dtype=np.float64)
         deltas = np.array(
@@ -720,7 +895,7 @@ class CoreSmokeTests(unittest.TestCase):
     def test_goto_model_calibration_fit_rejects_outlier_sample(self) -> None:
         model = GoToModel()
         model.init_from_mechanics()
-        j_true = np.array([[0.0011, 0.0003], [-0.0001, 0.0010]], dtype=np.float64)
+        j_true = np.array([[0.00068, 0.000025], [-0.00002, 0.00060]], dtype=np.float64)
         steps = np.array(
             [
                 [-900.0, -500.0],
@@ -773,6 +948,239 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertLess(abs(calls[1][4] - calls[0][4]), 0.01)
         self.assertGreater(elapsed, 0.01)
 
+    def test_goto_adaptive_slew_respects_safe_speed_floor(self) -> None:
+        ctrl = GoToController(cfg=GoToConfig(), model=GoToModel())
+
+        self.assertEqual(
+            ctrl._adaptive_slew_delay_us(
+                100.0,
+                1800,
+                min_delay_us=400,
+                full_speed_distance_deg=20.0,
+            ),
+            400,
+        )
+        self.assertEqual(
+            ctrl._adaptive_slew_delay_us(
+                0.0,
+                1800,
+                min_delay_us=400,
+                full_speed_distance_deg=20.0,
+            ),
+            1800,
+        )
+
+    def test_loaded_firmware_slew_profile_accelerates_and_brakes_symmetrically(self) -> None:
+        total = 6000
+        periods = [
+            firmware_move_period_us(400, total, remaining)
+            for remaining in range(total, 0, -1)
+        ]
+
+        # Longer period means lower instantaneous speed.  The loaded firmware
+        # starts slowly, reaches the selected maximum speed, and brakes to the
+        # same cadence at the end.
+        self.assertEqual(periods[0], 2500)
+        self.assertEqual(min(periods), 403)
+        self.assertEqual(periods[-1], 2500)
+        self.assertTrue(all(a >= b for a, b in zip(periods[:3000], periods[1:3001])))
+        self.assertTrue(all(a <= b for a, b in zip(periods[-3001:-1], periods[-3000:])))
+
+        short = [
+            firmware_move_period_us(400, 200, remaining)
+            for remaining in range(200, 0, -1)
+        ]
+        self.assertGreater(min(short), 1200)
+        self.assertEqual(short[0], short[-1])
+
+    def test_goto_blocking_executes_one_model_move_without_platesolving(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        model.synced = True
+        model.ref_steps = np.zeros(2, dtype=np.float64)
+        model.ref_az_alt_deg = np.array([100.0, 30.0], dtype=np.float64)
+        ctrl = GoToController(
+            cfg=GoToConfig(
+                alt_min_deg=0.0,
+                alt_max_deg=90.0,
+                tol_arcsec=0.01,
+                max_iters=1,
+                gain=1.0,
+                max_step_per_iter=0,
+                slew_delay_us_az=1,
+                slew_delay_us_alt=1,
+                settle_s=0.0,
+                max_unfitted_goto_deg=0.0,
+                max_goto_distance_deg=0.0,
+            ),
+            model=model,
+        )
+        moves: list[tuple[Axis, int, int]] = []
+
+        with (
+            patch("goto.resolve_target_icrs", return_value=object()),
+            patch(
+                "goto.icrs_to_altaz_deg",
+                return_value=np.array([108.0, 38.0], dtype=np.float64),
+            ),
+            patch.object(
+                ctrl,
+                "_platesolving_live",
+                side_effect=AssertionError("GoTo must not plate-solve"),
+            ),
+        ):
+            status = ctrl.goto_blocking(
+                "target",
+                get_live_frame=lambda: None,
+                platesolving_cfg=AppConfig().platesolving,
+                move_steps=lambda axis, direction, steps, delay_us: moves.append(
+                    (axis, int(direction), int(steps))
+                ),
+                stages=6,
+                platesolving_feedback=True,
+            )
+
+        self.assertTrue(status.ok)
+        self.assertEqual(status.status, "OK")
+        self.assertEqual(status.iters, 1)
+        self.assertEqual(len(moves), 2)
+        np.testing.assert_allclose(model.steps_est, [12800.0, 12800.0])
+
+    def test_goto_rejects_large_move_before_model_fit(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        model.synced = True
+        model.ref_az_alt_deg = np.array([100.0, 30.0], dtype=np.float64)
+        ctrl = GoToController(
+            cfg=GoToConfig(
+                alt_min_deg=0.0,
+                alt_max_deg=90.0,
+                max_unfitted_goto_deg=3.0,
+                max_goto_distance_deg=10.0,
+            ),
+            model=model,
+        )
+        moves = []
+        with (
+            patch("goto.resolve_target_icrs", return_value=object()),
+            patch(
+                "goto.icrs_to_altaz_deg",
+                return_value=np.array([108.0, 30.0], dtype=np.float64),
+            ),
+        ):
+            status = ctrl.goto_blocking(
+                "target",
+                get_live_frame=lambda: None,
+                platesolving_cfg=AppConfig().platesolving,
+                move_steps=lambda *args: moves.append(args),
+            )
+
+        self.assertFalse(status.ok)
+        self.assertEqual(status.status, "ERR_MODEL_NOT_FITTED_FOR_DISTANCE")
+        self.assertEqual(moves, [])
+
+    def test_goto_rejects_route_beyond_absolute_distance_limit(self) -> None:
+        model = GoToModel()
+        model.init_from_mechanics()
+        model.synced = True
+        model.model_fit_samples = 4
+        model.ref_az_alt_deg = np.array([100.0, 30.0], dtype=np.float64)
+        ctrl = GoToController(
+            cfg=GoToConfig(
+                alt_min_deg=0.0,
+                alt_max_deg=90.0,
+                max_unfitted_goto_deg=3.0,
+                max_goto_distance_deg=10.0,
+            ),
+            model=model,
+        )
+        with (
+            patch("goto.resolve_target_icrs", return_value=object()),
+            patch(
+                "goto.icrs_to_altaz_deg",
+                return_value=np.array([112.0, 30.0], dtype=np.float64),
+            ),
+        ):
+            status = ctrl.goto_blocking(
+                "target",
+                get_live_frame=lambda: None,
+                platesolving_cfg=AppConfig().platesolving,
+                move_steps=lambda *args: self.fail("unsafe move dispatched"),
+            )
+
+        self.assertFalse(status.ok)
+        self.assertEqual(status.status, "ERR_GOTO_DISTANCE_LIMIT")
+
+    def test_goto_worker_forces_single_model_only_move(self) -> None:
+        cfg = AppConfig()
+        controller = GoToController(cfg=GoToConfig(), model=GoToModel())
+        captured: dict[str, object] = {}
+
+        def _goto_blocking(target, **kwargs):
+            captured["target"] = target
+            captured.update(kwargs)
+            return GoToStatus(ok=True, status="OK", iters=2)
+
+        controller.goto_blocking = _goto_blocking
+        worker = GoToWorker(
+            goto_controller=controller,
+            get_state=lambda: SimpleNamespace(),
+            publish_state=lambda patch: None,
+            get_frame=lambda: None,
+            get_goto_cfg=lambda: cfg.goto,
+            get_mount_cfg=lambda: cfg.mount,
+            get_sep_cfg=lambda: cfg.sep,
+            get_camera_cfg=lambda: cfg.camera,
+            get_platesolving_cfg=lambda: cfg.platesolving,
+            get_observer=lambda: ObserverConfig(),
+            apply_camera_param=lambda name, value: None,
+            pause_tracking=lambda: False,
+            resume_tracking=lambda: None,
+            pause_stacking=lambda: False,
+            resume_stacking=lambda: None,
+            rate_mount=lambda az, alt: None,
+            move_steps=lambda axis, direction, steps, delay_us: None,
+            stop_mount=lambda: None,
+        )
+
+        worker._handle_request(
+            {
+                "kind": "goto",
+                "target": "M42",
+                "params": {"stages": 4, "platesolving_feedback": True},
+            }
+        )
+
+        self.assertEqual(captured["target"], "M42")
+        self.assertEqual(int(captured["stages"]), 1)
+        self.assertFalse(bool(captured["platesolving_feedback"]))
+        self.assertEqual(controller.cfg.max_iters, 1)
+        self.assertEqual(controller.cfg.stages, 1)
+        self.assertFalse(controller.cfg.platesolving_feedback)
+        self.assertEqual(
+            controller.cfg.max_step_per_iter,
+            cfg.goto.max_step_per_iter,
+        )
+
+    def test_goto_target_resolution_failure_returns_status(self) -> None:
+        model = GoToModel()
+        model.synced = True
+        ctrl = GoToController(cfg=GoToConfig(), model=model)
+
+        with patch("goto.resolve_target_icrs", side_effect=ValueError("unknown target")):
+            status = ctrl.goto_blocking(
+                "Arturo",
+                get_live_frame=lambda: None,
+                platesolving_cfg=AppConfig().platesolving,
+                move_steps=lambda axis, direction, steps, delay_us: None,
+                stages=3,
+                platesolving_feedback=False,
+            )
+
+        self.assertFalse(status.ok)
+        self.assertEqual(status.status, "ERR_TARGET_RESOLVE")
+        self.assertEqual(status.iters, 0)
+
     def test_mount_manual_move_worker_uses_blocking_move(self) -> None:
         class _FakeMount:
             def __init__(self) -> None:
@@ -813,12 +1221,58 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertFalse(bool(call.get("stop_before_move")))
         self.assertEqual(noted, [(Axis.AZ, +1, 20000)])
 
+    def test_mount_manual_move_worker_takes_up_backlash_without_counting_it(self) -> None:
+        class _FakeMount:
+            def __init__(self) -> None:
+                self.calls = []
+
+            def is_connected(self) -> bool:
+                return True
+
+            def move_steps(self, **kwargs):
+                self.calls.append(dict(kwargs))
+                return "OK"
+
+        fake_mount = _FakeMount()
+        noted = []
+        directions = {Axis.ALT: +1}
+        worker = MountMoveWorker(
+            get_mount=lambda: fake_mount,
+            note_manual_move=lambda axis, direction, steps: noted.append(
+                (axis, direction, steps)
+            ),
+            get_last_direction=lambda axis: directions.get(axis, 0),
+            set_last_direction=lambda axis, direction: directions.__setitem__(
+                axis, direction
+            ),
+            get_backlash_steps=lambda axis: 10 if axis == Axis.ALT else 0,
+            publish_state=lambda _patch: None,
+            out_log=None,
+        )
+
+        worker._handle_request(
+            {
+                "axis": Axis.ALT,
+                "direction": -1,
+                "steps": 25,
+                "delay_us": 1800,
+            }
+        )
+
+        self.assertEqual([int(call["steps"]) for call in fake_mount.calls], [10, 25])
+        self.assertEqual(noted, [(Axis.ALT, -1, 25)])
+        self.assertEqual(directions[Axis.ALT], -1)
+
     def test_goto_model_manual_fit_rotation_tilt_is_limited(self) -> None:
         model = GoToModel()
         model.init_from_mechanics()
         model.max_tilt_ns_oe_deg = 2.0
 
-        j_true = np.array([[0.0011, 0.0002], [-0.0001, 0.0010]], dtype=np.float64)
+        j_true = model.mechanical_J().copy()
+        j_true[0, 0] *= 1.04
+        j_true[1, 1] *= 0.97
+        j_true[0, 1] = 0.02 * j_true[1, 1]
+        j_true[1, 0] = -0.02 * j_true[0, 0]
         base_steps = np.array([2400.0, -800.0], dtype=np.float64)
         base_mount = np.array([170.0, 42.0], dtype=np.float64)
         # Intentionally above tilt limits; fit must clamp x/y to +/-2 deg.
@@ -844,8 +1298,10 @@ class CoreSmokeTests(unittest.TestCase):
             world = _rotate_altaz_deg(np.array([az_mount, alt_mount], dtype=np.float64), r_true)
             model.add_manual_sample(world, theta_deg=0.0)
 
+        before_j = model.J_deg_per_step.copy()
         ok = model.fit_J_from_manual_samples(min_samples=5, ridge=1e-9)
-        self.assertTrue(ok)
+        self.assertFalse(ok)
+        np.testing.assert_allclose(model.J_deg_per_step, before_j, rtol=0.0, atol=0.0)
         self.assertLessEqual(abs(float(model.model_pitch_deg)), 2.000001)
         self.assertLessEqual(abs(float(model.model_yaw_deg)), 2.000001)
 
@@ -972,6 +1428,92 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertGreaterEqual(len(rate_calls), 2)
         self.assertTrue(all(abs(float(az)) > 0.0 for az, _ in rate_calls))
         self.assertTrue(all(abs(float(alt)) <= 1e-9 for _, alt in rate_calls))
+
+    def test_goto_roll_estimate_accounts_emitted_rate_steps(self) -> None:
+        cfg = AppConfig()
+        state = SimpleNamespace(
+            camera=SimpleNamespace(connected=True, roll_deg=0.0),
+            mount=SimpleNamespace(connected=True),
+        )
+        controller = GoToController(cfg=GoToConfig(), model=GoToModel())
+        applied_camera_params = []
+        published_patches = []
+
+        def _rate_mount(az: float, alt: float) -> tuple[int, int]:
+            if abs(float(az)) > 1e-9:
+                return (-4 if az < 0.0 else 4), 0
+            return 0, 0
+
+        worker = GoToWorker(
+            goto_controller=controller,
+            get_state=lambda: state,
+            publish_state=lambda patch: published_patches.append(patch),
+            get_frame=lambda: None,
+            get_goto_cfg=lambda: cfg.goto,
+            get_mount_cfg=lambda: cfg.mount,
+            get_sep_cfg=lambda: cfg.sep,
+            get_camera_cfg=lambda: cfg.camera,
+            get_platesolving_cfg=lambda: cfg.platesolving,
+            get_observer=lambda: ObserverConfig(),
+            apply_camera_param=lambda name, value: applied_camera_params.append((name, float(value))),
+            pause_tracking=lambda: False,
+            resume_tracking=lambda: None,
+            pause_stacking=lambda: False,
+            resume_stacking=lambda: None,
+            rate_mount=_rate_mount,
+            move_steps=lambda axis, direction, steps, delay_us: None,
+            stop_mount=lambda: None,
+        )
+        frame = _AutocalFrame(
+            raw16=np.zeros((8, 8), dtype=np.uint16),
+            t_capture=0.0,
+            t_wall=time.time(),
+            t_mono=0.0,
+            obj_xy=np.array([[4.0, 4.0]], dtype=np.float64),
+            star_count=1,
+            saturation_frac=0.0,
+            top_sources=(),
+        )
+        worker._autocal_capture_frames = lambda **kwargs: [frame, frame]
+
+        drift_results = [
+            {
+                "vx_mean": -1.0,
+                "vy_mean": 0.0,
+                "vx_std": 0.0,
+                "vy_std": 0.0,
+            },
+            {
+                "vx_mean": 2.0,
+                "vy_mean": 0.0,
+                "vx_std": 0.0,
+                "vy_std": 0.0,
+            },
+        ]
+        with patch("goto.estimate_sensor_drift_from_stack", side_effect=drift_results):
+            out = worker._goto_estimate_roll_blocking(
+                {
+                    "roll_frames": 2,
+                    "roll_window": 1,
+                    "roll_rate_attempts": 1,
+                    "roll_ramp_s": 0.0,
+                    "roll_settle_s": 0.0,
+                }
+            )
+
+        self.assertTrue(out["ok"])
+        np.testing.assert_allclose(controller.model.steps_est, [-4.0, 0.0])
+        self.assertEqual(len(applied_camera_params), 1)
+        self.assertEqual(applied_camera_params[0][0], "roll_deg")
+        self.assertAlmostEqual(applied_camera_params[0][1], float(out["roll_deg"]), places=9)
+        self.assertEqual(controller.model.model_roll_samples, 1)
+        self.assertAlmostEqual(controller.model.model_roll_deg, float(out["roll_deg"]), places=9)
+        self.assertTrue(
+            any(
+                "model_camera_roll_deg" in dict(patch.get("goto", {}))
+                for patch in published_patches
+            )
+        )
 
 
 if __name__ == "__main__":

@@ -1,12 +1,10 @@
 # stacking.py
 from __future__ import annotations
 
-import multiprocessing as mp
-import os
 import queue
 import threading
 import time
-from dataclasses import asdict, dataclass, field
+from dataclasses import dataclass, field
 from typing import Any, Dict, List, Literal, Optional
 
 import cv2
@@ -16,6 +14,7 @@ from config import AppConfig
 from imaging import ensure_raw16_bayer
 from logging_utils import log_error
 from preview import stretch_to_u8
+from workers import BaseWorker
 
 # ============================================================
 # Types
@@ -674,358 +673,120 @@ class StackEngine:
                 self._preview_jpeg = jpg.tobytes() if ok else None
 
 
+# Worker thread wrapper
 # ============================================================
-# Process-backed worker (drizzle/stacking isolated from control loop)
-# ============================================================
 
-def _coerce_int(v: Any, default: int) -> int:
-    try:
-        return int(v)
-    except Exception:
-        return int(default)
+class StackingWorker(BaseWorker):
+    """
+    Thread-backed worker with a short "latest wins" backlog.
 
+    We intentionally keep only a small queue so the stack never keeps chewing
+    through old frames after a reset/target change.
+    """
 
-def _put_latest(q_obj: Any, payload: Dict[str, Any]) -> None:
-    try:
-        q_obj.put_nowait(payload)
-        return
-    except queue.Full:
-        pass
-    except Exception:
-        return
-
-    try:
-        while True:
-            q_obj.get_nowait()
-    except queue.Empty:
-        pass
-    except Exception:
-        pass
-
-    try:
-        q_obj.put_nowait(payload)
-    except Exception:
-        pass
-
-
-def _serialize_metrics(m: StackingMetrics) -> Dict[str, Any]:
-    return asdict(m)
-
-
-def _best_effort_pin_single_core() -> None:
-    # Best effort: on Linux we pin this process to one core to reduce contention.
-    try:
-        if not (hasattr(os, "sched_setaffinity") and hasattr(os, "sched_getaffinity")):
-            return
-        avail = sorted(int(x) for x in os.sched_getaffinity(0))  # type: ignore[attr-defined]
-        if not avail:
-            return
-        env = os.environ.get("ASTROPANOPTES_STACKING_CORE", "").strip()
-        if env:
-            core_req = _coerce_int(env, avail[-1])
-            core = avail[core_req % len(avail)]
-        else:
-            core = avail[-1]
-        os.sched_setaffinity(0, {int(core)})  # type: ignore[attr-defined]
-    except Exception:
-        return
-
-
-def _drain_frames(frame_q: Any, batch_size: int) -> List[Dict[str, Any]]:
-    batch: List[Dict[str, Any]] = []
-    try:
-        batch.append(frame_q.get(timeout=0.02))
-    except queue.Empty:
-        return batch
-    except Exception:
-        return batch
-
-    for _ in range(max(0, int(batch_size) - 1)):
-        try:
-            batch.append(frame_q.get_nowait())
-        except queue.Empty:
-            break
-        except Exception:
-            break
-    return batch
-
-
-def _stacking_process_main(
-    cfg: AppConfig,
-    frame_q: Any,
-    cmd_q: Any,
-    state_q: Any,
-    resp_q: Any,
-) -> None:
-    try:
-        cv2.setNumThreads(1)
-    except Exception:
-        pass
-    _best_effort_pin_single_core()
-
-    engine = StackEngine(cfg)
-    engine.configure_from_cfg()
-
-    def _push_state() -> None:
-        _put_latest(
-            state_q,
-            {
-                "metrics": _serialize_metrics(engine.metrics),
-                "preview_jpeg": engine.get_preview_jpeg(),
-            },
-        )
-
-    _push_state()
-    running = True
-
-    while running:
-        while True:
-            try:
-                cmd = cmd_q.get_nowait()
-            except queue.Empty:
-                break
-            except Exception:
-                cmd = None
-            if not isinstance(cmd, dict):
-                continue
-
-            op = str(cmd.get("op", "")).lower()
-            if op == "shutdown":
-                running = False
-                break
-
-            if op == "start":
-                engine.start()
-                _push_state()
-                continue
-            if op == "stop":
-                engine.stop()
-                _push_state()
-                continue
-            if op == "reset":
-                engine.reset()
-                _push_state()
-                continue
-            if op == "set_params":
-                params = cmd.get("params", {})
-                if isinstance(params, dict) and params:
-                    engine.set_params(**params)
-                    _push_state()
-                continue
-            if op == "sync_cfg":
-                cfg_payload = cmd.get("stacking_cfg", {})
-                if isinstance(cfg_payload, dict):
-                    for k, v in cfg_payload.items():
-                        if not hasattr(cfg.stacking, k):
-                            continue
-                        if k == "drizzle_scale":
-                            v = _normalize_drizzle_scale(v)
-                        setattr(cfg.stacking, k, v)
-                    engine.configure_from_cfg()
-                    _push_state()
-                continue
-            if op == "snapshot":
-                req_id = cmd.get("req_id")
-                mean, wgt = engine.get_stack_snapshot(mean_dtype=np.float32, wgt_dtype=np.float32)
-                _put_latest(resp_q, {"req_id": req_id, "mean": mean, "wgt": wgt})
-                continue
-
-        if not running:
-            break
-
-        if not bool(engine.enabled):
-            time.sleep(0.01)
-            continue
-
-        batch = _drain_frames(frame_q, batch_size=max(1, int(cfg.stacking.batch_size)))
-        if not batch:
-            continue
-
-        engine.step_batch(batch)
-        _push_state()
-
-
-class StackingWorker:
     def __init__(self, cfg: AppConfig):
+        super().__init__(name="StackingWorker")
         self.cfg = cfg
-        self.metrics = StackingMetrics()
+        self.engine = StackEngine(cfg)
+        self.engine.configure_from_cfg()
+        self.metrics = self.engine.metrics
 
-        self._state_lock = threading.RLock()
-        self._rpc_lock = threading.Lock()
-        self._lifecycle_lock = threading.Lock()
-        self._state_stop = threading.Event()
+        self._q: "queue.Queue[Dict[str, Any]]" = queue.Queue(maxsize=max(1, int(cfg.stacking.max_queue)))
+        self._queue_lock = threading.Lock()
+        self._gen_lock = threading.Lock()
+        self._generation = 0
+        self._max_backlog = self._compute_backlog_limit()
 
-        self._preview_jpeg: Optional[bytes] = None
-        self._enabled = False
-        self._dropped_local = 0
-        self._rpc_seq = 0
-
-        self._ctx = mp.get_context("spawn")
-        self._frame_q = self._ctx.Queue(maxsize=max(1, int(getattr(cfg.stacking, "max_queue", 80))))
-        self._cmd_q = self._ctx.Queue(maxsize=64)
-        self._state_q = self._ctx.Queue(maxsize=4)
-        self._resp_q = self._ctx.Queue(maxsize=4)
-
-        self._proc: Optional[mp.Process] = None
-        self._state_thr: Optional[threading.Thread] = None
-
-        self._ensure_backend()
-        self.configure_from_cfg()
         if bool(cfg.stacking.enabled_init):
             self.start()
 
-    def _ensure_backend(self) -> None:
-        with self._lifecycle_lock:
-            if self._proc is not None and self._proc.is_alive():
-                return
-            self._state_stop.clear()
-            self._proc = self._ctx.Process(
-                target=_stacking_process_main,
-                args=(self.cfg, self._frame_q, self._cmd_q, self._state_q, self._resp_q),
-                name="StackingProcess",
-                daemon=True,
-            )
-            self._proc.start()
+    def _compute_backlog_limit(self) -> int:
+        batch_size = max(1, int(getattr(self.cfg.stacking, "batch_size", 1)))
+        max_queue = max(1, int(getattr(self.cfg.stacking, "max_queue", batch_size)))
+        # One batch is enough; more than that only adds latency and stale frames.
+        return max(1, min(max_queue, batch_size))
 
-            self._state_thr = threading.Thread(
-                target=self._state_pump,
-                name="StackingStatePump",
-                daemon=True,
-            )
-            self._state_thr.start()
+    def _current_generation(self) -> int:
+        with self._gen_lock:
+            return int(self._generation)
 
-    def _state_pump(self) -> None:
-        while not self._state_stop.is_set():
+    def _bump_generation(self) -> int:
+        with self._gen_lock:
+            self._generation += 1
+            return int(self._generation)
+
+    def _flush_queue_locked(self) -> int:
+        dropped = 0
+        while True:
             try:
-                msg = self._state_q.get(timeout=0.2)
+                self._q.get_nowait()
+                dropped += 1
             except queue.Empty:
-                continue
-            except Exception:
-                if self._state_stop.is_set():
-                    break
-                continue
+                break
+        return dropped
 
-            if not isinstance(msg, dict):
-                continue
-            metrics_payload = msg.get("metrics", {})
-            preview = msg.get("preview_jpeg", None)
+    def _flush_queue(self) -> int:
+        with self._queue_lock:
+            dropped = self._flush_queue_locked()
+        if dropped > 0:
+            self.metrics.frames_dropped += int(dropped)
+        return int(dropped)
 
-            if isinstance(metrics_payload, dict):
-                with self._state_lock:
-                    for k, v in metrics_payload.items():
-                        if hasattr(self.metrics, k):
-                            setattr(self.metrics, k, v)
-                    remote_drop = _coerce_int(metrics_payload.get("frames_dropped", 0), 0)
-                    self.metrics.frames_dropped = int(remote_drop + self._dropped_local)
-            with self._state_lock:
-                self._preview_jpeg = preview if (preview is None or isinstance(preview, bytes)) else None
-
-    def _send_cmd(self, payload: Dict[str, Any], *, timeout_s: float = 0.2) -> None:
-        self._ensure_backend()
-        try:
-            self._cmd_q.put(payload, timeout=max(0.01, float(timeout_s)))
-        except queue.Full:
-            try:
-                self._cmd_q.get_nowait()
-            except Exception:
-                pass
-            try:
-                self._cmd_q.put_nowait(payload)
-            except Exception:
-                pass
-
-    def _rpc_snapshot(self, *, timeout_s: float = 6.0) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        self._ensure_backend()
-        with self._rpc_lock:
-            self._rpc_seq += 1
-            req_id = int(self._rpc_seq)
-            try:
-                self._cmd_q.put({"op": "snapshot", "req_id": req_id}, timeout=0.5)
-            except Exception:
-                return None, None
-
-            deadline = time.monotonic() + max(0.1, float(timeout_s))
-            while time.monotonic() < deadline:
-                rem = deadline - time.monotonic()
-                if rem <= 0.0:
-                    break
+    def _trim_backlog(self) -> None:
+        dropped = 0
+        with self._queue_lock:
+            while self._q.qsize() >= self._max_backlog:
                 try:
-                    out = self._resp_q.get(timeout=min(0.2, rem))
+                    self._q.get_nowait()
+                    dropped += 1
                 except queue.Empty:
-                    continue
-                except Exception:
                     break
-                if not isinstance(out, dict):
-                    continue
-                if int(out.get("req_id", -1)) != req_id:
-                    continue
-                mean = out.get("mean")
-                wgt = out.get("wgt")
-                return mean, wgt
-        return None, None
+        if dropped > 0:
+            self.metrics.frames_dropped += int(dropped)
+
+    def _reconfigure(self, fn: Any) -> None:
+        self._bump_generation()
+        was_enabled = bool(self.engine.enabled)
+        self.engine.stop()
+        self._flush_queue()
+        fn()
+        self._max_backlog = self._compute_backlog_limit()
+        if was_enabled:
+            self.engine.start()
 
     def configure_from_cfg(self) -> None:
-        cfg_payload = asdict(self.cfg.stacking)
-        if "drizzle_scale" in cfg_payload:
-            cfg_payload["drizzle_scale"] = _normalize_drizzle_scale(cfg_payload["drizzle_scale"])
-        self._send_cmd({"op": "sync_cfg", "stacking_cfg": cfg_payload}, timeout_s=0.5)
+        self._reconfigure(self.engine.configure_from_cfg)
 
     def start(self) -> None:
-        self._enabled = True
-        with self._state_lock:
-            self.metrics.enabled = True
-        self._send_cmd({"op": "start"})
+        self._flush_queue()
+        self.engine.start()
+        super().start()
+
+    def _wake_worker(self) -> None:
+        with self._lock:
+            self._pending = {"op": "process"}
+        BaseWorker.start(self)
 
     def stop(self) -> None:
-        self._enabled = False
-        with self._state_lock:
-            self.metrics.enabled = False
-        self._send_cmd({"op": "stop"})
+        self._bump_generation()
+        self.engine.stop()
+        self._flush_queue()
+        super().stop()
+        self.join(timeout=1.0)
 
     def shutdown(self) -> None:
-        with self._lifecycle_lock:
-            self._enabled = False
-            self._state_stop.set()
-            proc = self._proc
-            state_thr = self._state_thr
-
-            if proc is not None and proc.is_alive():
-                try:
-                    self._cmd_q.put_nowait({"op": "shutdown"})
-                except Exception:
-                    pass
-                proc.join(timeout=1.5)
-                if proc.is_alive():
-                    proc.terminate()
-                    proc.join(timeout=1.0)
-
-            if state_thr is not None and state_thr.is_alive():
-                state_thr.join(timeout=0.5)
-
-            self._proc = None
-            self._state_thr = None
+        self.stop()
 
     def reset(self) -> None:
-        self._dropped_local = 0
-        with self._state_lock:
-            self.metrics.frames_dropped = 0
-        self._send_cmd({"op": "reset"})
+        self._reconfigure(self.engine.reset)
 
     def set_params(self, **kwargs: Any) -> None:
-        applied: Dict[str, Any] = {}
-        for k, v in kwargs.items():
-            if not hasattr(self.cfg.stacking, k):
-                continue
-            if k == "drizzle_scale":
-                v = _normalize_drizzle_scale(v)
-            setattr(self.cfg.stacking, k, v)
-            applied[k] = v
-        if applied:
-            self._send_cmd({"op": "set_params", "params": applied}, timeout_s=0.5)
+        if not kwargs:
+            return
+        self._reconfigure(lambda: self.engine.set_params(**kwargs))
 
     def get_preview_jpeg(self) -> Optional[bytes]:
-        with self._state_lock:
-            return self._preview_jpeg
+        return self.engine.get_preview_jpeg()
 
     def get_stack_snapshot(
         self,
@@ -1033,41 +794,56 @@ class StackingWorker:
         mean_dtype: Optional[np.dtype] = np.float32,
         wgt_dtype: Optional[np.dtype] = np.float32,
     ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
-        mean, wgt = self._rpc_snapshot(timeout_s=6.0)
-        if mean is None:
-            return None, None
-
-        if mean_dtype is None:
-            out_mean = mean
-        elif mean_dtype == np.uint16:
-            out_mean = mean.astype(np.uint16, copy=False)
-        else:
-            out_mean = mean.astype(mean_dtype, copy=False)
-
-        if wgt is None:
-            out_wgt = None
-        elif wgt_dtype is None:
-            out_wgt = wgt
-        else:
-            out_wgt = wgt.astype(wgt_dtype, copy=False)
-
-        return out_mean, out_wgt
+        return self.engine.get_stack_snapshot(mean_dtype=mean_dtype, wgt_dtype=wgt_dtype)
 
     def enqueue_frame(self, raw16: np.ndarray, t: Optional[float] = None) -> None:
-        if not self._enabled:
+        if not self.engine.enabled:
             return
-        self._ensure_backend()
-        item = {"raw16": raw16, "t": float(time.time() if t is None else t)}
+        gen = self._current_generation()
+        self._trim_backlog()
+        item = {"raw16": raw16, "t": float(time.time() if t is None else t), "gen": int(gen)}
         try:
-            self._frame_q.put_nowait(item)
+            self._q.put_nowait(item)
         except queue.Full:
-            self._dropped_local += 1
-            with self._state_lock:
-                self.metrics.frames_dropped = int(self.metrics.frames_dropped) + 1
+            # Drop the oldest frame and keep the newest one.
+            dropped = 0
+            with self._queue_lock:
+                try:
+                    self._q.get_nowait()
+                    dropped = 1
+                except queue.Empty:
+                    dropped = 0
+                try:
+                    self._q.put_nowait(item)
+                except queue.Full:
+                    dropped += 1
+            if dropped > 0:
+                self.metrics.frames_dropped += int(dropped)
             return
+        self._wake_worker()
 
-    def __del__(self) -> None:
-        try:
-            self.shutdown()
-        except Exception:
-            pass
+    def _handle_request(self, request: Dict[str, Any]) -> None:
+        _ = request
+        batch_size = max(1, int(self.cfg.stacking.batch_size))
+        while not self._cancel.is_set():
+            batch: List[Dict[str, Any]] = []
+            try:
+                batch.append(self._q.get_nowait())
+            except queue.Empty:
+                break
+
+            for _ in range(batch_size - 1):
+                try:
+                    batch.append(self._q.get_nowait())
+                except queue.Empty:
+                    break
+
+            cur_gen = self._current_generation()
+            fresh_batch = [item for item in batch if int(item.get("gen", cur_gen)) == cur_gen]
+            dropped = len(batch) - len(fresh_batch)
+            if dropped > 0:
+                self.metrics.frames_dropped += int(dropped)
+            if not fresh_batch:
+                continue
+
+            self.engine.step_batch(fresh_batch)

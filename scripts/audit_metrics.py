@@ -19,11 +19,10 @@ def iter_py_files(root: Path) -> list[Path]:
 
 
 def count_patterns(text: str) -> dict[str, int]:
-    except_pass_inline = len(re.findall(r"except Exception:\s*pass\b", text))
-    except_pass_multiline = len(re.findall(r"except Exception:\s*\n\s*pass\b", text))
+    except_exception_pass = len(re.findall(r"except Exception:[^\S\n]*(?:\n[^\S\n]*)?pass\b", text))
     bare_except = len(re.findall(r"^\s*except:\b", text, flags=re.MULTILINE))
     return {
-        "except_exception_pass": except_pass_inline + except_pass_multiline,
+        "except_exception_pass": except_exception_pass,
         "bare_except": bare_except,
     }
 

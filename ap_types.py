@@ -82,6 +82,8 @@ class Frame:
     Frame lógico del sistema.
 
     - raw: frame full-res (uint16 Bayer) para todo el pipeline geométrico
+    - t_capture: timestamp monotónico (`time.perf_counter`) para deltas/control
+    - meta["t_wall"]: timestamp Unix (`time.time`) para nombres, logs y astrometría
     - u8_view: vista opcional para preview
     - meta: metadatos varios (seq, exp_ms, gain, binning, roi, etc.)
     """
@@ -135,6 +137,14 @@ class TrackingState:
     calib_src: str = "none"
     calib_det: float = 0.0
     n_det: int = 0
+    measurement_valid: bool = False
+    measurement_reason: str = "off"
+    measurement_source: str = "none"
+    error_x_px: float = 0.0
+    error_y_px: float = 0.0
+    error_px: float = 0.0
+    lock_conf: float = 0.0
+    fail_count: int = 0
     calib_ms_az: int = 0
     calib_ms_alt: int = 0
     bootstrap_active: bool = False
@@ -188,6 +198,7 @@ class PlatesolvingState:
 class GotoState:
     status: GotoStatus = GotoStatus.IDLE
     reason: Optional[str] = None
+    diagnostics_dir: Optional[str] = None
     busy: bool = False
     synced: bool = False
     pointing_valid: bool = False
@@ -197,6 +208,11 @@ class GotoState:
     pointing_dec_deg: float = 0.0
     last_error_arcsec: float = 0.0
     manual_samples: int = 0
+    sample_last_ok: bool = False
+    sample_last_reason: Optional[str] = None
+    sample_last_az_deg: float = 0.0
+    sample_last_alt_deg: float = 0.0
+    sample_last_roll_deg: float = 0.0
     J00: float = 0.0
     J01: float = 0.0
     J10: float = 0.0
@@ -218,6 +234,17 @@ class GotoState:
     model_fit_rms_az_deg: float = 0.0
     model_fit_rms_alt_deg: float = 0.0
     model_fit_rms_arcsec: float = 0.0
+    periodic_error_az_deg: float = 0.0
+    periodic_error_alt_deg: float = 0.0
+    periodic_model_samples: int = 0
+    last_direction_az: int = 0
+    last_direction_alt: int = 0
+    backlash_steps_az: int = 0
+    backlash_steps_alt: int = 0
+    expected_stars_overlay_enabled: bool = False
+    expected_stars_overlay_count: int = 0
+    expected_stars_overlay_source: str = ""
+    expected_stars_overlay_reason: Optional[str] = None
     autocal_status: GotoAutocalStatus = GotoAutocalStatus.IDLE
     autocal_reason: Optional[str] = None
     autocal_last_ok: bool = False

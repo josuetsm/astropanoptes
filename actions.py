@@ -51,6 +51,7 @@ class ActionType(str, Enum):
     # platesolving (OBLIGATORIO)
     PLATESOLVING_RUN = "PLATESOLVING_RUN"
     PLATESOLVING_SET_PARAMS = "PLATESOLVING_SET_PARAMS"
+    PLATESOLVING_DOWNLOAD_CURRENT_FIELD = "PLATESOLVING_DOWNLOAD_CURRENT_FIELD"
     RESET_PLATESOLVING_DEFAULTS = "RESET_PLATESOLVING_DEFAULTS"
     MOUNT_SYNC = "MOUNT_SYNC"
     MOUNT_GOTO = "MOUNT_GOTO"
@@ -60,6 +61,7 @@ class ActionType(str, Enum):
     GOTO_AUTOCALIBRATE = "GOTO_AUTOCALIBRATE"
     GOTO_FIT_MODEL = "GOTO_FIT_MODEL"
     GOTO_ESTIMATE_ROLL = "GOTO_ESTIMATE_ROLL"
+    GOTO_VALIDATE_SAMPLE = "GOTO_VALIDATE_SAMPLE"
     GOTO_RESET = "GOTO_RESET"
     GOTO_CANCEL = "GOTO_CANCEL"
     GOTO_LIST_SAMPLES = "GOTO_LIST_SAMPLES"
@@ -68,6 +70,7 @@ class ActionType(str, Enum):
 
     # live overlay
     LIVE_SEP_SET_PARAMS = "LIVE_SEP_SET_PARAMS"
+    EXPECTED_STARS_SET_PARAMS = "EXPECTED_STARS_SET_PARAMS"
 
 
 @dataclass(frozen=True)
@@ -133,9 +136,18 @@ def mount_set_microsteps(az_div: int, alt_div: int) -> Action:
     )
 
 
-def mount_move_steps(axis: Axis, direction: int, steps: int, delay_us: int) -> Action:
+def mount_move_steps(
+    axis: Axis,
+    direction: int,
+    steps: int,
+    delay_us: int,
+    profile: str = "smooth",
+) -> Action:
     if direction not in (-1, +1):
         raise ValueError("direction must be -1 or +1")
+    profile_value = str(profile or "smooth").strip().lower()
+    if profile_value not in {"smooth", "direct"}:
+        raise ValueError("profile must be smooth or direct")
     return Action(
         ActionType.MOUNT_MOVE_STEPS,
         {
@@ -143,6 +155,7 @@ def mount_move_steps(axis: Axis, direction: int, steps: int, delay_us: int) -> A
             "direction": int(direction),
             "steps": int(steps),
             "delay_us": int(delay_us),
+            "profile": profile_value,
         },
         _now(),
     )
@@ -207,6 +220,10 @@ def goto_estimate_roll(params: Dict[str, Any] | None = None) -> Action:
     return Action(ActionType.GOTO_ESTIMATE_ROLL, {"params": params or {}}, _now())
 
 
+def goto_validate_sample(result: Any) -> Action:
+    return Action(ActionType.GOTO_VALIDATE_SAMPLE, {"result": result}, _now())
+
+
 # -------------------------
 # Factories: Stacking
 # -------------------------
@@ -248,6 +265,13 @@ def platesolving_run(target: Any, **kwargs: Any) -> Action:
 
 def platesolving_set_params(**kwargs: Any) -> Action:
     return Action(ActionType.PLATESOLVING_SET_PARAMS, dict(kwargs), _now())
+
+
+def platesolving_download_current_field(radius_deg: float | None = None) -> Action:
+    payload: Dict[str, Any] = {}
+    if radius_deg is not None:
+        payload["radius_deg"] = float(radius_deg)
+    return Action(ActionType.PLATESOLVING_DOWNLOAD_CURRENT_FIELD, payload, _now())
 
 
 def platesolving_reset_defaults() -> Action:
@@ -302,3 +326,7 @@ def goto_restore_last_log() -> Action:
 # -------------------------
 def live_sep_set_params(**kwargs: Any) -> Action:
     return Action(ActionType.LIVE_SEP_SET_PARAMS, dict(kwargs), _now())
+
+
+def expected_stars_set_params(**kwargs: Any) -> Action:
+    return Action(ActionType.EXPECTED_STARS_SET_PARAMS, dict(kwargs), _now())

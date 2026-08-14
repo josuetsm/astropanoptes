@@ -15,7 +15,7 @@ if str(ROOT) not in sys.path:
 from mount_arduino import ArduinoConfig, ArduinoController  # noqa: E402
 
 
-MS_CHOICES: tuple[int, ...] = (8, 16, 32, 64)
+MS_CHOICES: tuple[int, ...] = (64,)
 
 
 def axis_to_fw(axis: str) -> str:
@@ -36,6 +36,21 @@ def dir_to_fw(direction: str) -> str:
     raise ValueError(f"invalid direction: {direction}")
 
 
+def mechanical_reduction(
+    *,
+    pulley_teeth: int,
+    belt_pitch_m: float,
+    ring_radius_m: float,
+    gear_reduction: float | None,
+) -> float:
+    if gear_reduction is not None:
+        ratio = float(gear_reduction)
+        if math.isfinite(ratio) and ratio > 0.0:
+            return float(ratio)
+    ring_teeth = (2.0 * math.pi * float(ring_radius_m)) / float(belt_pitch_m)
+    return float(ring_teeth / float(pulley_teeth))
+
+
 def expected_deg_for_steps(
     *,
     steps: int,
@@ -44,9 +59,15 @@ def expected_deg_for_steps(
     pulley_teeth: int,
     belt_pitch_m: float,
     ring_radius_m: float,
+    gear_reduction: float | None,
 ) -> float:
-    ring_teeth = (2.0 * math.pi * float(ring_radius_m)) / float(belt_pitch_m)
-    steps_per_axis_rev = float(full_steps) * float(microsteps) * (ring_teeth / float(pulley_teeth))
+    ratio = mechanical_reduction(
+        pulley_teeth=pulley_teeth,
+        belt_pitch_m=belt_pitch_m,
+        ring_radius_m=ring_radius_m,
+        gear_reduction=gear_reduction,
+    )
+    steps_per_axis_rev = float(full_steps) * float(microsteps) * ratio
     return float(steps) * (360.0 / steps_per_axis_rev)
 
 
@@ -58,16 +79,17 @@ def inferred_microsteps(
     pulley_teeth: int,
     belt_pitch_m: float,
     ring_radius_m: float,
+    gear_reduction: float | None,
 ) -> float:
     if not math.isfinite(measured_deg) or abs(measured_deg) <= 1e-9:
         return float("nan")
-    ring_teeth = (2.0 * math.pi * float(ring_radius_m)) / float(belt_pitch_m)
-    return (
-        float(steps)
-        * 360.0
-        * float(pulley_teeth)
-        / (abs(float(measured_deg)) * float(full_steps) * ring_teeth)
+    ratio = mechanical_reduction(
+        pulley_teeth=pulley_teeth,
+        belt_pitch_m=belt_pitch_m,
+        ring_radius_m=ring_radius_m,
+        gear_reduction=gear_reduction,
     )
+    return float(steps) * 360.0 / (abs(float(measured_deg)) * float(full_steps) * ratio)
 
 
 def nearest_ms(ms_value: float) -> int:
@@ -76,7 +98,7 @@ def nearest_ms(ms_value: float) -> int:
 
 def parse_args(argv: list[str]) -> argparse.Namespace:
     p = argparse.ArgumentParser(
-        description="Sweep MS 8/16/32/64 and compare measured angle vs expected angle."
+        description="Verify the hardware-fixed MS64 scale against a measured angle."
     )
     p.add_argument("--port", default="AUTO", help="Serial port path or AUTO")
     p.add_argument("--baud", type=int, default=115200, help="Baudrate")
@@ -90,14 +112,22 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
     p.add_argument("--steps", type=int, default=20000, help="MOVE steps")
     p.add_argument("--delay-us", type=int, default=1000, help="MOVE delay_us")
     p.add_argument("--settle-s", type=float, default=0.25, help="Extra wait after move finishes")
-    p.add_argument("--microsteps", nargs="*", type=int, default=list(MS_CHOICES), help="MS values to test")
+    p.add_argument(
+        "--microsteps",
+        nargs="*",
+        type=int,
+        default=list(MS_CHOICES),
+        help="legacy option; only the hardware-fixed value 64 is accepted",
+    )
 
     # Mechanics (same defaults as goto.py)
     p.add_argument("--full-steps", type=int, default=200, help="Motor full-steps per rev")
+    p.add_argument("--gear-reduction-az", type=float, default=45.0, help="AZ motor:axis reduction")
+    p.add_argument("--gear-reduction-alt", type=float, default=45.0, help="ALT motor:axis reduction")
     p.add_argument("--pulley-teeth", type=int, default=20, help="Motor pulley teeth")
     p.add_argument("--belt-pitch-m", type=float, default=0.002, help="Belt pitch in meters")
-    p.add_argument("--ring-radius-az", type=float, default=0.24, help="AZ ring radius in meters")
-    p.add_argument("--ring-radius-alt", type=float, default=0.235, help="ALT ring radius in meters")
+    p.add_argument("--ring-radius-az", type=float, default=0.24, help="AZ ring radius fallback in meters")
+    p.add_argument("--ring-radius-alt", type=float, default=0.235, help="ALT ring radius fallback in meters")
 
     p.add_argument("--no-prompt", action="store_true", help="Do not ask for measured degrees")
     return p.parse_args(argv)
@@ -106,8 +136,8 @@ def parse_args(argv: list[str]) -> argparse.Namespace:
 def _drain(ctrl: ArduinoController, *, max_lines: int = 60, max_time_s: float = 0.20) -> None:
     try:
         ctrl._drain_lines(max_lines=max_lines, max_time_s=max_time_s)  # type: ignore[attr-defined]
-    except Exception:
-        pass
+    except Exception as exc:
+        print(f"warning: failed to drain serial input: {exc}", file=sys.stderr)
 
 
 def tx(ctrl: ArduinoController, cmd: str, *, timeout_s: float = 1.0) -> str:
@@ -134,6 +164,8 @@ def main(argv: list[str]) -> int:
     axis_fw = axis_to_fw(args.axis)
     dir_fw = dir_to_fw(args.direction)
     ring_radius_m = float(args.ring_radius_az if axis_fw == "A" else args.ring_radius_alt)
+    gear_reduction = float(args.gear_reduction_az if axis_fw == "A" else args.gear_reduction_alt)
+    gear_reduction_arg = gear_reduction if gear_reduction > 0.0 else None
     steps = max(1, int(args.steps))
     delay_us = max(1, int(args.delay_us))
     settle_s = max(0.0, float(args.settle_s))
@@ -144,7 +176,7 @@ def main(argv: list[str]) -> int:
         if m in MS_CHOICES:
             sweep.append(m)
     if not sweep:
-        raise ValueError(f"no valid microsteps in --microsteps (allowed: {MS_CHOICES})")
+        raise ValueError("microstepping is hardware-fixed at 1/64")
 
     cfg = ArduinoConfig(port=str(args.port), baud=int(args.baud))
     ctrl = ArduinoController(cfg)
@@ -163,8 +195,14 @@ def main(argv: list[str]) -> int:
             return 3
 
         print("")
-        print(f"Sweep axis={axis_fw} direction={dir_fw} steps={steps} delay_us={delay_us}")
-        print("Enter measured angle in degrees after each move (blank=skip).")
+        ratio = mechanical_reduction(
+            pulley_teeth=int(args.pulley_teeth),
+            belt_pitch_m=float(args.belt_pitch_m),
+            ring_radius_m=ring_radius_m,
+            gear_reduction=gear_reduction_arg,
+        )
+        print(f"Fixed-MS64 verification axis={axis_fw} direction={dir_fw} steps={steps} delay_us={delay_us} reduction={ratio:.3f}:1")
+        print("Enter the measured angle in degrees after the move (blank=skip).")
         print("")
 
         rows: list[dict[str, float | int | str]] = []
@@ -190,6 +228,7 @@ def main(argv: list[str]) -> int:
                 pulley_teeth=int(args.pulley_teeth),
                 belt_pitch_m=float(args.belt_pitch_m),
                 ring_radius_m=ring_radius_m,
+                gear_reduction=gear_reduction_arg,
             )
             print(
                 f"  MOVE -> {move_resp or 'NO-RESP'} | STOP -> {stop_resp or 'NO-RESP'} "
@@ -219,6 +258,7 @@ def main(argv: list[str]) -> int:
                 pulley_teeth=int(args.pulley_teeth),
                 belt_pitch_m=float(args.belt_pitch_m),
                 ring_radius_m=ring_radius_m,
+                gear_reduction=gear_reduction_arg,
             )
             near = nearest_ms(inferred_ms) if math.isfinite(inferred_ms) else -1
             rows.append(
@@ -256,8 +296,8 @@ def main(argv: list[str]) -> int:
     finally:
         try:
             tx(ctrl, "ENABLE 0", timeout_s=1.0)
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"warning: failed to disable mount before close: {exc}", file=sys.stderr)
         ctrl.close()
 
 

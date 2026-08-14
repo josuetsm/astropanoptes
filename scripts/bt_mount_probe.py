@@ -130,8 +130,8 @@ def _find_bt_device_id_by_name(name: str) -> str:
                     if nm == wanted:
                         addr = str((row or {}).get("address", "")).strip()
                         return addr or wanted
-        except Exception:
-            pass
+        except Exception as exc:
+            print(f"BT hint: no se pudo parsear la salida JSON de blueutil: {exc}", file=sys.stderr)
     return wanted
 
 

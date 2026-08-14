@@ -8,7 +8,7 @@ from typing import Optional, Dict, Any, Tuple
 
 import numpy as np
 
-from logging_utils import log_error
+from logging_utils import log_error, log_info
 
 try:
     import pyPOACamera  # user-provided SDK wrapper
@@ -30,11 +30,21 @@ def _perf() -> float:
     return time.perf_counter()
 
 
+def _now_s() -> float:
+    return time.time()
+
+
 def _sleep_s(s: float) -> None:
     # sleep mínimo para no quemar CPU en polling
     if s <= 0:
         return
     time.sleep(s)
+
+
+def camera_ready_timeout_s(exp_ms: float) -> float:
+    """Allow a complete exposure plus SDK/USB delivery margin."""
+    exp_s = max(0.0, float(exp_ms)) / 1000.0
+    return max(2.0, (exp_s * 1.25) + 1.0)
 
 
 def _require_poa() -> None:
@@ -192,7 +202,7 @@ class POACameraDevice:
 
     def configure(self, cfg: CameraConfig, *, force_no_binning: bool = True) -> None:
         """
-        Configura ROI/bin/format/exp/gain.
+        Configura ROI/bin/format/exp/gain/offset.
 
         Política solicitada:
         - Para stacking, NO queremos binning en la captura raw.
@@ -235,9 +245,117 @@ class POACameraDevice:
         # pyPOACamera.SetExp usa microsegundos según tu snippet: SetExp(cam_id, int(EXP_MS * 1000), False)
         # eso sugiere unidad = microsegundos.
         exp_us = int(float(cfg.exp_ms) * 1000.0)
-        pyPOACamera.SetExp(self.cam_id, exp_us, False)
+        exp_err = pyPOACamera.SetExp(self.cam_id, exp_us, False)
+        if exp_err != pyPOACamera.POAErrors.POA_OK:
+            raise RuntimeError(f"SetExp falló (err={exp_err}, exp_us={exp_us}).")
 
-        pyPOACamera.SetGain(self.cam_id, int(cfg.gain), bool(cfg.auto_gain))
+        requested_gain = int(cfg.gain)
+        applied_gain = requested_gain
+        try:
+            attr_err, gain_attr = pyPOACamera.GetConfigAttributesByConfigID(
+                self.cam_id,
+                pyPOACamera.POAConfig.POA_GAIN,
+            )
+            if attr_err == pyPOACamera.POAErrors.POA_OK:
+                gain_min = int(gain_attr.minValue)
+                gain_max = int(gain_attr.maxValue)
+                if gain_min <= gain_max:
+                    applied_gain = int(np.clip(requested_gain, gain_min, gain_max))
+                    if applied_gain != requested_gain:
+                        log_info(
+                            None,
+                            "Camera: gain fuera del rango del sensor; "
+                            f"requested={requested_gain} applied={applied_gain} "
+                            f"range=[{gain_min},{gain_max}]",
+                        )
+        except Exception as exc:
+            # Older SDKs may not expose config attributes. SetGain still
+            # validates the value below and its return code is never ignored.
+            log_error(
+                None,
+                "Camera: no se pudo consultar el rango de gain",
+                exc,
+                throttle_s=10.0,
+                throttle_key="camera_gain_range",
+            )
+
+        gain_err = pyPOACamera.SetGain(self.cam_id, applied_gain, bool(cfg.auto_gain))
+        if gain_err != pyPOACamera.POAErrors.POA_OK:
+            raise RuntimeError(f"SetGain falló (err={gain_err}, gain={applied_gain}).")
+
+        requested_offset = int(cfg.offset)
+        applied_offset = requested_offset
+        try:
+            attr_err, offset_attr = pyPOACamera.GetConfigAttributesByConfigID(
+                self.cam_id,
+                pyPOACamera.POAConfig.POA_OFFSET,
+            )
+            if attr_err == pyPOACamera.POAErrors.POA_OK:
+                offset_min = int(offset_attr.minValue)
+                offset_max = int(offset_attr.maxValue)
+                if offset_min <= offset_max:
+                    applied_offset = int(np.clip(requested_offset, offset_min, offset_max))
+                    if applied_offset != requested_offset:
+                        log_info(
+                            None,
+                            "Camera: offset fuera del rango del sensor; "
+                            f"requested={requested_offset} applied={applied_offset} "
+                            f"range=[{offset_min},{offset_max}]",
+                        )
+        except Exception as exc:
+            log_error(
+                None,
+                "Camera: no se pudo consultar el rango de offset",
+                exc,
+                throttle_s=10.0,
+                throttle_key="camera_offset_range",
+            )
+
+        offset_err = pyPOACamera.SetConfig(
+            self.cam_id,
+            pyPOACamera.POAConfig.POA_OFFSET,
+            applied_offset,
+            False,
+        )
+        if offset_err != pyPOACamera.POAErrors.POA_OK:
+            raise RuntimeError(f"SetOffset falló (err={offset_err}, offset={applied_offset}).")
+
+        actual_exp_us = int(exp_us)
+        actual_gain = int(applied_gain)
+        actual_auto_gain = bool(cfg.auto_gain)
+        actual_offset = int(applied_offset)
+        try:
+            get_exp_err, read_exp_us, _auto_exp = pyPOACamera.GetExp(self.cam_id)
+            if get_exp_err == pyPOACamera.POAErrors.POA_OK:
+                actual_exp_us = int(read_exp_us)
+            get_gain_err, read_gain, read_auto_gain = pyPOACamera.GetGain(self.cam_id)
+            if get_gain_err == pyPOACamera.POAErrors.POA_OK:
+                actual_gain = int(read_gain)
+                actual_auto_gain = bool(read_auto_gain)
+            get_offset_err, read_offset, _auto_offset = pyPOACamera.GetConfig(
+                self.cam_id,
+                pyPOACamera.POAConfig.POA_OFFSET,
+            )
+            if get_offset_err == pyPOACamera.POAErrors.POA_OK:
+                actual_offset = int(read_offset)
+        except Exception as exc:
+            log_error(
+                None,
+                "Camera: no se pudo verificar exposición/gain/offset aplicados",
+                exc,
+                throttle_s=10.0,
+                throttle_key="camera_config_readback",
+            )
+        cfg.exp_ms = float(actual_exp_us) / 1000.0
+        cfg.gain = int(actual_gain)
+        cfg.offset = int(actual_offset)
+        cfg.auto_gain = bool(actual_auto_gain)
+        log_info(
+            None,
+            "Camera: settings verified "
+            f"exposure={cfg.exp_ms:.3f}ms gain={cfg.gain} offset={cfg.offset} "
+            f"auto_gain={int(cfg.auto_gain)}",
+        )
 
         # Gamma / Debayer: depende de SDK; se controlará desde otro módulo si procede.
         # Por ahora se deja en metadata; no forzamos aquí.
@@ -269,14 +387,27 @@ class POACameraDevice:
     def bytes_per_px(self) -> int:
         return self._bytes_per_px
 
-    def wait_ready(self, ready_sleep_s: float = 0.0005) -> None:
+    def wait_ready(
+        self,
+        ready_sleep_s: float = 0.0005,
+        *,
+        stop_event: Optional[threading.Event] = None,
+        timeout_s: Optional[float] = None,
+    ) -> bool:
         """
         Poll de ImageReady. Mantener sleep mínimo para no saturar CPU.
+
+        Returns False when stop_event is set or timeout_s expires.
         """
+        t0 = _perf()
         while True:
+            if stop_event is not None and stop_event.is_set():
+                return False
             _, ready = pyPOACamera.ImageReady(self.cam_id)
             if ready:
-                return
+                return True
+            if timeout_s is not None and (_perf() - t0) >= float(timeout_s):
+                return False
             _sleep_s(ready_sleep_s)
 
     def read_into(self, buf_u8: np.ndarray, timeout_ms: int = 1000) -> None:
@@ -410,6 +541,9 @@ class CameraStream:
             "roi": (0, 0, w, h) if not self._cfg.use_roi else (self._cfg.roi_x, self._cfg.roi_y, w, h),
             "binning_hw": 1,  # forzado
             "img_format": fmt.name,
+            "exp_ms": float(self._cfg.exp_ms),
+            "gain": int(self._cfg.gain),
+            "offset": int(self._cfg.offset),
         }
 
         # FPS capture
@@ -417,13 +551,40 @@ class CameraStream:
         n = 0
 
         ring_i = 0
+        ready_timeout_s = camera_ready_timeout_s(float(self._cfg.exp_ms))
 
         while not self._stop.is_set():
             # esperar ready y leer
-            dev.wait_ready(ready_sleep_s=ready_sleep_s)
+            try:
+                ready = dev.wait_ready(
+                    ready_sleep_s=ready_sleep_s,
+                    stop_event=self._stop,
+                    timeout_s=ready_timeout_s,
+                )
+            except Exception as exc:
+                log_error(None, "CameraStream: wait_ready failed", exc, throttle_s=5.0, throttle_key="camera_wait_ready")
+                self._dropped += 1
+                if self._stop.is_set():
+                    break
+                _sleep_s(max(0.001, ready_sleep_s))
+                continue
+
+            if not ready:
+                if self._stop.is_set():
+                    break
+                self._dropped += 1
+                log_error(
+                    None,
+                    "CameraStream: image ready timeout",
+                    TimeoutError(f"ImageReady timed out after {ready_timeout_s:.2f}s"),
+                    throttle_s=5.0,
+                    throttle_key="camera_ready_timeout",
+                )
+                continue
 
             buf = self._bufs[ring_i]
             t_cap = _perf()
+            t_wall = _now_s()
             try:
                 dev.read_into(buf, timeout_ms=1000)
             except Exception as exc:
@@ -437,7 +598,14 @@ class CameraStream:
 
             # construir vistas sin copias grandes cuando se puede
             if fmt != pyPOACamera.POAImgFormat.POA_RAW16:
-                raise RuntimeError(f"CameraStream: unexpected format {fmt} (RAW16 required)")
+                log_error(
+                    None,
+                    "CameraStream: unexpected format",
+                    RuntimeError(f"unexpected format {fmt} (RAW16 required)"),
+                    throttle_s=5.0,
+                    throttle_key="camera_unexpected_format",
+                )
+                break
 
             # reinterpretación little-endian
             u16 = buf[: w * h * 2].view("<u2").reshape(h, w)
@@ -453,6 +621,8 @@ class CameraStream:
                     "width": int(w),
                     "height": int(h),
                     "fmt": str(fmt.name),
+                    "t_capture_mono": float(t_cap),
+                    "t_wall": float(t_wall),
                 }
             )
             fr = Frame(

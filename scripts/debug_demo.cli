@@ -1,0 +1,6 @@
+# Smoke test reproducible del runtime completo sin hardware.
+wait camera.connected true 8
+wait mount.connected true 8
+status --json
+health
+image live demo-smoke 8

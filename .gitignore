@@ -29,10 +29,22 @@ myenv/
 
 # Generated data/images
 *.npy
+*.npz
 *.png
+*.fit
+*.fits
+*.fits.gz
 
 # Stacking outputs
+raw_output/
 stack_output/
+
+# Camera calibration and goto diagnostics
+calibration_frames/
+diagnostics/
+
+# Terminal diagnostic captures
+terminal_output/
 
 # Temporary test data
 tile_n16_ring_123.ecsv
