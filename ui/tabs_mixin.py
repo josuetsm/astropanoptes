@@ -28,6 +28,7 @@ from PyQt6.QtWidgets import (
 
 
 OBSERVER_PRESETS = (
+    ("San Carlos", {"lat_deg": -36.4248, "lon_deg": -71.9580, "height_m": 161.0}),
     ("Algarrobo", {"lat_deg": -33.3667, "lon_deg": -71.6667, "height_m": 28.0}),
     ("Estación Central (Santiago)", {"lat_deg": -33.4569, "lon_deg": -70.6990, "height_m": 520.0}),
 )
@@ -41,6 +42,9 @@ if TYPE_CHECKING:
 def _set_option_tooltip(widget: QWidget, text: str) -> None:
     widget.setToolTip(text)
     widget.setToolTipDuration(12_000)
+    for child in widget.findChildren(QLineEdit):
+        child.setToolTip(text)
+        child.setToolTipDuration(12_000)
 
 
 def _option_label(text: str, tooltip: str) -> QLabel:
@@ -419,16 +423,49 @@ class ObserverTabMixin:
         self.ds_obs_rot_tol.setSuffix(" deg")
 
         self.btn_obs_apply = QPushButton("Apply")
+        _set_option_tooltip(
+            self.btn_obs_apply,
+            "Aplica ubicación, escala óptica y prior de rotación al plate solving y al modelo de apuntado.",
+        )
         self.btn_obs_apply.clicked.connect(self._observer_apply)
 
-        form.addRow("Ubicación:", self.dd_obs_site)
+        _add_option_row(
+            form,
+            "Ubicación:",
+            self.dd_obs_site,
+            "Sitio del observador usado para convertir entre RA/Dec y Az/Alt.",
+        )
         form.addRow("Lat/Lon/Alt:", self.lbl_obs_site_coords)
-        form.addRow("Focal:", self.ds_obs_focal_mm)
-        form.addRow("Tamaño píxel:", self.ds_obs_pixel_um)
-        form.addRow("Barlow:", self.dd_obs_barlow)
+        _add_option_row(
+            form,
+            "Focal:",
+            self.ds_obs_focal_mm,
+            "Distancia focal base del telescopio, sin multiplicador Barlow.",
+        )
+        _add_option_row(
+            form,
+            "Tamaño píxel:",
+            self.ds_obs_pixel_um,
+            "Tamaño físico del píxel del sensor. Afecta la escala angular por píxel.",
+        )
+        _add_option_row(
+            form,
+            "Barlow:",
+            self.dd_obs_barlow,
+            "Multiplicador óptico aplicado a la focal base para calcular la focal efectiva.",
+        )
         form.addRow("Focal efectiva:", self.lbl_obs_effective_focal)
+        _set_option_tooltip(
+            self.cb_obs_rot_prior,
+            "Usa la orientación esperada de la cámara/montura como prior para acelerar y estabilizar plate solving.",
+        )
         form.addRow(self.cb_obs_rot_prior)
-        form.addRow("Tolerancia rotación:", self.ds_obs_rot_tol)
+        _add_option_row(
+            form,
+            "Tolerancia rotación:",
+            self.ds_obs_rot_tol,
+            "Margen angular permitido alrededor del prior de rotación durante plate solving.",
+        )
         form.addRow(self.btn_obs_apply)
 
         box.setLayout(form)
@@ -532,13 +569,41 @@ class CameraTabMixin:
         self.sb_gain.setRange(0, 6000)
         self.sb_gain.setValue(self.cfg.camera.gain)
 
+        self.sb_offset = QSpinBox()
+        self.sb_offset.setRange(0, 500)
+        self.sb_offset.setValue(self.cfg.camera.offset)
+
         self.btn_apply_cam = QPushButton("Apply")
+        _set_option_tooltip(
+            self.btn_apply_cam,
+            "Aplica exposición, ganancia y offset a la cámara activa.",
+        )
         self.btn_apply_cam.clicked.connect(self._camera_apply)
         self.btn_record_raw = QPushButton("Record 20s RAW (.npy)")
+        _set_option_tooltip(
+            self.btn_record_raw,
+            "Graba 20 segundos de frames RAW en raw_output para diagnóstico o análisis offline.",
+        )
         self.btn_record_raw.clicked.connect(self._camera_record_raw)
 
-        form.addRow("Exposure:", self.ds_exp_ms)
-        form.addRow("Gain:", self.sb_gain)
+        _add_option_row(
+            form,
+            "Exposure:",
+            self.ds_exp_ms,
+            "Tiempo de exposición por frame. Exposiciones más largas capturan más señal y bajan el FPS máximo.",
+        )
+        _add_option_row(
+            form,
+            "Gain:",
+            self.sb_gain,
+            "Ganancia electrónica de la cámara. Más ganancia aumenta señal aparente y ruido.",
+        )
+        _add_option_row(
+            form,
+            "Offset:",
+            self.sb_offset,
+            "Nivel negro que evita recortar el ruido en cero. Para gain 360, la Mars-C requiere aproximadamente 350.",
+        )
         form.addRow(self.btn_apply_cam)
         form.addRow(self.btn_record_raw)
         box.setLayout(form)
@@ -558,6 +623,10 @@ class TrackingTabMixin:
         self.btn_tr_stop = QPushButton("Stop")
         self.btn_tr_reset = QPushButton("Reset keyframe")
         self.btn_tr_apply = QPushButton("Apply")
+        _set_option_tooltip(self.btn_tr_start, "Activa tracking y comienza a enviar correcciones de velocidad a la montura.")
+        _set_option_tooltip(self.btn_tr_stop, "Detiene tracking y deja la montura sin correcciones de tracking.")
+        _set_option_tooltip(self.btn_tr_reset, "Reinicia la referencia visual usada para medir deriva desde el frame actual.")
+        _set_option_tooltip(self.btn_tr_apply, "Aplica los parámetros visibles de tracking sin iniciar ni detener el tracking.")
 
         actions = QHBoxLayout()
         actions.addWidget(self.btn_tr_start)
@@ -629,7 +698,7 @@ class TrackingTabMixin:
 
         self.sb_tr_sep_min_sources = QSpinBox()
         self.sb_tr_sep_min_sources.setRange(1, 100)
-        self.sb_tr_sep_min_sources.setValue(1)
+        self.sb_tr_sep_min_sources.setValue(3)
 
         self.sb_tr_sep_bw = QSpinBox()
         self.sb_tr_sep_bw.setRange(4, 512)
@@ -743,6 +812,11 @@ class StackingTabMixin:
         self.btn_st_reset = QPushButton("Reset")
         self.btn_st_save = QPushButton("Save Stack")
         self.btn_st_apply = QPushButton("Apply")
+        _set_option_tooltip(self.btn_st_start, "Inicia el apilado en vivo de los frames entrantes.")
+        _set_option_tooltip(self.btn_st_stop, "Pausa el apilado en vivo sin borrar el stack acumulado.")
+        _set_option_tooltip(self.btn_st_reset, "Borra el stack acumulado y reinicia las estadísticas de apilado.")
+        _set_option_tooltip(self.btn_st_save, "Guarda el stack actual en stack_output como RAW numpy y PNG.")
+        _set_option_tooltip(self.btn_st_apply, "Aplica los parámetros visibles de stacking y reconfigura el motor de apilado.")
         self.cb_st_color = QCheckBox("Stacking a color (RGB)")
         self.cb_st_color.setChecked(str(self.cfg.stacking.color_mode).lower() == "rgb")
         self.cb_st_color.toggled.connect(self._stacking_color_toggled)
@@ -907,6 +981,8 @@ class ObjectDetectionTabMixin:
 
         self.btn_od_start = QPushButton("Start")
         self.btn_od_stop = QPushButton("Stop")
+        _set_option_tooltip(self.btn_od_start, "Activa el overlay de detección SEP sobre la vista live.")
+        _set_option_tooltip(self.btn_od_stop, "Desactiva el overlay de detección SEP sobre la vista live.")
 
         row = QHBoxLayout()
         row.addWidget(self.btn_od_start)
@@ -937,11 +1013,36 @@ class ObjectDetectionTabMixin:
         self.sb_od_bh.setValue(self.cfg.sep.bh)
 
         form.addRow(row)
-        form.addRow("minarea:", self.sb_od_minarea)
-        form.addRow("thresh_sigma:", self.ds_od_sigma)
-        form.addRow("max_det:", self.sb_od_maxdet)
-        form.addRow("bw:", self.sb_od_bw)
-        form.addRow("bh:", self.sb_od_bh)
+        _add_option_row(
+            form,
+            "minarea:",
+            self.sb_od_minarea,
+            "Cantidad mínima de píxeles conectados sobre el umbral para aceptar una detección.",
+        )
+        _add_option_row(
+            form,
+            "thresh_sigma:",
+            self.ds_od_sigma,
+            "Umbral de detección en sigmas sobre el fondo local. Más alto reduce falsos positivos.",
+        )
+        _add_option_row(
+            form,
+            "max_det:",
+            self.sb_od_maxdet,
+            "Cantidad máxima de detecciones que se muestran y procesan en el overlay.",
+        )
+        _add_option_row(
+            form,
+            "bw:",
+            self.sb_od_bw,
+            "Ancho de la malla de fondo usada por SEP para detección live.",
+        )
+        _add_option_row(
+            form,
+            "bh:",
+            self.sb_od_bh,
+            "Alto de la malla de fondo usada por SEP para detección live.",
+        )
 
         box.setLayout(form)
         layout.addWidget(box)
@@ -960,41 +1061,61 @@ class GoToTabMixin:
 
         self.dd_goto_mode = QComboBox()
         self.dd_goto_mode.addItems(["name (SIMBAD)", "planet/moon", "radec", "altaz"])
+        _set_option_tooltip(
+            self.dd_goto_mode,
+            "Tipo de objetivo para GoTo: nombre SIMBAD, planeta/luna, coordenadas RA/Dec o coordenadas Az/Alt.",
+        )
 
         self.ed_goto_name = QLineEdit()
         self.ed_goto_name.setPlaceholderText("Object name (SIMBAD)")
+        _set_option_tooltip(
+            self.ed_goto_name,
+            "Nombre astronómico que se resolverá con SIMBAD, por ejemplo M42, Vega o Saturn Nebula.",
+        )
 
         self.dd_goto_planet = QComboBox()
         self.dd_goto_planet.addItems(
             ["moon", "mercury", "venus", "mars", "jupiter", "saturn", "uranus", "neptune"]
         )
+        _set_option_tooltip(
+            self.dd_goto_planet,
+            "Objeto del sistema solar calculado para la hora y ubicación actuales.",
+        )
 
         self.ds_ra = QDoubleSpinBox()
         self.ds_ra.setRange(0.0, 360.0)
         self.ds_ra.setDecimals(6)
+        _set_option_tooltip(self.ds_ra, "Ascensión recta del objetivo en grados ICRS/J2000.")
 
         self.ds_dec = QDoubleSpinBox()
         self.ds_dec.setRange(-90.0, 90.0)
         self.ds_dec.setDecimals(6)
+        _set_option_tooltip(self.ds_dec, "Declinación del objetivo en grados ICRS/J2000.")
 
         self.ed_ra_hms = QLineEdit()
         self.ed_ra_hms.setPlaceholderText("RA HH:MM:SS(.s)")
+        _set_option_tooltip(self.ed_ra_hms, "Ascensión recta en formato horas:minutos:segundos.")
 
         self.ed_dec_dms = QLineEdit()
         self.ed_dec_dms.setPlaceholderText("Dec ±DD:MM:SS")
+        _set_option_tooltip(self.ed_dec_dms, "Declinación en formato grados:minutos:segundos con signo.")
 
         self.dd_radec_fmt = QComboBox()
         self.dd_radec_fmt.addItems(["deg", "HMS/DMS"])
+        _set_option_tooltip(self.dd_radec_fmt, "Formato de entrada para coordenadas RA/Dec.")
 
         self.ds_az = QDoubleSpinBox()
         self.ds_az.setRange(0.0, 360.0)
         self.ds_az.setDecimals(6)
+        _set_option_tooltip(self.ds_az, "Azimut local del objetivo, en grados desde el norte hacia el este.")
 
         self.ds_alt = QDoubleSpinBox()
         self.ds_alt.setRange(0.0, 90.0)
         self.ds_alt.setDecimals(6)
+        _set_option_tooltip(self.ds_alt, "Altitud local del objetivo sobre el horizonte.")
 
         self.tgt_frame = QFrame()
+        _set_option_tooltip(self.tgt_frame, "Campos del objetivo según el modo de GoTo seleccionado.")
         self.tgt_v = QVBoxLayout(self.tgt_frame)
         self.tgt_v.setContentsMargins(0, 0, 0, 0)
         self.tgt_v.setSpacing(6)
@@ -1032,53 +1153,75 @@ class GoToTabMixin:
         self.sb_goto_ps_nseeds = QSpinBox()
         self.sb_goto_ps_nseeds.setRange(0, 10)
         self.sb_goto_ps_nseeds.setValue(self.cfg.platesolving.N_seed)
+        _set_option_tooltip(
+            self.sb_goto_ps_nseeds,
+            "Cantidad de estrellas semilla usadas por Plate Solving. Más semillas puede mejorar robustez y costo.",
+        )
 
         self.sb_goto_ps_mininl = QSpinBox()
         self.sb_goto_ps_mininl.setRange(1, 100)
         self.sb_goto_ps_mininl.setValue(self.cfg.platesolving.min_inliers)
+        _set_option_tooltip(
+            self.sb_goto_ps_mininl,
+            "Mínimo de coincidencias requeridas para aceptar una solución de plate solving.",
+        )
 
-        self.ds_autocal_ps_radius = QDoubleSpinBox()
-        self.ds_autocal_ps_radius.setRange(0.1, 30.0)
-        self.ds_autocal_ps_radius.setDecimals(2)
-        self.ds_autocal_ps_radius.setValue(
+        self.ds_goto_ps_radius = QDoubleSpinBox()
+        self.ds_goto_ps_radius.setRange(0.1, 30.0)
+        self.ds_goto_ps_radius.setDecimals(2)
+        self.ds_goto_ps_radius.setValue(
             float(self.cfg.platesolving.search_radius_deg or 1.0)
         )
-        self.ds_autocal_ps_radius.setSuffix(" deg")
-
-        self.ds_autocal_ps_gmax = QDoubleSpinBox()
-        self.ds_autocal_ps_gmax.setRange(6.0, 20.0)
-        self.ds_autocal_ps_gmax.setDecimals(2)
-        self.ds_autocal_ps_gmax.setValue(float(self.cfg.platesolving.gmax))
-
-        self.dd_autocal_ps_mode = QComboBox()
-        self.dd_autocal_ps_mode.addItems(
-            ["deriva (actual)", "alt/az manual", "alt/az actual (registrado)"]
+        self.ds_goto_ps_radius.setSuffix(" deg")
+        _set_option_tooltip(
+            self.ds_goto_ps_radius,
+            "Radio alrededor del Az/Alt aproximado donde Plate Solving buscará la solución.",
         )
 
-        self.ds_autocal_ps_manual_az = QDoubleSpinBox()
-        self.ds_autocal_ps_manual_az.setRange(0.0, 360.0)
-        self.ds_autocal_ps_manual_az.setDecimals(6)
+        self.ds_goto_ps_gmax = QDoubleSpinBox()
+        self.ds_goto_ps_gmax.setRange(6.0, 20.0)
+        self.ds_goto_ps_gmax.setDecimals(2)
+        self.ds_goto_ps_gmax.setValue(float(self.cfg.platesolving.gmax))
+        _set_option_tooltip(
+            self.ds_goto_ps_gmax,
+            "Magnitud límite del catálogo usado por plate solving. Mayor valor incluye estrellas más débiles.",
+        )
 
-        self.ds_autocal_ps_manual_alt = QDoubleSpinBox()
-        self.ds_autocal_ps_manual_alt.setRange(0.0, 90.0)
-        self.ds_autocal_ps_manual_alt.setDecimals(6)
+        self.ds_goto_ps_az = QDoubleSpinBox()
+        self.ds_goto_ps_az.setRange(0.0, 360.0)
+        self.ds_goto_ps_az.setDecimals(6)
+        _set_option_tooltip(self.ds_goto_ps_az, "Azimut aproximado del centro del campo que se resolverá.")
 
-        self.autocal_manual_frame = QFrame()
-        row_manual = QHBoxLayout(self.autocal_manual_frame)
+        self.ds_goto_ps_alt = QDoubleSpinBox()
+        self.ds_goto_ps_alt.setRange(-10.0, 90.0)
+        self.ds_goto_ps_alt.setDecimals(6)
+        _set_option_tooltip(self.ds_goto_ps_alt, "Altitud aproximada del centro del campo que se resolverá.")
+
+        self.dd_platesolve_mode = QComboBox()
+        self.dd_platesolve_mode.addItem("Deriva", "drift")
+        self.dd_platesolve_mode.addItem("Alt/Az (manual)", "manual_altaz")
+        self.dd_platesolve_mode.addItem("Alt/Az (registrado)", "current_altaz")
+        _set_option_tooltip(
+            self.dd_platesolve_mode,
+            "Origen de la posición aproximada: deriva medida, coordenadas Alt/Az ingresadas manualmente o el Alt/Az registrado por el modelo.",
+        )
+
+        self.platesolve_target_frame = QFrame()
+        row_manual = QHBoxLayout(self.platesolve_target_frame)
         row_manual.setContentsMargins(0, 0, 0, 0)
         row_manual.addWidget(QLabel("Az°"))
-        row_manual.addWidget(self.ds_autocal_ps_manual_az)
+        row_manual.addWidget(self.ds_goto_ps_az)
         row_manual.addSpacing(10)
         row_manual.addWidget(QLabel("Alt°"))
-        row_manual.addWidget(self.ds_autocal_ps_manual_alt)
+        row_manual.addWidget(self.ds_goto_ps_alt)
         row_manual.addStretch(1)
 
         rowfb = QHBoxLayout()
-        rowfb.addWidget(QLabel("AutoCal radius:"))
-        rowfb.addWidget(self.ds_autocal_ps_radius)
+        rowfb.addWidget(QLabel("Plate Solving radius:"))
+        rowfb.addWidget(self.ds_goto_ps_radius)
         rowfb.addSpacing(8)
-        rowfb.addWidget(QLabel("AutoCal gmax:"))
-        rowfb.addWidget(self.ds_autocal_ps_gmax)
+        rowfb.addWidget(QLabel("gmax:"))
+        rowfb.addWidget(self.ds_goto_ps_gmax)
         rowfb.addStretch(1)
 
         rowps = QHBoxLayout()
@@ -1091,15 +1234,30 @@ class GoToTabMixin:
 
         self.btn_goto = QPushButton("GoTo")
         self.btn_cancel = QPushButton("Cancel")
-        self.btn_autocal = QPushButton("Platesolving")
+        self.btn_platesolve = QPushButton("Plate Solving")
         self.btn_roll = QPushButton("Estimar Roll")
         self.btn_fit_model = QPushButton("Fit GoTo Model")
+        self.btn_fit_model.setEnabled(False)
         self.btn_list_samples = QPushButton("Listar Muestras")
         self.btn_prune_outliers = QPushButton("Eliminar Outliers")
         self.btn_restore_last_log = QPushButton("Cargar Último Registro")
         self.btn_reset_goto = QPushButton("Reset")
         self.btn_home = QPushButton("Home")
         self.cb_expected_stars = QCheckBox("Estrellas esperadas según modelo")
+        _set_option_tooltip(self.btn_goto, "Mueve la montura hacia el objetivo usando el modelo GoTo actual.")
+        _set_option_tooltip(self.btn_cancel, "Cancela la operación GoTo en curso.")
+        _set_option_tooltip(self.btn_platesolve, "Resuelve el cuadro vivo y agrega la muestra sólo si pasa automáticamente las validaciones de match, RMS, movimiento y roll; no cambia parámetros de Cámara.")
+        _set_option_tooltip(self.btn_roll, "Estima y aplica la orientación del eje +Az en la imagen sin cambiar exposición ni ganancia.")
+        _set_option_tooltip(self.btn_fit_model, "Ajusta el modelo GoTo usando las muestras manuales registradas.")
+        _set_option_tooltip(self.btn_list_samples, "Muestra en el log las muestras manuales disponibles para el ajuste.")
+        _set_option_tooltip(self.btn_prune_outliers, "Elimina muestras que degradan el ajuste del modelo GoTo.")
+        _set_option_tooltip(self.btn_restore_last_log, "Carga el último respaldo CSV de muestras manuales del modelo GoTo.")
+        _set_option_tooltip(self.btn_reset_goto, "Borra sincronización, muestras manuales y estado del modelo GoTo.")
+        _set_option_tooltip(self.btn_home, "Mueve la montura a una posición segura predeterminada.")
+        _set_option_tooltip(
+            self.cb_expected_stars,
+            "Muestra en el preview estrellas proyectadas según el modelo GoTo ajustado.",
+        )
         self.cb_expected_stars.setChecked(False)
         self.cb_expected_stars.setEnabled(False)
         self.ds_expected_stars_mag = QDoubleSpinBox()
@@ -1109,17 +1267,25 @@ class GoToTabMixin:
             float(self.cfg.preview.expected_stars_mag_limit)
         )
         self.ds_expected_stars_mag.setPrefix("mag≤")
+        _set_option_tooltip(
+            self.ds_expected_stars_mag,
+            "Magnitud máxima de estrellas esperadas que se dibujan en el overlay del modelo.",
+        )
         self.sb_expected_stars_max = QSpinBox()
         self.sb_expected_stars_max.setRange(1, 5000)
         self.sb_expected_stars_max.setValue(int(self.cfg.preview.expected_stars_max))
         self.sb_expected_stars_max.setPrefix("máx ")
+        _set_option_tooltip(
+            self.sb_expected_stars_max,
+            "Cantidad máxima de estrellas esperadas que se proyectan en el preview.",
+        )
         self.lbl_expected_stars = QLabel("Requiere Fit GoTo Model")
 
         rowb_top = QHBoxLayout()
         for button in [
             self.btn_goto,
             self.btn_cancel,
-            self.btn_autocal,
+            self.btn_platesolve,
             self.btn_roll,
             self.btn_home,
         ]:
@@ -1143,7 +1309,7 @@ class GoToTabMixin:
 
         self.btn_goto.clicked.connect(self._goto_start)
         self.btn_cancel.clicked.connect(self._goto_cancel)
-        self.btn_autocal.clicked.connect(self._autocalibrate)
+        self.btn_platesolve.clicked.connect(self._goto_platesolve)
         self.btn_roll.clicked.connect(self._goto_estimate_roll)
         self.btn_fit_model.clicked.connect(self._goto_fit_model)
         self.btn_list_samples.clicked.connect(self._goto_list_samples)
@@ -1158,14 +1324,27 @@ class GoToTabMixin:
         self.sb_expected_stars_max.valueChanged.connect(
             self._expected_stars_params_changed
         )
+        self.dd_platesolve_mode.currentIndexChanged.connect(
+            self._platesolve_mode_switch
+        )
 
         self.lbl_goto_samples = QLabel("0")
 
-        form.addRow("mode:", self.dd_goto_mode)
-        form.addRow("target:", self.tgt_frame)
+        _add_option_row(
+            form,
+            "mode:",
+            self.dd_goto_mode,
+            "Tipo de objetivo y formato de entrada para la orden GoTo.",
+        )
+        form.addRow(_option_label("target:", "Campos del objetivo según el modo seleccionado."), self.tgt_frame)
         form.addRow(rowfb)
-        form.addRow("AutoCal PS mode:", self.dd_autocal_ps_mode)
-        form.addRow("AutoCal manual:", self.autocal_manual_frame)
+        _add_option_row(
+            form,
+            "Plate Solving modo:",
+            self.dd_platesolve_mode,
+            "Selecciona deriva, Alt/Az manual o el Alt/Az registrado como punto de partida para Plate Solving.",
+        )
+        form.addRow("Plate Solving centro:", self.platesolve_target_frame)
         form.addRow(rowps)
         form.addRow(rowb)
         form.addRow("manual samples:", self.lbl_goto_samples)
@@ -1183,10 +1362,18 @@ class GoToTabMixin:
 
         self.dd_goto_mode.currentIndexChanged.connect(self._goto_mode_switch)
         self.dd_radec_fmt.currentIndexChanged.connect(self._goto_mode_switch)
-        self.dd_autocal_ps_mode.currentIndexChanged.connect(self._autocal_ps_mode_switch)
         self._goto_mode_switch()
-        self._autocal_ps_mode_switch()
+        self._platesolve_mode_switch()
         return widget
+
+    def _platesolve_mode_value(self: "AstroPanoptesWindow") -> str:
+        return str(self.dd_platesolve_mode.currentData() or "drift")
+
+    def _platesolve_mode_switch(self: "AstroPanoptesWindow") -> None:
+        manual = self._platesolve_mode_value() == "manual_altaz"
+        self.platesolve_target_frame.setVisible(manual)
+        self.ds_goto_ps_az.setEnabled(manual)
+        self.ds_goto_ps_alt.setEnabled(manual)
 
     def _expected_stars_params_changed(self: "AstroPanoptesWindow", *_args) -> None:
         self.runner.request_expected_stars_params(
@@ -1240,21 +1427,6 @@ class GoToTabMixin:
         else:
             self.tgt_v.addWidget(self.altaz_frame)
 
-    def _autocal_ps_mode_value(self: "AstroPanoptesWindow") -> str:
-        mode = self.dd_autocal_ps_mode.currentText()
-        if mode.startswith("alt/az manual"):
-            return "manual_altaz"
-        if mode.startswith("alt/az actual"):
-            return "current_altaz"
-        return "drift"
-
-    def _autocal_ps_mode_switch(self: "AstroPanoptesWindow") -> None:
-        manual = self._autocal_ps_mode_value() == "manual_altaz"
-        self.autocal_manual_frame.setVisible(manual)
-        self.ds_autocal_ps_manual_az.setEnabled(manual)
-        self.ds_autocal_ps_manual_alt.setEnabled(manual)
-
-
 class ModulesTabsMixin(
     ObserverTabMixin,
     CameraTabMixin,
@@ -1272,6 +1444,12 @@ class ModulesTabsMixin(
         tabs.addTab(self._tab_stacking(), "Stacking")
         tabs.addTab(self._tab_od(), "Object Detection")
         tabs.addTab(self._tab_goto(), "GoTo")
+        tabs.setTabToolTip(0, "Ubicación, escala óptica y prior de rotación para plate solving.")
+        tabs.setTabToolTip(1, "Exposición, ganancia y captura RAW de diagnóstico.")
+        tabs.setTabToolTip(2, "Control de tracking, feed-forward sideral y detección SEP para deriva.")
+        tabs.setTabToolTip(3, "Live stacking, color, drizzle, alineación y preview del stack.")
+        tabs.setTabToolTip(4, "Overlay de detección SEP sobre la vista live.")
+        tabs.setTabToolTip(5, "Plate Solving y toma manual de muestras, ajuste del modelo GoTo y estrellas esperadas.")
 
         wrap = QWidget()
         layout = QVBoxLayout(wrap)

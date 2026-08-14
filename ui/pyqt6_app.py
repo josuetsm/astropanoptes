@@ -39,11 +39,11 @@ if str(ROOT_DIR) not in sys.path:
     sys.path.insert(0, str(ROOT_DIR))
 
 from actions import tracking_keyframe_reset
-from ap_types import Axis
+from ap_types import Axis, CameraStatus, MountStatus
 from app_runner import AppRunner
 from config import AppConfig
 from logging_utils import set_global_log_sink
-from ui.tabs_mixin import ModulesTabsMixin, STACKING_DRIZZLE_SCALES
+from ui.tabs_mixin import ModulesTabsMixin, STACKING_DRIZZLE_SCALES, _set_option_tooltip
 
 
 class QtLogSink(QObject):
@@ -239,6 +239,8 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.runner = runner
         self.cfg = cfg
         self._ps_outputs_enabled = False
+        self._camera_connection_pending: Optional[bool] = None
+        self._mount_connection_pending: Optional[bool] = None
 
         self.setWindowTitle("AstroPanoptes")
         self.resize(1280, 760)
@@ -307,9 +309,14 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
 
         self.view_tabs.addTab(wrap_live, "Live")
         self.view_tabs.addTab(wrap_stack, "Stacked")
+        self.view_tabs.setTabToolTip(0, "Preview live de la cámara con overlays activos.")
+        self.view_tabs.setTabToolTip(1, "Preview del stack acumulado por el módulo Stacking.")
+        _set_option_tooltip(self.live_view, "Imagen live de la cámara. Los overlays se dibujan sobre esta vista.")
+        _set_option_tooltip(self.stacked_view, "Imagen resultante del apilado en vivo.")
 
         self.log = QTextEdit()
         self.log.setReadOnly(True)
+        _set_option_tooltip(self.log, "Registro de eventos, errores y acciones ejecutadas por la aplicación.")
 
         self.logs_frame = QGroupBox("Logs")
         logs_layout = QVBoxLayout(self.logs_frame)
@@ -342,17 +349,21 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
 
         self.cb_demo = QCheckBox("Demo")
         self.cb_demo.setChecked(bool(getattr(self.cfg.simulation, "enabled", False)))
-        self.cb_demo.setToolTip("Usa cámara y montura simuladas para probar sin hardware")
+        _set_option_tooltip(self.cb_demo, "Usa cámara y montura simuladas para probar sin hardware.")
         self.cb_demo.toggled.connect(self._simulation_toggled)
 
-        self.btn_connect_camera = QPushButton("Connect camera")
-        self.btn_disconnect_camera = QPushButton("Disconnect camera")
-        self.btn_connect_mount = QPushButton("Connect mount")
-        self.btn_disconnect_mount = QPushButton("Disconnect mount")
-        self.btn_connect_camera.clicked.connect(self._connect_camera)
-        self.btn_disconnect_camera.clicked.connect(self._disconnect_camera)
-        self.btn_connect_mount.clicked.connect(self._connect_mount)
-        self.btn_disconnect_mount.clicked.connect(self._disconnect_mount)
+        self.btn_camera_connection = QPushButton("Connect camera")
+        self.btn_mount_connection = QPushButton("Connect mount")
+        _set_option_tooltip(
+            self.btn_camera_connection,
+            "Conecta la cámara; cuando está conectada, el mismo botón la desconecta.",
+        )
+        _set_option_tooltip(
+            self.btn_mount_connection,
+            "Conecta la montura rehaciendo primero el enlace Bluetooth; cuando está conectada, el mismo botón la desconecta.",
+        )
+        self.btn_camera_connection.clicked.connect(self._toggle_camera_connection)
+        self.btn_mount_connection.clicked.connect(self._toggle_mount_connection)
 
         self.ch_cam = Chip("Camera")
         self.ch_mount = Chip("Mount")
@@ -362,11 +373,26 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.ch_od = Chip("Object Detection")
         self.ch_ps = Chip("Plate Solving")
         self.ch_goto = Chip("GoTo")
+        _set_option_tooltip(self.ch_cam, "Estado de conexión de la cámara.")
+        _set_option_tooltip(self.ch_mount, "Estado de conexión de la montura.")
+        _set_option_tooltip(self.ch_sync, "Indica si el modelo GoTo está sincronizado con el cielo.")
+        _set_option_tooltip(self.ch_tracking, "Indica si tracking está activo.")
+        _set_option_tooltip(self.ch_stacking, "Indica si stacking está activo.")
+        _set_option_tooltip(self.ch_od, "Indica si el overlay de detección de objetos está activo.")
+        _set_option_tooltip(self.ch_ps, "Indica si plate solving está ejecutándose.")
+        _set_option_tooltip(self.ch_goto, "Indica si una operación GoTo está en curso.")
 
         self.lbl_fps = QLabel("FPS cap/max: --/--/--")
-        self.lbl_drift = QLabel("drift vx/vy: --/-- px/s")
+        self.lbl_drift = QLabel("tracking error: -- px | drift: --/-- px/s")
         self.lbl_coords = QLabel("RA/Dec: -- -- | Az/Alt: -- --")
         self.lbl_errors = QLabel("Errors: none")
+        _set_option_tooltip(self.lbl_fps, "FPS capturado y límite estimado según exposición actual.")
+        _set_option_tooltip(
+            self.lbl_drift,
+            "Error respecto del objetivo, deriva medida y confianza del tracking. Si la medición falla se muestra como inválida, nunca como cero.",
+        )
+        _set_option_tooltip(self.lbl_coords, "Apuntado estimado actual en RA/Dec y Az/Alt.")
+        _set_option_tooltip(self.lbl_errors, "Últimos errores activos publicados por cámara, montura, tracking, stacking, plate solving o GoTo.")
         self.lbl_errors.setStyleSheet(
             "QLabel { padding:4px 10px; border:1px solid #5a2a2a; border-radius:10px; "
             "background:#1b0f0f; color:#ffdada; }"
@@ -382,10 +408,8 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         row.setSpacing(10)
         row.addWidget(self.cb_demo)
         row.addSpacing(8)
-        row.addWidget(self.btn_connect_camera)
-        row.addWidget(self.btn_disconnect_camera)
-        row.addWidget(self.btn_connect_mount)
-        row.addWidget(self.btn_disconnect_mount)
+        row.addWidget(self.btn_camera_connection)
+        row.addWidget(self.btn_mount_connection)
         row.addSpacing(8)
         for widget in [
             self.ch_cam,
@@ -428,6 +452,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
 
         modules_panel = self._build_modules_tabs()
         self.dock_modules = QDockWidget("Modules", self)
+        _set_option_tooltip(self.dock_modules, "Panel de configuración de módulos de observación y control.")
         self.dock_modules.setWidget(modules_panel)
         self.dock_modules.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetMovable
@@ -442,6 +467,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         mv.addWidget(self._build_manual_mount_panel())
 
         self.dock_manual = QDockWidget("Manual Controls", self)
+        _set_option_tooltip(self.dock_manual, "Controles manuales directos para mover la montura por pasos.")
         self.dock_manual.setWidget(manual_wrap)
         self.dock_manual.setFeatures(
             QDockWidget.DockWidgetFeature.DockWidgetMovable
@@ -458,15 +484,21 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
     def _build_menu(self) -> None:
         menu_view = self.menuBar().addMenu("View")
 
-        menu_view.addAction(self.dock_modules.toggleViewAction())
-        menu_view.addAction(self.dock_manual.toggleViewAction())
+        act_modules = self.dock_modules.toggleViewAction()
+        act_modules.setToolTip("Muestra u oculta el panel Modules.")
+        menu_view.addAction(act_modules)
+        act_manual = self.dock_manual.toggleViewAction()
+        act_manual.setToolTip("Muestra u oculta los controles manuales de montura.")
+        menu_view.addAction(act_manual)
 
         act_top = self.tb_top.toggleViewAction()
         act_top.setText("Top Bar")
+        act_top.setToolTip("Muestra u oculta la barra superior de conexiones y estado.")
         menu_view.addAction(act_top)
 
         self.act_logs = QAction("Logs", self, checkable=True)
         self.act_logs.setChecked(True)
+        self.act_logs.setToolTip("Muestra u oculta el panel de logs.")
         self.act_logs.toggled.connect(self.logs_frame.setVisible)
         menu_view.addAction(self.act_logs)
 
@@ -481,11 +513,30 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.sb_steps = QSpinBox()
         self.sb_steps.setRange(1, 2_000_000)
         self.sb_steps.setValue(2000)
+        _set_option_tooltip(
+            self.sb_steps,
+            "Cantidad de microsteps enviados por cada pulsación manual de dirección.",
+        )
 
         self.sb_delay = QSpinBox()
-        self.sb_delay.setRange(50, 200_000)
+        self.sb_delay.setRange(10, 200_000)
         self.sb_delay.setValue(1000)
         self.sb_delay.setSuffix(" µs")
+        _set_option_tooltip(
+            self.sb_delay,
+            "Retardo mínimo entre microsteps: fija la velocidad máxima. "
+            "En modo suave fija la velocidad máxima; en modo directo fija la "
+            "velocidad constante.",
+        )
+
+        self.dd_manual_move_profile = QComboBox()
+        self.dd_manual_move_profile.addItem("Suave (curva S)", "smooth")
+        self.dd_manual_move_profile.addItem("Directo (sin rampa)", "direct")
+        _set_option_tooltip(
+            self.dd_manual_move_profile,
+            "Suave acelera y frena con una curva S. Directo aplica de inmediato "
+            "la velocidad indicada por delay_us.",
+        )
 
         toprow = QHBoxLayout()
         toprow.addWidget(QLabel("steps:"))
@@ -494,6 +545,11 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         toprow.addWidget(QLabel("delay_us:"))
         toprow.addWidget(self.sb_delay)
         toprow.addStretch(1)
+
+        profilerow = QHBoxLayout()
+        profilerow.addWidget(QLabel("Movimiento:"))
+        profilerow.addWidget(self.dd_manual_move_profile)
+        profilerow.addStretch(1)
 
         def mk_btn(text: str, danger: bool = False) -> QToolButton:
             button = QToolButton()
@@ -518,6 +574,11 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.b_left = mk_btn("◀")
         self.b_right = mk_btn("▶")
         self.b_stop = mk_btn("■", danger=True)
+        _set_option_tooltip(self.b_up, "Mueve manualmente el eje de altitud en dirección positiva.")
+        _set_option_tooltip(self.b_down, "Mueve manualmente el eje de altitud en dirección negativa.")
+        _set_option_tooltip(self.b_left, "Mueve manualmente el eje de azimut en dirección negativa.")
+        _set_option_tooltip(self.b_right, "Mueve manualmente el eje de azimut en dirección positiva.")
+        _set_option_tooltip(self.b_stop, "Detiene inmediatamente el movimiento de la montura.")
 
         grid = QGridLayout()
         grid.setHorizontalSpacing(6)
@@ -543,6 +604,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         layout.setContentsMargins(12, 12, 12, 12)
         layout.setSpacing(10)
         layout.addLayout(toprow)
+        layout.addLayout(profilerow)
         layout.addLayout(dwrap)
 
         return card
@@ -552,9 +614,11 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
     def _camera_apply(self) -> None:
         exp_ms = float(self.ds_exp_ms.value())
         gain = int(self.sb_gain.value())
+        offset = int(self.sb_offset.value())
         self.runner.request_camera_param("exp_ms", exp_ms)
         self.runner.request_camera_param("gain", gain)
-        self._log(f"[camera] apply exposure={exp_ms:.1f} ms gain={gain}")
+        self.runner.request_camera_param("offset", offset)
+        self._log(f"[camera] apply exposure={exp_ms:.1f} ms gain={gain} offset={offset}")
 
     def _camera_record_raw(self) -> None:
         if not bool(self.runner.get_state().camera.connected):
@@ -587,6 +651,28 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
     def _disconnect_mount(self) -> None:
         self.runner.request_mount_disconnect()
         self._log("[top] Disconnect mount")
+
+    def _toggle_camera_connection(self) -> None:
+        connected = bool(self.runner.get_state().camera.connected)
+        self._camera_connection_pending = not connected
+        self.btn_camera_connection.setEnabled(False)
+        if connected:
+            self.btn_camera_connection.setText("Disconnecting camera…")
+            self._disconnect_camera()
+        else:
+            self.btn_camera_connection.setText("Connecting camera…")
+            self._connect_camera()
+
+    def _toggle_mount_connection(self) -> None:
+        connected = bool(self.runner.get_state().mount.connected)
+        self._mount_connection_pending = not connected
+        self.btn_mount_connection.setEnabled(False)
+        if connected:
+            self.btn_mount_connection.setText("Disconnecting mount…")
+            self._disconnect_mount()
+        else:
+            self.btn_mount_connection.setText("Connecting mount…")
+            self._connect_mount()
 
     def _download_gaia_current_field(self) -> None:
         self.runner.request_platesolving_download_current_field()
@@ -778,29 +864,31 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.runner.request_goto_cancel()
         self._log("[goto] Cancel")
 
-    def _autocalibrate(self) -> None:
-        ps_mode = self._autocal_ps_mode_value()
+    def _goto_platesolve(self) -> None:
+        ps_mode = self._platesolve_mode_value()
         params = {
-            "autocal_solve_radius_deg": float(self.ds_autocal_ps_radius.value()),
-            "autocal_solve_gmax": float(self.ds_autocal_ps_gmax.value()),
+            "autocal_solve_radius_deg": float(self.ds_goto_ps_radius.value()),
+            "autocal_solve_gmax": float(self.ds_goto_ps_gmax.value()),
             "N_seed": int(self.sb_goto_ps_nseeds.value()),
             "min_inliers": int(self.sb_goto_ps_mininl.value()),
             "autocal_ps_mode": ps_mode,
         }
         if ps_mode == "manual_altaz":
             params["autocal_ps_target"] = {
-                "az_deg": float(self.ds_autocal_ps_manual_az.value()),
-                "alt_deg": float(self.ds_autocal_ps_manual_alt.value()),
+                "az_deg": float(self.ds_goto_ps_az.value()),
+                "alt_deg": float(self.ds_goto_ps_alt.value()),
             }
         self.runner.request_goto_autocalibrate(params)
-        target_txt = ""
-        if "autocal_ps_target" in params:
-            target_txt = f", target={params['autocal_ps_target']}"
+        target_txt = (
+            f" target={params['autocal_ps_target']}"
+            if "autocal_ps_target" in params
+            else ""
+        )
         self._log(
-            "[goto] AutoCalibrate "
-            f"(radius={params['autocal_solve_radius_deg']:.2f}deg, gmax={params['autocal_solve_gmax']:.2f}, "
-            f"N_seed={params['N_seed']}, min_inliers={params['min_inliers']}, "
-            f"ps_mode={params['autocal_ps_mode']}{target_txt})"
+            "[goto] Plate Solving "
+            f"mode={ps_mode}{target_txt} "
+            f"radius={self.ds_goto_ps_radius.value():.2f}deg; "
+            "exposición/ganancia preservadas"
         )
 
     def _goto_estimate_roll(self) -> None:
@@ -838,12 +926,22 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
     def _manual_move(self, axis: Axis, direction: int) -> None:
         steps = int(self.sb_steps.value())
         delay_us = int(self.sb_delay.value())
+        profile = str(self.dd_manual_move_profile.currentData() or "smooth")
         if axis == Axis.AZ and self.cfg.mount.invert_az:
             direction *= -1
         if axis == Axis.ALT and self.cfg.mount.invert_alt:
             direction *= -1
-        self.runner.request_mount_move_steps(axis, direction, steps, delay_us)
-        self._log(f"[manual] move axis={axis.value} direction={direction} steps={steps} delay_us={delay_us}")
+        self.runner.request_mount_move_steps(
+            axis,
+            direction,
+            steps,
+            delay_us,
+            profile=profile,
+        )
+        self._log(
+            f"[manual] move axis={axis.value} direction={direction} "
+            f"steps={steps} delay_us={delay_us} profile={profile}"
+        )
 
     def _manual_stop(self) -> None:
         self.runner.request_mount_stop()
@@ -857,13 +955,64 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             f"FPS cap/max: {state.camera.fps_capture:.2f}/"
             f"{fps_max:.2f}"
         )
-        self.lbl_drift.setText(f"drift vx/vy: {state.tracking.vx:.2f}/{state.tracking.vy:.2f} px/s")
+        tracking = state.tracking
+        if not bool(tracking.enabled):
+            self.lbl_drift.setText("tracking error: -- px | drift: --/-- px/s")
+        elif bool(getattr(tracking, "measurement_valid", False)):
+            control_text = (
+                "feedback: calibrated"
+                if str(getattr(tracking, "calib_src", "none")) != "none"
+                else "feedback: unavailable"
+            )
+            self.lbl_drift.setText(
+                f"tracking error: {float(tracking.error_px):.2f} px | "
+                f"drift: {float(tracking.vx):.2f}/{float(tracking.vy):.2f} px/s | "
+                f"lock: {100.0 * float(tracking.lock_conf):.0f}% | {control_text}"
+            )
+        else:
+            reason_labels = {
+                "initializing": "acquiring reference",
+                "no_sources": "no sources",
+                "detection_failed": "detection failed",
+                "low_confidence": "low confidence",
+                "estimator_disagreement": "ambiguous match",
+                "shift_out_of_range": "shift out of range",
+                "lost_lock": "lock lost; reacquiring",
+                "off": "off",
+            }
+            reason = str(getattr(tracking, "measurement_reason", "low_confidence"))
+            reason_text = reason_labels.get(reason, reason.replace("_", " "))
+            self.lbl_drift.setText(
+                f"tracking: invalid measurement ({reason_text}) | "
+                f"detections: {int(tracking.n_det)} | lock: {100.0 * float(tracking.lock_conf):.0f}%"
+            )
         if hasattr(self, "lbl_goto_samples"):
-            self.lbl_goto_samples.setText(str(getattr(state.goto, "manual_samples", 0)))
+            manual_samples = int(getattr(state.goto, "manual_samples", 0))
+            self.lbl_goto_samples.setText(str(manual_samples))
+            if hasattr(self, "btn_platesolve"):
+                self.btn_platesolve.setEnabled(not bool(state.platesolving.busy))
+            if hasattr(self, "btn_fit_model"):
+                self.btn_fit_model.setEnabled(manual_samples >= 3)
+                if manual_samples < 3:
+                    self.btn_fit_model.setToolTip(
+                        f"Requiere al menos 3 muestras válidas ({manual_samples}/3)."
+                    )
+                else:
+                    self.btn_fit_model.setToolTip(
+                        "Ajusta el modelo GoTo usando las muestras manuales registradas."
+                    )
         if hasattr(self, "cb_expected_stars"):
             self._update_expected_stars_controls(state)
 
-        if state.goto.pointing_valid:
+        if bool(getattr(state.goto, "sample_last_ok", False)):
+            ra_str = self._format_ra_deg(state.platesolving.center_ra_deg)
+            dec_str = self._format_dec_deg(state.platesolving.center_dec_deg)
+            az_str = self._format_az_deg(state.goto.sample_last_az_deg)
+            alt_str = self._format_alt_deg(state.goto.sample_last_alt_deg)
+            self.lbl_coords.setText(
+                f"Muestra aceptada · RA/Dec: {ra_str} {dec_str} | Az/Alt: {az_str} {alt_str}"
+            )
+        elif state.goto.pointing_valid:
             ra_str = self._format_ra_deg(state.goto.pointing_ra_deg)
             dec_str = self._format_dec_deg(state.goto.pointing_dec_deg)
             az_str = self._format_az_deg(state.goto.pointing_az_deg)
@@ -936,6 +1085,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.lbl_ps_dxdy.setText(f"{state.platesolving.dx_px:.1f} / {state.platesolving.dy_px:.1f}")
 
     def _update_chips_from_state(self, state) -> None:
+        self._update_connection_buttons(state)
         self.ch_cam.set_mode("green" if state.camera.connected else "red")
         self.ch_mount.set_mode("green" if state.mount.connected else "red")
         self.ch_sync.set_mode("green" if state.goto.synced else "red")
@@ -944,6 +1094,49 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.ch_od.set_mode("active" if self.od_enabled else "neutral")
         self.ch_ps.set_mode("active" if state.platesolving.busy else "neutral")
         self.ch_goto.set_mode("active" if state.goto.busy else "neutral")
+
+    def _update_connection_buttons(self, state) -> None:
+        camera_status = state.camera.status
+        if self._camera_connection_pending is not None:
+            target = bool(self._camera_connection_pending)
+            if bool(state.camera.connected) == target or camera_status == CameraStatus.ERROR:
+                self._camera_connection_pending = None
+
+        camera_busy = (
+            camera_status == CameraStatus.CONNECTING
+            or self._camera_connection_pending is not None
+        )
+        self.btn_camera_connection.setEnabled(not camera_busy)
+        if camera_busy:
+            target = self._camera_connection_pending
+            self.btn_camera_connection.setText(
+                "Disconnecting camera…" if target is False else "Connecting camera…"
+            )
+        else:
+            self.btn_camera_connection.setText(
+                "Disconnect camera" if state.camera.connected else "Connect camera"
+            )
+
+        mount_status = state.mount.status
+        if self._mount_connection_pending is not None:
+            target = bool(self._mount_connection_pending)
+            if bool(state.mount.connected) == target or mount_status == MountStatus.ERROR:
+                self._mount_connection_pending = None
+
+        mount_busy = (
+            mount_status == MountStatus.CONNECTING
+            or self._mount_connection_pending is not None
+        )
+        self.btn_mount_connection.setEnabled(not mount_busy)
+        if mount_busy:
+            target = self._mount_connection_pending
+            self.btn_mount_connection.setText(
+                "Disconnecting mount…" if target is False else "Connecting mount…"
+            )
+        else:
+            self.btn_mount_connection.setText(
+                "Disconnect mount" if state.mount.connected else "Connect mount"
+            )
 
     def _update_error_banner(self, state) -> None:
         errors = []

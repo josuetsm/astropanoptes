@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import json
 import queue
 import threading
 import time
@@ -48,6 +49,7 @@ from actions import (
     goto_cancel,
     goto_list_samples,
     goto_prune_outliers,
+    goto_validate_sample,
     expected_stars_set_params,
     live_sep_set_params,
     mount_connect,
@@ -80,12 +82,17 @@ from gaia_cache import (
 from camera_poa import POACameraDevice, CameraStream
 from imaging import ensure_raw16_bayer
 from preview import make_preview_jpeg, encode_jpeg
-from mount_arduino import ArduinoMount, resolve_common_microsteps
+from mount_arduino import (
+    ArduinoMount,
+    estimate_firmware_move_duration_s,
+    resolve_common_microsteps,
+)
 from simulation import SimulatedCameraStream, SimulatedMount, SimulationState, restore_iers_after_demo
 
 from tracking import (
     auto_reset,
     make_tracking_state,
+    reset_tracker,
     tracking_step,
     tracking_set_params,
 )
@@ -103,7 +110,17 @@ from platesolving import (
     load_gaia_auth,
 )
 
-from goto import GoToController, GoToConfig as GoToRuntimeConfig, GoToModel, MountKinematics, GoToWorker
+from goto import (
+    GoToController,
+    GoToConfig as GoToRuntimeConfig,
+    GoToModel,
+    MountKinematics,
+    GoToWorker,
+    _platesolving_result_obstime,
+    platesolving_center_to_altaz_deg,
+    platesolving_roll_sample_deg,
+    roll_axis_distance_deg,
+)
 from mount_arduino import MountMoveWorker
 
 
@@ -202,6 +219,7 @@ class AppRunner:
             sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
             sep_minarea=int(self.cfg.sep.minarea),
             sep_max_sources=int(self.cfg.platesolving.max_det),
+            sep_min_sources=3,
         )
 
         # Stacking subsystem
@@ -216,7 +234,7 @@ class AppRunner:
         self._gaia_download_thread: Optional[threading.Thread] = None
 
         # Config platesolving (runtime copy, actualizable desde UI por action)
-        self._platesolving_observer = ObserverConfig()  # Algarrobo por default en tu platesolving.py
+        self._platesolving_observer = ObserverConfig()  # San Carlos por defecto.
         self._platesolving_worker = PlatesolvingWorker(
             get_frame=self._get_live_frame_for_platesolving,
             get_cfg=self._get_platesolving_cfg_snapshot,
@@ -231,9 +249,8 @@ class AppRunner:
             motor_full_steps_per_rev=200,
             microsteps_az=int(self.cfg.mount.ms_az),
             microsteps_alt=int(self.cfg.mount.ms_alt),
-            motor_pulley_teeth=20,
-            ring_radius_m_az=0.24,
-            ring_radius_m_alt=0.235,
+            gear_reduction_az=45.0,
+            gear_reduction_alt=45.0,
             axis_sign_az=+1,
             axis_sign_alt=_axis_sign_from_invert(self.cfg.mount.invert_alt),
         )
@@ -248,7 +265,13 @@ class AppRunner:
             max_step_per_iter=int(self.cfg.goto.max_step_per_iter),
             slew_delay_us_az=int(self.cfg.goto.slew_delay_us),
             slew_delay_us_alt=int(self.cfg.goto.slew_delay_us),
+            slew_min_delay_us=int(self.cfg.goto.slew_min_delay_us),
+            slew_full_speed_distance_deg=float(self.cfg.goto.slew_full_speed_distance_deg),
+            max_unfitted_goto_deg=float(self.cfg.goto.max_unfitted_goto_deg),
+            max_goto_distance_deg=float(self.cfg.goto.max_goto_distance_deg),
             settle_s=float(self.cfg.goto.settle_s),
+            backlash_steps_az=int(self.cfg.goto.backlash_steps_az),
+            backlash_steps_alt=int(self.cfg.goto.backlash_steps_alt),
             stages=int(self.cfg.goto.stages),
             platesolving_feedback=bool(self.cfg.goto.platesolving_feedback),
         )
@@ -257,7 +280,15 @@ class AppRunner:
         self._mount_move_worker = MountMoveWorker(
             get_mount=lambda: self._mount,
             note_manual_move=self._goto.model.note_manual_move,
+            get_last_direction=self._goto.model.last_move_direction,
+            set_last_direction=self._goto.model.set_last_move_direction,
+            get_backlash_steps=lambda axis: (
+                self._goto.model.backlash_steps_az
+                if axis == Axis.AZ
+                else self._goto.model.backlash_steps_alt
+            ),
             publish_state=self._update_state,
+            operation_finished=lambda: self._finish_operation("mount_move"),
             out_log=self.out_log,
         )
         self._manual_move_active_until_s: Dict[str, float] = {
@@ -297,6 +328,19 @@ class AppRunner:
             stop_mount=self._mount_stop,
             out_log=self.out_log,
         )
+        self._operation_lock = threading.Lock()
+        self._operation_started = {
+            "platesolving": 0,
+            "goto": 0,
+            "mount_move": 0,
+            "camera_record": 0,
+        }
+        self._operation_finished = {
+            "platesolving": 0,
+            "goto": 0,
+            "mount_move": 0,
+            "camera_record": 0,
+        }
         # State + outputs (thread-safe)
         self._state = AppState()
         self._state_lock = threading.Lock()
@@ -361,6 +405,14 @@ class AppRunner:
                     "calib_src": "none",
                     "calib_det": 0.0,
                     "n_det": 0,
+                    "measurement_valid": False,
+                    "measurement_reason": "off",
+                    "measurement_source": "none",
+                    "error_x_px": 0.0,
+                    "error_y_px": 0.0,
+                    "error_px": 0.0,
+                    "lock_conf": 0.0,
+                    "fail_count": 0,
                 },
                 "stacking": {
                     "enabled": self._stacking_enabled,
@@ -397,6 +449,17 @@ class AppRunner:
                     "J01": float(self._goto.model.J_deg_per_step[0, 1]),
                     "J10": float(self._goto.model.J_deg_per_step[1, 0]),
                     "J11": float(self._goto.model.J_deg_per_step[1, 1]),
+                    "periodic_error_az_deg": float(
+                        np.linalg.norm(self._goto.model.periodic_coeff_deg[0, :])
+                    ),
+                    "periodic_error_alt_deg": float(
+                        np.linalg.norm(self._goto.model.periodic_coeff_deg[1, :])
+                    ),
+                    "periodic_model_samples": int(self._goto.model.periodic_model_samples),
+                    "last_direction_az": int(self._goto.model.last_move_direction_az),
+                    "last_direction_alt": int(self._goto.model.last_move_direction_alt),
+                    "backlash_steps_az": int(self._goto.model.backlash_steps_az),
+                    "backlash_steps_alt": int(self._goto.model.backlash_steps_alt),
                     "expected_stars_overlay_enabled": False,
                     "expected_stars_overlay_count": 0,
                     "expected_stars_overlay_source": "",
@@ -710,10 +773,45 @@ class AppRunner:
             return None
 
     def _publish_platesolving_state(self, patch: Dict[str, Dict[str, Any]]) -> None:
+        with self._operation_lock:
+            for name in ("platesolving", "goto"):
+                section = patch.get(name, {})
+                if not isinstance(section, dict) or "busy" not in section:
+                    continue
+                if bool(section.get("busy")):
+                    if str(getattr(section.get("status"), "value", section.get("status"))) == "RUNNING":
+                        self._operation_started[name] += 1
+                else:
+                    self._operation_finished[name] = self._operation_started[name]
         result = patch.pop("platesolving_result", None)
+        # GoToWorker consumes its own plate solutions (continuity check,
+        # manual sample/sync and calibration). Re-enqueuing the same result in
+        # the runner used to store every AutoCal solution twice and biased the
+        # pointing-model fit. Explicit PlatesolvingWorker results remain
+        # automatically validated here.
+        result_handled = bool(patch.pop("platesolving_result_handled", False))
         self._update_state(patch)
-        if result is not None and bool(getattr(result, "success", False)):
-            self._last_platesolving_result = result
+        if result is not None:
+            # Never leave an older successful solve available for Sync after
+            # the newest attempt was rejected (including motion-continuity
+            # rejection). A stale solution is more dangerous than no solution.
+            self._last_platesolving_result = (
+                result if bool(getattr(result, "success", False)) else None
+            )
+            if self._last_platesolving_result is not None and not result_handled:
+                # The operator decides when to solve; the program decides if
+                # the resulting sample is trustworthy enough for the model.
+                self.enqueue(goto_validate_sample(result))
+            else:
+                result_status = str(getattr(result, "status", "PLATESOLVING_FAILED"))
+                self._update_state(
+                    {
+                        "goto": {
+                            "sample_last_ok": False,
+                            "sample_last_reason": result_status,
+                        }
+                    }
+                )
 
     def _goto_pointing_snapshot(self) -> Optional[Dict[str, float]]:
         az_alt = self._goto.model.current_az_alt_deg()
@@ -898,6 +996,29 @@ class AppRunner:
         coverage["field_source"] = source
         return coverage
 
+    def get_operation_counters(self) -> Dict[str, Dict[str, int]]:
+        """Monotonic operation counters used by terminal automation.
+
+        Unlike polling ``busy == false``, these counters cannot report success
+        before a queued worker request has actually started.
+        """
+        with self._operation_lock:
+            return {
+                name: {
+                    "started": int(self._operation_started[name]),
+                    "finished": int(self._operation_finished[name]),
+                }
+                for name in self._operation_started
+            }
+
+    def _start_operation(self, name: str) -> None:
+        with self._operation_lock:
+            self._operation_started[name] += 1
+
+    def _finish_operation(self, name: str) -> None:
+        with self._operation_lock:
+            self._operation_finished[name] = self._operation_started[name]
+
     def request_camera_connect(self, camera_index: int) -> None:
         self.enqueue(camera_connect(camera_index))
 
@@ -925,11 +1046,30 @@ class AppRunner:
     def request_mount_set_microsteps(self, az_div: int, alt_div: int) -> None:
         self.enqueue(mount_set_microsteps(az_div=az_div, alt_div=alt_div))
 
-    def request_mount_move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
-        self.enqueue(mount_move_steps(axis=axis, direction=direction, steps=steps, delay_us=delay_us))
+    def request_mount_move_steps(
+        self,
+        axis: Axis,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        profile: str = "smooth",
+    ) -> None:
+        self.enqueue(
+            mount_move_steps(
+                axis=axis,
+                direction=direction,
+                steps=steps,
+                delay_us=delay_us,
+                profile=profile,
+            )
+        )
 
     def request_mount_stop(self) -> None:
         self.enqueue(mount_stop())
+
+    def cancel_platesolving(self) -> None:
+        """Cooperatively cancel the currently running explicit plate solve."""
+        self._platesolving_worker.cancel_current()
 
     def request_mount_sync(self) -> None:
         self.enqueue(mount_sync())
@@ -988,7 +1128,7 @@ class AppRunner:
     def request_stacking_save(self, **kwargs: Any) -> None:
         self.enqueue(stacking_save(**kwargs))
 
-    def request_platesolving_run(self, target: str) -> None:
+    def request_platesolving_run(self, target: Any) -> None:
         self.enqueue(platesolving_run(target=target))
 
     def request_platesolving_download_current_field(self, radius_deg: Optional[float] = None) -> None:
@@ -1016,10 +1156,11 @@ class AppRunner:
 
     def _tracking_keyframe_reset(self) -> None:
         try:
-            self._tracking_state.key_obj_xy = "PENDING"
-            self._tracking_state.lock_conf = 0.0
-            self._tracking_state.rate_az = 0.0
-            self._tracking_state.rate_alt = 0.0
+            # Reset both the absolute target and the incremental reference.
+            # Keeping the old incremental frame after a GoTo/manual movement
+            # made the first new frame look like a tracking jump and could send
+            # the controller toward the previous field.
+            reset_tracker(self._tracking_state, now_t=float(_perf()), mode="STABILIZE")
             self._tracking_last_frame_token = None
             self._tracking_last_output = None
         except Exception as exc:
@@ -1030,14 +1171,30 @@ class AppRunner:
         self._tracking_ff_hold_alt = 0.0
         self._tracking_ff_last_valid_t = None
 
-    def _estimate_manual_move_runtime_s(self, *, steps: int, delay_us: int) -> float:
-        steps_i = max(0, int(steps))
-        delay_i = max(0, int(delay_us))
-        pulse_us = 3.0
-        return float(steps_i) * ((float(delay_i) + pulse_us) / 1.0e6)
+    def _estimate_manual_move_runtime_s(
+        self,
+        *,
+        steps: int,
+        delay_us: int,
+        profile: str = "smooth",
+    ) -> float:
+        return estimate_firmware_move_duration_s(
+            int(steps), int(delay_us), profile=profile
+        )
 
-    def _mark_manual_move_active(self, *, axis: Axis, steps: int, delay_us: int) -> None:
-        est_s = self._estimate_manual_move_runtime_s(steps=steps, delay_us=delay_us)
+    def _mark_manual_move_active(
+        self,
+        *,
+        axis: Axis,
+        steps: int,
+        delay_us: int,
+        profile: str = "smooth",
+    ) -> None:
+        est_s = self._estimate_manual_move_runtime_s(
+            steps=steps,
+            delay_us=delay_us,
+            profile=profile,
+        )
         until = _perf() + est_s + 0.05
         key = axis.value
         prev = float(self._manual_move_active_until_s.get(key, 0.0))
@@ -1077,14 +1234,29 @@ class AppRunner:
             return
         direction = +1 if int(signed_steps) >= 0 else -1
         steps = abs(int(signed_steps))
-        self._mount.move_steps(
-            axis=axis,
-            direction=direction,
-            steps=steps,
-            delay_us=int(delay_us),
-            blocking=False,
-            stop_before_move=False,
-        )
+        try:
+            self._mount.move_steps(
+                axis=axis,
+                direction=direction,
+                steps=steps,
+                delay_us=int(delay_us),
+                profile="direct",
+                blocking=False,
+                stop_before_move=False,
+            )
+        except TypeError as exc:
+            # Keep rate emulation compatible with lightweight/legacy mount
+            # adapters that predate the optional movement profile.
+            if "profile" not in str(exc):
+                raise
+            self._mount.move_steps(
+                axis=axis,
+                direction=direction,
+                steps=steps,
+                delay_us=int(delay_us),
+                blocking=False,
+                stop_before_move=False,
+            )
 
     def _mount_rate_safe(self, az: float, alt: float) -> tuple[int, int]:
         if self._mount is None:
@@ -1177,7 +1349,15 @@ class AppRunner:
     def _goto_move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
         if self._mount is None:
             raise RuntimeError("mount not connected")
-        self._mount.move_steps(axis, direction, steps, delay_us, blocking=False, stop_before_move=False)
+        self._mount.move_steps(
+            axis,
+            direction,
+            steps,
+            delay_us,
+            profile="direct",
+            blocking=False,
+            stop_before_move=False,
+        )
 
     def _pause_tracking_for_goto(self) -> bool:
         was_tracking = self._get_tracking_enabled()
@@ -1329,6 +1509,8 @@ class AppRunner:
             self.cfg.camera.exp_ms = float(value)
         elif n in ("gain",):
             self.cfg.camera.gain = int(value)
+        elif n in ("offset", "black_level"):
+            self.cfg.camera.offset = int(value)
         elif n in ("auto_gain",):
             self.cfg.camera.auto_gain = bool(value)
         elif n in ("img_format",):
@@ -1426,6 +1608,13 @@ class AppRunner:
                     "model_fit_rms_az_deg": float(fit_report["model_fit_rms_az_deg"]),
                     "model_fit_rms_alt_deg": float(fit_report["model_fit_rms_alt_deg"]),
                     "model_fit_rms_arcsec": float(fit_report["model_fit_rms_arcsec"]),
+                    "periodic_error_az_deg": float(fit_report["periodic_error_az_deg"]),
+                    "periodic_error_alt_deg": float(fit_report["periodic_error_alt_deg"]),
+                    "periodic_model_samples": int(fit_report["periodic_model_samples"]),
+                    "last_direction_az": int(self._goto.model.last_move_direction_az),
+                    "last_direction_alt": int(self._goto.model.last_move_direction_alt),
+                    "backlash_steps_az": int(self._goto.model.backlash_steps_az),
+                    "backlash_steps_alt": int(self._goto.model.backlash_steps_alt),
                 }
             }
         )
@@ -1444,6 +1633,7 @@ class AppRunner:
             sep_thresh_sigma=float(self.cfg.sep.thresh_sigma),
             sep_minarea=int(self.cfg.sep.minarea),
             sep_max_sources=int(self.cfg.platesolving.max_det),
+            sep_min_sources=3,
         )
         self._update_state(
             {
@@ -1499,8 +1689,14 @@ class AppRunner:
             return
 
         try:
+            state_snapshot = self.get_state()
+            platesolving_overlay = list(
+                getattr(state_snapshot.platesolving, "overlay", None) or []
+            )
             overlay_enabled = bool(
-                self._live_sep_overlay_enabled or self._expected_stars_overlay_enabled
+                self._live_sep_overlay_enabled
+                or self._expected_stars_overlay_enabled
+                or platesolving_overlay
             )
 
             raw16 = ensure_raw16_bayer(fr.raw)
@@ -1516,6 +1712,11 @@ class AppRunner:
                 )
                 if self._live_sep_overlay_enabled:
                     u8_preview = self._apply_live_sep_overlay(raw16_work, u8_preview)
+                if platesolving_overlay:
+                    u8_preview = self._apply_platesolving_overlay(
+                        u8_preview,
+                        platesolving_overlay,
+                    )
                 if self._expected_stars_overlay_enabled:
                     wall_t = self._frame_wall_t(fr)
                     obstime = (
@@ -1585,6 +1786,59 @@ class AppRunner:
         except Exception as exc:
             log_error(self.out_log, "Live SEP: overlay failed", exc, throttle_s=2.0, throttle_key="live_sep_overlay")
             return u8_preview
+
+    def _apply_platesolving_overlay(
+        self,
+        u8_preview: np.ndarray,
+        overlay: Sequence[Any],
+    ) -> np.ndarray:
+        """Draw persistent detections and the exact plate-solving seeds."""
+        if u8_preview.ndim == 2:
+            img = cv2.cvtColor(u8_preview, cv2.COLOR_GRAY2BGR)
+        else:
+            img = u8_preview.copy()
+        h, w = img.shape[:2]
+        colors = {
+            "det": (255, 0, 0),
+            "det_persistent": (255, 255, 0),
+            "seed": (255, 0, 255),
+            "match": (0, 255, 0),
+            "guide": (0, 0, 255),
+        }
+        for item in overlay:
+            if isinstance(item, dict):
+                x_raw = item.get("x", 0.0)
+                y_raw = item.get("y", 0.0)
+                kind = str(item.get("kind", "det"))
+                label = item.get("label", None)
+            else:
+                x_raw = getattr(item, "x", 0.0)
+                y_raw = getattr(item, "y", 0.0)
+                kind = str(getattr(item, "kind", "det"))
+                label = getattr(item, "label", None)
+            x = int(round(float(x_raw)))
+            y = int(round(float(y_raw)))
+            if x < 0 or y < 0 or x >= w or y >= h:
+                continue
+            color = colors.get(kind, (255, 255, 0))
+            radius = 12 if kind == "seed" else 9 if kind in {"match", "guide"} else 7
+            thickness = 2 if kind == "seed" else 1
+            cv2.circle(img, (x, y), radius, color, thickness, lineType=cv2.LINE_AA)
+            if kind == "seed":
+                cv2.line(img, (x - 5, y), (x + 5, y), color, 1, lineType=cv2.LINE_AA)
+                cv2.line(img, (x, y - 5), (x, y + 5), color, 1, lineType=cv2.LINE_AA)
+            if kind in {"seed", "guide"} and label:
+                cv2.putText(
+                    img,
+                    str(label),
+                    (x + radius + 2, max(12, y - radius)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.45,
+                    color,
+                    1,
+                    lineType=cv2.LINE_AA,
+                )
+        return img
 
     def _invalidate_expected_stars_catalog(self) -> None:
         self._expected_stars_catalog = None
@@ -1903,6 +2157,15 @@ class AppRunner:
     def _mount_set_microsteps(self, az_div: int, alt_div: int) -> None:
         if self._mount is None or not self._mount.is_connected():
             return
+        if int(az_div) != 64 or int(alt_div) != 64:
+            log_error(
+                self.out_log,
+                "Mount: ignored microstep change; hardware is fixed at 1/64",
+                ValueError(
+                    f"requested AZ=1/{int(az_div)} ALT=1/{int(alt_div)}"
+                ),
+            )
+            return
         try:
             common_ms = resolve_common_microsteps(int(az_div), int(alt_div), default_ms=64)
             self._mount.stop()
@@ -1912,12 +2175,7 @@ class AppRunner:
             self._goto.model.set_microsteps(int(common_ms), int(common_ms))
             self.cfg.mount.ms_az = int(common_ms)
             self.cfg.mount.ms_alt = int(common_ms)
-            if int(az_div) != int(alt_div):
-                log_info(
-                    self.out_log,
-                    f"Mount: MS requested AZ={int(az_div)} ALT={int(alt_div)} but firmware is common; using {int(common_ms)}",
-                )
-            log_info(self.out_log, f"Mount: MS set (COMMON={int(common_ms)})")
+            log_info(self.out_log, "Mount: fixed microstepping confirmed (1/64)")
         except Exception as exc:
             self._update_state(
                 {
@@ -1927,15 +2185,29 @@ class AppRunner:
             )
             log_error(self.out_log, "Mount: MS failed", exc)
 
-    def _mount_move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
+    def _mount_move_steps(
+        self,
+        axis: Axis,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        profile: str = "smooth",
+    ) -> None:
         if self._mount is None or not self._mount.is_connected():
             return
-        self._mark_manual_move_active(axis=axis, steps=int(steps), delay_us=int(delay_us))
+        self._mark_manual_move_active(
+            axis=axis,
+            steps=int(steps),
+            delay_us=int(delay_us),
+            profile=profile,
+        )
+        self._start_operation("mount_move")
         self._mount_move_worker.request(
             axis=axis,
             direction=direction,
             steps=steps,
             delay_us=delay_us,
+            profile=profile,
         )
 
     # -------------------------
@@ -2282,6 +2554,7 @@ class AppRunner:
                 log_info(self.out_log, "Raw record: already running")
                 return
             self._raw_record_active = True
+        self._start_operation("camera_record")
 
         duration_s = max(0.1, float(duration_s))
         if not basename:
@@ -2289,6 +2562,7 @@ class AppRunner:
 
         def _worker() -> None:
             frames: list[np.ndarray] = []
+            frame_metadata: list[dict[str, Any]] = []
             try:
                 stream = self._cam_stream
                 if stream is None:
@@ -2322,6 +2596,14 @@ class AppRunner:
                         )
                         raw16 = np.asarray(fr.raw)
                     frames.append(raw16.copy())
+                    frame_metadata.append(
+                        {
+                            "index": int(len(frames) - 1),
+                            "seq": int(seq) if seq is not None else None,
+                            "t_capture_s": float(fr.t_capture),
+                            "t_wall_unix": self._frame_wall_t(fr),
+                        }
+                    )
 
                 if not frames:
                     log_info(self.out_log, "Raw record: no frames captured")
@@ -2335,9 +2617,30 @@ class AppRunner:
                 out_path = os.path.join(out_dir, f"{basename}.npy")
                 stack = np.stack(frames, axis=0)
                 np.save(out_path, stack)
+                metadata_path = str(Path(out_path).with_suffix(".json"))
+                with open(metadata_path, "w", encoding="utf-8") as handle:
+                    json.dump(
+                        {
+                            "raw_file": str(Path(out_path).resolve()),
+                            "shape": [int(value) for value in stack.shape],
+                            "dtype": str(stack.dtype),
+                            "duration_requested_s": float(duration_s),
+                            "camera": {
+                                "exp_ms": float(self.cfg.camera.exp_ms),
+                                "gain": int(self.cfg.camera.gain),
+                                "offset": int(self.cfg.camera.offset),
+                            },
+                            "frames": frame_metadata,
+                        },
+                        handle,
+                        indent=2,
+                        sort_keys=True,
+                    )
                 log_info(
                     self.out_log,
-                    f"Raw record: saved {stack.shape[0]} frames to {out_path} (shape={stack.shape}, dtype={stack.dtype})",
+                    f"Raw record: saved {stack.shape[0]} frames to {out_path} "
+                    f"with timing metadata {metadata_path} "
+                    f"(shape={stack.shape}, dtype={stack.dtype})",
                 )
             except Exception as exc:
                 log_error(self.out_log, "Raw record: failed", exc)
@@ -2345,6 +2648,7 @@ class AppRunner:
                 with self._raw_record_lock:
                     self._raw_record_active = False
                     self._raw_record_thread = None
+                self._finish_operation("camera_record")
 
         self._raw_record_thread = threading.Thread(target=_worker, name="RawRecord", daemon=True)
         self._raw_record_thread.start()
@@ -2480,7 +2784,31 @@ class AppRunner:
                                 "calib_src": str(out.calib_src),
                                 "calib_det": float(out.detA),
                                 "n_det": int(out.n_det),
-                                "last_error": "SEP: no detections" if int(out.n_det) == 0 else None,
+                                "measurement_valid": bool(out.ok),
+                                "measurement_reason": str(out.measurement_reason),
+                                "measurement_source": str(out.measurement_source),
+                                "error_x_px": float(out.x_hat),
+                                "error_y_px": float(out.y_hat),
+                                "error_px": float(np.hypot(out.x_hat, out.y_hat)),
+                                "lock_conf": float(out.lock_conf),
+                                "fail_count": int(out.fail_count),
+                                "last_error": (
+                                    "SEP: detection failed"
+                                    if str(out.measurement_reason) == "detection_failed"
+                                    else (
+                                        "SEP: no detections"
+                                        if str(out.measurement_reason) == "no_sources"
+                                        else (
+                                            f"measurement invalid: {out.measurement_reason}"
+                                            if (not out.ok and int(out.fail_count) >= 2)
+                                            else (
+                                                "feedback calibration unavailable"
+                                                if (out.ok and str(out.calib_src) == "none")
+                                                else None
+                                            )
+                                        )
+                                    )
+                                ),
                             }
                         }
                     )
@@ -2505,6 +2833,14 @@ class AppRunner:
                             "rate_ff_az": 0.0,
                             "rate_ff_alt": 0.0,
                             "n_det": 0,
+                            "measurement_valid": False,
+                            "measurement_reason": "off",
+                            "measurement_source": "none",
+                            "error_x_px": 0.0,
+                            "error_y_px": 0.0,
+                            "error_px": 0.0,
+                            "lock_conf": 0.0,
+                            "fail_count": 0,
                             "last_error": None,
                         }
                     }
@@ -2728,6 +3064,43 @@ class AppRunner:
             return
 
         if t == ActionType.MOUNT_STOP:
+            self._platesolving_worker.cancel_current()
+            move_was_active = bool(
+                self._mount_move_worker.is_busy()
+                or self._is_manual_move_active()
+                or self.get_state().goto.busy
+                or self._get_tracking_enabled()
+            )
+            self._goto_worker.cancel()
+            self._reset_tracking_feedforward_cache()
+            self._update_state(
+                {
+                    "tracking": {
+                        "enabled": False,
+                        "status": TrackingStatus.OFF,
+                        "mode": TrackingMode.IDLE,
+                        "measurement_valid": False,
+                        "measurement_reason": "emergency_stop",
+                    },
+                    "goto": {
+                        "busy": False,
+                        "status": GotoStatus.CANCELLED,
+                        "reason": (
+                            "STOP_POSITION_UNKNOWN"
+                            if move_was_active
+                            else "STOPPED"
+                        ),
+                    },
+                }
+            )
+            if move_was_active:
+                # Firmware STOP does not report how many steps of an in-flight
+                # MOVE were completed. Keeping the old sync would make the
+                # next GoTo unsafe.
+                self._goto.model.synced = False
+                self._update_state(
+                    {"goto": {"synced": False, "pointing_valid": False}}
+                )
             self._mount_stop()
             self._tracking_keyframe_reset()
             return
@@ -2743,7 +3116,8 @@ class AppRunner:
             direction = int(p.get("direction", 1))
             steps = int(p.get("steps", 600))
             delay_us = int(p.get("delay_us", 1800))
-            self._mount_move_steps(axis, direction, steps, delay_us)
+            profile = str(p.get("profile", "smooth"))
+            self._mount_move_steps(axis, direction, steps, delay_us, profile)
             self._tracking_keyframe_reset()
             return
 
@@ -2782,6 +3156,12 @@ class AppRunner:
                         "mode": TrackingMode.IDLE,
                         "ff_enabled": bool(getattr(self.cfg.tracking, "sidereal_ff_enabled", True)),
                         "ff_ready": False,
+                        "measurement_valid": False,
+                        "measurement_reason": "initializing",
+                        "measurement_source": "none",
+                        "lock_conf": 0.0,
+                        "fail_count": 0,
+                        "last_error": None,
                     }
                 }
             )
@@ -2807,6 +3187,12 @@ class AppRunner:
                         "rate_ff_alt": 0.0,
                         "rate_fb_az": 0.0,
                         "rate_fb_alt": 0.0,
+                        "measurement_valid": False,
+                        "measurement_reason": "off",
+                        "measurement_source": "none",
+                        "lock_conf": 0.0,
+                        "fail_count": 0,
+                        "last_error": None,
                     }
                 }
             )
@@ -2995,10 +3381,22 @@ class AppRunner:
                         observer_payload[observer_field] = payload.pop(key)
 
                 with self._platesolving_cfg_lock:
+                    if "temporal_min_hits" in payload:
+                        payload["temporal_min_hits"] = max(
+                            10, int(payload["temporal_min_hits"])
+                        )
+                    if "temporal_window_frames" in payload:
+                        payload["temporal_window_frames"] = max(
+                            10, int(payload["temporal_window_frames"])
+                        )
                     d = dict(self.cfg.platesolving.__dict__)
                     for k, v in payload.items():
                         if k in d:
                             d[k] = v
+                    d["temporal_window_frames"] = max(
+                        int(d.get("temporal_min_hits", 10)),
+                        int(d.get("temporal_window_frames", 12)),
+                    )
                     self.cfg.platesolving = PlatesolvingConfig(**d)
                     if observer_payload:
                         obs = dict(self._platesolving_observer.__dict__)
@@ -3105,6 +3503,15 @@ class AppRunner:
             if user and pw:
                 save_gaia_auth(user, pw)
                 log_info(self.out_log, "Platesolving: Gaia credentials saved")
+            self._last_platesolving_result = None
+            self._update_state(
+                {
+                    "goto": {
+                        "sample_last_ok": False,
+                        "sample_last_reason": "SOLVING",
+                    }
+                }
+            )
             self._platesolving_request(target=target)
             log_info(self.out_log, "Platesolving: RUN source=live")
             return True
@@ -3112,7 +3519,182 @@ class AppRunner:
         return False
 
     def _handle_goto_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
+        if t == ActionType.GOTO_VALIDATE_SAMPLE:
+            sol = p.get("result", None)
+            if sol is None or not bool(getattr(sol, "success", False)):
+                self._update_state(
+                    {
+                        "goto": {
+                            "status": GotoStatus.FAIL,
+                            "reason": "SAMPLE_NO_VALID_SOLUTION",
+                            "sample_last_ok": False,
+                            "sample_last_reason": "SAMPLE_NO_VALID_SOLUTION",
+                        }
+                    }
+                )
+                log_info(self.out_log, "GoTo: automatic sample validation rejected (no valid solution)")
+                return True
+            try:
+                ps_cfg = self._get_platesolving_cfg_snapshot()
+                n_inliers = int(getattr(sol, "n_inliers", 0))
+                rms_px = float(getattr(sol, "rms_px", float("inf")))
+                min_inliers = max(1, int(getattr(ps_cfg, "min_inliers", 1)))
+                max_rms_px = float(getattr(ps_cfg, "max_rms_px", 0.0))
+                quality_reason: Optional[str] = None
+                if n_inliers < min_inliers:
+                    quality_reason = "SAMPLE_INSUFFICIENT_INLIERS"
+                elif not np.isfinite(rms_px):
+                    quality_reason = "SAMPLE_INVALID_RMS"
+                elif max_rms_px > 0.0 and rms_px > max_rms_px:
+                    quality_reason = "SAMPLE_RMS_TOO_HIGH"
+
+                solve_obstime = _platesolving_result_obstime(sol)
+                az_alt = platesolving_center_to_altaz_deg(
+                    float(sol.center_ra_deg),
+                    float(sol.center_dec_deg),
+                    observer=self._platesolving_observer,
+                    obstime=solve_obstime,
+                )
+                roll = platesolving_roll_sample_deg(
+                    sol,
+                    observer=self._platesolving_observer,
+                    obstime=solve_obstime,
+                )
+                if not np.isfinite(roll):
+                    quality_reason = quality_reason or "SAMPLE_INVALID_ROLL"
+
+                continuity = self._goto.model.manual_sample_continuity_report(
+                    az_alt,
+                    roll_deg=roll,
+                )
+                if not bool(continuity.get("motion_ok", False)):
+                    quality_reason = quality_reason or "SAMPLE_MOTION_MISMATCH"
+                if not bool(continuity.get("roll_ok", False)):
+                    quality_reason = quality_reason or "SAMPLE_ROLL_MISMATCH"
+
+                # Estimar Roll establishes an independent axis orientation.
+                # Apply it as a first-sample guard, modulo 180 degrees because
+                # a plate axis has no arrow direction.
+                model_roll_samples = int(getattr(self._goto.model, "model_roll_samples", 0))
+                model_roll_deg = float(getattr(self._goto.model, "model_roll_deg", float("nan")))
+                roll_tolerance = max(
+                    0.0,
+                    float(getattr(self._goto.model, "manual_sample_roll_tolerance_deg", 12.0)),
+                )
+                roll_axis_error = float("nan")
+                if model_roll_samples > 0 and np.isfinite(model_roll_deg) and np.isfinite(roll):
+                    roll_axis_error = roll_axis_distance_deg(roll, model_roll_deg)
+                    if roll_tolerance > 0.0 and roll_axis_error > roll_tolerance:
+                        quality_reason = quality_reason or "SAMPLE_ESTIMATED_ROLL_MISMATCH"
+
+                if quality_reason is not None:
+                    self._last_platesolving_result = None
+                    self._update_state(
+                        {
+                            "goto": {
+                                "status": GotoStatus.FAIL,
+                                "reason": quality_reason,
+                                "sample_last_ok": False,
+                                "sample_last_reason": quality_reason,
+                                "sample_last_az_deg": float(az_alt[0]),
+                                "sample_last_alt_deg": float(az_alt[1]),
+                                "sample_last_roll_deg": float(roll),
+                            },
+                            "platesolving": {
+                                "last_ok": False,
+                                "reason": quality_reason,
+                            },
+                        }
+                    )
+                    log_info(
+                        self.out_log,
+                        "GoTo: sample automatically rejected "
+                        f"reason={quality_reason} inliers={n_inliers}/{min_inliers} "
+                        f"rms={rms_px:.3f}/{max_rms_px:.3f}px "
+                        f"motion={float(continuity.get('observed_motion_deg', float('nan'))):.4f}deg "
+                        f"limit={float(continuity.get('motion_limit_deg', float('nan'))):.4f}deg "
+                        f"roll_jump={float(continuity.get('roll_jump_deg', float('nan'))):.3f}deg "
+                        f"roll_est_error={roll_axis_error:.3f}deg",
+                    )
+                    return True
+                debug_info = dict(self.get_state().platesolving.debug_info or {})
+                source = str(debug_info.get("diagnostics_dir", "") or "")
+                n_samples = self._goto.model.add_manual_sample(
+                    az_alt,
+                    roll_deg=roll,
+                    source=source or None,
+                )
+                # A verified plate solve is the best available absolute
+                # pointing measurement. Rebase the existing fitted model at
+                # the current emitted-step counter so waypoint errors cannot
+                # accumulate into the next GoTo. This preserves J, fit
+                # diagnostics, and all manual samples.
+                self._goto.model.sync_from_world_az_alt(az_alt)
+                self._update_state(
+                    {
+                        "goto": {
+                            "J00": float(self._goto.model.J_deg_per_step[0, 0]),
+                            "J01": float(self._goto.model.J_deg_per_step[0, 1]),
+                            "J10": float(self._goto.model.J_deg_per_step[1, 0]),
+                            "J11": float(self._goto.model.J_deg_per_step[1, 1]),
+                            "manual_samples": int(n_samples),
+                            "status": GotoStatus.OK,
+                            "reason": None,
+                            "sample_last_ok": True,
+                            "sample_last_reason": "SAMPLE_ACCEPTED_AUTOMATICALLY",
+                            "sample_last_az_deg": float(az_alt[0]),
+                            "sample_last_alt_deg": float(az_alt[1]),
+                            "sample_last_roll_deg": float(roll),
+                        },
+                    }
+                )
+                log_info(
+                    self.out_log,
+                    "GoTo: sample automatically accepted "
+                    f"n={n_samples} inliers={n_inliers} rms={rms_px:.3f}px "
+                    f"az={float(az_alt[0]):.6f} alt={float(az_alt[1]):.6f} roll={float(roll):+.3f}",
+                )
+            except Exception as exc:
+                self._update_state(
+                    {
+                        "goto": {
+                            "status": GotoStatus.FAIL,
+                            "reason": "SAMPLE_VALIDATION_FAILED",
+                            "sample_last_ok": False,
+                            "sample_last_reason": "SAMPLE_VALIDATION_FAILED",
+                        }
+                    }
+                )
+                log_error(self.out_log, "GoTo: automatic sample validation failed", exc)
+            return True
+
         if t == ActionType.MOUNT_SYNC:
+            manual_az = p.get("az_deg")
+            manual_alt = p.get("alt_deg")
+            if manual_az is not None and manual_alt is not None:
+                az_alt = np.asarray([float(manual_az), float(manual_alt)], dtype=np.float64)
+                ok = bool(
+                    np.all(np.isfinite(az_alt))
+                    and 0.0 <= float(az_alt[0]) <= 360.0
+                    and -10.0 <= float(az_alt[1]) <= 90.0
+                    and self._goto.model.sync_from_world_az_alt(az_alt)
+                )
+                self._update_state(
+                    {
+                        "goto": {
+                            "synced": bool(ok),
+                            "status": GotoStatus.OK if ok else GotoStatus.FAIL,
+                            "reason": None if ok else "SYNC_INVALID_ALTAZ",
+                        }
+                    }
+                )
+                log_info(
+                    self.out_log,
+                    "GoTo: explicit AltAz sync "
+                    f"{'OK' if ok else 'ERR'} az={float(az_alt[0]):.6f} "
+                    f"alt={float(az_alt[1]):.6f}",
+                )
+                return True
             sol = getattr(self, "_last_platesolving_result", None)
             if sol is None or not bool(getattr(sol, "success", False)):
                 log_info(self.out_log, "GoTo: sync failed (no successful platesolving cached)")
@@ -3179,6 +3761,13 @@ class AppRunner:
             return True
 
         if t == ActionType.GOTO_RESET:
+            self._last_platesolving_result = None
+            self._update_state(
+                {
+                    "goto": {"sample_last_ok": False, "sample_last_reason": None},
+                    "platesolving": {"last_ok": False, "reason": None},
+                }
+            )
             self._goto_worker.request(kind="reset", target=None, params={})
             return True
 
@@ -3187,9 +3776,31 @@ class AppRunner:
             return True
 
         if t == ActionType.GOTO_CANCEL:
+            move_was_active = bool(
+                self._goto_worker.is_busy()
+                or self._mount_move_worker.is_busy()
+                or self._is_manual_move_active()
+                or self.get_state().goto.busy
+            )
             self._goto_worker.cancel()
             self._mount_stop()
-            self._update_state({"goto": {"busy": False, "status": GotoStatus.CANCELLED, "reason": "CANCELLED"}})
+            if move_was_active:
+                self._goto.model.synced = False
+            self._update_state(
+                {
+                    "goto": {
+                        "busy": False,
+                        "status": GotoStatus.CANCELLED,
+                        "reason": (
+                            "CANCEL_POSITION_UNKNOWN"
+                            if move_was_active
+                            else "CANCELLED"
+                        ),
+                        "synced": bool(self._goto.model.synced),
+                        "pointing_valid": bool(self._goto.model.synced),
+                    }
+                }
+            )
             return True
 
         return False

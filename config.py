@@ -21,9 +21,12 @@ class CameraConfig:
     binning: int = 1
     img_format: str = "RAW16"  # recomendado para stacking a color
 
-    # exposure/gain
+    # exposure/gain/black level.  The Mars-C preset for its low-read-noise
+    # region (gain 380) uses offset 350; gain 360 with the factory offset 12
+    # clips a large part of a dark frame at the digital floor.
     exp_ms: float = 100.0
     gain: int = 360
+    offset: int = 350
     auto_gain: bool = False
 
     # camera gamma (si aplica en SDK)
@@ -139,18 +142,66 @@ class PlatesolvingConfig:
     rotation_prior_roll_offset_deg: float = 0.0
     rotation_prior_az_step_deg: float = 0.05
 
+    # Sanity check against known optics: a candidate triplet match is rejected
+    # if its fitted plate scale deviates from pixel_size_m/focal_m by more
+    # than this fraction. Real matches recover the true scale to well under
+    # 1%; a wrong triplet (accepted by the loose side-length tolerance for
+    # short/tight triangles) typically implies a scale far outside this band.
+    scale_tol_frac: float = 0.04
+
+    # The first trustworthy position is established from three genuinely
+    # different camera frames.  Only the first frame performs the expensive
+    # triplet search; the following frames verify the projected Gaia field
+    # using the previous WCS and the expected sidereal drift.
+    initial_consensus_count: int = 3
+    initial_consensus_timeout_s: float = 8.0
+    consensus_pointing_tol_arcsec: float = 30.0
+    consensus_scale_tol_frac: float = 0.02
+    consensus_roll_tol_deg: float = 3.0
+    fast_prior_match_radius_px: float = 24.0
+    fast_prior_center_shift_px: float = 64.0
+    fast_prior_rotation_tol_deg: float = 5.0
+    fast_prior_max_age_s: float = 60.0
+
     # App-level control
     auto_solve: bool = False
     solve_every_s: float = 15.0
 
     # Debug
     debug_input_stats: bool = False
+    # Persist the exact RAW16 frame(s), configuration and solver result for
+    # each explicit solve. Set ASTROPANOPTES_DIAGNOSTICS=0 to disable at run time.
+    diagnostics_enabled: bool = True
+    diagnostics_dir: str = "stack_output/goto_diagnostics"
 
     # Image processing
     max_det: int = 250
     det_thresh_sigma: float = 3.5
     det_minarea: int = 5
     point_sigma: float = 1.2  # sigma for gaussian blur of point-maps
+
+    # Temporal source confirmation. SEP still runs on each native RAW16 frame
+    # (median 3x3 + local background subtraction), but a source only reaches
+    # the plate solver after being tracked through at least 10 frames. The
+    # tracker estimates and removes frame-to-frame stellar drift first.
+    temporal_detection_enabled: bool = True
+    # Camera reconfiguration restarts the stream asynchronously.  Explicit
+    # solves wait briefly for the first new RAW frame instead of failing with
+    # NO_FRAME during that normal transition.
+    frame_wait_timeout_s: float = 3.0
+    # Hard wall-clock budget for an explicit solve, including temporal frame
+    # collection and independent consensus. Cooperative checkpoints stop the
+    # expensive catalog search without killing its worker thread.
+    total_timeout_s: float = 120.0
+    temporal_window_frames: int = 12
+    temporal_min_hits: int = 10
+    # Must cover at least ten distinct frames even at long exposure. The old
+    # 8 s default made the configured 10-hit requirement impossible at
+    # exposures around 1 s or longer.
+    temporal_detection_timeout_s: float = 20.0
+    temporal_match_radius_px: float = 4.0
+    temporal_max_drift_per_frame_px: float = 32.0
+    temporal_min_drift_response: float = 0.05
 
     # Gaia cache + query
     cache_dir: str = "~/.cache/gaia_cones"
@@ -179,9 +230,24 @@ class PlatesolvingConfig:
     match_max_px: float = 3.5  # in full-res pixels
     match_tol_arcsec: float = 5.0
     pred_margin_arcsec: float = 25.0
-    min_inliers: int = 4
+    # A triplet hypothesis already contributes up to three matches by
+    # construction. Requiring six total matches (three independent
+    # confirmations) prevents a seed triplet plus one accidental catalog
+    # neighbor from being accepted as a real solution.
+    min_inliers: int = 6
+    min_validation_inliers: int = 3
+    max_rms_px: float = 2.5
+    # The search radius is also the declared pointing uncertainty. A fitted
+    # optical center outside that cone is not a valid answer for the request.
+    # Set the factor to 0 to disable this guard for special offline uses.
+    max_center_offset_factor: float = 1.0
+    max_center_offset_margin_deg: float = 0.0
     N_det: int = 30
     N_seed: int = 3
+    # Clipped stars can have severely biased flux/centroids and used to
+    # dominate the brightest-three seed triplet. They remain available as
+    # validation detections, but interior detections are preferred as seeds.
+    seed_edge_margin_px: float = 8.0
 
     # Search area (Gaia cone radius)
     search_radius_deg: float | None = 1.0
@@ -203,10 +269,34 @@ class GoToConfig:
     max_iters: int = 1
     gain: float = 1.0
     settle_s: float = 0.25
+    # Measured physical slack consumed when an axis reverses. These pulses do
+    # not represent sky motion and therefore are not added to the model's
+    # commanded-position counter.
+    backlash_steps_az: int = 0
+    backlash_steps_alt: int = 10
     max_step_per_iter: int = 0
     slew_delay_us: int = 1800
+    # Hard lower bound for adaptive GoTo delays. Smaller delays mean more
+    # speed. The loaded firmware accelerates and brakes around this target, so
+    # it remains the maximum-speed limit without needing a firmware update.
+    slew_min_delay_us: int = 400
+    slew_full_speed_distance_deg: float = 20.0
+    # Until a model has been fitted from independent plate-solve samples, only
+    # short verification moves are allowed. A sync establishes position, not
+    # motor direction/scale.
+    max_unfitted_goto_deg: float = 3.0
+    # A single model-only command should never produce an unexpectedly large
+    # slew. Longer routes must be split into verified stops or explicitly
+    # override this value in an advanced request.
+    max_goto_distance_deg: float = 10.0
     stages: int = 1
     platesolving_feedback: bool = False
+
+    # One self-contained directory per GoTo/AutoCal/model-fit operation. It
+    # links pre-slew model state, SEP/plate-solving raws, drift stacks and the
+    # emitted motor commands in an append-only timeline.
+    diagnostics_enabled: bool = True
+    diagnostics_dir: str = "stack_output/goto_diagnostics"
 
     # Safe operating window
     alt_min_deg: float = 10.0

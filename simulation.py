@@ -18,7 +18,7 @@ from config import AppConfig, SimulationConfig
 from gaia_cache import GaiaCacheMissError, gaia_healpix_cone_with_mag, load_gaia_auth
 from goto import MountKinematics
 from logging_utils import log_error, log_info
-from mount_arduino import resolve_common_microsteps
+from mount_arduino import estimate_firmware_move_duration_s, resolve_common_microsteps
 from platesolving import ObserverConfig, expected_field_rotation_deg, parse_target_to_icrs
 
 
@@ -238,10 +238,14 @@ class SimulatedMount:
         return "OK SIM MS"
 
     @staticmethod
-    def _estimate_move_duration_s(steps: int, delay_us: int) -> float:
-        steps_i = max(0, int(steps))
-        delay_i = max(0, int(delay_us))
-        return float(steps_i) * ((float(delay_i) + 3.0) / 1.0e6)
+    def _estimate_move_duration_s(
+        steps: int,
+        delay_us: int,
+        profile: str = "smooth",
+    ) -> float:
+        return estimate_firmware_move_duration_s(
+            int(steps), int(delay_us), profile=profile
+        )
 
     def move_steps(
         self,
@@ -250,6 +254,7 @@ class SimulatedMount:
         steps: int,
         delay_us: int,
         *,
+        profile: str = "smooth",
         blocking: bool = True,
         stop_before_move: bool = True,
     ) -> str:
@@ -259,7 +264,9 @@ class SimulatedMount:
             return "OK SIM MOVE skipped"
         self._state.apply_move(axis=axis, direction=int(direction), steps=int(steps))
         if bool(blocking):
-            wait_s = self._estimate_move_duration_s(int(steps), int(delay_us))
+            wait_s = self._estimate_move_duration_s(
+                int(steps), int(delay_us), profile=profile
+            )
             if wait_s > 0.0:
                 time.sleep(min(wait_s + 0.02, 0.25))
         return "OK SIM MOVE"

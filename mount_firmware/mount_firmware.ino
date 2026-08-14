@@ -1,31 +1,22 @@
 // ============================================================
 // Dual-stepper controller for ESP32 (TMC2209 STEP/DIR)
-// + Microstepping via COMMON MS pins (standalone)
+// + Fixed 1/64 microstepping (configured by hardware wiring)
 // + Bluetooth Classic SPP via BluetoothSerial
 //
 // Commands (newline-terminated; CR/LF/CRLF accepted):
 //   PING
 //   ENABLE 0|1
-//   MS <8|16|32|64>                 (common -> affects both drivers)
-//   MS AZ <8|16|32|64>              (accepted; same as MS <ms>)
-//   MS ALT <8|16|32|64>             (accepted; same as MS <ms>)
+//   MS 64                            (legacy compatibility; no-op)
+//   MS AZ|ALT 64                     (legacy compatibility; no-op)
 //   STOP
-//   MOVE A|B FWD|REV steps delay_us
-//   STATUS                              (adds PINMS=<ms1>,<ms2>)
+//   MOVE A|B FWD|REV steps delay_us [SMOOTH|DIRECT]
+//   STATUS                              (reports MS=64 MSFIXED=1)
 //   DEBUG 0|1                       (toggle ALIVE heartbeat)
 //
 // YOUR PCB pinout (ESP32 30-pin):
 //   EN  (common): GPIO21  (LOW=enabled)
-//   MS1 (common): GPIO19
-//   MS2 (common): GPIO18
 //   AZ:  STEP=GPIO33  DIR=GPIO25
 //   ALT: STEP=GPIO26  DIR=GPIO27
-//
-// Microstep table (your driver board mapping):
-//   LOW/LOW   -> 1/8
-//   HIGH/HIGH -> 1/16
-//   HIGH/LOW  -> 1/32
-//   LOW/HIGH  -> 1/64
 //
 // Notes (Mac terminal cleanliness):
 // - Responses are forced to CRLF ("\r\n") regardless of terminal.
@@ -47,22 +38,36 @@ static const uint8_t STEP_B = 26;  // ALT STEP
 static const uint8_t DIR_B  = 27;  // ALT DIR
 
 static const uint8_t EN_PIN  = 21; // LOW=enabled (common)
-static const uint8_t MS1_PIN = 19; // common
-static const uint8_t MS2_PIN = 18; // common
 
 static const uint16_t STEP_PULSE_US = 3;
+
+// MOVE acceleration profile. A GoTo may request a short period for a long
+// slew, but starting/stopping at that cadence excites the telescope structure.
+// Start slowly and use a symmetric S-curve in step frequency.  Short moves
+// stay inside a gentle triangular profile; long slews keep their requested
+// high speed only in the central cruise section.
+static const float MOVE_MAX_RATE_STEPS_S = 12000.0f;
+static const float MOVE_SMOOTH_START_RATE_STEPS_S = 400.0f;
+static const float MOVE_SMOOTH_MAX_ACCEL_STEPS_S2 = 4000.0f;
+static const float SMOOTHERSTEP_MAX_DERIVATIVE = 1.875f;
 
 static bool g_enabled = false;
 
 // MOVE scheduler (non-blocking)
 static volatile long g_moveRemA = 0;
 static volatile long g_moveRemB = 0;
+static long g_moveTotalA = 0;
+static long g_moveTotalB = 0;
+static uint32_t moveTargetPerA_us = 0;
+static uint32_t moveTargetPerB_us = 0;
 static uint32_t movePerA_us  = 0;
 static uint32_t movePerB_us  = 0;
 static uint32_t moveNextA_us = 0;
 static uint32_t moveNextB_us = 0;
+static bool moveSmoothA = true;
+static bool moveSmoothB = true;
 
-static volatile uint16_t g_ms_common = 64;
+static const uint16_t FIXED_MICROSTEPS = 64;
 
 // BT state / debug
 static volatile bool g_btConnected = false;
@@ -85,71 +90,73 @@ static inline void setEnable(bool on) {
   digitalWrite(EN_PIN, on ? LOW : HIGH);
 }
 
-static bool setMSPinsCommon(uint16_t ms) {
-  switch (ms) {
-    case 8:
-      digitalWrite(MS1_PIN, LOW);
-      digitalWrite(MS2_PIN, LOW);
-      g_ms_common = 8;
-      return true;
-    case 16:
-      digitalWrite(MS1_PIN, HIGH);
-      digitalWrite(MS2_PIN, HIGH);
-      g_ms_common = 16;
-      return true;
-    case 32:
-      digitalWrite(MS1_PIN, HIGH);
-      digitalWrite(MS2_PIN, LOW);
-      g_ms_common = 32;
-      return true;
-    case 64:
-      digitalWrite(MS1_PIN, LOW);
-      digitalWrite(MS2_PIN, HIGH);
-      g_ms_common = 64;
-      return true;
-    default:
-      return false;
-  }
-}
-
-// Apply common MS pins. If relatchEnabled=true and drivers are enabled,
-// briefly disable -> apply MS -> enable so external drivers can re-sample.
-static bool applyMSCommon(uint16_t ms, bool relatchEnabled) {
-  bool wasEnabled = g_enabled;
-  if (relatchEnabled && wasEnabled) {
-    setEnable(false);
-    delay(2);
-  }
-
-  if (!setMSPinsCommon(ms)) {
-    // restore previous enable state if needed
-    if (relatchEnabled && wasEnabled) {
-      setEnable(true);
-      delay(2);
-    }
-    return false;
-  }
-
-  // Let MS levels settle on board traces/driver input.
-  delayMicroseconds(300);
-
-  if (relatchEnabled && wasEnabled) {
-    setEnable(true);
-    delay(2);
-  }
-  return true;
-}
-
 static inline void clearMovePlans() {
   g_moveRemA = 0;
   g_moveRemB = 0;
+  g_moveTotalA = 0;
+  g_moveTotalB = 0;
+  moveTargetPerA_us = 0;
+  moveTargetPerB_us = 0;
   movePerA_us = 0;
   movePerB_us = 0;
   moveNextA_us = 0;
   moveNextB_us = 0;
 }
 
-static void startMoveNonBlocking(char axis, bool fwd, long steps, long delay_us) {
+static uint32_t profiledMovePeriodUs(
+  uint32_t requestedPer_us,
+  long total,
+  long remaining,
+  bool smoothProfile
+) {
+  const uint32_t safeMinPeriod_us = (uint32_t)ceilf(1000000.0f / MOVE_MAX_RATE_STEPS_S);
+  const uint32_t targetPer_us = max(requestedPer_us, safeMinPeriod_us);
+  if (targetPer_us == 0 || total <= 0 || remaining <= 0) return targetPer_us;
+  if (!smoothProfile) return targetPer_us;
+
+  const float targetRate = 1000000.0f / (float)targetPer_us;
+  const float startRate = min(
+    targetRate,
+    MOVE_SMOOTH_START_RATE_STEPS_S
+  );
+  if (targetRate <= startRate) return targetPer_us;
+
+  const long completed = max(0L, total - remaining);
+  const long stoppingEdge = max(0L, remaining - 1L);
+  const float edgeSteps = (float)min(completed, stoppingEdge);
+  const float halfMoveSteps = max(1.0f, (float)total / 2.0f);
+  const float idealRampSteps = (
+    (targetRate * targetRate - startRate * startRate)
+    * SMOOTHERSTEP_MAX_DERIVATIVE
+    / (2.0f * MOVE_SMOOTH_MAX_ACCEL_STEPS_S2)
+  );
+  const float rampSteps = max(1.0f, min(halfMoveSteps, idealRampSteps));
+  if (edgeSteps >= rampSteps) return targetPer_us;
+
+  const float peakRateSq = min(
+    targetRate * targetRate,
+    startRate * startRate
+      + 2.0f * MOVE_SMOOTH_MAX_ACCEL_STEPS_S2
+      * rampSteps / SMOOTHERSTEP_MAX_DERIVATIVE
+  );
+  const float x = edgeSteps / rampSteps;
+  // Smootherstep: continuous jerk and zero acceleration at both endpoints.
+  const float smoother = x * x * x * (x * (x * 6.0f - 15.0f) + 10.0f);
+  const float rate = sqrtf(
+    startRate * startRate + (peakRateSq - startRate * startRate) * smoother
+  );
+  if (!(rate > 0.0f)) return (uint32_t)ceilf(1000000.0f / startRate);
+  const uint32_t period_us = (uint32_t)roundf(1000000.0f / rate);
+  return max(safeMinPeriod_us, period_us);
+}
+
+static void startMoveNonBlocking(
+  char axis,
+  bool fwd,
+  long steps,
+  long delay_us,
+  bool smoothProfile
+) {
   if (steps <= 0) return;
   if (delay_us < 0) delay_us = 0;
 
@@ -159,12 +166,18 @@ static void startMoveNonBlocking(char axis, bool fwd, long steps, long delay_us)
   if (axis == 'A') {
     digitalWrite(DIR_A, fwd ? HIGH : LOW);
     g_moveRemA = steps;
-    movePerA_us = per_us;
+    g_moveTotalA = steps;
+    moveSmoothA = smoothProfile;
+    moveTargetPerA_us = per_us;
+    movePerA_us = profiledMovePeriodUs(per_us, steps, steps, moveSmoothA);
     moveNextA_us = now;
   } else { // 'B'
     digitalWrite(DIR_B, fwd ? HIGH : LOW);
     g_moveRemB = steps;
-    movePerB_us = per_us;
+    g_moveTotalB = steps;
+    moveSmoothB = smoothProfile;
+    moveTargetPerB_us = per_us;
+    movePerB_us = profiledMovePeriodUs(per_us, steps, steps, moveSmoothB);
     moveNextB_us = now;
   }
 }
@@ -222,16 +235,12 @@ void setup() {
   pinMode(DIR_B, OUTPUT);
 
   pinMode(EN_PIN, OUTPUT);
-  pinMode(MS1_PIN, OUTPUT);
-  pinMode(MS2_PIN, OUTPUT);
 
   setHighDrive(STEP_A);
   setHighDrive(DIR_A);
   setHighDrive(STEP_B);
   setHighDrive(DIR_B);
   setHighDrive(EN_PIN);
-  setHighDrive(MS1_PIN);
-  setHighDrive(MS2_PIN);
 
   digitalWrite(STEP_A, LOW);
   digitalWrite(STEP_B, LOW);
@@ -240,10 +249,6 @@ void setup() {
 
   setEnable(false);
   delay(2);
-  applyMSCommon(64, false);
-  // Second pass helps boards that need extra settle time at boot.
-  delay(2);
-  applyMSCommon(64, false);
 
   SerialBT.register_callback(btCallback);
   SerialBT.begin("AstroPanoptes-ESP32");
@@ -266,17 +271,32 @@ void loop() {
     uint32_t now = micros();
 
     if (g_moveRemA > 0 && movePerA_us > 0 && (int32_t)(now - moveNextA_us) >= 0) {
+      const uint32_t stepStarted_us = micros();
       pulseStep(STEP_A);
       g_moveRemA -= 1;
-      moveNextA_us += movePerA_us;
-      if (g_moveRemA <= 0) { g_moveRemA = 0; movePerA_us = 0; }
+      if (g_moveRemA <= 0) {
+        g_moveRemA = 0;
+        movePerA_us = 0;
+      } else {
+        movePerA_us = profiledMovePeriodUs(moveTargetPerA_us, g_moveTotalA, g_moveRemA, moveSmoothA);
+        // Schedule from the pulse start so movePerA_us is the true
+        // step-to-step period. Using micros() after the pulse silently added
+        // STEP_PULSE_US a second time and made host duration estimates drift.
+        moveNextA_us = stepStarted_us + movePerA_us;
+      }
     }
 
     if (g_moveRemB > 0 && movePerB_us > 0 && (int32_t)(now - moveNextB_us) >= 0) {
+      const uint32_t stepStarted_us = micros();
       pulseStep(STEP_B);
       g_moveRemB -= 1;
-      moveNextB_us += movePerB_us;
-      if (g_moveRemB <= 0) { g_moveRemB = 0; movePerB_us = 0; }
+      if (g_moveRemB <= 0) {
+        g_moveRemB = 0;
+        movePerB_us = 0;
+      } else {
+        movePerB_us = profiledMovePeriodUs(moveTargetPerB_us, g_moveTotalB, g_moveRemB, moveSmoothB);
+        moveNextB_us = stepStarted_us + movePerB_us;
+      }
     }
   }
 
@@ -309,8 +329,6 @@ void loop() {
     bool enableOn = (on != 0);
     if (enableOn) {
       bool wasEnabled = g_enabled;
-      // Re-apply current MS before enabling to avoid stale latched value.
-      if (!applyMSCommon((uint16_t)g_ms_common, wasEnabled)) { btPrintCRLF("ERR"); return; }
       if (!wasEnabled) {
         setEnable(true);
         delay(2);
@@ -341,8 +359,11 @@ void loop() {
       ms = (uint16_t)atoi(a1);
     }
 
-    if (!applyMSCommon(ms, true)) { btPrintCRLF("ERR"); return; }
-    replyBT(String("OK MS ") + String((uint16_t)g_ms_common));
+    if (ms != FIXED_MICROSTEPS) {
+      replyBT(String("ERR MS_FIXED ") + String((uint16_t)FIXED_MICROSTEPS));
+      return;
+    }
+    replyBT(String("OK MS_FIXED ") + String((uint16_t)FIXED_MICROSTEPS));
     return;
   }
 
@@ -351,6 +372,7 @@ void loop() {
     char *dr = strtok(NULL, " ");
     char *st = strtok(NULL, " ");
     char *du = strtok(NULL, " ");
+    char *pf = strtok(NULL, " ");
 
     if (!ax || !dr || !st || !du) { btPrintCRLF("ERR"); return; }
     char axis = ax[0];
@@ -362,8 +384,15 @@ void loop() {
     long steps = atol(st);
     long delay_us = atol(du);
     if (delay_us < 0) delay_us = 0;
+    bool smoothProfile = true;
+    if (pf && !strcmp(pf, "DIRECT")) {
+      smoothProfile = false;
+    } else if (pf && strcmp(pf, "SMOOTH")) {
+      btPrintCRLF("ERR PROFILE");
+      return;
+    }
 
-    startMoveNonBlocking(axis, fwd, steps, delay_us);
+    startMoveNonBlocking(axis, fwd, steps, delay_us, smoothProfile);
     btPrintCRLF("OK");
     return;
   }
@@ -372,12 +401,12 @@ void loop() {
     String s;
     s.reserve(110);
     s += "EN=";    s += (g_enabled ? "1" : "0");
-    s += " MS=";   s += String((uint16_t)g_ms_common);
-    s += " PINMS=";
-    s += String(digitalRead(MS1_PIN) ? 1 : 0);
-    s += ",";
-    s += String(digitalRead(MS2_PIN) ? 1 : 0);
+    s += " MS=";   s += String((uint16_t)FIXED_MICROSTEPS);
+    s += " MSFIXED=1";
+    s += " MOVEPROFILES=1";
     s += " MOVE="; s += String((long)g_moveRemA); s += ","; s += String((long)g_moveRemB);
+    s += " PROFILE="; s += (moveSmoothA ? "SMOOTH" : "DIRECT");
+    s += ","; s += (moveSmoothB ? "SMOOTH" : "DIRECT");
     s += " BT=";   s += (g_btConnected ? "1" : "0");
     s += " DBG=";  s += (g_debugAlive ? "1" : "0");
     replyBT(s);

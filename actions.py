@@ -61,6 +61,7 @@ class ActionType(str, Enum):
     GOTO_AUTOCALIBRATE = "GOTO_AUTOCALIBRATE"
     GOTO_FIT_MODEL = "GOTO_FIT_MODEL"
     GOTO_ESTIMATE_ROLL = "GOTO_ESTIMATE_ROLL"
+    GOTO_VALIDATE_SAMPLE = "GOTO_VALIDATE_SAMPLE"
     GOTO_RESET = "GOTO_RESET"
     GOTO_CANCEL = "GOTO_CANCEL"
     GOTO_LIST_SAMPLES = "GOTO_LIST_SAMPLES"
@@ -135,9 +136,18 @@ def mount_set_microsteps(az_div: int, alt_div: int) -> Action:
     )
 
 
-def mount_move_steps(axis: Axis, direction: int, steps: int, delay_us: int) -> Action:
+def mount_move_steps(
+    axis: Axis,
+    direction: int,
+    steps: int,
+    delay_us: int,
+    profile: str = "smooth",
+) -> Action:
     if direction not in (-1, +1):
         raise ValueError("direction must be -1 or +1")
+    profile_value = str(profile or "smooth").strip().lower()
+    if profile_value not in {"smooth", "direct"}:
+        raise ValueError("profile must be smooth or direct")
     return Action(
         ActionType.MOUNT_MOVE_STEPS,
         {
@@ -145,6 +155,7 @@ def mount_move_steps(axis: Axis, direction: int, steps: int, delay_us: int) -> A
             "direction": int(direction),
             "steps": int(steps),
             "delay_us": int(delay_us),
+            "profile": profile_value,
         },
         _now(),
     )
@@ -207,6 +218,10 @@ def goto_autocalibrate(params: Dict[str, Any] | None = None) -> Action:
 
 def goto_estimate_roll(params: Dict[str, Any] | None = None) -> Action:
     return Action(ActionType.GOTO_ESTIMATE_ROLL, {"params": params or {}}, _now())
+
+
+def goto_validate_sample(result: Any) -> Action:
+    return Action(ActionType.GOTO_VALIDATE_SAMPLE, {"result": result}, _now())
 
 
 # -------------------------

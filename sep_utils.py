@@ -1,10 +1,74 @@
 from __future__ import annotations
 
+import threading
 from typing import Optional, Tuple
 
 import numpy as np
 import sep
 from imaging import ensure_raw16_bayer, median_prefilter_raw16
+
+
+_SEP_EXTRACT_LOCK = threading.Lock()
+_SEP_PIXSTACK = 300_000
+
+
+def _is_pixstack_error(exc: BaseException) -> bool:
+    text = str(exc).strip().lower()
+    return "pixel buffer full" in text or "pixstack" in text
+
+
+def _extract_with_crowding_recovery(
+    img_det: np.ndarray,
+    *,
+    threshold: float,
+    minarea: int,
+) -> np.ndarray:
+    """Retry a crowded SEP extraction without letting it kill a worker.
+
+    A normal stellar image succeeds on the first pass.  Bright terrestrial or
+    strongly structured frames can exceed SEP's 300k active-pixel stack; for
+    those frames, progressively retain only the strongest sources.  If even
+    that is insufficient, grow the global stack to the image size and make one
+    final bounded attempt.
+    """
+    global _SEP_PIXSTACK
+    last_error: Optional[BaseException] = None
+    threshold_factors = (1.0, 1.5, 2.25, 3.5)
+    with _SEP_EXTRACT_LOCK:
+        for factor in threshold_factors:
+            try:
+                return sep.extract(
+                    img_det,
+                    float(threshold) * float(factor),
+                    minarea=int(minarea),
+                )
+            except Exception as exc:
+                if not _is_pixstack_error(exc):
+                    raise
+                last_error = exc
+
+        required = max(300_000, int(img_det.size) + 1024)
+        if required > int(_SEP_PIXSTACK):
+            sep.set_extract_pixstack(int(required))
+            _SEP_PIXSTACK = int(required)
+        try:
+            # The previous retries increased the threshold only to reduce the
+            # active-pixel count while using the old global pixstack. Once the
+            # stack is large enough, retry the requested threshold so dense
+            # but valid stellar fields do not silently lose faint sources.
+            return sep.extract(
+                img_det,
+                float(threshold),
+                minarea=int(minarea),
+            )
+        except Exception as exc:
+            if not _is_pixstack_error(exc):
+                raise
+            last_error = exc
+
+    if last_error is not None:
+        raise last_error
+    raise RuntimeError("SEP extraction failed without an error")
 
 
 def sep_detect_from_raw16(
@@ -41,7 +105,11 @@ def sep_detect_from_raw16(
     img_det = np.maximum(img_sub, 0.0, out=img_sub)
 
     thresh = float(sep_thresh_sigma) * float(bkg.globalrms)
-    objects = sep.extract(img_det, thresh, minarea=int(sep_minarea))
+    objects = _extract_with_crowding_recovery(
+        img_det,
+        threshold=thresh,
+        minarea=int(sep_minarea),
+    )
 
     if objects is None or len(objects) == 0:
         obj_xy = np.zeros((0, 2), dtype=np.float64)

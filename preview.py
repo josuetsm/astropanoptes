@@ -92,6 +92,45 @@ def stretch_fast_u8(
     return y.astype(np.uint8)
 
 
+def stretch_fast_native_to_u8(
+    img: np.ndarray,
+    plo: float = 5.0,
+    phi: float = 99.5,
+    sample_stride: int = 4,
+) -> np.ndarray:
+    """Percentile-stretch native u8/u16 data before quantizing to u8.
+
+    RAW16 cameras often carry only 10–14 significant bits.  Taking the high
+    byte first discards weak star/background differences when those bits are
+    right-aligned, so percentile estimation and scaling must happen in the
+    native integer domain.
+    """
+    arr = np.asarray(img)
+    if arr.dtype == np.uint8:
+        return stretch_fast_u8(
+            arr,
+            plo=plo,
+            phi=phi,
+            sample_stride=sample_stride,
+        )
+    if arr.size == 0:
+        return np.asarray(arr, dtype=np.uint8)
+    if sample_stride > 1 and arr.shape[0] >= 64 and arr.shape[1] >= 64:
+        sample = arr[::sample_stride, ::sample_stride]
+    else:
+        sample = arr
+    lo = float(np.percentile(sample, plo))
+    hi = float(np.percentile(sample, phi))
+    if not np.isfinite(lo):
+        lo = float(np.min(sample))
+    if not np.isfinite(hi):
+        hi = float(np.max(sample))
+    if hi <= lo:
+        hi = lo + 1.0
+    scaled = (arr.astype(np.float32) - lo) * (255.0 / (hi - lo))
+    return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
+
+
 def encode_jpeg(u8: np.ndarray, quality: int = 75) -> bytes:
     """
     Encode JPEG rápido para preview UI.
@@ -128,9 +167,12 @@ def make_preview_jpeg(
     Retorna:
       (jpeg_bytes, u8_preview_used)
     """
-    u8 = to_u8_preview(img)
-
-    u8s = stretch_fast_u8(u8, plo=plo, phi=phi, sample_stride=sample_stride)
+    u8s = stretch_fast_native_to_u8(
+        img,
+        plo=plo,
+        phi=phi,
+        sample_stride=sample_stride,
+    )
     jpg = encode_jpeg(u8s, quality=jpeg_quality)
     return jpg, u8s
 
@@ -139,6 +181,7 @@ __all__ = [
     "stretch_to_u8",
     "to_u8_preview",
     "stretch_fast_u8",
+    "stretch_fast_native_to_u8",
     "encode_jpeg",
     "make_preview_jpeg",
 ]

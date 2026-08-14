@@ -63,7 +63,7 @@ class SepTrackingConfig:
     thresh_sigma: float = 3.0
     minarea: int = 5
     max_sources: int = 50
-    min_sources: int = 1
+    min_sources: int = 3
 
 
 @dataclass
@@ -191,6 +191,20 @@ class TrackingOutput:
     calib_src: str
     detA: float
     n_det: int
+    measurement_reason: str = ""
+    measurement_source: str = "none"
+    lock_conf: float = 0.0
+    fail_count: int = 0
+
+
+@dataclass(frozen=True)
+class _AlignmentMeasurement:
+    ok: bool
+    dx: float = 0.0
+    dy: float = 0.0
+    resp: float = 0.0
+    source: str = "none"
+    reason: str = "low_confidence"
 
 
 # ============================================================
@@ -491,19 +505,38 @@ def estimate_shift_from_source_matches(
     if not np.all(np.isfinite(center)):
         center = np.zeros(2, dtype=np.float64)
 
-    # Candidate displacement for each cur/ref pair is cur - ref. Gate matches
-    # around the previous valid displacement so dense star fields do not jump to
-    # a different nearest star when the profile correlation is ambiguous.
+    # Candidate displacement for each cur/ref pair is cur - ref.  Match after
+    # removing the predicted displacement, and only retain mutual nearest
+    # neighbours.  The old one-way matcher allowed several current sources to
+    # claim the same reference star, which could report a high response while
+    # silently jumping to a neighbouring star in a dense field.
     d = cur[:, None, :] - ref[None, :, :]
     err = d - center.reshape(1, 1, 2)
     dist2 = np.sum(err * err, axis=2)
-    nn_idx = np.argmin(dist2, axis=1)
-    nn_dist = np.sqrt(dist2[np.arange(cur.shape[0]), nn_idx])
-    good = nn_dist <= float(max_shift_px)
+    cur_to_ref = np.argmin(dist2, axis=1)
+    ref_to_cur = np.argmin(dist2, axis=0)
+    cur_idx = np.arange(cur.shape[0])
+    mutual = ref_to_cur[cur_to_ref] == cur_idx
+    nn_dist = np.sqrt(dist2[cur_idx, cur_to_ref])
+    good = mutual & (nn_dist <= float(max_shift_px))
     if not np.any(good):
         return 0.0, 0.0, 0.0, 0
 
-    shifts = d[np.arange(cur.shape[0]), nn_idx][good]
+    shifts = d[cur_idx, cur_to_ref][good]
+    initial_matches = int(shifts.shape[0])
+    if initial_matches < int(min_sources):
+        return 0.0, 0.0, 0.0, initial_matches
+
+    # Reject inconsistent pairs around the robust common translation.  This
+    # keeps cosmic rays, variable detections and stars entering/leaving the
+    # frame from pulling the measured target displacement away.
+    center_shift = np.median(shifts, axis=0)
+    residual = np.hypot(shifts[:, 0] - center_shift[0], shifts[:, 1] - center_shift[1])
+    residual_med = float(np.median(residual))
+    residual_mad = float(np.median(np.abs(residual - residual_med)))
+    residual_limit = max(0.75, residual_med + 3.5 * max(residual_mad, 0.10))
+    inliers = residual <= residual_limit
+    shifts = shifts[inliers]
     matches = int(shifts.shape[0])
     if matches < int(min_sources):
         return 0.0, 0.0, 0.0, int(matches)
@@ -511,8 +544,223 @@ def estimate_shift_from_source_matches(
     dx = float(np.median(shifts[:, 0]))
     dy = float(np.median(shifts[:, 1]))
     denom = float(max(1, min(ref.shape[0], cur.shape[0])))
-    resp = float(matches / denom)
+    resp = clamp(float(matches / denom), 0.0, 1.0)
     return dx, dy, resp, matches
+
+
+def _choose_consistent_alignment(
+    candidates: list[tuple[str, float, float, float]],
+    *,
+    center_dx: float,
+    center_dy: float,
+    agree_px: float,
+    lock_conf: float,
+) -> _AlignmentMeasurement:
+    if not candidates:
+        return _AlignmentMeasurement(ok=False, reason="low_confidence")
+
+    center = np.array([float(center_dx), float(center_dy)], dtype=np.float64)
+    if not np.all(np.isfinite(center)):
+        center = np.zeros(2, dtype=np.float64)
+    agree = max(0.5, float(agree_px))
+
+    # Prefer an estimator cluster over any isolated high response.  In
+    # particular this prevents a repeated 1-D profile or a neighbouring star
+    # from winning merely because it is close to the previous value.
+    best_cluster: list[tuple[str, float, float, float]] = []
+    best_key: tuple[float, float, float] | None = None
+    for item in candidates:
+        cluster = [
+            other
+            for other in candidates
+            if float(np.hypot(item[1] - other[1], item[2] - other[2])) <= agree
+        ]
+        xy = np.array([[c[1], c[2]] for c in cluster], dtype=np.float64)
+        cluster_center = np.median(xy, axis=0)
+        key = (
+            float(len(cluster)),
+            float(sum(c[3] for c in cluster)),
+            -float(np.linalg.norm(cluster_center - center)),
+        )
+        if best_key is None or key > best_key:
+            best_key = key
+            best_cluster = cluster
+
+    if len(best_cluster) >= 2:
+        reliability = {"phase": 1.0, "source": 1.15, "profile": 0.75}
+        weights = np.array(
+            [max(1e-3, float(c[3])) * reliability.get(c[0], 1.0) for c in best_cluster],
+            dtype=np.float64,
+        )
+        xy = np.array([[c[1], c[2]] for c in best_cluster], dtype=np.float64)
+        def _weighted_median(values: np.ndarray) -> float:
+            order = np.argsort(values)
+            values_sorted = values[order]
+            weights_sorted = weights[order]
+            cutoff = 0.5 * float(np.sum(weights_sorted))
+            idx = int(np.searchsorted(np.cumsum(weights_sorted), cutoff, side="left"))
+            return float(values_sorted[min(idx, len(values_sorted) - 1)])
+
+        fused = np.array(
+            [_weighted_median(xy[:, 0]), _weighted_median(xy[:, 1])],
+            dtype=np.float64,
+        )
+        resp = clamp(float(np.average([c[3] for c in best_cluster], weights=weights)), 0.0, 1.0)
+        names = "+".join(sorted({c[0] for c in best_cluster}))
+        return _AlignmentMeasurement(
+            ok=True,
+            dx=float(fused[0]),
+            dy=float(fused[1]),
+            resp=float(resp),
+            source=names,
+            reason="ok",
+        )
+
+    # A single estimator is still useful in a sparse field.  Once locked, do
+    # not accept an isolated estimate that also contradicts the motion model.
+    priority = {"source": 2, "phase": 1, "profile": 0}
+    ordered = sorted(
+        candidates,
+        key=lambda c: (
+            float(np.hypot(c[1] - center[0], c[2] - center[1])),
+            -float(c[3]),
+            -priority.get(c[0], 0),
+        ),
+    )
+    chosen = ordered[0]
+    distance = float(np.hypot(chosen[1] - center[0], chosen[2] - center[1]))
+    # A 1-D profile can correlate strongly even for unrelated noise because it
+    # collapses an entire image axis.  It is therefore a guard/consensus signal,
+    # never a sufficient target measurement on its own.
+    single_min_resp = {"phase": 0.15, "source": 0.45, "profile": float("inf")}
+    if float(chosen[3]) < single_min_resp.get(str(chosen[0]), 0.25):
+        return _AlignmentMeasurement(
+            ok=False,
+            dx=float(chosen[1]),
+            dy=float(chosen[2]),
+            resp=float(chosen[3]),
+            source=str(chosen[0]),
+            reason="low_confidence",
+        )
+    if len(candidates) > 1 and float(lock_conf) >= 0.25 and distance > (2.0 * agree):
+        return _AlignmentMeasurement(
+            ok=False,
+            dx=float(chosen[1]),
+            dy=float(chosen[2]),
+            resp=float(chosen[3]),
+            source=str(chosen[0]),
+            reason="estimator_disagreement",
+        )
+    return _AlignmentMeasurement(
+        ok=True,
+        dx=float(chosen[1]),
+        dy=float(chosen[2]),
+        resp=float(chosen[3]),
+        source=str(chosen[0]),
+        reason="ok",
+    )
+
+
+def _estimate_alignment(
+    state: TrackingState,
+    *,
+    ref_align_u16: np.ndarray,
+    cur_align_u16: np.ndarray,
+    ref_obj_xy: Optional[np.ndarray],
+    cur_obj_xy: np.ndarray,
+    center_dx: float,
+    center_dy: float,
+    search_radius_px: float,
+    max_displacement_px: float,
+    min_sources: int,
+) -> _AlignmentMeasurement:
+    n_det = int(cur_obj_xy.shape[0])
+    if n_det < int(min_sources):
+        return _AlignmentMeasurement(ok=False, reason="no_sources")
+
+    dx_phase, dy_phase, resp_phase = estimate_shift_from_phase_alignment(
+        ref_align_u16,
+        cur_align_u16,
+        max_shift_px=float(max_displacement_px),
+        median_k=int(state.cfg.align.median_k),
+    )
+    dx_profile, dy_profile, resp_profile = estimate_shift_from_profile_alignment(
+        ref_align_u16,
+        cur_align_u16,
+        center_dx=float(center_dx),
+        center_dy=float(center_dy),
+        max_shift_px=float(search_radius_px),
+        median_k=int(state.cfg.align.median_k),
+        smooth_k=int(state.cfg.align.smooth_k),
+        use_subpixel=bool(state.cfg.align.use_subpixel),
+    )
+
+    dx_src = 0.0
+    dy_src = 0.0
+    resp_src = 0.0
+    source_matches = 0
+    if ref_obj_xy is not None and len(ref_obj_xy) > 0:
+        try:
+            dx_src, dy_src, resp_src, source_matches = estimate_shift_from_source_matches(
+                ref_obj_xy,
+                cur_obj_xy,
+                center_dx=float(center_dx),
+                center_dy=float(center_dy),
+                max_shift_px=float(search_radius_px),
+                min_sources=max(2, int(min_sources)),
+            )
+        except Exception as exc:
+            log_error(None, "Tracking: source matching failed", exc, throttle_s=2.0, throttle_key="tracking_source_match")
+
+    resp_min = float(state.cfg.resp_min)
+    max_disp = max(0.5, float(max_displacement_px))
+
+    def _finite_in_range(dx: float, dy: float) -> bool:
+        mag = float(np.hypot(dx, dy))
+        return bool(np.isfinite(mag) and mag <= max_disp)
+
+    candidates: list[tuple[str, float, float, float]] = []
+    if float(resp_phase) >= resp_min and _finite_in_range(dx_phase, dy_phase):
+        candidates.append(("phase", float(dx_phase), float(dy_phase), float(resp_phase)))
+    if (
+        int(source_matches) >= max(2, int(min_sources))
+        and float(resp_src) >= max(float(state.cfg.rate.source_resp_min), resp_min)
+        and _finite_in_range(dx_src, dy_src)
+    ):
+        candidates.append(("source", float(dx_src), float(dy_src), float(resp_src)))
+    if float(resp_profile) >= resp_min and _finite_in_range(dx_profile, dy_profile):
+        candidates.append(("profile", float(dx_profile), float(dy_profile), float(resp_profile)))
+
+    agree_limit = max(
+        float(state.cfg.rate.source_profile_disagree_px),
+        min(3.0, 0.10 * max(1.0, float(search_radius_px))),
+    )
+    selected = _choose_consistent_alignment(
+        candidates,
+        center_dx=float(center_dx),
+        center_dy=float(center_dy),
+        agree_px=float(agree_limit),
+        lock_conf=float(state.lock_conf),
+    )
+    if selected.ok:
+        return selected
+
+    raw_mags = [
+        float(np.hypot(dx_phase, dy_phase)),
+        float(np.hypot(dx_profile, dy_profile)),
+    ]
+    if source_matches > 0:
+        raw_mags.append(float(np.hypot(dx_src, dy_src)))
+    if any(np.isfinite(mag) and mag > max_disp for mag in raw_mags):
+        return _AlignmentMeasurement(
+            ok=False,
+            dx=float(selected.dx),
+            dy=float(selected.dy),
+            resp=float(selected.resp),
+            source=str(selected.source),
+            reason="shift_out_of_range",
+        )
+    return selected
 
 
 # ============================================================
@@ -524,9 +772,11 @@ def auto_reset(state: TrackingState, *, src: str = "none", theta: Optional[np.nd
     a = state.auto
     a.ok = False
     a.src = src
+    has_calibration = theta is not None
 
     if theta is None:
-        # inicial razonable (no crítica)
+        # Prior used to initialise RLS only.  It is not a measured calibration
+        # and must never be allowed to drive the mount by itself.
         theta = np.array([[0.20, 0.00, 0.0],
                           [0.00, 0.10, 0.0]], dtype=np.float64)
 
@@ -546,6 +796,9 @@ def auto_reset(state: TrackingState, *, src: str = "none", theta: Optional[np.nd
     a.last_upd_t = None
 
     _auto_recompute_pinv(state)
+    if not has_calibration:
+        a.A_pinv = None
+        a.ok = False
 
 
 def _auto_recompute_pinv(state: TrackingState) -> None:
@@ -789,28 +1042,35 @@ def tracking_step(
     raw_align = _ensure_raw16_bayer(raw16)
 
     cfg_sep = state.cfg.sep_track
-    _, _, objects, _ = sep_detect_from_raw16(
-        raw_align,
-        sep_bw=int(cfg_sep.bw),
-        sep_bh=int(cfg_sep.bh),
-        sep_thresh_sigma=float(cfg_sep.thresh_sigma),
-        sep_minarea=int(cfg_sep.minarea),
-        max_sources=int(cfg_sep.max_sources),
-    )
-
-    resp_min = float(state.cfg.resp_min)
+    sep_failed = False
+    try:
+        _, _, objects, _ = sep_detect_from_raw16(
+            raw_align,
+            sep_bw=int(cfg_sep.bw),
+            sep_bh=int(cfg_sep.bh),
+            sep_thresh_sigma=float(cfg_sep.thresh_sigma),
+            sep_minarea=int(cfg_sep.minarea),
+            max_sources=int(cfg_sep.max_sources),
+        )
+    except Exception as exc:
+        # A single malformed/saturated frame must not disable tracking for the
+        # rest of the session.  Treat it as an invalid measurement and retain
+        # the last trustworthy references for the next frame.
+        sep_failed = True
+        objects = np.zeros((0,), dtype=[("x", "f8"), ("y", "f8"), ("flux", "f8")])
+        log_error(None, "Tracking: SEP detection failed", exc, throttle_s=2.0, throttle_key="tracking_sep")
 
     obj_xy, _ = _extract_obj_xy_and_flux(objects)
     n_det = int(obj_xy.shape[0])
     min_sources = max(1, int(state.cfg.sep_track.min_sources))
 
-    if (not state.auto.ok) or state.auto.A_pinv is None:
-        auto_reset(state, src="auto")
-
-    # keyframe init/pending
-    if state.key_obj_xy is None:
-        reset_keyframe(state, obj_xy, align_u16=raw_align, now_t=now_t)
-    elif isinstance(state.key_obj_xy, str) and state.key_obj_xy == "PENDING":
+    # Do not anchor either reference to a frame where SEP failed.  Doing so
+    # made the next good frame compare against noise/blur and often caused a
+    # second loss immediately after a transient bad exposure.
+    keyframe_pending = state.key_obj_xy is None or (
+        isinstance(state.key_obj_xy, str) and state.key_obj_xy == "PENDING"
+    )
+    if keyframe_pending and n_det >= min_sources:
         reset_keyframe(state, obj_xy, align_u16=raw_align, now_t=now_t)
 
     # first frame
@@ -819,7 +1079,7 @@ def tracking_step(
         state.prev_align_u16 = raw_align.copy()
         state.prev_t = now_t
         return TrackingOutput(
-            ok=True,
+            ok=False,
             mode=state.current_mode,
             resp=0.0,
             dx=0.0,
@@ -834,6 +1094,41 @@ def tracking_step(
             calib_src="none",
             detA=0.0,
             n_det=int(n_det),
+            measurement_reason=(
+                "detection_failed" if sep_failed else ("initializing" if n_det >= min_sources else "no_sources")
+            ),
+            measurement_source="none",
+            lock_conf=float(state.lock_conf),
+            fail_count=int(state.fail),
+        )
+
+    prev_n_det = int(state.prev_obj_xy.shape[0]) if isinstance(state.prev_obj_xy, np.ndarray) else 0
+    if prev_n_det < min_sources and n_det >= min_sources:
+        state.prev_obj_xy = obj_xy
+        state.prev_align_u16 = raw_align.copy()
+        state.prev_t = now_t
+        state.last_dx_inc = 0.0
+        state.last_dy_inc = 0.0
+        return TrackingOutput(
+            ok=False,
+            mode=state.current_mode,
+            resp=0.0,
+            dx=0.0,
+            dy=0.0,
+            vx=float(state.vx_inst),
+            vy=float(state.vy_inst),
+            abs_resp=float(state.abs_resp_last),
+            x_hat=float(state.x_hat),
+            y_hat=float(state.y_hat),
+            rate_az=float(state.rate_az),
+            rate_alt=float(state.rate_alt),
+            calib_src=str(state.calib_src_last),
+            detA=float(state.auto.detA if state.auto.ok else 0.0),
+            n_det=int(n_det),
+            measurement_reason="initializing",
+            measurement_source="none",
+            lock_conf=float(state.lock_conf),
+            fail_count=int(state.fail),
         )
 
     dt = float(now_t - float(state.prev_t))
@@ -854,122 +1149,85 @@ def tracking_step(
     )
     max_shift_inc = min(max_shift_inc, float(state.cfg.align.max_shift_px))
 
-    # Vector de deriva (px). Preferimos correlación de fase 2D; los perfiles
-    # 1D y el matching de fuentes quedan como fallback/guardarraíl.
-    dx_phase, dy_phase, resp_phase = estimate_shift_from_phase_alignment(
-        state.prev_align_u16,
-        raw_align,
-        max_shift_px=float(max_shift_inc),
-        median_k=int(state.cfg.align.median_k),
-    )
-
-    dx_profile, dy_profile, resp_profile = estimate_shift_from_profile_alignment(
-        state.prev_align_u16,
-        raw_align,
-        center_dx=float(state.last_dx_inc),
-        center_dy=float(state.last_dy_inc),
-        max_shift_px=float(max_shift_inc),
-        median_k=int(state.cfg.align.median_k),
-        smooth_k=int(state.cfg.align.smooth_k),
-        use_subpixel=bool(state.cfg.align.use_subpixel),
-    )
-
-    dx_src = 0.0
-    dy_src = 0.0
-    resp_src = 0.0
-    source_matches = 0
-    source_good = False
-    if state.prev_obj_xy is not None and n_det >= min_sources:
-        try:
-            min_source_matches = max(2, int(min_sources))
-            dx_src, dy_src, resp_src, source_matches = estimate_shift_from_source_matches(
-                state.prev_obj_xy,
-                obj_xy,
-                center_dx=float(state.last_dx_inc),
-                center_dy=float(state.last_dy_inc),
-                max_shift_px=float(max_shift_inc),
-                min_sources=int(min_source_matches),
-            )
-            source_mag = float(np.hypot(dx_src, dy_src))
-            source_good = (
-                int(source_matches) >= min_source_matches
-                and float(resp_src) >= max(float(state.cfg.rate.source_resp_min), resp_min)
-                and source_mag <= float(max_shift_inc)
-                and np.isfinite(source_mag)
-            )
-        except Exception as exc:
-            log_error(None, "Tracking: source matching failed", exc, throttle_s=2.0, throttle_key="tracking_source_match")
-
-    phase_mag = float(np.hypot(dx_phase, dy_phase))
-    phase_good = (
-        n_det >= min_sources
-        and float(resp_phase) >= resp_min
-        and phase_mag <= float(max_shift_inc)
-        and np.isfinite(phase_mag)
-    )
-
-    profile_mag = float(np.hypot(dx_profile, dy_profile))
-    profile_good = (
-        n_det >= min_sources
-        and float(resp_profile) >= resp_min
-        and profile_mag <= float(max_shift_inc)
-        and np.isfinite(profile_mag)
-    )
-
-    prev = np.array([float(state.last_dx_inc), float(state.last_dy_inc)], dtype=np.float64)
-    disagree_limit = max(
-        float(state.cfg.rate.source_profile_disagree_px),
-        0.25 * float(max_shift_inc),
-    )
-
-    candidates: list[tuple[str, float, float, float]] = []
-    if phase_good:
-        candidates.append(("phase", float(dx_phase), float(dy_phase), float(resp_phase)))
-    if source_good:
-        candidates.append(("source", float(dx_src), float(dy_src), float(resp_src)))
-    if profile_good:
-        candidates.append(("profile", float(dx_profile), float(dy_profile), float(resp_profile)))
-
-    if not candidates:
-        dx_inc = float(dx_phase if np.isfinite(dx_phase) else 0.0)
-        dy_inc = float(dy_phase if np.isfinite(dy_phase) else 0.0)
-        resp_inc = float(resp_phase if np.isfinite(resp_phase) else 0.0)
-    elif len(candidates) == 1:
-        _, dx_inc, dy_inc, resp_inc = candidates[0]
+    # Predict displacement from the last valid instantaneous velocity.  Since
+    # prev_t is deliberately kept on bad frames, this prediction and the search
+    # radius grow with the actual gap and allow reacquisition after a short
+    # dropout without changing the target reference.
+    if float(state.lock_conf) > 0.0 and np.isfinite(state.vx_inst) and np.isfinite(state.vy_inst):
+        center_dx = float(state.vx_inst) * dt
+        center_dy = float(state.vy_inst) * dt
     else:
-        # Select the valid estimator closest to the last accepted per-frame
-        # shift. This suppresses jumps to another star/profile peak while still
-        # allowing smooth drift.
-        candidates.sort(
-            key=lambda item: (
-                float(np.hypot(item[1] - prev[0], item[2] - prev[1])),
-                -float(item[3]),
-            )
-        )
-        _, dx_inc, dy_inc, resp_inc = candidates[0]
+        center_dx = float(state.last_dx_inc)
+        center_dy = float(state.last_dy_inc)
 
-        # If all estimators disagree strongly with the previous shift, treat the
-        # frame as bad instead of feeding a jump into velocity/RLS.
-        if float(np.hypot(dx_inc - prev[0], dy_inc - prev[1])) > disagree_limit and float(state.lock_conf) > 0.0:
-            resp_inc = 0.0
-
-    state.last_dx_inc = float(dx_inc)
-    state.last_dy_inc = float(dy_inc)
-    mag_inc = float(np.hypot(dx_inc, dy_inc))
-
-    good_inc = (
-        n_det >= min_sources
-        and float(resp_inc) >= resp_min
-        and mag_inc <= max_shift_inc
-        and np.isfinite(mag_inc)
-        and (phase_good or source_good or profile_good)
+    inc = _estimate_alignment(
+        state,
+        ref_align_u16=state.prev_align_u16,
+        cur_align_u16=raw_align,
+        ref_obj_xy=state.prev_obj_xy,
+        cur_obj_xy=obj_xy,
+        center_dx=float(center_dx),
+        center_dy=float(center_dy),
+        search_radius_px=float(max_shift_inc),
+        max_displacement_px=float(max_shift_inc),
+        min_sources=int(min_sources),
     )
+    dx_inc = float(inc.dx)
+    dy_inc = float(inc.dy)
+    resp_inc = float(inc.resp)
+    good_inc = bool(inc.ok)
+    measurement_reason = str(inc.reason)
+    measurement_source = str(inc.source)
+    if sep_failed:
+        measurement_reason = "detection_failed"
+
+    # Periodically validate accumulated error against the original target
+    # keyframe.  Also attempt it immediately on an incremental failure; a valid
+    # absolute match can recover lock without ever adopting the bad frame as the
+    # new target.
+    abs_measurement: Optional[_AlignmentMeasurement] = None
+    abs_due = state.abs_last_t is None or (
+        (now_t - float(state.abs_last_t)) >= float(state.cfg.keyframe.abs_corr_every_s)
+    )
+    if state.key_align_u16 is not None and (abs_due or not good_inc):
+        abs_search = min(
+            float(state.cfg.keyframe.abs_max_px),
+            max(float(max_shift_inc), 2.0 * float(state.cfg.rate.source_profile_disagree_px)),
+        )
+        abs_measurement = _estimate_alignment(
+            state,
+            ref_align_u16=state.key_align_u16,
+            cur_align_u16=raw_align,
+            ref_obj_xy=state.key_obj_xy if isinstance(state.key_obj_xy, np.ndarray) else None,
+            cur_obj_xy=obj_xy,
+            center_dx=float(state.x_hat + center_dx),
+            center_dy=float(state.y_hat + center_dy),
+            search_radius_px=float(abs_search),
+            max_displacement_px=float(state.cfg.keyframe.abs_max_px),
+            min_sources=int(min_sources),
+        )
+        state.abs_last_t = now_t
+        state.abs_resp_last = float(abs_measurement.resp)
+
+        if not good_inc and abs_measurement.ok:
+            recovery_dx = float(abs_measurement.dx - state.x_hat)
+            recovery_dy = float(abs_measurement.dy - state.y_hat)
+            recovery_mag = float(np.hypot(recovery_dx, recovery_dy))
+            if np.isfinite(recovery_mag) and recovery_mag <= float(max_shift_inc):
+                dx_inc = recovery_dx
+                dy_inc = recovery_dy
+                resp_inc = float(abs_measurement.resp)
+                good_inc = True
+                measurement_reason = "keyframe_recovery"
+                measurement_source = f"keyframe:{abs_measurement.source}"
 
     state.resp_inc = float(resp_inc)
     meas_clipped = False
 
     if good_inc:
         state.fail = 0
+        state.last_dx_inc = float(dx_inc)
+        state.last_dy_inc = float(dy_inc)
         state.x_hat += float(dx_inc)
         state.y_hat += float(dy_inc)
 
@@ -999,14 +1257,6 @@ def tracking_step(
         decay = clamp(float(state.cfg.rate.lock_drop_decay), 0.0, 1.0)
         state.vpx *= decay
         state.vpy *= decay
-        state.vx_inst = 0.0
-        state.vy_inst = 0.0
-        if n_det >= min_sources:
-            state.prev_obj_xy = obj_xy
-            state.prev_align_u16 = raw_align.copy()
-            state.prev_t = now_t
-            state.last_dx_inc = 0.0
-            state.last_dy_inc = 0.0
 
     warmup_frames = max(1, int(state.cfg.rate.lock_warmup_frames))
     lock_drop = clamp(float(state.cfg.rate.lock_drop_decay), 0.0, 1.0)
@@ -1022,6 +1272,7 @@ def tracking_step(
 
     # fail reset
     if state.fail >= int(state.cfg.rate.fail_reset_n):
+        failed_frames = int(state.fail)
         state.rate_az = 0.0
         state.rate_alt = 0.0
         reset_tracker(state, now_t=now_t, mode="STABILIZE")
@@ -1041,33 +1292,22 @@ def tracking_step(
             calib_src="none",
             detA=0.0,
             n_det=int(n_det),
+            measurement_reason="lost_lock",
+            measurement_source=str(measurement_source),
+            lock_conf=0.0,
+            fail_count=int(failed_frames),
         )
 
-    # ABS correction against keyframe
-    if state.key_align_u16 is not None:
-        if (state.abs_last_t is None) or ((now_t - float(state.abs_last_t)) >= float(state.cfg.keyframe.abs_corr_every_s)):
-            dx_abs, dy_abs, resp_abs = estimate_shift_from_profile_alignment(
-                state.key_align_u16,
-                raw_align,
-                center_dx=float(state.x_hat),
-                center_dy=float(state.y_hat),
-                max_shift_px=float(state.cfg.keyframe.abs_max_px),
-                median_k=int(state.cfg.align.median_k),
-                smooth_k=int(state.cfg.align.smooth_k),
-                use_subpixel=bool(state.cfg.align.use_subpixel),
-            )
-            state.abs_last_t = now_t
-            state.abs_resp_last = float(resp_abs)
-            mag_abs = float(np.hypot(dx_abs, dy_abs))
-
-            if (
-                resp_abs >= float(state.cfg.keyframe.abs_resp_min)
-                and mag_abs <= float(state.cfg.keyframe.abs_max_px)
-                and np.isfinite(mag_abs)
-            ):
-                beta = float(state.cfg.keyframe.abs_blend_beta)
-                state.x_hat = (1.0 - beta) * state.x_hat + beta * float(dx_abs)
-                state.y_hat = (1.0 - beta) * state.y_hat + beta * float(dy_abs)
+    if good_inc and abs_measurement is not None and abs_measurement.ok:
+        mag_abs = float(np.hypot(abs_measurement.dx, abs_measurement.dy))
+        if (
+            float(abs_measurement.resp) >= float(state.cfg.keyframe.abs_resp_min)
+            and mag_abs <= float(state.cfg.keyframe.abs_max_px)
+            and np.isfinite(mag_abs)
+        ):
+            beta = float(state.cfg.keyframe.abs_blend_beta)
+            state.x_hat = (1.0 - beta) * state.x_hat + beta * float(abs_measurement.dx)
+            state.y_hat = (1.0 - beta) * state.y_hat + beta * float(abs_measurement.dy)
 
     # control (compute rates) - only if tracking_enabled
     calib_pinv, b_use, src, detA = _get_A_pinv_use(state)
@@ -1177,4 +1417,8 @@ def tracking_step(
         calib_src=str(src),
         detA=float(detA),
         n_det=int(n_det),
+        measurement_reason=str(measurement_reason),
+        measurement_source=str(measurement_source),
+        lock_conf=float(state.lock_conf),
+        fail_count=int(state.fail),
     )

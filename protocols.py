@@ -14,7 +14,15 @@ class MountProtocol(Protocol):
     def is_connected(self) -> bool:
         ...
 
-    def move_steps(self, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
+    def move_steps(
+        self,
+        axis: Axis,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        *,
+        profile: str = "smooth",
+    ) -> None:
         ...
 
     def stop(self) -> None:

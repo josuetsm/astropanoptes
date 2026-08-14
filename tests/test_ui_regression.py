@@ -3,9 +3,20 @@ import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PyQt6.QtWidgets import QApplication, QLabel
+from PyQt6.QtWidgets import (
+    QApplication,
+    QCheckBox,
+    QComboBox,
+    QDoubleSpinBox,
+    QLabel,
+    QLineEdit,
+    QPushButton,
+    QSpinBox,
+    QToolButton,
+)
 
 from app_runner import AppRunner
+from ap_types import Axis, CameraStatus, MountStatus
 from config import AppConfig
 from ui.pyqt6_app import AstroPanoptesWindow
 
@@ -23,7 +34,7 @@ class UiRegressionTests(unittest.TestCase):
     def tearDown(self) -> None:
         self.window.close()
 
-    def test_modules_tabs_without_plate_solving(self) -> None:
+    def test_plate_solving_is_available_in_goto_panel(self) -> None:
         labels = [
             self.window.modules_tabs.tabText(i)
             for i in range(self.window.modules_tabs.count())
@@ -31,10 +42,117 @@ class UiRegressionTests(unittest.TestCase):
         self.assertIn("GoTo", labels)
         self.assertNotIn("Gaia", labels)
         self.assertNotIn("Plate Solving", labels)
+        self.assertEqual(self.window.btn_platesolve.text(), "Plate Solving")
+        self.assertEqual(
+            [
+                self.window.dd_platesolve_mode.itemText(i)
+                for i in range(self.window.dd_platesolve_mode.count())
+            ],
+            ["Deriva", "Alt/Az (manual)", "Alt/Az (registrado)"],
+        )
+        self.assertFalse(hasattr(self.window, "btn_autocal"))
+        self.assertFalse(hasattr(self.window, "btn_accept_sample"))
+        self.assertFalse(hasattr(self.window, "btn_reject_sample"))
+
+    def test_plate_solving_manual_altaz_submits_operator_target(self) -> None:
+        calls: list[dict] = []
+        self.runner.request_goto_autocalibrate = lambda params: calls.append(dict(params))
+        self.window.dd_platesolve_mode.setCurrentText("Alt/Az (manual)")
+        self.window.ds_goto_ps_az.setValue(123.456)
+        self.window.ds_goto_ps_alt.setValue(42.25)
+
+        self.window.btn_platesolve.click()
+
+        self.assertTrue(calls)
+        self.assertEqual(calls[-1]["autocal_ps_mode"], "manual_altaz")
+        self.assertEqual(
+            calls[-1]["autocal_ps_target"],
+            {"az_deg": 123.456, "alt_deg": 42.25},
+        )
+        self.assertNotIn("exp_ms", calls[-1])
+        self.assertNotIn("gain", calls[-1])
+
+    def test_plate_solving_non_manual_modes_use_no_operator_target(self) -> None:
+        calls: list[dict] = []
+        self.runner.request_goto_autocalibrate = lambda params: calls.append(dict(params))
+
+        for label, value in (
+            ("Deriva", "drift"),
+            ("Alt/Az (registrado)", "current_altaz"),
+        ):
+            self.window.dd_platesolve_mode.setCurrentText(label)
+            self.window.btn_platesolve.click()
+            self.assertEqual(calls[-1]["autocal_ps_mode"], value)
+            self.assertNotIn("autocal_ps_target", calls[-1])
 
     def test_on_tick_without_plate_solving_widgets(self) -> None:
         self.assertFalse(getattr(self.window, "_ps_outputs_enabled", True))
         self.window._on_tick()
+
+    def test_toolbar_has_one_toggle_button_per_device(self) -> None:
+        self.assertFalse(hasattr(self.window, "btn_connect_camera"))
+        self.assertFalse(hasattr(self.window, "btn_disconnect_camera"))
+        self.assertFalse(hasattr(self.window, "btn_connect_mount"))
+        self.assertFalse(hasattr(self.window, "btn_disconnect_mount"))
+        self.assertEqual(self.window.btn_camera_connection.text(), "Connect camera")
+        self.assertEqual(self.window.btn_mount_connection.text(), "Connect mount")
+
+    def test_manual_controls_select_smooth_or_direct_move_profile(self) -> None:
+        calls: list[tuple] = []
+        self.runner.request_mount_move_steps = lambda *args, **kwargs: calls.append(
+            (args, kwargs)
+        )
+        self.window.sb_steps.setValue(1234)
+        self.window.sb_delay.setValue(567)
+
+        self.assertEqual(self.window.sb_delay.minimum(), 10)
+        self.assertEqual(self.window.dd_manual_move_profile.currentData(), "smooth")
+        self.window._manual_move(Axis.ALT, -1)
+        self.assertEqual(calls[-1][0], (Axis.ALT, -1, 1234, 567))
+        self.assertEqual(calls[-1][1], {"profile": "smooth"})
+
+        self.window.dd_manual_move_profile.setCurrentIndex(1)
+        self.window._manual_move(Axis.AZ, 1)
+        self.assertEqual(calls[-1][0], (Axis.AZ, 1, 1234, 567))
+        self.assertEqual(calls[-1][1], {"profile": "direct"})
+
+    def test_camera_connection_button_toggles_from_runner_state(self) -> None:
+        calls: list[str] = []
+        self.runner.request_camera_connect = lambda _index: calls.append("connect")
+        self.runner.request_camera_disconnect = lambda: calls.append("disconnect")
+
+        self.window.btn_camera_connection.click()
+        self.assertEqual(calls, ["connect"])
+        self.assertFalse(self.window.btn_camera_connection.isEnabled())
+
+        self.runner._update_state(
+            {"camera": {"connected": True, "status": CameraStatus.OK}}
+        )
+        self.window._update_chips_from_state(self.runner.get_state())
+        self.assertTrue(self.window.btn_camera_connection.isEnabled())
+        self.assertEqual(self.window.btn_camera_connection.text(), "Disconnect camera")
+
+        self.window.btn_camera_connection.click()
+        self.assertEqual(calls, ["connect", "disconnect"])
+
+    def test_mount_connection_button_toggles_from_runner_state(self) -> None:
+        calls: list[str] = []
+        self.runner.request_mount_connect = lambda _port, _baud: calls.append("connect")
+        self.runner.request_mount_disconnect = lambda: calls.append("disconnect")
+
+        self.window.btn_mount_connection.click()
+        self.assertEqual(calls, ["connect"])
+        self.assertFalse(self.window.btn_mount_connection.isEnabled())
+
+        self.runner._update_state(
+            {"mount": {"connected": True, "status": MountStatus.OK}}
+        )
+        self.window._update_chips_from_state(self.runner.get_state())
+        self.assertTrue(self.window.btn_mount_connection.isEnabled())
+        self.assertEqual(self.window.btn_mount_connection.text(), "Disconnect mount")
+
+        self.window.btn_mount_connection.click()
+        self.assertEqual(calls, ["connect", "disconnect"])
 
     def test_expected_stars_overlay_is_enabled_after_model_fit(self) -> None:
         calls: list[dict] = []
@@ -139,6 +257,32 @@ class UiRegressionTests(unittest.TestCase):
         ]
         self.assertTrue(labels)
         self.assertIn("Respuesta mínima", labels[0].toolTip())
+
+    def test_interactive_controls_have_tooltips(self) -> None:
+        missing: list[tuple[str, str]] = []
+        classes = (
+            QPushButton,
+            QCheckBox,
+            QComboBox,
+            QSpinBox,
+            QDoubleSpinBox,
+            QLineEdit,
+            QToolButton,
+        )
+        for widget_cls in classes:
+            for widget in self.window.findChildren(widget_cls):
+                text = widget.text() if hasattr(widget, "text") else ""
+                name = widget.objectName() or text or widget_cls.__name__
+                internal_qt_widget = name.startswith("qt_") or name in {
+                    "ScrollLeftButton",
+                    "ScrollRightButton",
+                }
+                if internal_qt_widget:
+                    continue
+                if not widget.toolTip():
+                    missing.append((widget_cls.__name__, name))
+
+        self.assertEqual([], missing)
 
     def test_goto_uses_model_without_platesolving_parameters(self) -> None:
         calls: list[tuple[object, dict]] = []

@@ -2,6 +2,10 @@
 from __future__ import annotations
 
 import json
+import math
+import os
+import plistlib
+import re
 import shutil
 import subprocess
 import threading
@@ -18,7 +22,135 @@ from logging_utils import log_error, log_info
 from workers import BaseWorker
 
 
-SUPPORTED_MICROSTEPS: tuple[int, ...] = (8, 16, 32, 64)
+FIXED_MICROSTEPS = 64
+SUPPORTED_MICROSTEPS: tuple[int, ...] = (FIXED_MICROSTEPS,)
+
+STEP_PULSE_US = 3
+FIRMWARE_MOVE_MAX_RATE_STEPS_S = 12_000.0
+FIRMWARE_MOVE_SMOOTH_START_RATE_STEPS_S = 400.0
+FIRMWARE_MOVE_SMOOTH_MAX_ACCEL_STEPS_S2 = 4_000.0
+_SMOOTHERSTEP_MAX_DERIVATIVE = 1.875
+
+
+def normalize_move_profile(profile: str) -> str:
+    value = str(profile or "smooth").strip().lower()
+    if value not in {"smooth", "direct"}:
+        raise ValueError("move profile must be 'smooth' or 'direct'")
+    return value
+
+
+def firmware_move_period_us(
+    target_delay_us: int,
+    total_steps: int,
+    remaining_steps: int,
+    profile: str = "smooth",
+) -> int:
+    """Mirror the selectable, rate-limited firmware MOVE profile."""
+    move_profile = normalize_move_profile(profile)
+    requested_period = max(1, int(target_delay_us) + int(STEP_PULSE_US))
+    safe_min_period = int(math.ceil(1.0e6 / FIRMWARE_MOVE_MAX_RATE_STEPS_S))
+    target_period = max(requested_period, safe_min_period)
+    total = max(0, int(total_steps))
+    remaining = max(0, int(remaining_steps))
+    if total <= 0 or remaining <= 0 or move_profile == "direct":
+        return target_period
+
+    target_rate = 1.0e6 / float(target_period)
+    start_rate = min(
+        target_rate,
+        float(FIRMWARE_MOVE_SMOOTH_START_RATE_STEPS_S),
+    )
+    if target_rate <= start_rate:
+        return target_period
+
+    completed = max(0, total - remaining)
+    stopping_edge = max(0, remaining - 1)
+    edge_steps = float(min(completed, stopping_edge))
+    half_move_steps = max(1.0, float(total) / 2.0)
+    ideal_ramp_steps = (
+        (target_rate * target_rate - start_rate * start_rate)
+        * _SMOOTHERSTEP_MAX_DERIVATIVE
+        / (2.0 * FIRMWARE_MOVE_SMOOTH_MAX_ACCEL_STEPS_S2)
+    )
+    ramp_steps = max(1.0, min(half_move_steps, ideal_ramp_steps))
+    if edge_steps >= ramp_steps:
+        return target_period
+
+    # Smootherstep gives zero acceleration at both ends. Interpolating rate²
+    # makes the peak physical acceleration analytically bounded.
+    peak_rate_sq = min(
+        target_rate * target_rate,
+        start_rate * start_rate
+        + (
+            2.0
+            * FIRMWARE_MOVE_SMOOTH_MAX_ACCEL_STEPS_S2
+            * ramp_steps
+            / _SMOOTHERSTEP_MAX_DERIVATIVE
+        ),
+    )
+    x = edge_steps / ramp_steps
+    smoother = x * x * x * (x * (x * 6.0 - 15.0) + 10.0)
+    rate = math.sqrt(
+        start_rate * start_rate
+        + (peak_rate_sq - start_rate * start_rate) * smoother
+    )
+    if not (rate > 0.0):
+        rate = start_rate
+    return max(safe_min_period, int(round(1.0e6 / rate)))
+
+
+def estimate_firmware_move_duration_s(
+    steps: int,
+    min_delay_us: int,
+    profile: str = "smooth",
+) -> float:
+    """Estimate one firmware MOVE using the selected profile."""
+    total = max(0, int(steps))
+    if total <= 0:
+        return 0.0
+    move_profile = normalize_move_profile(profile)
+    if move_profile == "direct":
+        period_sum_us = total * firmware_move_period_us(
+            min_delay_us, total, total, profile=move_profile
+        )
+    else:
+        requested_period = max(1, int(min_delay_us) + int(STEP_PULSE_US))
+        safe_min_period = int(
+            math.ceil(1.0e6 / FIRMWARE_MOVE_MAX_RATE_STEPS_S)
+        )
+        target_period = max(requested_period, safe_min_period)
+        target_rate = 1.0e6 / float(target_period)
+        start_rate = min(
+            target_rate,
+            float(FIRMWARE_MOVE_SMOOTH_START_RATE_STEPS_S),
+        )
+        ideal_ramp_steps = max(
+            1.0,
+            (
+                (target_rate * target_rate - start_rate * start_rate)
+                * _SMOOTHERSTEP_MAX_DERIVATIVE
+                / (2.0 * FIRMWARE_MOVE_SMOOTH_MAX_ACCEL_STEPS_S2)
+            ),
+        )
+        ramp_count = min(total // 2, int(math.ceil(ideal_ramp_steps)))
+        edge_sum_us = sum(
+            firmware_move_period_us(
+                min_delay_us,
+                total,
+                total - completed,
+                profile=move_profile,
+            )
+            for completed in range(ramp_count)
+        )
+        center_count = total - (2 * ramp_count)
+        center_period = firmware_move_period_us(
+            min_delay_us,
+            total,
+            total - ramp_count,
+            profile=move_profile,
+        )
+        period_sum_us = (2 * edge_sum_us) + (center_count * center_period)
+    return float(period_sum_us / 1.0e6)
 
 
 # =========================
@@ -81,41 +213,24 @@ def resolve_mount_port(port: str) -> str:
             score += 70
         if "esp32" in hint:
             score += 40
-        if "bluetooth" in hint or "spp" in hint:
-            score += 20
-        if dev.startswith("/dev/cu."):
-            score += 5
-        candidates.append((score, dev))
+        # Never treat macOS' generic incoming RFCOMM endpoint, unrelated
+        # headsets, or debug ports as the telescope. AUTO must wait for a
+        # positively identified AstroPanoptes port instead of guessing.
+        if score > 0:
+            candidates.append((score, dev))
 
     if not candidates:
         return ""
 
     candidates.sort(key=lambda item: (-item[0], item[1]))
     best_score, best_dev = candidates[0]
-    if best_score > 0:
-        return best_dev
-
-    # Fallback when no ESP32-like metadata is exposed by the OS.
-    for _score, dev in candidates:
-        if dev.startswith("/dev/cu."):
-            return dev
-    return best_dev
+    return best_dev if best_score > 0 else ""
 
 
 def resolve_common_microsteps(az_div: int, alt_div: int, *, default_ms: int = 64) -> int:
-    """
-    ESP32 firmware uses COMMON MS1/MS2 pins:
-    both axes always end up with the same microstep divider.
-    """
-    az = int(az_div)
-    alt = int(alt_div)
-    if az in SUPPORTED_MICROSTEPS and alt in SUPPORTED_MICROSTEPS:
-        return az
-    if az in SUPPORTED_MICROSTEPS:
-        return az
-    if alt in SUPPORTED_MICROSTEPS:
-        return alt
-    return int(default_ms)
+    """Return the hardware-wired microstep divisor (always 1/64)."""
+    _ = az_div, alt_div, default_ms
+    return int(FIXED_MICROSTEPS)
 
 
 def _axis_to_fw(axis: Axis) -> str:
@@ -161,6 +276,8 @@ class ArduinoConfig:
     bt_device_name: str = "AstroPanoptes-ESP32"
     bt_forget_retry_s: float = 0.80
     bt_pair_after_forget: bool = True
+    bt_inquiry_s: float = 6.0
+    bt_serial_port_wait_s: float = 20.0
 
 
 class ArduinoController:
@@ -171,20 +288,28 @@ class ArduinoController:
       PING                  -> READY
       ENABLE 0|1            -> OK
       STOP                  -> OK
-      MS <8|16|32|64>       -> OK MS <common>
-      MS AZ <...>           -> OK MS <common> (accepted, but common pins)
-      MS ALT <...>          -> OK MS <common> (accepted, but common pins)
+      MS 64                 -> OK MS_FIXED 64 (legacy no-op)
+      MS AZ|ALT 64          -> OK MS_FIXED 64 (legacy no-op)
       MOVE A|B FWD|REV steps delay_us -> OK
-      STATUS                -> EN=... MS=... MOVE=... BT=... DBG=...
+      STATUS                -> EN=... MS=64 MSFIXED=1 MOVE=... BT=... DBG=...
     """
 
     def __init__(self, cfg: ArduinoConfig):
         self.cfg = cfg
         self._ser: Optional[serial.Serial] = None
         self._lock = threading.Lock()
+        self._move_profiles_supported: Optional[bool] = None
 
     def _blueutil_path(self) -> str:
-        return str(shutil.which("blueutil") or "")
+        found = str(shutil.which("blueutil") or "")
+        if found:
+            return found
+
+        # Finder-launched .app bundles do not normally inherit Homebrew's PATH.
+        for candidate in ("/opt/homebrew/bin/blueutil", "/usr/local/bin/blueutil"):
+            if os.path.isfile(candidate) and os.access(candidate, os.X_OK):
+                return candidate
+        return ""
 
     def _blueutil_run(self, *args: str, timeout_s: float = 10.0) -> tuple[int, str, str]:
         bin_path = self._blueutil_path()
@@ -202,6 +327,62 @@ class ArduinoController:
         except Exception as exc:
             return (1, "", str(exc))
 
+    @staticmethod
+    def _blueutil_device_id(row: object) -> str:
+        if not isinstance(row, dict):
+            return ""
+        return str(row.get("address", "") or row.get("id", "") or "").strip()
+
+    def _blueutil_find_device_in(self, *args: str) -> str:
+        name = str(self.cfg.bt_device_name or "").strip()
+        if not name:
+            return ""
+
+        timeout_s = 15.0
+        if "--inquiry" in args:
+            try:
+                inquiry_index = args.index("--inquiry")
+                inquiry_s = float(args[inquiry_index + 1])
+            except (ValueError, IndexError, TypeError):
+                inquiry_s = float(self.cfg.bt_inquiry_s)
+            # blueutil's advertised inquiry duration excludes the later name
+            # lookup pass, which can add several seconds on macOS.
+            timeout_s = max(20.0, inquiry_s + 20.0)
+
+        rc, out, err = self._blueutil_run(*args, "--format", "json", timeout_s=timeout_s)
+        if rc != 0 or not out:
+            if err:
+                log_info(
+                    None,
+                    f"Mount: BT device lookup hint ({err})",
+                    throttle_s=2.0,
+                    throttle_key="mount_blueutil_lookup_hint",
+                )
+            return ""
+
+        try:
+            rows = json.loads(out)
+        except Exception as exc:
+            log_error(
+                None,
+                "Mount: failed to parse blueutil device JSON",
+                exc,
+                throttle_s=10.0,
+                throttle_key="mount_blueutil_json",
+            )
+            return ""
+
+        if not isinstance(rows, list):
+            return ""
+        wanted = name.casefold()
+        for row in rows:
+            if not isinstance(row, dict):
+                continue
+            candidate_name = str(row.get("name", "") or "").strip()
+            if candidate_name.casefold() == wanted:
+                return self._blueutil_device_id(row)
+        return ""
+
     def _blueutil_get_device_id(self) -> str:
         """
         Returns BT device ID (address if possible) for the configured mount device name.
@@ -210,42 +391,65 @@ class ArduinoController:
         if not name:
             return ""
 
-        rc, out, _err = self._blueutil_run("--paired", "--format", "json", timeout_s=6.0)
-        if rc == 0 and out:
-            try:
-                rows = json.loads(out)
-                if isinstance(rows, list):
-                    for row in rows:
-                        nm = str((row or {}).get("name", "")).strip()
-                        if nm == name:
-                            addr = str((row or {}).get("address", "")).strip()
-                            return addr or name
-            except Exception as exc:
-                log_error(
-                    None,
-                    "Mount: failed to parse blueutil paired-device JSON",
-                    exc,
-                    throttle_s=10.0,
-                    throttle_key="mount_blueutil_json",
-                )
-        return name
+        if re.fullmatch(r"[0-9A-Fa-f]{2}(?:[:-]?[0-9A-Fa-f]{2}){5}", name):
+            return name
 
-    def _refresh_bt_pairing(self) -> None:
+        device_id = self._blueutil_find_device_in("--paired")
+        if device_id:
+            return device_id
+
+        device_id = self._macos_persistent_device_id()
+        if device_id:
+            return device_id
+
+        # Once macOS has forgotten the device, name lookup only works after an
+        # inquiry. Keep the discovered address because pairing by name is not
+        # reliable for unpaired devices on recent macOS releases.
+        inquiry_s = max(1, int(round(float(self.cfg.bt_inquiry_s))))
+        return self._blueutil_find_device_in("--inquiry", str(inquiry_s))
+
+    def _macos_persistent_device_id(self) -> str:
+        """Recover an RFCOMM device address kept by macOS after unpairing."""
+        name = str(self.cfg.bt_device_name or "").strip().casefold()
+        if not name:
+            return ""
+
+        plist_path = "/Library/Preferences/com.apple.Bluetooth.plist"
+        try:
+            with open(plist_path, "rb") as stream:
+                preferences = plistlib.load(stream)
+        except (OSError, plistlib.InvalidFileException):
+            return ""
+
+        ports = preferences.get("PersistentPorts", {})
+        if not isinstance(ports, dict):
+            return ""
+        for address, details in ports.items():
+            if not isinstance(details, dict):
+                continue
+            bsd_name = str(details.get("BSDName", "") or "").strip().casefold()
+            if bsd_name == name:
+                return str(address or "").strip()
+        return ""
+
+    def _refresh_bt_pairing(self) -> tuple[bool, str]:
         """
         macOS workaround:
         disconnect + unpair + pair + connect via blueutil to avoid stale RFCOMM sessions.
         """
         if not bool(self.cfg.bt_forget_before_connect):
-            return
+            return (True, "")
         if not self._blueutil_path():
-            return
+            return (False, "blueutil no encontrado; instala con 'brew install blueutil'")
         device_id = self._blueutil_get_device_id()
         if not device_id:
-            return
+            return (False, f"dispositivo Bluetooth '{self.cfg.bt_device_name}' no encontrado")
 
-        rc_disc, _o_disc, e_disc = self._blueutil_run("--disconnect", device_id, timeout_s=6.0)
+        rc_disc, _o_disc, e_disc = self._blueutil_run("--disconnect", device_id, timeout_s=4.0)
         if rc_disc != 0 and e_disc:
             log_info(None, f"Mount: BT disconnect hint ({e_disc})", throttle_s=2.0, throttle_key="mount_bt_disconnect_hint")
+        else:
+            self._blueutil_run("--wait-disconnect", device_id, "5", timeout_s=6.0)
 
         rc_unpair, _o_unpair, e_unpair = self._blueutil_run("--unpair", device_id, timeout_s=8.0)
         if rc_unpair != 0 and e_unpair:
@@ -255,16 +459,39 @@ class ArduinoController:
             time.sleep(float(self.cfg.bt_forget_retry_s))
 
         if bool(self.cfg.bt_pair_after_forget):
-            rc_pair, _o_pair, e_pair = self._blueutil_run("--pair", device_id, timeout_s=12.0)
+            rc_pair, _o_pair, e_pair = self._blueutil_run("--pair", device_id, timeout_s=30.0)
             if rc_pair != 0:
-                log_info(None, f"Mount: BT pair hint ({e_pair or 'pair failed'})", throttle_s=2.0, throttle_key="mount_bt_pair_hint")
+                message = e_pair or "pair failed"
+                log_info(None, f"Mount: BT pair hint ({message})", throttle_s=2.0, throttle_key="mount_bt_pair_hint")
+                return (False, f"no se pudo emparejar la montura: {message}")
 
-        rc_conn, _o_conn, e_conn = self._blueutil_run("--connect", device_id, timeout_s=10.0)
-        if rc_conn != 0 and e_conn:
-            log_info(None, f"Mount: BT connect hint ({e_conn})", throttle_s=2.0, throttle_key="mount_bt_connect_hint")
+        rc_conn, _o_conn, e_conn = self._blueutil_run("--connect", device_id, timeout_s=20.0)
+        if rc_conn != 0:
+            message = e_conn or "connect failed"
+            log_info(None, f"Mount: BT connect hint ({message})", throttle_s=2.0, throttle_key="mount_bt_connect_hint")
+            return (False, f"no se pudo conectar la montura por Bluetooth: {message}")
+
+        rc_wait, _o_wait, e_wait = self._blueutil_run("--wait-connect", device_id, "15", timeout_s=16.0)
+        if rc_wait != 0:
+            message = e_wait or "connection timeout"
+            return (False, f"macOS no confirmó la conexión Bluetooth: {message}")
 
         if float(self.cfg.bt_forget_retry_s) > 0.0:
             time.sleep(float(self.cfg.bt_forget_retry_s))
+        return (True, "")
+
+    def _wait_for_mount_port(self) -> str:
+        target_port = resolve_mount_port(self.cfg.port)
+        if target_port or not _is_auto_port_value(self.cfg.port):
+            return target_port
+
+        deadline = time.monotonic() + max(0.0, float(self.cfg.bt_serial_port_wait_s))
+        while time.monotonic() < deadline:
+            time.sleep(0.20)
+            target_port = resolve_mount_port(self.cfg.port)
+            if target_port:
+                return target_port
+        return ""
 
     @property
     def is_connected(self) -> bool:
@@ -284,12 +511,17 @@ class ArduinoController:
           - ENABLE 1
           - STOP
         """
-        target_port = resolve_mount_port(self.cfg.port)
+        if self.is_connected:
+            return f"Mount ya conectado ({self.cfg.port})"
+
+        # The Bluetooth SPP serial port may not exist while the device is
+        # forgotten. Recreate the OS-level pairing first, then resolve it.
+        bt_ok, bt_error = self._refresh_bt_pairing()
+        target_port = self._wait_for_mount_port()
         if not target_port:
             available = ", ".join(list_serial_ports()) or "none"
-            return f"Mount error al conectar (no serial port found; available={available})"
-
-        self._refresh_bt_pairing()
+            detail = f"; Bluetooth={bt_error}" if (not bt_ok and bt_error) else ""
+            return f"Mount error al conectar (no serial port found; available={available}{detail})"
 
         open_attempts = max(1, int(self.cfg.open_attempts))
         last_error = "Mount error al conectar (unknown)"
@@ -325,6 +557,7 @@ class ArduinoController:
                         log_error(None, "Mount: failed to reset serial buffers", exc, throttle_s=5.0, throttle_key="mount_reset_buffers")
 
                     self._ser = ser
+                    self._move_profiles_supported = None
                     self.cfg.port = target_port
                 except Exception as e:
                     self._ser = None
@@ -383,6 +616,7 @@ class ArduinoController:
                 throttle_key="mount_close_locked",
             )
         self._ser = None
+        self._move_profiles_supported = None
 
     def close(self) -> None:
         with self._lock:
@@ -439,6 +673,28 @@ class ArduinoController:
 
         return lines
 
+    @staticmethod
+    def _response_matches_command(cmd: str, line: str) -> bool:
+        """Reject delayed/asynchronous lines that belong to another command."""
+        command = str(cmd or "").strip().upper()
+        response = str(line or "").strip().upper()
+        if not response:
+            return False
+        if response.startswith("ERR"):
+            return True
+        verb = command.split(" ", 1)[0]
+        if verb == "PING":
+            return response == "READY"
+        if verb == "STATUS":
+            return response.startswith("EN=") and "MOVE=" in response
+        if verb == "MS":
+            return response.startswith("OK MS")
+        if verb == "DEBUG":
+            return response.startswith("OK DEBUG")
+        if verb in {"ENABLE", "STOP", "MOVE"}:
+            return response == "OK"
+        return True
+
     def send(self, cmd: str, timeout_s: float = 0.20, *, reset_input: Optional[bool] = None) -> str:
         """
         Envía un comando y espera 1 línea de respuesta (bloqueante hasta timeout_s).
@@ -480,7 +736,7 @@ class ArduinoController:
                     except Exception as exc:
                         log_error(None, "Mount: failed to read serial response", exc, throttle_s=5.0, throttle_key="mount_read_response")
                         line = ""
-                    if line:
+                    if line and self._response_matches_command(cmd, line):
                         return line
                     if (time.time() - t0) > float(timeout_s):
                         return ""
@@ -502,7 +758,14 @@ class ArduinoController:
     def stop(self) -> str:
         return self.send("STOP", timeout_s=0.80, reset_input=False)
 
-    def move(self, axis: str, direction: str, steps: int, delay_us: int) -> str:
+    def move(
+        self,
+        axis: str,
+        direction: str,
+        steps: int,
+        delay_us: int,
+        profile: str = "smooth",
+    ) -> str:
         axis = (axis or "").strip().upper()
         direction = (direction or "").strip().upper()
 
@@ -513,28 +776,54 @@ class ArduinoController:
 
         steps_i = max(0, int(steps))
         delay_i = max(0, int(delay_us))
+        profile_i = normalize_move_profile(profile).upper()
+        if self._move_profiles_supported is not True:
+            status = self.status().upper()
+            self._move_profiles_supported = "MOVEPROFILES=1" in status
+        if not self._move_profiles_supported:
+            if profile_i != "DIRECT":
+                raise RuntimeError(
+                    "firmware does not advertise MOVEPROFILES=1; flash the updated "
+                    "firmware before using smooth moves"
+                )
+            # Legacy firmware implements the same constant-cadence move used
+            # by the DIRECT profile, but accepts no trailing profile token.
+            est_s = estimate_firmware_move_duration_s(
+                steps_i,
+                delay_i,
+                profile="direct",
+            )
+            timeout_s = max(3.50, est_s + 1.5)
+            return self.send(
+                f"MOVE {axis} {direction} {steps_i} {delay_i}",
+                timeout_s=float(timeout_s),
+            )
         # Works with both firmware variants:
         # - legacy blocking MOVE (needs long timeout);
         # - new non-blocking MOVE (returns immediately anyway).
-        est_s = (float(steps_i) * 2.0 * float(delay_i)) / 1.0e6
+        est_s = estimate_firmware_move_duration_s(
+            steps_i,
+            delay_i,
+            profile=profile_i.lower(),
+        )
         timeout_s = max(3.50, est_s + 1.5)
-        return self.send(f"MOVE {axis} {direction} {steps_i} {delay_i}", timeout_s=float(timeout_s))
+        return self.send(
+            f"MOVE {axis} {direction} {steps_i} {delay_i} {profile_i}",
+            timeout_s=float(timeout_s),
+        )
 
     def status(self) -> str:
         return self.send("STATUS", timeout_s=0.50, reset_input=False)
 
     def set_microsteps(self, az_div: int, alt_div: int) -> str:
-        ms = resolve_common_microsteps(int(az_div), int(alt_div), default_ms=64)
-        if int(az_div) != int(alt_div):
-            log_info(
-                None,
-                f"Mount: MS common pins active; forcing AZ={int(az_div)} ALT={int(alt_div)} -> {ms}",
-                throttle_s=2.0,
-                throttle_key="mount_ms_common_force",
+        if int(az_div) != FIXED_MICROSTEPS or int(alt_div) != FIXED_MICROSTEPS:
+            raise ValueError(
+                f"Microstepping is hardware-fixed at 1/{FIXED_MICROSTEPS}; "
+                f"requested AZ=1/{int(az_div)} ALT=1/{int(alt_div)}"
             )
-        if ms not in SUPPORTED_MICROSTEPS:
-            raise ValueError(f"Unsupported microsteps value: {ms} (supported: {SUPPORTED_MICROSTEPS})")
-        return self.send(f"MS {ms}", timeout_s=0.60)
+        # Compatibility handshake: new firmware treats this as a no-op while
+        # older installed firmware still receives the known-safe value.
+        return self.send(f"MS {FIXED_MICROSTEPS}", timeout_s=0.60)
 
 
 # =========================
@@ -548,7 +837,7 @@ class ArduinoMount:
       - connect(port, baud)
       - disconnect()
       - stop()
-      - set_microsteps(az_div, alt_div)     -> MS ...
+      - set_microsteps(64, 64)              -> legacy fixed-MS handshake
       - move_steps(axis, direction, steps, delay_us) -> MOVE ...
     """
 
@@ -568,7 +857,8 @@ class ArduinoMount:
 
     def disconnect(self) -> None:
         try:
-            self.stop()
+            if self.ctrl.is_connected:
+                self.stop()
         except Exception as exc:
             log_error(None, "Mount: stop failed during disconnect", exc, throttle_s=2.0, throttle_key="mount_stop_on_disconnect")
         finally:
@@ -584,12 +874,14 @@ class ArduinoMount:
         return self.ctrl.set_microsteps(int(az_div), int(alt_div))
 
     @staticmethod
-    def _estimate_move_duration_s(steps: int, delay_us: int) -> float:
-        steps_i = max(0, int(steps))
-        delay_i = max(0, int(delay_us))
-        # Firmware MOVE cadence is approximately one step every (delay_us + pulse_us).
-        pulse_us = 3.0
-        return float(steps_i) * ((float(delay_i) + pulse_us) / 1.0e6)
+    def _estimate_move_duration_s(
+        steps: int,
+        delay_us: int,
+        profile: str = "smooth",
+    ) -> float:
+        return estimate_firmware_move_duration_s(
+            int(steps), int(delay_us), profile=profile
+        )
 
     def move_steps(
         self,
@@ -598,6 +890,7 @@ class ArduinoMount:
         steps: int,
         delay_us: int,
         *,
+        profile: str = "smooth",
         blocking: bool = True,
         stop_before_move: bool = True,
     ) -> str:
@@ -637,9 +930,20 @@ class ArduinoMount:
                     throttle_key="mount_stop_before_move",
                 )
 
-        resp = self.ctrl.move(ax, dr, int(steps), int(delay_us))
+        move_profile = normalize_move_profile(profile)
+        resp = self.ctrl.move(
+            ax,
+            dr,
+            int(steps),
+            int(delay_us),
+            profile=move_profile,
+        )
         if bool(blocking):
-            wait_s = self._estimate_move_duration_s(int(steps), int(delay_us))
+            wait_s = self._estimate_move_duration_s(
+                int(steps),
+                int(delay_us),
+                profile=move_profile,
+            )
             # Small safety margin for serial/firmware jitter.
             if wait_s > 0.0:
                 time.sleep(wait_s + 0.05)
@@ -661,41 +965,86 @@ class MountMoveWorker(BaseWorker):
         *,
         get_mount: Callable[[], Optional["ArduinoMount"]],
         note_manual_move: Callable[[Axis, int, int], None],
+        get_last_direction: Optional[Callable[[Axis], int]] = None,
+        set_last_direction: Optional[Callable[[Axis, int], None]] = None,
+        get_backlash_steps: Optional[Callable[[Axis], int]] = None,
         publish_state: StatePublisherProtocol,
+        operation_finished: Optional[Callable[[], None]] = None,
         out_log: Any = None,
     ) -> None:
         super().__init__(name="MountMoveWorker")
         self._get_mount = get_mount
         self._note_manual_move = note_manual_move
+        self._get_last_direction = get_last_direction
+        self._set_last_direction = set_last_direction
+        self._get_backlash_steps = get_backlash_steps
         self._publish_state = publish_state
+        self._operation_finished = operation_finished
         self._out_log = out_log
 
-    def request(self, *, axis: Axis, direction: int, steps: int, delay_us: int) -> None:
+    def request(
+        self,
+        *,
+        axis: Axis,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        profile: str = "smooth",
+    ) -> None:
         super().request(
             axis=axis,
             direction=int(direction),
             steps=int(steps),
             delay_us=int(delay_us),
+            profile=normalize_move_profile(profile),
         )
 
     def _handle_request(self, request: Dict[str, Any]) -> None:
-        mount = self._get_mount()
-        if mount is None or not mount.is_connected():
-            return
-        axis = request["axis"]
-        direction = int(request["direction"])
-        steps = int(request["steps"])
-        delay_us = int(request["delay_us"])
-
         try:
+            mount = self._get_mount()
+            if mount is None or not mount.is_connected():
+                return
+            axis = request["axis"]
+            direction = int(request["direction"])
+            steps = int(request["steps"])
+            delay_us = int(request["delay_us"])
+            profile = normalize_move_profile(str(request.get("profile", "smooth")))
+            new_direction = +1 if direction >= 0 else -1
+            previous_direction = (
+                int(self._get_last_direction(axis))
+                if self._get_last_direction is not None
+                else 0
+            )
+            backlash_steps = (
+                max(0, int(self._get_backlash_steps(axis)))
+                if self._get_backlash_steps is not None
+                else 0
+            )
+            if (
+                previous_direction in (-1, +1)
+                and previous_direction != new_direction
+                and backlash_steps > 0
+            ):
+                mount.move_steps(
+                    axis=axis,
+                    direction=new_direction,
+                    steps=backlash_steps,
+                    delay_us=delay_us,
+                    profile=profile,
+                    blocking=True,
+                    stop_before_move=False,
+                )
+                if self._set_last_direction is not None:
+                    self._set_last_direction(axis, new_direction)
             mount.move_steps(
                 axis=axis,
                 direction=direction,
                 steps=steps,
                 delay_us=delay_us,
-                # Keep manual commands serialized at the app layer.
-                # Firmware keeps only one active plan per axis, so sending a
-                # second MOVE too early can replace the previous one.
+                profile=profile,
+                # One MOVE is important: the loaded firmware accelerates and
+                # brakes each command internally. Splitting it would create
+                # repeated slowdowns between chunks.
                 blocking=True,
                 stop_before_move=False,
             )
@@ -709,3 +1058,6 @@ class MountMoveWorker(BaseWorker):
                 }
             )
             log_error(self._out_log, "Mount: MOVE steps failed", exc)
+        finally:
+            if self._operation_finished is not None:
+                self._operation_finished()
