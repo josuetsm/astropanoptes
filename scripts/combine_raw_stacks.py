@@ -45,9 +45,9 @@ def _parse_args() -> argparse.Namespace:
     )
     parser.add_argument("--name", required=True, help="Output filename stem")
     parser.add_argument(
-        "--output-dir", type=Path, default=Path("stack_output/raw_drizzle_x3")
+        "--output-dir", type=Path, default=Path("stack_output/raw_drizzle_x2")
     )
-    parser.add_argument("--coverage-fraction", type=float, default=0.55)
+    parser.add_argument("--coverage-fraction", type=float, default=0.20)
     parser.add_argument("--cross-max-shift", type=int, default=1000)
     parser.add_argument("--cross-min-response", type=float, default=0.50)
     parser.add_argument("--asinh-strength", type=float, default=12.0)
@@ -410,6 +410,14 @@ def main() -> int:
     metadata = {
         "name": args.name,
         "drizzle_scale": next(iter(scale_values)),
+        "color_reconstruction": stacks[0].metadata.get(
+            "color_reconstruction", "per_recording_rgb"
+        ),
+        "cfa_accumulation_before_color_reconstruction": bool(
+            stacks[0].metadata.get(
+                "cfa_accumulation_before_color_reconstruction", False
+            )
+        ),
         "frames_total": int(
             sum(int(stack.metadata["frames_total"]) for stack in stacks)
         ),

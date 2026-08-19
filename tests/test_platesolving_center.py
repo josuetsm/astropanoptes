@@ -1,6 +1,7 @@
 from unittest.mock import patch
 
 import astropy.units as u
+import pytest
 from astropy.coordinates import SkyCoord
 from astropy.time import Time
 import numpy as np
@@ -162,6 +163,74 @@ def test_fast_prior_verification_refits_six_catalog_stars_without_triplets() -> 
     assert float(result.metrics["fast_prior"]) == 1.0
     solved = SkyCoord(result.center_ra_deg * u.deg, result.center_dec_deg * u.deg)
     assert float(solved.separation(center).arcsec) < 0.2
+
+
+def test_fast_prior_verification_respects_a_low_min_inliers_for_sparse_fields() -> None:
+    # Regression test: this function used to hardcode a floor of 6 detections
+    # regardless of cfg.min_inliers, which made multi-frame consensus
+    # confirmation (initial_consensus_count) impossible in genuinely
+    # star-poor fields (heavy light pollution, narrow FoV) even when the
+    # single-frame floor was deliberately configured low to match reality.
+    cfg = AppConfig().platesolving
+    cfg.pixel_size_m = 1.0e-6
+    cfg.focal_m = 0.206265
+    cfg.search_radius_deg = 1.0
+    cfg.N_det = 12
+    cfg.min_inliers = 3
+    cfg.rotation_prior_enable = False
+    width, height = 500, 360
+    obstime = Time("2026-06-08T01:00:00", scale="utc")
+    center = SkyCoord(ra=120.0 * u.deg, dec=-30.0 * u.deg, frame="icrs")
+    offsets = np.array(
+        [[-160.0, -90.0], [-60.0, 105.0], [70.0, -115.0]],
+        dtype=np.float64,
+    )
+    coords = SkyCoord(
+        lon=offsets[:, 0] * u.arcsec,
+        lat=offsets[:, 1] * u.arcsec,
+        frame=center.skyoffset_frame(),
+    ).icrs
+    catalog = pd.DataFrame(
+        {
+            "source_id": np.arange(len(coords), dtype=np.int64),
+            "ra": coords.ra.deg,
+            "dec": coords.dec.deg,
+            "phot_g_mean_mag": np.linspace(8.0, 13.0, len(coords)),
+        }
+    )
+    detections = project_catalog_to_pixels(
+        coords,
+        center_icrs=center,
+        scale_arcsec_per_px=1.0,
+        theta_deg=17.0,
+        image_width=width,
+        image_height=height,
+    )
+    prior = _prior_result(center, theta_deg=17.0, obstime=obstime)
+
+    with (
+        patch(
+            "platesolving.detect_sep_objects",
+            return_value=(
+                np.zeros((height, width), dtype=np.float32),
+                detections,
+                np.linspace(8000.0, 1000.0, len(detections)),
+            ),
+        ),
+        patch("platesolving._gaia_load_df", return_value=catalog),
+    ):
+        result = verify_plate_from_prior(
+            np.zeros((height, width), dtype=np.uint16),
+            prior=prior,
+            target=center,
+            cfg=cfg,
+            observer=ObserverConfig(),
+            obstime=obstime,
+        )
+
+    assert result.success
+    assert result.status == "OK_FAST_PRIOR"
+    assert result.n_inliers == 3
 
 
 def test_fast_prior_verification_rejects_a_far_false_first_solution() -> None:
@@ -676,3 +745,9 @@ def test_solve_plate_rejects_center_outside_requested_search_cone() -> None:
     assert not result.success
     assert result.status == "CENTER_OUT_OF_RANGE"
     assert float(result.metrics["target_offset_deg"]) > 1.4
+
+
+def test_default_observer_is_estacion_central() -> None:
+    observer = ObserverConfig()
+    assert observer.lat_deg == pytest.approx(-33.4569, abs=1e-3)
+    assert observer.lon_deg == pytest.approx(-70.6990, abs=1e-3)

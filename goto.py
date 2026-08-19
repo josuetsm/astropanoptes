@@ -1456,6 +1456,8 @@ class GoToModel:
     model_fit_rms_alt_deg: float = 0.0
     model_fit_rms_arcsec: float = 0.0
     last_fit_reason: str = "NOT_FITTED"
+    # Cycles of transmission error spanned by the samples of the last fit.
+    last_fit_phase_coverage: Dict[str, float] = field(default_factory=dict)
 
     def mechanical_J(self) -> np.ndarray:
         """Return the signed diagonal matrix implied by the mount mechanics."""
@@ -1467,6 +1469,62 @@ class GoToModel:
             dtype=np.float64,
         )
 
+    def manual_phase_coverage(self, sample_mask: Optional[np.ndarray] = None) -> Dict[str, float]:
+        """Fraction of a transmission-error cycle spanned by the samples, per axis.
+
+        J is the *mean* scale; the cycloidal transmission error is what makes
+        the locally measured scale wander (up to max_periodic_error*2pi/period,
+        about 20% with the defaults). So a fit built from moves much shorter
+        than one lobe measures the local slope of that error, not the mean
+        scale, and can land far outside the mechanical envelope even when the
+        gearing is perfect. Reporting the coverage turns an opaque
+        "outside mechanical limits" rejection into an actionable one.
+        """
+        out = {"az": 0.0, "alt": 0.0, "min": 0.0}
+        if not self._manual_steps_abs:
+            return out
+        S = np.stack(self._manual_steps_abs, axis=0).astype(np.float64)
+        if sample_mask is not None:
+            m = np.asarray(sample_mask, dtype=bool).reshape(-1)
+            if m.size == S.shape[0] and m.any():
+                S = S[m, :]
+        if S.shape[0] < 2:
+            return out
+        for axis_idx, (axis, key) in enumerate(((Axis.AZ, "az"), (Axis.ALT, "alt"))):
+            period = float(self.kin.transmission_error_period_steps(axis))
+            if not np.isfinite(period) or period <= 0.0:
+                continue
+            span_steps = float(np.ptp(S[:, axis_idx]))
+            out[key] = float(min(span_steps / period, 10.0))
+        out["min"] = float(min(out["az"], out["alt"]))
+        return out
+
+    def _coupling_limit_factors(self) -> Tuple[float, float]:
+        """Geometric correction of the cross-coupling budget with altitude.
+
+        The coupling limit is meant to bound the physical non-orthogonality of
+        the axes, but J is expressed in degrees of *azimuth* per step, and near
+        the zenith one degree of azimuth is a tiny angle on the sky (cos alt).
+        A fixed limit on the raw J entry therefore becomes absurdly strict up
+        high: a real 1.6 deg non-orthogonality measured at alt 78 deg reads as
+        0.10 in J terms and gets rejected against a 0.05 budget, even though on
+        the sky it is only 0.029.
+
+        Returns (factor_for_J01, factor_for_J10):
+          - J[0,1] is azimuth per alt-step  -> its sky angle is J01*cos(alt),
+            so the budget on J01 scales as 1/cos(alt).
+          - J[1,0] is altitude per az-step  -> an az step moves cos(alt) on the
+            sky, so the budget on J10 scales as cos(alt).
+        """
+        alt = float(np.clip(float(self.ref_az_alt_deg[1]), -89.0, 89.0))
+        cos_alt = float(np.cos(np.deg2rad(alt)))
+        if (not np.isfinite(cos_alt)) or cos_alt <= 1e-6:
+            cos_alt = 1e-6
+        # Bounded so a near-zenith reference cannot open the budget without end.
+        widen = float(np.clip(1.0 / cos_alt, 1.0, 6.0))
+        narrow = float(np.clip(cos_alt, 1.0 / 6.0, 1.0))
+        return widen, narrow
+
     def constrain_J_to_mechanics(self, candidate: np.ndarray) -> np.ndarray:
         """Project a fitted J into a safe neighborhood of the mechanical J."""
         mechanical = self.mechanical_J()
@@ -1476,6 +1534,9 @@ class GoToModel:
 
         scale_frac = _clamp(float(self.max_step_scale_deviation_frac), 0.0, 0.95)
         coupling_frac = _clamp(float(self.max_step_axis_coupling_frac), 0.0, 0.50)
+        widen, narrow = self._coupling_limit_factors()
+        # column 0 drives J[1,0] (alt per az-step); column 1 drives J[0,1].
+        cross_gain = (narrow, widen)
         for col in range(2):
             diag = col
             cross = 1 - col
@@ -1489,7 +1550,7 @@ class GoToModel:
                 mech_abs * (1.0 + scale_frac),
             )
             J[diag, col] = mech_sign * fitted_along_sign
-            cross_limit = coupling_frac * mech_abs
+            cross_limit = coupling_frac * mech_abs * float(cross_gain[col])
             J[cross, col] = _clamp(float(J[cross, col]), -cross_limit, cross_limit)
 
         return J
@@ -2587,11 +2648,23 @@ class GoToModel:
                 fit = fit_new
 
         if not self.is_J_within_mechanical_limits(fit["J_unconstrained"]):
-            self.last_fit_reason = "MODEL_OUTSIDE_MECHANICAL_LIMITS"
+            # Distinguish "the gearing is wrong" from "the samples are too
+            # short to measure the mean scale". With moves well under one
+            # cycloidal lobe the fit reads the local slope of the transmission
+            # error, which alone can exceed the envelope on perfect hardware.
+            coverage = self.manual_phase_coverage(mask)
+            short_travel = float(coverage.get("min", 0.0)) < 0.5
+            reason = (
+                "MODEL_FIT_PHASE_COVERAGE_TOO_SHORT"
+                if short_travel
+                else "MODEL_OUTSIDE_MECHANICAL_LIMITS"
+            )
+            self.last_fit_reason = reason
+            self.last_fit_phase_coverage = dict(coverage)
             self._log_fit_csv(
                 fit_kind="calibration",
                 ok=False,
-                reason="MODEL_OUTSIDE_MECHANICAL_LIMITS",
+                reason=reason,
                 min_samples=int(min_samples),
                 ridge=float(ridge),
                 total_samples=int(n_all),
@@ -8703,6 +8776,18 @@ class GoToWorker(BaseWorker):
                 self._publish_j_matrix_state()
                 fit_reason = str(getattr(self._goto.model, "last_fit_reason", "DEGENERATE_MODEL"))
                 diagnostic_status = "FIT_MODEL_OK" if ok else f"FIT_MODEL_ERR_{fit_reason}"
+                if not ok and fit_reason == "MODEL_FIT_PHASE_COVERAGE_TOO_SHORT":
+                    cov = dict(getattr(self._goto.model, "last_fit_phase_coverage", {}) or {})
+                    period_az = int(self._goto.model.kin.transmission_error_period_steps(Axis.AZ))
+                    period_alt = int(self._goto.model.kin.transmission_error_period_steps(Axis.ALT))
+                    log_info(
+                        self._out_log,
+                        "GoTo fit: recorrido insuficiente para medir la escala media "
+                        f"(az={cov.get('az', 0.0):.2f} ciclos, alt={cov.get('alt', 0.0):.2f} ciclos). "
+                        "El error de transmisión ciclodial domina en movimientos cortos; "
+                        f"usa desplazamientos de al menos un ciclo completo "
+                        f"({period_az} pasos en az, {period_alt} en alt).",
+                    )
                 self._diagnostics_record(
                     "fit_model_result",
                     success=ok,

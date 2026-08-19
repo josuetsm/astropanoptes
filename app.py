@@ -5,8 +5,16 @@ from typing import Optional
 
 
 def main(argv: Optional[list[str]] = None) -> int:
-    """Inicia la GUI por defecto o la consola con ``--cli``/``cli``."""
+    """Inicia la GUI por defecto, la consola con ``--cli``/``cli``, o se conecta
+    a una GUI ya abierta con ``attach``."""
     args = list(sys.argv[1:] if argv is None else argv)
+
+    attach_requested = bool(args) and args[0].lower() == "attach"
+    if attach_requested:
+        from control_client import main as attach_main
+
+        return int(attach_main(args[1:]))
+
     cli_requested = "--cli" in args or (bool(args) and args[0].lower() in {"cli", "terminal"})
     if cli_requested:
         args = [arg for index, arg in enumerate(args) if arg != "--cli" and not (index == 0 and arg.lower() in {"cli", "terminal"})]

@@ -1,8 +1,9 @@
 from types import SimpleNamespace
 from unittest.mock import patch
 
+from app_runner import AppRunner
 from camera_poa import CameraInfo, POACameraDevice
-from config import CameraConfig
+from config import AppConfig, CameraConfig
 import camera_poa
 
 
@@ -70,6 +71,15 @@ def test_camera_config_clamps_gain_to_sdk_range() -> None:
     assert cfg.gain == 500
     assert cfg.offset == 350
     assert cfg.exp_ms == 100.0
+
+
+def test_runner_applies_gamma_without_restarting_camera_stream() -> None:
+    runner = AppRunner(AppConfig())
+
+    needs_restart = runner._set_camera_param_value("gamma", 1.6)
+
+    assert runner.cfg.camera.gamma == 1.6
+    assert needs_restart is False
 
 
 def test_camera_config_rejects_failed_gain_write() -> None:

@@ -5,7 +5,7 @@ import queue
 import threading
 import time
 from dataclasses import dataclass, field
-from typing import Any, Dict, List, Literal, Optional
+from typing import Any, Dict, List, Literal, Optional, Tuple
 
 import cv2
 import numpy as np
@@ -107,6 +107,11 @@ class LiveMosaicStackerGray:
         self.last_dy = 0.0
         self.last_resp = 0.0
         self.n = 0
+        # Frames are aligned onto the first accepted frame, so the mosaic shows
+        # the sky as it was at that instant. Plate solving needs that time, not
+        # "now", to convert the fitted center between AltAz and ICRS.
+        self.ref_time_unix: Optional[float] = None
+        self.last_time_unix: Optional[float] = None
 
     def reset(self) -> None:
         self.sum = None
@@ -121,6 +126,8 @@ class LiveMosaicStackerGray:
         self.last_dy = 0.0
         self.last_resp = 0.0
         self.n = 0
+        self.ref_time_unix = None
+        self.last_time_unix = None
 
     def has_data(self) -> bool:
         return self.sum is not None and self.wgt is not None and self.n > 0
@@ -231,7 +238,9 @@ class LiveMosaicStackerGray:
         ref_gray[~m] = 0.0
         return np.clip(ref_gray, 0.0, 65535.0).astype(np.uint16)
 
-    def add_frame(self, raw_u16: np.ndarray) -> bool:
+    def add_frame(self, raw_u16: np.ndarray, t_unix: Optional[float] = None) -> bool:
+        if t_unix is not None:
+            self.last_time_unix = float(t_unix)
         gray_align = self._raw_to_gray_align(raw_u16)
         current_signature = build_raw_alignment_signature(
             gray_align,
@@ -252,6 +261,7 @@ class LiveMosaicStackerGray:
             self.last_dx = 0.0
             self.last_dy = 0.0
             self.last_resp = 1.0
+            self.ref_time_unix = self.last_time_unix
             return True
 
         if not current_signature.has_signal:
@@ -260,6 +270,7 @@ class LiveMosaicStackerGray:
 
         if (h != self.frame_h) or (w != self.frame_w):
             # ROI/binning changed while stacking: reinitialize to keep state consistent.
+            keep_t = self.last_time_unix
             self.reset()
             self.sum = stack_img.astype(np.float32, copy=False)
             self.wgt = np.ones((h, w), np.float32)
@@ -269,6 +280,8 @@ class LiveMosaicStackerGray:
             self.frame_w = w
             self.n = 1
             self.last_resp = 1.0
+            self.last_time_unix = keep_t
+            self.ref_time_unix = keep_t
             return True
 
         x_ref = int(np.floor(self.pos_x))
@@ -359,26 +372,64 @@ class LiveMosaicStackerGray:
             return None
         return np.nan_to_num(self.wgt, nan=0.0, posinf=0.0, neginf=0.0).astype(np.float32, copy=False)
 
+    def _preview_valid_mask(self, shape: Tuple[int, int]) -> Optional[np.ndarray]:
+        """Pixels that actually received data.
+
+        The mosaic canvas grows as frames dither, so its untouched borders read
+        zero. Including them in the stretch statistics drags the black point
+        far below the real sky background and washes the image out.
+        """
+        if self.wgt is None:
+            return None
+        h = min(shape[0], self.wgt.shape[0])
+        w = min(shape[1], self.wgt.shape[1])
+        mask = np.zeros(shape, dtype=bool)
+        mask[:h, :w] = self.wgt[:h, :w] > 0
+        return mask if mask.any() else None
+
+    def _preview_levels(self, x: np.ndarray, mask: Optional[np.ndarray]) -> Tuple[float, float]:
+        """Black/white points from percentiles of the data that exists.
+
+        The old code used a fixed black point (``preview_log_vmin``) in log
+        space plus the absolute maximum. A fixed black point cannot work: under
+        light pollution the sky background alone sits well above it, so the
+        background rendered mid-grey. And a single hot pixel set the white
+        point. Percentiles adapt to the actual frame and ignore outliers;
+        ``preview_log_vmin`` is kept as a floor so existing configs still bite.
+        """
+        data = x[mask] if mask is not None else x.reshape(-1)
+        if data.size == 0:
+            return float(self.preview_log_vmin), float(self.preview_log_vmin) + 1.0
+        lo = float(np.percentile(data, 30.0))
+        hi = float(np.percentile(data, 99.7))
+        lo = max(lo, float(self.preview_log_vmin))
+        if not np.isfinite(lo):
+            lo = float(self.preview_log_vmin)
+        if (not np.isfinite(hi)) or hi <= lo:
+            hi = lo + 1e-3
+        return lo, hi
+
     def get_preview_u8(self) -> Optional[np.ndarray]:
         mean = self.get_mean_u16()
         if mean is None:
             return None
 
-        if mean.ndim == 3:
-            x = np.log1p(mean.astype(np.float32, copy=False))
+        x = np.log1p(mean.astype(np.float32, copy=False))
+        mask = self._preview_valid_mask(x.shape[:2])
+
+        if x.ndim == 3:
             y = np.empty_like(x, dtype=np.float32)
             for c in range(3):
-                xc = x[..., c]
-                vmax_c = float(xc.max()) if xc.size > 0 else self.preview_log_vmin + 1.0
-                denom_c = max(vmax_c - self.preview_log_vmin, 1e-6)
-                y[..., c] = np.clip((xc - self.preview_log_vmin) / denom_c, 0.0, 1.0)
+                lo, hi = self._preview_levels(x[..., c], mask)
+                y[..., c] = np.clip((x[..., c] - lo) / (hi - lo), 0.0, 1.0)
+            if mask is not None:
+                y[~mask] = 0.0
             return (y * 255.0 + 0.5).astype(np.uint8)
 
-        x = np.log1p(mean.astype(np.float32, copy=False))
-        vmax = float(x.max()) if x.size > 0 else self.preview_log_vmin + 1.0
-        denom = max(vmax - self.preview_log_vmin, 1e-6)
-        y = (x - self.preview_log_vmin) / denom
-        y = np.clip(y, 0.0, 1.0)
+        lo, hi = self._preview_levels(x, mask)
+        y = np.clip((x - lo) / (hi - lo), 0.0, 1.0)
+        if mask is not None:
+            y[~mask] = 0.0
         return (y * 255.0 + 0.5).astype(np.uint8)
 
 
@@ -557,6 +608,41 @@ class StackEngine:
 
             return mean, wgt
 
+    def get_stack_for_solve(self) -> Optional[Dict[str, Any]]:
+        """Return the live mosaic ready for plate solving.
+
+        Stacking short exposures beats simply lengthening the exposure in a
+        light-polluted sky: stars stay point-like instead of trailing, the
+        accumulated signal reveals fainter stars, and the mosaic canvas grows
+        past a single frame, so the solver sees a wider field than the camera
+        does at any instant.
+
+        The returned image is the mono mean over the full canvas. ``obstime_unix``
+        is the *reference* frame time (frames are aligned onto it), and
+        ``drizzle_scale`` must be used to rescale the plate scale, since drizzle
+        subdivides pixels.
+        """
+        with self._stack_lock:
+            eng = self._live_gray
+            if eng is None or not eng.has_data():
+                return None
+            mean_u16 = eng.get_mean_u16()
+            wgt = eng.get_weight_f32()
+            if mean_u16 is None:
+                return None
+            if mean_u16.ndim == 3:
+                mean_u16 = mean_u16.mean(axis=2).astype(np.uint16)
+            return {
+                "image": np.ascontiguousarray(mean_u16),
+                "weight": None if wgt is None else np.ascontiguousarray(wgt),
+                "obstime_unix": eng.ref_time_unix,
+                "last_time_unix": eng.last_time_unix,
+                "drizzle_scale": float(eng.drizzle_scale),
+                "frames": int(eng.n),
+                "canvas": (int(eng.canvas_h), int(eng.canvas_w)),
+                "frame_shape": (int(eng.frame_h), int(eng.frame_w)),
+            }
+
     def get_latest_stack_frame(
         self,
         *,
@@ -599,7 +685,7 @@ class StackEngine:
             for item in batch:
                 try:
                     raw16_work = ensure_raw16_bayer(item["raw16"])
-                    if self._live_gray.add_frame(raw16_work):
+                    if self._live_gray.add_frame(raw16_work, t_unix=item.get("t")):
                         used += 1
                     else:
                         rejected += 1
@@ -780,6 +866,9 @@ class StackingWorker(BaseWorker):
         wgt_dtype: Optional[np.dtype] = np.float32,
     ) -> tuple[Optional[np.ndarray], Optional[np.ndarray]]:
         return self.engine.get_stack_snapshot(mean_dtype=mean_dtype, wgt_dtype=wgt_dtype)
+
+    def get_stack_for_solve(self) -> Optional[Dict[str, Any]]:
+        return self.engine.get_stack_for_solve()
 
     def enqueue_frame(self, raw16: np.ndarray, t: Optional[float] = None) -> None:
         if not self.engine.enabled:

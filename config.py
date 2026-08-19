@@ -138,7 +138,9 @@ class PlatesolvingConfig:
     # Instrument (SI)
     pixel_size_m: float = 2.9e-6
     focal_m: float = 0.9
-    rotation_prior_enable: bool = True
+    # Off by default: real sessions saw the roll estimate confused with the
+    # drift-correction orientation, producing a wrong rotation prior.
+    rotation_prior_enable: bool = False
     rotation_prior_tol_deg: float = 45.0
     rotation_prior_roll_offset_deg: float = 0.0
     rotation_prior_az_step_deg: float = 0.05
@@ -150,12 +152,19 @@ class PlatesolvingConfig:
     # short/tight triangles) typically implies a scale far outside this band.
     scale_tol_frac: float = 0.04
 
-    # The first trustworthy position is established from three genuinely
-    # different camera frames.  Only the first frame performs the expensive
-    # triplet search; the following frames verify the projected Gaia field
-    # using the previous WCS and the expected sidereal drift.
+    # The first trustworthy position is established from several genuinely
+    # different camera frames: only the first frame performs the expensive
+    # triplet search, and the following frames verify the projected Gaia field
+    # using the previous WCS and the expected sidereal drift. This is the real
+    # safety net for a light-polluted sky like Santiago's, where a single
+    # frame often only has 3-4 real stars (min_inliers below has to be set low
+    # to match): a lone low-inlier solve is cheap to fake by coincidence
+    # against a large catalog, but reproducing the *same* pointing/scale/roll
+    # across independent frames by chance is not. Requiring only 1 (i.e. no
+    # confirmation at all) defeats that net entirely and was what let a false
+    # 3-star match through during real observing.
     initial_consensus_count: int = 3
-    initial_consensus_timeout_s: float = 8.0
+    initial_consensus_timeout_s: float = 20.0
     consensus_pointing_tol_arcsec: float = 30.0
     consensus_scale_tol_frac: float = 0.02
     consensus_roll_tol_deg: float = 3.0
@@ -193,7 +202,9 @@ class PlatesolvingConfig:
     # Hard wall-clock budget for an explicit solve, including temporal frame
     # collection and independent consensus. Cooperative checkpoints stop the
     # expensive catalog search without killing its worker thread.
-    total_timeout_s: float = 120.0
+    # Real observing sessions are weather-limited; a shorter budget matched
+    # what actually worked without stalling on a closing sky.
+    total_timeout_s: float = 75.0
     temporal_window_frames: int = 12
     temporal_min_hits: int = 10
     # Must cover at least ten distinct frames even at long exposure. The old
@@ -211,7 +222,8 @@ class PlatesolvingConfig:
     gmax: float = 15.0
     nside: int = 16
     order: str = "ring"
-    bright_catalog_enabled: bool = True
+    # Same reasoning as download_missing_tiles: keep solves offline by default.
+    bright_catalog_enabled: bool = False
     bright_catalog_margin_deg: float = 0.15
     prefer_parquet: bool = True
     row_limit: int = -1
@@ -224,19 +236,24 @@ class PlatesolvingConfig:
     theta_refine_span_deg: float = 12.0
     triplet_tol_arcsec: float = 3.0
     triplet_sigma_arcsec: float = 0.6
-    triplet_max_trials: int = 500
-    max_i_scan: int = 2000
+    # Dense real fields (e.g. Milky Way) needed a wider search budget than
+    # these defaults to reliably find a valid triplet.
+    triplet_max_trials: int = 1500
+    max_i_scan: int = 5000
 
     # Matching
     match_max_px: float = 3.5  # in full-res pixels
     match_tol_arcsec: float = 5.0
     pred_margin_arcsec: float = 25.0
     # A triplet hypothesis already contributes up to three matches by
-    # construction. Requiring six total matches (three independent
-    # confirmations) prevents a seed triplet plus one accidental catalog
-    # neighbor from being accepted as a real solution.
-    min_inliers: int = 6
-    min_validation_inliers: int = 3
+    # construction, so 3 is the structural floor: a field with only 3 real
+    # stars (common under Santiago's light pollution, in this instrument's
+    # narrow ~0.36x0.20 deg FoV) can never produce a "validation" inlier
+    # beyond the seed triplet, no matter how good the detector is. Guarding
+    # against a false 3-star coincidence is initial_consensus_count's job
+    # (above), not this single-frame count's.
+    min_inliers: int = 3
+    min_validation_inliers: int = 0
     max_rms_px: float = 2.5
     # The search radius is also the declared pointing uncertainty. A fitted
     # optical center outside that cone is not a valid answer for the request.
@@ -244,18 +261,20 @@ class PlatesolvingConfig:
     max_center_offset_factor: float = 1.0
     max_center_offset_margin_deg: float = 0.0
     N_det: int = 30
-    N_seed: int = 3
+    N_seed: int = 8
     # Clipped stars can have severely biased flux/centroids and used to
     # dominate the brightest-three seed triplet. They remain available as
     # validation detections, but interior detections are preferred as seeds.
     seed_edge_margin_px: float = 8.0
 
     # Search area (Gaia cone radius)
-    search_radius_deg: float | None = 1.0
+    search_radius_deg: float | None = 3.0
     search_radius_factor: float = 1.4  # radius ~= factor * (diag/2)
 
-    # Download missing tiles
-    download_missing_tiles: bool = True
+    # Download missing tiles. Off by default: the full local Gaia cache
+    # (mag <= gmax) already covers real sessions, and downloads over a
+    # residential link were the main source of stalls in practice.
+    download_missing_tiles: bool = False
 
     # Guides / labeling
     guide_n: int = 3

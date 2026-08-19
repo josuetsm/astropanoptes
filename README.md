@@ -85,6 +85,9 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
   - Utilidades rápidas para preview: stretch por percentiles y JPEG encode.
   - Extracción rápida del canal verde desde Bayer RAW16.
 
+- **`preview.py`**
+  - Pipeline de preview/visor: stretch por percentiles + gamma (`cfg.camera.gamma`, controlable desde la pestaña Camera o `camera set gamma VALOR`) + JPEG. Solo afecta la imagen mostrada; el RAW guardado no cambia.
+
 ### 4) Tracking y control de montura
 - **`tracking.py`**
   - Tracking incremental por perfiles RAW16 de precisión y detalle, sin ejecutar SEP.
@@ -111,8 +114,12 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 ```bash
 source /Users/josue/myenv/bin/activate
 python scripts/stack_raw_recordings.py raw_output/raw_*.npy \
-  --scale 3 --output-dir stack_output/raw_drizzle_x3
+  --scale 2 --output-dir stack_output/raw_drizzle_x2
 ```
+
+  - El apilado offline registra las muestras Bayer antes de reconstruir RGB,
+    evitando ampliar el patrón de la matriz de color. x2 es el valor recomendado;
+    x3 se conserva para ópticas y capturas cuyo muestreo medido realmente lo justifique.
 
   - `scripts/combine_raw_stacks.py` registra stacks de varias grabaciones del
     mismo campo, normaliza su respuesta fotométrica y pondera cada sesión por
@@ -121,7 +128,22 @@ python scripts/stack_raw_recordings.py raw_output/raw_*.npy \
 
 - **`platesolving.py` + `gaia_cache.py`**
   - Detecta fuentes con SEP, consulta/carga Gaia, resuelve por tripletas y publica overlays/debug.
+  - **Resolver sobre el mosaico apilado** (`platesolving source stack`): en cielos con
+    mucha contaminación lumínica es preferible a alargar la exposición. Con
+    exposiciones cortas las estrellas quedan puntuales en vez de convertirse en
+    trazas por deriva sideral, la señal acumulada saca estrellas más débiles, y
+    el mosaico cubre más cielo que un frame suelto — el detector entrega muchas
+    más fuentes utilizables, que es justo lo que necesita la búsqueda de tripletas.
+    El runner corrige automáticamente dos cosas al usar esta fuente: la escala de
+    placa se divide por el factor drizzle, y la época del solve es el instante del
+    **frame de referencia** del stack (no "ahora"), porque los frames se alinean
+    sobre él; usar la hora actual desplazaría el centro por toda la deriva
+    acumulada durante el apilado. Con `platesolving source live` se vuelve al frame
+    vivo.
   - Usa caché en `~/.cache/gaia_cones` por defecto.
+  - Observador por defecto: **Estación Central, Santiago** (`ObserverConfig()`); se puede cambiar desde la pestaña `Observador` o con `platesolving set observer_lat_deg=... observer_lon_deg=... observer_height_m=...`.
+  - Los defaults de `PlatesolvingConfig` (`search_radius_deg=3`, `N_seed=8`, `max_i_scan=5000`, `triplet_max_trials=1500`, `rotation_prior_enable=False`, `total_timeout_s=75`, `download_missing_tiles=False`, `bright_catalog_enabled=False`) son los que resolvieron campos reales de forma repetible en sesiones de observación; `platesolving download` sigue permitiendo traer teselas puntuales aunque `download_missing_tiles` esté en `False` por defecto.
+  - **Confianza en cielos contaminados (Santiago).** Bajo contaminación lumínica fuerte y con este FoV angosto (~0.36°×0.20°) un cuadro suele tener solo 3–4 estrellas reales. Por eso el umbral por cuadro es bajo (`min_inliers=3`, el piso estructural: una tripleta semilla aporta 3 coincidencias por construcción, así que un campo de 3 estrellas nunca puede producir un `min_validation_inliers` mayor) y la garantía contra falsos positivos recae en el **consenso multi-cuadro** (`initial_consensus_count=3`): una coincidencia falsa de 3 estrellas contra un catálogo grande es fácil por azar en un cuadro, pero reproducir el *mismo* centro/escala/rotación en cuadros independientes no lo es. Bajar `initial_consensus_count` a 1 desactiva esa red y permite aceptar soluciones falsas.
   - Hipparcos y Tycho-2 completos pueden descargarse directamente desde CDS y
     teselarse localmente sin consultas TAP:
 
@@ -130,8 +152,31 @@ source /Users/josue/myenv/bin/activate
 python scripts/import_bright_catalogs.py --workers 6
 ```
 
+- **`transmission_error.py`**
+  - Aprende el error de transmisión cicloidal **desde el propio tracking**, sin
+    plate solves dedicados. El lazo visual ya estima por RLS la respuesta real
+    px/µstep decenas de veces por segundo; su variación con la fase del lóbulo
+    *es* el error de transmisión. El colector acumula (fase, ganancia) en bins,
+    ajusta el primer armónico y lo convierte a los coeficientes que usa
+    `GoToModel.periodic_coeff_deg` (la ganancia es la derivada del offset, así
+    que la conversión lleva un factor `P·k/2π`).
+  - `transmission status` muestra cobertura de fase y estimación actual;
+    `transmission apply` la vuelca al modelo de apuntado. Se niega a ajustar sin
+    cobertura suficiente en vez de inventar coeficientes.
+
 - **`goto.py`**
   - Mantiene modelo de apuntado, sync desde plate solving, GoTo y calibraciones manual/auto.
+  - El presupuesto de acoplamiento entre ejes se corrige por `cos(alt)`: `J` está
+    en grados de *azimut* por paso, y cerca del cenit un grado de azimut abarca
+    un ángulo mínimo en el cielo, así que un límite fijo sobre la entrada cruda
+    rechazaría arriba la misma no-ortogonalidad física que acepta abajo.
+  - Un fit rechazado distingue `MODEL_FIT_PHASE_COVERAGE_TOO_SHORT` de
+    `MODEL_OUTSIDE_MECHANICAL_LIMITS`. `J` es la escala **media**; con
+    desplazamientos mucho menores que un lóbulo se mide la pendiente local del
+    error de transmisión (hasta ~20 % con los valores por defecto) y no la escala
+    media, de modo que un reductor perfecto puede caer fuera del sobre. El
+    mensaje indica cuántos ciclos cubrieron las muestras y cuántos pasos hace
+    falta mover.
   - Después de ajustar el modelo, la pestaña `GoTo` permite activar
     `Estrellas esperadas según modelo`. La vista Live dibuja en magenta las
     posiciones proyectadas desde el modelo, sin usar la última solución de
@@ -217,6 +262,16 @@ quit
 `image live`, `image stack` e `image platesolve` no intentan abrir una ventana. Guardan la imagen en `terminal_output/images/` y crean al lado un archivo `.json` con el estado del runtime. Se puede cambiar la carpeta con `--images-dir`.
 
 `view start` inicia un visor de solo lectura en `http://127.0.0.1:8765/` y lo abre en el navegador. La consola permanece disponible para mover, detener y ejecutar plate solving. En paralelo se reemplaza atómicamente `terminal_output/images/live-latest.jpg`, de modo que una herramienta de diagnóstico pueda inspeccionar exactamente la imagen más reciente. `view status`, `view open` y `view stop` consultan, reabren y detienen el visor. Para scripts se puede usar `view start 8765 2 no-open`; el servidor nunca escucha fuera de `127.0.0.1`.
+
+### Controlar la GUI ya abierta desde otra terminal
+
+Al iniciar `python app.py` (la GUI PyQt6), la app también abre un socket de control local en `~/.astropanoptes/control.sock` (permisos `0600`, solo el usuario dueño puede conectarse). Otro proceso —una terminal del usuario, o un agente como Codex/Claude Code— puede conectarse a esa misma sesión con:
+
+```bash
+python app.py attach -c "camera connect" -c "tracking start" -c "status --json"
+```
+
+Sin `-c`/`--script` abre una consola interactiva (`python app.py attach`) con el mismo lenguaje de comandos que `--cli` (`help`, `status`, `mount move ...`, `goto ...`, etc.), pero ejecutado contra el `AppRunner` que ya está corriendo dentro de la ventana abierta, no contra uno nuevo. Los efectos se ven en vivo en la interfaz gráfica, y el usuario puede seguir usando los controles de la ventana al mismo tiempo: ambos caminos comparten el mismo estado y la misma cola de acciones. Si no hay ninguna GUI abierta, `attach` falla con un mensaje claro en vez de crear una sesión nueva (evita abrir dos conexiones a la cámara/montura a la vez). El socket se puede indicar explícitamente con `--socket RUTA` si se abrió más de una instancia con rutas distintas.
 
 Los movimientos manuales aceptan dos perfiles. `smooth` (predeterminado) usa una
 curva S limitada en velocidad y aceleración; `direct` aplica velocidad constante

@@ -11,6 +11,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QToolButton,
 )
@@ -89,6 +90,52 @@ class UiRegressionTests(unittest.TestCase):
         self.assertFalse(getattr(self.window, "_ps_outputs_enabled", True))
         self.window._on_tick()
 
+    def test_window_minimum_size_fits_available_desktop(self) -> None:
+        available = self._app.primaryScreen().availableGeometry()
+
+        self.window.show()
+        self._app.processEvents()
+
+        minimum = self.window.minimumSizeHint()
+        self.assertLessEqual(minimum.width(), available.width())
+        self.assertLessEqual(minimum.height(), available.height())
+
+        self.window.resize(available.size())
+        self._app.processEvents()
+        self.assertLessEqual(self.window.width(), available.width())
+        self.assertLessEqual(self.window.height(), available.height())
+
+        status_labels = (
+            self.window.lbl_fps,
+            self.window.lbl_drift,
+            self.window.lbl_coords,
+            self.window.lbl_errors,
+        )
+        for left, right in zip(status_labels, status_labels[1:]):
+            self.assertLess(left.geometry().right(), right.geometry().left())
+
+    def test_module_panels_scroll_instead_of_growing_window(self) -> None:
+        pages = [
+            self.window.modules_tabs.widget(index)
+            for index in range(self.window.modules_tabs.count())
+        ]
+
+        self.assertTrue(pages)
+        self.assertTrue(all(isinstance(page, QScrollArea) for page in pages))
+
+    def test_long_error_is_bounded_and_kept_in_tooltip(self) -> None:
+        long_error = "camera transport timeout " * 250
+        self.runner._update_state({"camera": {"last_error": long_error}})
+
+        self.window._update_error_banner(self.runner.get_state())
+        self.window.show()
+        self._app.processEvents()
+
+        self.assertLessEqual(len(self.window.lbl_errors.text()), 90)
+        self.assertIn(long_error, self.window.lbl_errors.toolTip())
+        available_width = self._app.primaryScreen().availableGeometry().width()
+        self.assertLessEqual(self.window.minimumSizeHint().width(), available_width)
+
     def test_toolbar_has_one_toggle_button_per_device(self) -> None:
         self.assertFalse(hasattr(self.window, "btn_connect_camera"))
         self.assertFalse(hasattr(self.window, "btn_disconnect_camera"))
@@ -141,12 +188,13 @@ class UiRegressionTests(unittest.TestCase):
         self.window.ds_exp_ms.setValue(250.0)
         self.window.sb_gain.setValue(320)
         self.window.sb_offset.setValue(24)
+        self.window.ds_gamma.setValue(1.2)
 
         self.window._camera_apply()
 
         self.assertEqual(
             calls,
-            [{"exp_ms": 250.0, "gain": 320, "offset": 24}],
+            [{"exp_ms": 250.0, "gain": 320, "offset": 24, "gamma": 1.2}],
         )
         self.assertEqual(self.window.log.document().maximumBlockCount(), 3000)
 

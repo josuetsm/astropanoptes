@@ -17,6 +17,16 @@ import numpy as np
 from stacking import LiveMosaicStackerGray, _bayer_to_gray_code, _bayer_to_rgb_code
 
 
+# (RGB channel, row parity, column parity).  Keeping the four CFA lattices
+# separate until after registration avoids enlarging a per-frame demosaic grid.
+_BAYER_CHANNEL_SAMPLES: dict[str, tuple[tuple[int, int, int], ...]] = {
+    "RGGB": ((0, 0, 0), (1, 0, 1), (1, 1, 0), (2, 1, 1)),
+    "BGGR": ((2, 0, 0), (1, 0, 1), (1, 1, 0), (0, 1, 1)),
+    "GRBG": ((1, 0, 0), (0, 0, 1), (2, 1, 0), (1, 1, 1)),
+    "GBRG": ((1, 0, 0), (2, 0, 1), (0, 1, 0), (1, 1, 1)),
+}
+
+
 def _parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(
         description=(
@@ -28,7 +38,7 @@ def _parse_args() -> argparse.Namespace:
     parser.add_argument(
         "--output-dir", type=Path, default=Path("stack_output/raw_drizzle")
     )
-    parser.add_argument("--scale", type=int, default=3, choices=(1, 2, 3))
+    parser.add_argument("--scale", type=int, default=2, choices=(1, 2, 3))
     parser.add_argument(
         "--bayer-pattern",
         default="RGGB",
@@ -107,8 +117,9 @@ def _common_bounds(
 
     output_h = native_h * scale
     output_w = native_w * scale
-    # Two output pixels of safety avoid interpolation against an image border.
-    margin = 2
+    # Two native pixels of safety ensure that every CFA color plane has valid
+    # interpolation support throughout the common output field.
+    margin = 2 * scale
     left = int(math.ceil(max(x * scale for x, _ in valid))) + margin
     top = int(math.ceil(max(y * scale for _, y in valid))) + margin
     right = int(math.floor(min(x * scale + output_w for x, _ in valid))) - margin
@@ -130,7 +141,8 @@ def _combine_common_field(
     width = right - left
     height = bottom - top
     accumulator = np.zeros((height, width, 3), dtype=np.float32)
-    rgb_code = _bayer_to_rgb_code(bayer_pattern)
+    weights = np.zeros((height, width, 3), dtype=np.float32)
+    channel_samples = _BAYER_CHANNEL_SAMPLES[bayer_pattern]
     accepted_indices = [
         index for index, position in enumerate(positions) if position is not None
     ]
@@ -155,29 +167,54 @@ def _combine_common_field(
         position = positions[frame_index]
         assert position is not None
         world_x, world_y = position
-        rgb = cv2.cvtColor(raw_frames[frame_index], rgb_code)
+        raw = raw_frames[frame_index]
 
-        # Match cv2.resize's pixel-center convention while applying scale and
-        # the measured subpixel translation in a single allocation.
-        center_offset = (float(scale) - 1.0) * 0.5
-        matrix = np.array(
-            [
-                [float(scale), 0.0, world_x * scale - left + center_offset],
-                [0.0, float(scale), world_y * scale - top + center_offset],
-            ],
-            dtype=np.float32,
-        )
-        warped = cv2.warpAffine(
-            rgb,
-            matrix,
-            (width, height),
-            flags=cv2.INTER_LINEAR,
-            borderMode=cv2.BORDER_CONSTANT,
-            borderValue=0,
-        )
-        accumulator += warped
+        # A CFA plane has one sample every two native sensor pixels.  Map each
+        # plane directly into the registered output grid, preserving OpenCV's
+        # pixel-center convention.  Color interpolation therefore happens
+        # between samples of the same color and only after subpixel alignment.
+        for channel, row_offset, column_offset in channel_samples:
+            plane = raw[row_offset::2, column_offset::2].astype(np.float32)
+            matrix = np.array(
+                [
+                    [
+                        2.0 * scale,
+                        0.0,
+                        scale * (column_offset + world_x + 0.5) - 0.5 - left,
+                    ],
+                    [
+                        0.0,
+                        2.0 * scale,
+                        scale * (row_offset + world_y + 0.5) - 0.5 - top,
+                    ],
+                ],
+                dtype=np.float32,
+            )
+            warped = cv2.warpAffine(
+                plane,
+                matrix,
+                (width, height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            support = cv2.warpAffine(
+                np.ones(plane.shape, dtype=np.float32),
+                matrix,
+                (width, height),
+                flags=cv2.INTER_LINEAR,
+                borderMode=cv2.BORDER_CONSTANT,
+                borderValue=0,
+            )
+            accumulator[..., channel] += warped
+            weights[..., channel] += support
 
-    accumulator /= float(len(accepted_indices))
+    np.divide(
+        accumulator,
+        weights,
+        out=accumulator,
+        where=weights > 1e-6,
+    )
     return np.clip(accumulator, 0.0, 65535.0).astype(np.uint16)
 
 
@@ -221,9 +258,20 @@ def _stretch_rgb(
     image *= gain[..., None]
 
     # A restrained saturation lift makes stellar colors visible without
-    # changing neutral background pixels.
+    # changing neutral background pixels.  In low-signal material, smooth only
+    # chroma before that lift: luminance detail stays untouched while residual
+    # high-frequency color noise is not mistaken for a Bayer checkerboard.
     display_luma = cv2.cvtColor(image, cv2.COLOR_RGB2GRAY)
     image -= display_luma[..., None]
+    chroma_sigma_px = 1.0 if low_signal else 0.0
+    if chroma_sigma_px > 0.0:
+        image = cv2.GaussianBlur(
+            image,
+            (0, 0),
+            sigmaX=chroma_sigma_px,
+            sigmaY=chroma_sigma_px,
+            borderType=cv2.BORDER_REFLECT,
+        )
     image *= 0.65 if low_signal else 1.15
     image += display_luma[..., None]
     np.clip(image, 0.0, 1.0, out=image)
@@ -237,6 +285,7 @@ def _stretch_rgb(
         "white_luma": white,
         "asinh_strength": strength,
         "display_gamma": display_gamma,
+        "display_chroma_sigma_px": chroma_sigma_px,
         "stellar_contrast": stellar_contrast,
         "stellar_density_snr": stellar_density_snr,
         "quality": "low_signal" if low_signal else "good",
@@ -332,6 +381,8 @@ def stack_recording(path: Path, args: argparse.Namespace) -> None:
         "drizzle_scale": args.scale,
         "alignment_resolution": "native",
         "alignment_algorithm": "raw_alignment_signature",
+        "color_reconstruction": "registered_cfa_planes_before_rgb_interpolation",
+        "cfa_accumulation_before_color_reconstruction": True,
         "min_response": args.min_response,
         "max_shift_native_px": args.max_shift,
         "frames_total": int(len(raw_frames)),

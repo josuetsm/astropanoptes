@@ -20,6 +20,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QLineEdit,
     QPushButton,
+    QScrollArea,
     QSpinBox,
     QTabWidget,
     QVBoxLayout,
@@ -28,9 +29,9 @@ from PyQt6.QtWidgets import (
 
 
 OBSERVER_PRESETS = (
+    ("Estación Central (Santiago)", {"lat_deg": -33.4569, "lon_deg": -70.6990, "height_m": 520.0}),
     ("San Carlos", {"lat_deg": -36.4248, "lon_deg": -71.9580, "height_m": 161.0}),
     ("Algarrobo", {"lat_deg": -33.3667, "lon_deg": -71.6667, "height_m": 28.0}),
-    ("Estación Central (Santiago)", {"lat_deg": -33.4569, "lon_deg": -70.6990, "height_m": 520.0}),
 )
 BARLOW_FACTORS = (1, 2, 3, 4, 5)
 STACKING_DRIZZLE_SCALES = (1.0, 2.0, 3.0)
@@ -588,10 +589,16 @@ class CameraTabMixin:
         self.sb_offset.setRange(0, 500)
         self.sb_offset.setValue(self.cfg.camera.offset)
 
+        self.ds_gamma = QDoubleSpinBox()
+        self.ds_gamma.setRange(0.1, 5.0)
+        self.ds_gamma.setDecimals(2)
+        self.ds_gamma.setSingleStep(0.05)
+        self.ds_gamma.setValue(float(getattr(self.cfg.camera, "gamma", 1.0)))
+
         self.btn_apply_cam = QPushButton("Apply")
         _set_option_tooltip(
             self.btn_apply_cam,
-            "Aplica exposición, ganancia y offset a la cámara activa.",
+            "Aplica exposición, ganancia, offset y gamma a la cámara activa.",
         )
         self.btn_apply_cam.clicked.connect(self._camera_apply)
         self.btn_record_raw = QPushButton("Start recording")
@@ -625,6 +632,12 @@ class CameraTabMixin:
             "Offset:",
             self.sb_offset,
             "Nivel negro que evita recortar el ruido en cero. Para gain 360, la Mars-C requiere aproximadamente 350.",
+        )
+        _add_option_row(
+            form,
+            "Gamma:",
+            self.ds_gamma,
+            "Curva de tono aplicada solo al preview/visor (no altera el RAW guardado). >1 aclara tonos medios, <1 los oscurece.",
         )
         form.addRow(self.btn_apply_cam)
         record_actions = QHBoxLayout()
@@ -1463,12 +1476,22 @@ class ModulesTabsMixin(
 ):
     def _build_modules_tabs(self: "AstroPanoptesWindow") -> QWidget:
         tabs = QTabWidget()
-        tabs.addTab(self._tab_observer(), "Observador")
-        tabs.addTab(self._tab_camera(), "Camera")
-        tabs.addTab(self._tab_tracking(), "Tracking")
-        tabs.addTab(self._tab_stacking(), "Stacking")
-        tabs.addTab(self._tab_od(), "Object Detection")
-        tabs.addTab(self._tab_goto(), "GoTo")
+        pages = (
+            (self._tab_observer(), "Observador"),
+            (self._tab_camera(), "Camera"),
+            (self._tab_tracking(), "Tracking"),
+            (self._tab_stacking(), "Stacking"),
+            (self._tab_od(), "Object Detection"),
+            (self._tab_goto(), "GoTo"),
+        )
+        for page, title in pages:
+            scroll = QScrollArea()
+            scroll.setWidgetResizable(True)
+            scroll.setFrameShape(QFrame.Shape.NoFrame)
+            scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
+            scroll.setWidget(page)
+            tabs.addTab(scroll, title)
         tabs.setTabToolTip(0, "Ubicación, escala óptica y prior de rotación para plate solving.")
         tabs.setTabToolTip(1, "Exposición, ganancia y captura RAW de diagnóstico.")
         tabs.setTabToolTip(2, "Control de tracking y alineación RAW16 directa con feed-forward sideral.")

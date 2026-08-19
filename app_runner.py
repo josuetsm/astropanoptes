@@ -85,6 +85,10 @@ from gaia_cache import (
 from camera_poa import POACameraDevice, CameraStream
 from imaging import ensure_raw16_bayer
 from preview import make_preview_jpeg, encode_jpeg
+from transmission_error import (
+    TransmissionErrorCollector,
+    gain_from_tracking_matrix,
+)
 from mount_arduino import (
     ArduinoMount,
     estimate_firmware_move_duration_s,
@@ -254,7 +258,12 @@ class AppRunner:
         self._gaia_coverage_error: Optional[str] = None
 
         # Config platesolving (runtime copy, actualizable desde UI por action)
-        self._platesolving_observer = ObserverConfig()  # San Carlos por defecto.
+        self._platesolving_observer = ObserverConfig()  # Estación Central por defecto.
+        # "live" = último frame de la cámara; "stack" = mosaico acumulado.
+        self._platesolving_source: str = "live"
+        self._transmission_collector: Optional[TransmissionErrorCollector] = None
+        self._transmission_gain_ref: Optional[np.ndarray] = None
+        self._platesolving_stack_info: Optional[Dict[str, Any]] = None
         self._platesolving_worker = PlatesolvingWorker(
             get_frame=self._get_live_frame_for_platesolving,
             get_cfg=self._get_platesolving_cfg_snapshot,
@@ -531,7 +540,27 @@ class AppRunner:
 
     def _get_platesolving_cfg_snapshot(self) -> PlatesolvingConfig:
         with self._platesolving_cfg_lock:
-            return self._copy_platesolving_config(self.cfg.platesolving)
+            cfg = self._copy_platesolving_config(self.cfg.platesolving)
+        if str(getattr(self, "_platesolving_source", "live")).lower() != "stack":
+            return cfg
+        # Solving the live mosaic: drizzle subdivides pixels, so the angular
+        # scale per pixel shrinks by that factor. Scaling the focal length is
+        # equivalent and keeps every scale check downstream consistent.
+        info = self._stacking.get_stack_for_solve() if self._stacking is not None else None
+        scale = float((info or {}).get("drizzle_scale", 1.0) or 1.0)
+        if np.isfinite(scale) and scale > 1.0:
+            cfg.focal_m = float(cfg.focal_m) * scale
+        # A mosaic covers more sky than one frame; widen the cone accordingly so
+        # a fitted center near the mosaic edge is not rejected as out of range.
+        if info is not None:
+            ch, cw = info.get("canvas", (0, 0))
+            fh, fw = info.get("frame_shape", (0, 0))
+            if fh > 0 and fw > 0 and ch >= fh and cw >= fw:
+                grow = max(float(ch) / float(fh), float(cw) / float(fw))
+                radius = getattr(cfg, "search_radius_deg", None)
+                if radius is not None and np.isfinite(grow) and grow > 1.0:
+                    cfg.search_radius_deg = float(radius) * min(grow, 3.0)
+        return cfg
 
     def _get_sep_cfg_snapshot(self) -> SepConfig:
         return replace(self.cfg.sep)
@@ -838,6 +867,14 @@ class AppRunner:
         return float(st.get("fps_capture", 0.0))
 
     def _get_live_frame_for_platesolving(self) -> Optional[np.ndarray]:
+        if str(getattr(self, "_platesolving_source", "live")).lower() == "stack":
+            stacked = self._get_stack_frame_for_platesolving()
+            if stacked is not None:
+                return stacked
+            log_info(
+                self.out_log,
+                "Platesolving: stack source empty, falling back to live frame",
+            )
         if self._cam_stream is None:
             return None
         fr = self._cam_stream.latest()
@@ -854,6 +891,41 @@ class AppRunner:
                 throttle_key="platesolving_frame_copy",
             )
             return None
+
+    def _get_stack_frame_for_platesolving(self) -> Optional[np.ndarray]:
+        """Live mosaic as solver input.
+
+        Stacking short exposures is preferable to a long one under heavy light
+        pollution: stars stay point-like rather than trailing, faint stars
+        emerge from the accumulated signal, and the mosaic spans more sky than
+        a single frame. The detector then sees many more usable sources, which
+        is exactly what the triplet search needs.
+        """
+        if self._stacking is None:
+            return None
+        try:
+            info = self._stacking.get_stack_for_solve()
+        except Exception as exc:
+            log_error(
+                self.out_log,
+                "Platesolving: stack snapshot failed",
+                exc,
+                throttle_s=5.0,
+                throttle_key="platesolving_stack_snapshot",
+            )
+            return None
+        if not info:
+            return None
+        img = info.get("image")
+        if img is None or int(info.get("frames", 0)) <= 0:
+            return None
+        self._platesolving_stack_info = info
+        log_info(
+            self.out_log,
+            f"Platesolving: using live stack ({int(info['frames'])} frames, "
+            f"canvas {info['canvas'][1]}x{info['canvas'][0]})",
+        )
+        return np.ascontiguousarray(img)
 
     def _publish_platesolving_state(self, patch: Dict[str, Dict[str, Any]]) -> None:
         with self._operation_lock:
@@ -1698,6 +1770,119 @@ class AppRunner:
             log_error(self.out_log, "Mount: MOVE rate-emulation failed", exc, throttle_s=2.0, throttle_key="mount_move_rate_emul")
             return 0, 0
 
+    def _ensure_transmission_collector(self) -> Optional[TransmissionErrorCollector]:
+        if self._transmission_collector is not None:
+            return self._transmission_collector
+        try:
+            kin = self._goto.model.kin
+            self._transmission_collector = TransmissionErrorCollector(
+                period_steps=(
+                    float(kin.transmission_error_period_steps(Axis.AZ)),
+                    float(kin.transmission_error_period_steps(Axis.ALT)),
+                ),
+                deg_per_step=(
+                    float(kin.deg_per_step(Axis.AZ)),
+                    float(kin.deg_per_step(Axis.ALT)),
+                ),
+            )
+        except Exception as exc:
+            log_error(
+                self.out_log,
+                "Transmission: collector init failed",
+                exc,
+                throttle_s=30.0,
+                throttle_key="transmission_collector_init",
+            )
+            return None
+        return self._transmission_collector
+
+    def _observe_transmission_error(self, out: Any) -> None:
+        """Feed the cycloidal error learner from the tracking loop.
+
+        The tracker's RLS already measures the real px/µstep response many
+        times per second. Its variation with lobe phase *is* the transmission
+        error, so recording it here gives thousands of free samples instead of
+        the eight hard-won plate solves the manual fit needs.
+        """
+        if not bool(getattr(out, "measurement_valid", False)):
+            return
+        if float(getattr(out, "lock_conf", 0.0)) < 0.7:
+            return
+        A = getattr(out, "A", None)
+        if A is None:
+            A = getattr(getattr(self._tracking_state, "auto", None), "A", None)
+        if A is None:
+            return
+        collector = self._ensure_transmission_collector()
+        if collector is None:
+            return
+        try:
+            norms = gain_from_tracking_matrix(A)
+            if norms is None:
+                return
+            if self._transmission_gain_ref is None:
+                self._transmission_gain_ref = np.asarray(norms, dtype=np.float64)
+                return
+            ref = self._transmission_gain_ref
+            # Reference tracks slowly so a genuine drift in plate scale (focus,
+            # altitude) does not masquerade as a transmission error.
+            self._transmission_gain_ref = 0.999 * ref + 0.001 * np.asarray(norms)
+            collector.observe(
+                steps=self._goto.model.steps_est,
+                gain=np.asarray(norms, dtype=np.float64) / ref,
+            )
+        except Exception as exc:
+            log_error(
+                self.out_log,
+                "Transmission: observe failed",
+                exc,
+                throttle_s=30.0,
+                throttle_key="transmission_observe",
+            )
+
+    def get_transmission_error_report(self) -> Dict[str, Any]:
+        """Coverage and current estimate of the learned transmission error."""
+        collector = self._transmission_collector
+        if collector is None:
+            return {"samples": 0, "coverage": {"az": 0.0, "alt": 0.0, "min": 0.0}, "fitted": False}
+        report: Dict[str, Any] = {
+            "samples": int(collector.samples),
+            "rejected": int(collector.rejected),
+            "coverage": collector.coverage(),
+            "fitted": False,
+        }
+        result = collector.fit()
+        if result is not None:
+            coeff, detail = result
+            report["fitted"] = True
+            report["coeff_deg"] = coeff.tolist()
+            report.update({k: float(v) for k, v in detail.items()})
+        return report
+
+    def apply_learned_transmission_error(self) -> bool:
+        """Push the learned periodic error into the pointing model."""
+        collector = self._transmission_collector
+        if collector is None:
+            return False
+        result = collector.fit()
+        if result is None:
+            log_info(self.out_log, "Transmission: cobertura de fase insuficiente todavía")
+            return False
+        coeff, detail = result
+        try:
+            self._goto.model.periodic_coeff_deg = self._goto.model.safe_periodic_coeff_for_prediction(coeff)
+            self._goto.model.periodic_model_samples = int(collector.samples)
+        except Exception as exc:
+            log_error(self.out_log, "Transmission: apply failed", exc)
+            return False
+        log_info(
+            self.out_log,
+            "Transmission: modelo periódico actualizado desde tracking "
+            f"({int(collector.samples)} muestras, "
+            f"cobertura az={detail.get('az_coverage', 0.0):.2f} alt={detail.get('alt_coverage', 0.0):.2f})",
+        )
+        return True
+
     def _tracking_rate_safe(self, az: float, alt: float) -> tuple[int, int]:
         moved_steps = self._mount_rate_safe(float(az), float(alt))
         self._goto.model.note_emitted_rate_steps(moved_steps)
@@ -1875,6 +2060,9 @@ class AppRunner:
             self.cfg.camera.offset = int(value)
         elif n in ("auto_gain",):
             self.cfg.camera.auto_gain = bool(value)
+        elif n in ("gamma",):
+            self.cfg.camera.gamma = float(value)
+            return False
         elif n in ("img_format",):
             self.cfg.camera.img_format = str(value)
         elif n in ("use_roi",):
@@ -2116,6 +2304,7 @@ class AppRunner:
                     phi=float(self.cfg.preview.stretch_phi),
                     jpeg_quality=int(self.cfg.preview.jpeg_quality),
                     sample_stride=4,
+                    gamma=float(self.cfg.camera.gamma),
                 )
                 if self._live_sep_overlay_enabled:
                     u8_preview = self._apply_live_sep_overlay(raw16_work, u8_preview)
@@ -2147,6 +2336,7 @@ class AppRunner:
                     phi=float(self.cfg.preview.stretch_phi),
                     jpeg_quality=int(self.cfg.preview.jpeg_quality),
                     sample_stride=4,
+                    gamma=float(self.cfg.camera.gamma),
                 )
 
             with self._preview_config_lock:
@@ -2653,7 +2843,12 @@ class AppRunner:
         """
         Encola un request para platesolving. Si hay uno pendiente, se reemplaza.
         """
-        self._platesolving_worker.request(target=target)
+        obstime_unix = None
+        if str(getattr(self, "_platesolving_source", "live")).lower() == "stack":
+            info = self._stacking.get_stack_for_solve() if self._stacking is not None else None
+            if info:
+                obstime_unix = info.get("obstime_unix")
+        self._platesolving_worker.request(target=target, obstime_unix=obstime_unix)
 
     def _current_field_center_icrs(self) -> Tuple[SkyCoord, str]:
         if self._simulation_enabled():
@@ -3233,6 +3428,8 @@ class AppRunner:
                             measurement_reason="processing",
                             measurement_source="none",
                         )
+
+                    self._observe_transmission_error(out)
 
                     rate_fb_az = float(out.rate_az)
                     rate_fb_alt = float(out.rate_alt)
@@ -3870,6 +4067,13 @@ class AppRunner:
                 payload = dict(p)
                 if "auto_target" in payload:
                     self._platesolving_auto_target = str(payload.pop("auto_target") or "")
+                if "source" in payload:
+                    source = str(payload.pop("source") or "live").strip().lower()
+                    if source not in {"live", "stack"}:
+                        log_info(self.out_log, f"Platesolving: fuente inválida {source!r} (use live|stack)")
+                    else:
+                        self._platesolving_source = source
+                        log_info(self.out_log, f"Platesolving: fuente = {source}")
 
                 observer_payload = {}
                 observer_keymap = {
