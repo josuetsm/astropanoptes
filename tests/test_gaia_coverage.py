@@ -24,6 +24,7 @@ def test_gaia_healpix_coverage_reports_cached_and_required_tiles(tmp_path: Path)
     cfg = AppConfig().platesolving
     cfg.cache_dir = str(tmp_path)
     cfg.nside = 1
+    cfg.bright_catalog_enabled = True
 
     empty = gaia_healpix_coverage(cfg=cfg)
     assert int(empty["total_tiles"]) == 12
@@ -118,6 +119,8 @@ def test_healpix_catalog_downloads_and_merges_bright_tile(tmp_path: Path) -> Non
     cfg.cache_dir = str(tmp_path)
     cfg.nside = 16
     cfg.bright_catalog_margin_deg = 0.0
+    cfg.download_missing_tiles = True
+    cfg.bright_catalog_enabled = True
     center = SkyCoord(ra=95.987877 * u.deg, dec=-52.695661 * u.deg, frame="icrs")
     gaia = Table({
         "source_id": np.array([5500822146529182592], dtype=np.int64),

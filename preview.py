@@ -52,17 +52,26 @@ def to_u8_preview(img: np.ndarray) -> np.ndarray:
     return x.astype(np.uint8)
 
 
+def _apply_gamma_u8(y01: np.ndarray, gamma: float) -> np.ndarray:
+    """Aplica gamma a una imagen ya normalizada en [0, 1] y la vuelve a u8."""
+    if gamma != 1.0:
+        y01 = y01 ** (1.0 / max(1e-3, float(gamma)))
+    return (y01 * 255.0).astype(np.uint8)
+
+
 def stretch_fast_u8(
     u8: np.ndarray,
     plo: float = 5.0,
     phi: float = 99.5,
     sample_stride: int = 4,
+    gamma: float = 1.0,
 ) -> np.ndarray:
     """
     Stretch rápido para preview (u8 -> u8), usando percentiles sobre un submuestreo.
 
     - sample_stride controla el costo de percentil:
         4 => usa 1/16 de los píxeles (aprox).
+    - gamma > 1 aclara tonos medios, gamma < 1 los oscurece (1.0 = sin cambio).
     """
     if u8.dtype != np.uint8:
         raise ValueError("stretch_fast_u8 espera uint8")
@@ -86,10 +95,10 @@ def stretch_fast_u8(
     if hi <= lo + 1.0:
         hi = lo + 1.0
 
-    # mapeo lineal: (x - lo) * 255/(hi-lo)
-    y = (u8.astype(np.float32) - lo) * (255.0 / (hi - lo))
-    y = np.clip(y, 0.0, 255.0)
-    return y.astype(np.uint8)
+    # mapeo lineal a [0, 1]: (x - lo) / (hi - lo)
+    y = (u8.astype(np.float32) - lo) * (1.0 / (hi - lo))
+    y = np.clip(y, 0.0, 1.0)
+    return _apply_gamma_u8(y, gamma)
 
 
 def stretch_fast_native_to_u8(
@@ -97,13 +106,15 @@ def stretch_fast_native_to_u8(
     plo: float = 5.0,
     phi: float = 99.5,
     sample_stride: int = 4,
+    gamma: float = 1.0,
 ) -> np.ndarray:
     """Percentile-stretch native u8/u16 data before quantizing to u8.
 
     RAW16 cameras often carry only 10–14 significant bits.  Taking the high
     byte first discards weak star/background differences when those bits are
     right-aligned, so percentile estimation and scaling must happen in the
-    native integer domain.
+    native integer domain. ``gamma`` is applied after the linear stretch
+    (see :func:`_apply_gamma_u8`).
     """
     arr = np.asarray(img)
     if arr.dtype == np.uint8:
@@ -112,6 +123,7 @@ def stretch_fast_native_to_u8(
             plo=plo,
             phi=phi,
             sample_stride=sample_stride,
+            gamma=gamma,
         )
     if arr.size == 0:
         return np.asarray(arr, dtype=np.uint8)
@@ -127,8 +139,9 @@ def stretch_fast_native_to_u8(
         hi = float(np.max(sample))
     if hi <= lo:
         hi = lo + 1.0
-    scaled = (arr.astype(np.float32) - lo) * (255.0 / (hi - lo))
-    return np.clip(scaled, 0.0, 255.0).astype(np.uint8)
+    scaled = (arr.astype(np.float32) - lo) * (1.0 / (hi - lo))
+    scaled = np.clip(scaled, 0.0, 1.0)
+    return _apply_gamma_u8(scaled, gamma)
 
 
 def encode_jpeg(u8: np.ndarray, quality: int = 75) -> bytes:
@@ -159,6 +172,7 @@ def make_preview_jpeg(
     phi: float = 99.5,
     jpeg_quality: int = 75,
     sample_stride: int = 4,
+    gamma: float = 1.0,
 ) -> Tuple[bytes, np.ndarray]:
     """
     Pipeline compacto para preview:
@@ -172,6 +186,7 @@ def make_preview_jpeg(
         plo=plo,
         phi=phi,
         sample_stride=sample_stride,
+        gamma=gamma,
     )
     jpg = encode_jpeg(u8s, quality=jpeg_quality)
     return jpg, u8s

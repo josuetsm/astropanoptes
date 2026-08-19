@@ -395,9 +395,11 @@ HELP_TEXT = """Comandos principales:
   solve OBJETIVO                   Plate solve por nombre o coordenadas
   solve altaz AZ ALT
   platesolving set nombre=valor ... | download [RADIO_DEG]
+  platesolving source live|stack   Resuelve el frame vivo o el mosaico apilado
   goto OBJETIVO | goto altaz AZ ALT | goto cancel|fit|samples|prune|restore|reset
   goto autocalibrate [nombre=valor ...] | goto roll
   overlay sep|expected on|off [nombre=valor ...]
+  transmission status|apply       Error de transmisión aprendido desde el tracking
 
   image live|stack|platesolve [NOMBRE] [ESPERA_SEG]
                                     Guarda JPEG + JSON en la carpeta de imágenes
@@ -858,13 +860,20 @@ class TerminalApp:
         if not args:
             raise CommandError("uso: platesolving set ... | download [RADIO_DEG]")
         operation = args[0].lower()
-        if operation == "set" and len(args) >= 2:
+        if operation == "source" and len(args) == 2:
+            source = str(args[1]).strip().lower()
+            if source not in {"live", "stack"}:
+                raise CommandError("uso: platesolving source live|stack")
+            self.runner.request_platesolving_params(source=source)
+        elif operation == "set" and len(args) >= 2:
             self.runner.request_platesolving_params(**_parse_assignments(args[1:]))
         elif operation == "download":
             radius = float(args[1]) if len(args) >= 2 else None
             self.runner.request_platesolving_download_current_field(radius)
         else:
-            raise CommandError("uso: platesolving set nombre=valor ... | download [RADIO_DEG]")
+            raise CommandError(
+                "uso: platesolving set nombre=valor ... | source live|stack | download [RADIO_DEG]"
+            )
         self._print("OK")
 
     def _goto(self, args: list[str]) -> None:
@@ -898,6 +907,23 @@ class TerminalApp:
             self._mark_operation_pending("goto")
             self.runner.request_mount_goto(self._target(args))
         self._print("OK")
+
+    def _transmission(self, args: list[str]) -> None:
+        operation = args[0].lower() if args else "status"
+        if operation == "status":
+            getter = getattr(self.runner, "get_transmission_error_report", None)
+            if not callable(getter):
+                raise CommandError("el runner no expone el aprendizaje de transmisión")
+            self._print(json.dumps(_jsonable(getter()), ensure_ascii=False, indent=2, sort_keys=True))
+            return
+        if operation == "apply":
+            apply = getattr(self.runner, "apply_learned_transmission_error", None)
+            if not callable(apply):
+                raise CommandError("el runner no expone el aprendizaje de transmisión")
+            ok = bool(apply())
+            self._print("OK" if ok else "ERR cobertura de fase insuficiente")
+            return
+        raise CommandError("uso: transmission status | apply")
 
     def _overlay(self, args: list[str]) -> None:
         if len(args) < 2:
@@ -1008,6 +1034,8 @@ class TerminalApp:
                 self._goto(args)
             elif command == "overlay":
                 self._overlay(args)
+            elif command in {"transmission", "transmision"}:
+                self._transmission(args)
             elif command in {"image", "imagen", "snapshot"}:
                 self._save_image(args)
             elif command in {"view", "live-view", "visor"}:

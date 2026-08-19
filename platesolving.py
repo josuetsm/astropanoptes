@@ -81,12 +81,12 @@ class TargetParseError(PlatesolvingError):
 @dataclass(frozen=True)
 class ObserverConfig:
     """
-    Default observer: San Carlos, Chile (approximate city center).
+    Default observer: Estación Central, Santiago, Chile (approximate).
     Used for AltAz -> ICRS conversion.
     """
-    lat_deg: float = -36.4248
-    lon_deg: float = -71.9580
-    height_m: float = 161.0
+    lat_deg: float = -33.4569
+    lon_deg: float = -70.6990
+    height_m: float = 520.0
     refraction_enable: bool = True
     refraction_P_hPa: float = 1013.25
     refraction_T_C: float = 15.0
@@ -1243,7 +1243,13 @@ def verify_plate_from_prior(
             obstime_unix=float(obstime.unix),
         )
 
-    min_inliers = max(6, int(getattr(cfg, "min_inliers", 6)))
+    # This used to be hardcoded to max(6, ...), silently ignoring a lower
+    # cfg.min_inliers. That defeats the whole point of the multi-frame
+    # consensus check (initial_consensus_count) as a substitute safety net in
+    # genuinely star-poor fields (heavy light pollution, narrow FoV): with a
+    # low per-frame floor here, a real single-star or two-star field could
+    # never be confirmed at all, no matter how many frames agreed.
+    min_inliers = max(1, int(getattr(cfg, "min_inliers", 6)))
     if img_xy.shape[0] < min_inliers:
         return _failure("FAST_PRIOR_NOT_ENOUGH_DETECTIONS", {"n_det": float(img_xy.shape[0])})
 
@@ -2620,9 +2626,9 @@ class PlatesolvingWorker(BaseWorker):
         self._request_cancel = threading.Event()
         self._solve_deadline = float("inf")
 
-    def request(self, *, target: Any) -> None:
+    def request(self, *, target: Any, obstime_unix: Optional[float] = None) -> None:
         self._request_cancel.clear()
-        super().request(target=target)
+        super().request(target=target, obstime_unix=obstime_unix)
 
     def cancel_current(self) -> None:
         self._request_cancel.set()
@@ -3115,7 +3121,20 @@ class PlatesolvingWorker(BaseWorker):
         try:
             sep_cfg = self._get_sep_cfg()
             observer = self._get_observer()
-            obstime = Time.now()
+            # A stacked mosaic shows the sky at its *reference* frame time, not
+            # now: frames are aligned onto that first frame. Using Time.now()
+            # would offset the fitted center by the sidereal drift accumulated
+            # while stacking, which for a minute-long stack is several arcmin.
+            requested_time = request.get("obstime_unix")
+            if requested_time is not None and np.isfinite(float(requested_time)):
+                obstime = Time(float(requested_time), format="unix", scale="utc")
+            else:
+                obstime = Time.now()
+            # Keep the first native frame available.  Temporal confirmation is
+            # a useful hot-pixel rejection layer, but it must not make a field
+            # unsolvable when the mount/camera motion estimate is unreliable
+            # (for example, faint stars with a changing SEP source count).
+            initial_raw16 = raw16.copy()
             debug_stats = bool(getattr(cfg, "debug_input_stats", False))
             self._log_input_stats(raw16, "frame(raw16)", debug_stats)
             diagnostics = DiagnosticSession(
@@ -3141,6 +3160,27 @@ class PlatesolvingWorker(BaseWorker):
                 sep_cfg=sep_cfg,
                 diagnostics=diagnostics,
             )
+            if (
+                temporal_detections is not None
+                and temporal_detections.xy.shape[0] < 3
+            ):
+                # Fall back to the original frame rather than the aligned
+                # temporal median, which can be nearly flat when drift
+                # estimation failed.  The full plate solver still requires a
+                # geometrically consistent Gaia match before reporting OK.
+                diagnostics.record(
+                    "platesolve_temporal_fallback",
+                    confirmed=int(temporal_detections.xy.shape[0]),
+                    drift_failures=int(temporal_detections.drift_failures),
+                    reason="TEMPORAL_CONFIRMATION_EMPTY",
+                )
+                log_info(
+                    self._out_log,
+                    "Platesolving: temporal confirmation empty; "
+                    "falling back to the original RAW16 frame",
+                )
+                temporal_detections = None
+                raw16 = initial_raw16
             if temporal_detections is not None:
                 diagnostics.save_raw(
                     "platesolve_temporal_reference",

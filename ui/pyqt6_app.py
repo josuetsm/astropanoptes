@@ -21,6 +21,7 @@ from PyQt6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QSizePolicy,
     QSpinBox,
     QSplitter,
     QTabWidget,
@@ -39,6 +40,7 @@ from actions import tracking_keyframe_reset
 from ap_types import Axis, CameraStatus, MountStatus
 from app_runner import AppRunner
 from config import AppConfig
+from control_server import DEFAULT_SOCKET_PATH, ControlServer, ControlServerError
 from logging_utils import set_global_log_sink
 from ui.tabs_mixin import ModulesTabsMixin, STACKING_DRIZZLE_SCALES, _set_option_tooltip
 
@@ -230,14 +232,53 @@ class Chip(QLabel):
             )
 
 
+class StatusLabel(QLabel):
+    """Status text that can shrink without making its window wider."""
+
+    def __init__(
+        self,
+        text: str,
+        *,
+        minimum_width: int,
+        preferred_width: int,
+        maximum_width: int,
+    ) -> None:
+        super().__init__(text)
+        self._preferred_width = int(preferred_width)
+        self.setMinimumWidth(int(minimum_width))
+        self.setMaximumWidth(int(maximum_width))
+        self.setSizePolicy(
+            QSizePolicy.Policy.Expanding,
+            QSizePolicy.Policy.Preferred,
+        )
+
+    def sizeHint(self) -> QSize:  # noqa: N802
+        hint = super().sizeHint()
+        hint.setWidth(self._preferred_width)
+        return hint
+
+    def minimumSizeHint(self) -> QSize:  # noqa: N802
+        hint = super().minimumSizeHint()
+        hint.setWidth(self.minimumWidth())
+        return hint
+
+
 class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
-    def __init__(self, runner: AppRunner, cfg: AppConfig) -> None:
+    def __init__(
+        self,
+        runner: AppRunner,
+        cfg: AppConfig,
+        *,
+        enable_control_server: bool = False,
+        control_socket_path: Path | str = DEFAULT_SOCKET_PATH,
+    ) -> None:
         super().__init__()
         self.runner = runner
         self.cfg = cfg
         self._ps_outputs_enabled = False
         self._camera_connection_pending: Optional[bool] = None
         self._mount_connection_pending: Optional[bool] = None
+        self._control_server: Optional[ControlServer] = None
 
         self.setWindowTitle("AstroPanoptes")
         self.resize(1280, 760)
@@ -273,8 +314,24 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
 
         self._log("PyQt6 UI ready.")
 
+        if enable_control_server:
+            self._start_control_server(control_socket_path)
+
+    def _start_control_server(self, socket_path: Path | str) -> None:
+        server = ControlServer(self.runner, socket_path=socket_path)
+        try:
+            server.start()
+        except (ControlServerError, OSError) as exc:
+            self._log(f"Control CLI no disponible: {exc}")
+            return
+        self._control_server = server
+        self._log(f"Control CLI activo: python app.py attach --socket {server.socket_path}")
+
     def closeEvent(self, event) -> None:  # noqa: N802
         set_global_log_sink(None)
+        if self._control_server is not None:
+            self._control_server.stop()
+            self._control_server = None
         self.runner.stop()
         super().closeEvent(event)
 
@@ -283,13 +340,13 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.view_tabs.setDocumentMode(True)
 
         self.live_view = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
-        self.live_view.setMinimumSize(QSize(640, 420))
+        self.live_view.setMinimumSize(QSize(320, 220))
         self.live_view.setStyleSheet(
             "QLabel { background:#0f0f0f; border:1px solid #2a2a2a; border-radius:10px; }"
         )
 
         self.stacked_view = QLabel(alignment=Qt.AlignmentFlag.AlignCenter)
-        self.stacked_view.setMinimumSize(QSize(640, 420))
+        self.stacked_view.setMinimumSize(QSize(320, 220))
         self.stacked_view.setStyleSheet(
             "QLabel { background:#0f0f0f; border:1px solid #2a2a2a; border-radius:10px; }"
         )
@@ -385,10 +442,30 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         _set_option_tooltip(self.ch_ps, "Indica si plate solving está ejecutándose.")
         _set_option_tooltip(self.ch_goto, "Indica si una operación GoTo está en curso.")
 
-        self.lbl_fps = QLabel("FPS cap/max: --/--/--")
-        self.lbl_drift = QLabel("tracking error: -- px | drift: --/-- px/s")
-        self.lbl_coords = QLabel("RA/Dec: -- -- | Az/Alt: -- --")
-        self.lbl_errors = QLabel("Errors: none")
+        self.lbl_fps = StatusLabel(
+            "FPS cap/max: --/--/--",
+            minimum_width=140,
+            preferred_width=170,
+            maximum_width=190,
+        )
+        self.lbl_drift = StatusLabel(
+            "tracking error: -- px | drift: --/-- px/s",
+            minimum_width=220,
+            preferred_width=330,
+            maximum_width=430,
+        )
+        self.lbl_coords = StatusLabel(
+            "RA/Dec: -- -- | Az/Alt: -- --",
+            minimum_width=180,
+            preferred_width=280,
+            maximum_width=360,
+        )
+        self.lbl_errors = StatusLabel(
+            "Errors: none",
+            minimum_width=110,
+            preferred_width=220,
+            maximum_width=360,
+        )
         _set_option_tooltip(self.lbl_fps, "FPS capturado y límite estimado según exposición actual.")
         _set_option_tooltip(
             self.lbl_drift,
@@ -406,14 +483,18 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
                 "background:#121212; color:#ddd; }"
             )
 
-        row = QHBoxLayout()
-        row.setContentsMargins(10, 8, 10, 8)
-        row.setSpacing(10)
-        row.addWidget(self.cb_demo)
-        row.addSpacing(8)
-        row.addWidget(self.btn_camera_connection)
-        row.addWidget(self.btn_mount_connection)
-        row.addSpacing(8)
+        controls = QHBoxLayout()
+        controls.setContentsMargins(10, 8, 10, 0)
+        controls.setSpacing(10)
+        controls.addWidget(self.cb_demo)
+        controls.addSpacing(8)
+        controls.addWidget(self.btn_camera_connection)
+        controls.addWidget(self.btn_mount_connection)
+        controls.addStretch(1)
+
+        statuses = QHBoxLayout()
+        statuses.setContentsMargins(10, 0, 10, 0)
+        statuses.setSpacing(10)
         for widget in [
             self.ch_cam,
             self.ch_mount,
@@ -424,21 +505,22 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             self.ch_ps,
             self.ch_goto,
         ]:
-            row.addWidget(widget)
-        row.addStretch(1)
+            statuses.addWidget(widget)
+        statuses.addStretch(1)
 
         metrics = QHBoxLayout()
         metrics.setContentsMargins(10, 0, 10, 8)
         metrics.setSpacing(8)
         metrics.addWidget(self.lbl_fps)
-        metrics.addWidget(self.lbl_drift)
-        metrics.addWidget(self.lbl_coords, stretch=1)
-        metrics.addWidget(self.lbl_errors)
+        metrics.addWidget(self.lbl_drift, stretch=2)
+        metrics.addWidget(self.lbl_coords, stretch=2)
+        metrics.addWidget(self.lbl_errors, stretch=2)
 
         layout = QVBoxLayout(top)
         layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(8)
-        layout.addLayout(row)
+        layout.setSpacing(6)
+        layout.addLayout(controls)
+        layout.addLayout(statuses)
         layout.addLayout(metrics)
 
         self.tb_top.addWidget(top)
@@ -618,10 +700,13 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         exp_ms = float(self.ds_exp_ms.value())
         gain = int(self.sb_gain.value())
         offset = int(self.sb_offset.value())
+        gamma = float(self.ds_gamma.value())
         self.runner.request_camera_params(
-            {"exp_ms": exp_ms, "gain": gain, "offset": offset}
+            {"exp_ms": exp_ms, "gain": gain, "offset": offset, "gamma": gamma}
         )
-        self._log(f"[camera] apply exposure={exp_ms:.1f} ms gain={gain} offset={offset}")
+        self._log(
+            f"[camera] apply exposure={exp_ms:.1f} ms gain={gain} offset={offset} gamma={gamma:.2f}"
+        )
 
     def _camera_record_raw(self) -> None:
         if not bool(self.runner.get_state().camera.connected):
@@ -1177,9 +1262,18 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         if state.goto.reason:
             errors.append(f"goto: {state.goto.reason}")
         if errors:
-            self.lbl_errors.setText(f"Errors: {' | '.join(errors)}")
+            full_text = f"Errors: {' | '.join(errors)}"
+            display_text = full_text
+            if len(display_text) > 90:
+                display_text = f"{display_text[:89]}…"
+            self.lbl_errors.setText(display_text)
+            self.lbl_errors.setToolTip(full_text)
         else:
             self.lbl_errors.setText("Errors: none")
+            self.lbl_errors.setToolTip(
+                "Últimos errores activos publicados por cámara, montura, tracking, "
+                "stacking, plate solving o GoTo."
+            )
 
     def _format_ra_deg(self, ra_deg: float) -> str:
         total_seconds = ra_deg * 240.0
@@ -1230,18 +1324,23 @@ class UI:
     runner: AppRunner
 
 
-def build_ui(runner: Optional[AppRunner] = None, *, cfg: Optional[AppConfig] = None) -> AstroPanoptesWindow:
+def build_ui(
+    runner: Optional[AppRunner] = None,
+    *,
+    cfg: Optional[AppConfig] = None,
+    enable_control_server: bool = True,
+) -> AstroPanoptesWindow:
     if runner is None:
         cfg = cfg or AppConfig()
         runner = AppRunner(cfg)
-        window = AstroPanoptesWindow(runner, cfg)
+        window = AstroPanoptesWindow(runner, cfg, enable_control_server=enable_control_server)
         runner.start()
         return window
     cfg = cfg or runner.cfg
-    return AstroPanoptesWindow(runner, cfg)
+    return AstroPanoptesWindow(runner, cfg, enable_control_server=enable_control_server)
 
 
-def show_ui(*, start_app: bool = True, start_runner: bool = True) -> UI:
+def show_ui(*, start_app: bool = True, start_runner: bool = True, enable_control_server: bool = True) -> UI:
     app = QApplication.instance()
     created = False
     if app is None:
@@ -1250,7 +1349,7 @@ def show_ui(*, start_app: bool = True, start_runner: bool = True) -> UI:
 
     cfg = AppConfig()
     runner = AppRunner(cfg)
-    window = AstroPanoptesWindow(runner, cfg)
+    window = AstroPanoptesWindow(runner, cfg, enable_control_server=enable_control_server)
     if start_runner:
         runner.start()
     window.showMaximized()
