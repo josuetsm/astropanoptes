@@ -410,6 +410,12 @@ HELP_TEXT = """Comandos principales:
 
 Los comandos `set` aceptan booleanos, números, null y JSON. Los logs del runtime
 van a stderr; las respuestas y el JSON de la CLI van a stdout.
+
+Formato de respuesta: una acción sin datos que devolver imprime "OK"; una
+consulta (status, get, config, health, transmission status, view status)
+imprime el valor o JSON solicitado; una acción con resultado (view start/open,
+await) imprime JSON con "ok". Cualquier fallo se reporta en stderr como
+"CLI ERROR: mensaje" y detiene los scripts (--script/-c).
 """
 
 
@@ -601,6 +607,7 @@ class TerminalApp:
                 }.get(name, name)
                 section = getattr(state, section_name)
                 payload = {
+                    "ok": True,
                     "operation": name,
                     "started": started,
                     "finished": finished,
@@ -713,7 +720,13 @@ class TerminalApp:
             if not self._live_view.running:
                 raise CommandError("el visor no esta activo; use view start")
             opened = bool(self._browser_open(self._live_view.url))
-            self._print(json.dumps({"ok": opened, "url": self._live_view.url}, sort_keys=True))
+            self._print(
+                json.dumps(
+                    {"ok": opened, "url": self._live_view.url},
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
             return
         if operation == "status" and len(args) <= 1:
             self._print(
@@ -920,8 +933,9 @@ class TerminalApp:
             apply = getattr(self.runner, "apply_learned_transmission_error", None)
             if not callable(apply):
                 raise CommandError("el runner no expone el aprendizaje de transmisión")
-            ok = bool(apply())
-            self._print("OK" if ok else "ERR cobertura de fase insuficiente")
+            if not apply():
+                raise CommandError("cobertura de fase insuficiente")
+            self._print("OK")
             return
         raise CommandError("uso: transmission status | apply")
 
@@ -1019,7 +1033,7 @@ class TerminalApp:
                 self._mount(args)
             elif command in {"stop", "emergency-stop", "estop"}:
                 self._emergency_stop()
-                self._print("OK emergency stop requested")
+                self._print("OK")
             elif command == "tracking":
                 self._tracking(args)
             elif command == "stacking":
@@ -1113,7 +1127,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             terminal.run_interactive()
             ok = not terminal.had_error
     except KeyboardInterrupt:
-        terminal._print("\nInterrumpido; cerrando de forma segura.")
+        terminal._error("interrumpido; cerrando de forma segura")
         ok = False
     except OSError as exc:
         terminal._error(str(exc))

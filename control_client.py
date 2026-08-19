@@ -108,7 +108,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         sock = connect(socket_path)
     except AttachError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ATTACH ERROR: {exc}", file=sys.stderr)
         return 2
 
     ok = True
@@ -123,7 +123,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if should_interact:
             ok = run_interactive(sock) and ok
     except AttachError as exc:
-        print(f"ERROR: {exc}", file=sys.stderr)
+        print(f"ATTACH ERROR: {exc}", file=sys.stderr)
         ok = False
     finally:
         sock.close()
