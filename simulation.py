@@ -124,6 +124,36 @@ class SimulationState:
         self._true_J_deg_per_step = self._build_true_J()
         self._steps_true = np.zeros(2, dtype=np.float64)
 
+        # --- Cycloidal transmission error (dominant mechanical effect) ---
+        # Amplitude and phase per axis. The output angle gains
+        # A*sin(2*pi*s/P + phase), so the locally measured scale swings by
+        # A*2*pi/P around nominal: a move much shorter than one lobe measures
+        # that local slope instead of the mean scale.
+        amp_lo = abs(_finite_float(getattr(cfg, "transmission_error_deg_min", 0.08), 0.08))
+        amp_hi = abs(_finite_float(getattr(cfg, "transmission_error_deg_max", 0.25), 0.25))
+        if amp_hi < amp_lo:
+            amp_lo, amp_hi = amp_hi, amp_lo
+        self.transmission_amp_deg = np.array(
+            [self._rng.uniform(amp_lo, amp_hi), self._rng.uniform(amp_lo, amp_hi)],
+            dtype=np.float64,
+        )
+        self.transmission_phase_rad = np.array(
+            [self._rng.uniform(0.0, 2.0 * np.pi), self._rng.uniform(0.0, 2.0 * np.pi)],
+            dtype=np.float64,
+        )
+
+        # --- Backlash ---
+        # Slack taken up when an axis reverses: the motor turns but the sky
+        # does not move until the pending amount is consumed.
+        bl_lo = int(max(0, getattr(cfg, "backlash_steps_min", 5)))
+        bl_hi = int(max(bl_lo, getattr(cfg, "backlash_steps_max", 40)))
+        self.backlash_steps = np.array(
+            [self._rng.integers(bl_lo, bl_hi + 1), self._rng.integers(bl_lo, bl_hi + 1)],
+            dtype=np.float64,
+        )
+        self._last_direction = np.zeros(2, dtype=np.float64)
+        self._backlash_pending = np.zeros(2, dtype=np.float64)
+
         self._az_deg = (float(cfg.initial_az_deg) + self.mount_tilt_az_deg) % 360.0
         self._alt_deg = float(np.clip(float(cfg.initial_alt_deg) + self.mount_tilt_alt_deg, 1.0, 89.0))
 
@@ -133,7 +163,10 @@ class SimulationState:
                 "Simulation: seeded demo mode "
                 f"seed={self.seed} mount_tilt=({self.mount_tilt_az_deg:+.3f},"
                 f"{self.mount_tilt_alt_deg:+.3f}) deg "
-                f"camera_roll_error={self.camera_roll_error_deg:+.3f} deg"
+                f"camera_roll_error={self.camera_roll_error_deg:+.3f} deg "
+                f"transmission_error=({self.transmission_amp_deg[0]:.3f},"
+                f"{self.transmission_amp_deg[1]:.3f}) deg "
+                f"backlash=({int(self.backlash_steps[0])},{int(self.backlash_steps[1])}) steps"
             ),
         )
 
@@ -168,6 +201,42 @@ class SimulationState:
             self.kin.microsteps_alt = int(common_ms)
             self._true_J_deg_per_step = self._build_true_J()
 
+    def _transmission_offset_deg(self, steps: np.ndarray) -> np.ndarray:
+        """Extra output angle from the cycloidal transmission error, per axis."""
+        out = np.zeros(2, dtype=np.float64)
+        for idx, axis in enumerate((Axis.AZ, Axis.ALT)):
+            period = float(self.kin.transmission_error_period_steps(axis))
+            if (not np.isfinite(period)) or period <= 0.0:
+                continue
+            phase = 2.0 * np.pi * float(steps[idx]) / period + float(self.transmission_phase_rad[idx])
+            out[idx] = float(self.transmission_amp_deg[idx]) * np.sin(phase)
+        return out
+
+    def _consume_backlash(self, d_steps: np.ndarray) -> np.ndarray:
+        """Return the steps that actually reach the sky after slack take-up.
+
+        On a direction reversal the mount first has to take up its mechanical
+        slack: the motor moves, the sky does not. Modelling this is what makes
+        a demo calibration face the same reversal error a real one does.
+        """
+        effective = np.zeros(2, dtype=np.float64)
+        for idx in range(2):
+            step = float(d_steps[idx])
+            if step == 0.0:
+                effective[idx] = 0.0
+                continue
+            direction = 1.0 if step > 0.0 else -1.0
+            if direction != float(self._last_direction[idx]):
+                # Reversal: a full slack width has to be consumed again.
+                self._backlash_pending[idx] = float(self.backlash_steps[idx])
+                self._last_direction[idx] = direction
+            pending = float(self._backlash_pending[idx])
+            magnitude = abs(step)
+            absorbed = min(pending, magnitude)
+            self._backlash_pending[idx] = pending - absorbed
+            effective[idx] = direction * (magnitude - absorbed)
+        return effective
+
     def apply_move(self, axis: Axis, direction: int, steps: int) -> Tuple[float, float]:
         steps_abs = abs(int(steps))
         if steps_abs <= 0:
@@ -180,8 +249,19 @@ class SimulationState:
             d_steps[1] = signed
 
         with self._lock:
-            d_altaz = self._true_J_deg_per_step @ d_steps
-            self._steps_true += d_steps
+            effective = self._consume_backlash(d_steps)
+            steps_before = self._steps_true.copy()
+            steps_after = steps_before + effective
+            # Linear term plus the *change* in periodic error between the two
+            # positions: over a whole lobe the periodic part cancels and the
+            # move measures the true mean scale, which is precisely why a
+            # full-cycle calibration move behaves so differently from a short one.
+            d_altaz = self._true_J_deg_per_step @ effective
+            d_altaz = d_altaz + (
+                self._transmission_offset_deg(steps_after)
+                - self._transmission_offset_deg(steps_before)
+            )
+            self._steps_true = steps_after
             self._az_deg = float((self._az_deg + float(d_altaz[0])) % 360.0)
             self._alt_deg = float(np.clip(self._alt_deg + float(d_altaz[1]), 1.0, 89.0))
             return float(self._az_deg), float(self._alt_deg)
@@ -200,6 +280,10 @@ class SimulationState:
                 "mount_tilt_az_deg": float(self.mount_tilt_az_deg),
                 "mount_tilt_alt_deg": float(self.mount_tilt_alt_deg),
                 "camera_roll_error_deg": float(self.camera_roll_error_deg),
+                "transmission_amp_az_deg": float(self.transmission_amp_deg[0]),
+                "transmission_amp_alt_deg": float(self.transmission_amp_deg[1]),
+                "backlash_steps_az": float(self.backlash_steps[0]),
+                "backlash_steps_alt": float(self.backlash_steps[1]),
             }
 
     def center_icrs(self, *, observer: ObserverConfig, obstime: Time) -> SkyCoord:
@@ -550,9 +634,29 @@ class SimulatedCameraStream:
         sim_cfg = self._cfg.simulation
         background = _finite_float(getattr(sim_cfg, "background_adu", 700.0), 700.0)
         noise = max(0.0, _finite_float(getattr(sim_cfg, "noise_adu", 18.0), 18.0))
-        img = self._rng.normal(background, noise, size=(h, w)).astype(np.float32)
+
+        # Skyglow scales with exposure and gain like any other photon source.
+        exp_scale = max(0.05, _finite_float(getattr(self._cfg.camera, "exp_ms", 100.0), 100.0) / 100.0)
+        gain_scale = max(0.2, _finite_float(getattr(self._cfg.camera, "gain", 360.0), 360.0) / 360.0)
+        sky_level = float(background * exp_scale * np.sqrt(gain_scale))
+
+        # Urban skyglow is not flat: it is brighter toward the horizon and
+        # toward the city. A flat background would hide how much the local
+        # background estimator in SEP actually does.
+        grad_frac = float(np.clip(_finite_float(getattr(sim_cfg, "sky_gradient_frac", 0.12), 0.12), 0.0, 1.0))
+        yy = np.linspace(-1.0, 1.0, h, dtype=np.float32)[:, None]
+        xx = np.linspace(-1.0, 1.0, w, dtype=np.float32)[None, :]
+        gradient = 1.0 + grad_frac * (0.7 * yy + 0.3 * xx)
+        img = (sky_level * gradient).astype(np.float32)
 
         stars_drawn = self._draw_catalog_stars(img, catalog, center_icrs, obstime)
+
+        # Photon noise, applied after the stars so bright sources carry their
+        # own shot noise. Under heavy skyglow this is what buries faint stars,
+        # and a purely Gaussian read-noise model makes them far too easy to find.
+        if bool(getattr(sim_cfg, "shot_noise_enabled", True)):
+            img = self._rng.poisson(np.clip(img, 0.0, None)).astype(np.float32)
+        img += self._rng.normal(0.0, noise, size=(h, w)).astype(np.float32)
         np.clip(img, 0.0, 65535.0, out=img)
 
         snap = self._state.snapshot()
@@ -638,13 +742,35 @@ class SimulatedCameraStream:
         finite = np.isfinite(mags)
         mags[~finite] = 15.0
 
+        sim_cfg = self._cfg.simulation
+
+        # Atmospheric extinction: a star low on the horizon is genuinely
+        # fainter. Without it the demo solves near the horizon as easily as at
+        # zenith, which is not what a real session faces.
+        k_ext = _finite_float(getattr(sim_cfg, "extinction_mag_per_airmass", 0.35), 0.35)
+        if k_ext > 0.0:
+            alt_now = float(self._state.snapshot_altaz()[1])
+            alt_clamped = float(np.clip(alt_now, 3.0, 90.0))
+            airmass = float(1.0 / max(0.05, np.sin(np.deg2rad(alt_clamped))))
+            mags = mags + k_ext * min(airmass, 8.0)
+
+        # No magnitude cutoff here: a faint star still gets its (tiny) patch
+        # added below. Whether it ends up visible is decided the same way a
+        # real sensor decides it, by comparison against sky background + read
+        # noise in _render_frame -- see star_flux_adu in config.py.
         order = np.argsort(mags)
-        max_stars = int(max(1, getattr(self._cfg.simulation, "max_render_stars", 240)))
+        max_stars = int(max(1, getattr(sim_cfg, "max_render_stars", 240)))
         order = order[:max_stars]
         px = px[order]
         mags = mags[order]
 
-        base_sigma = max(0.45, _finite_float(getattr(self._cfg.simulation, "star_sigma_px", 1.25), 1.25))
+        base_sigma = max(0.45, _finite_float(getattr(sim_cfg, "star_sigma_px", 1.25), 1.25))
+        # Seeing wanders frame to frame; that variation is exactly what makes
+        # lucky-imaging frame selection worthwhile.
+        jitter = float(np.clip(_finite_float(getattr(sim_cfg, "seeing_jitter_frac", 0.25), 0.25), 0.0, 0.9))
+        if jitter > 0.0:
+            base_sigma = float(base_sigma * (1.0 + self._rng.normal(0.0, jitter * 0.5)))
+            base_sigma = float(np.clip(base_sigma, 0.45, 12.0))
         base_flux = _finite_float(getattr(self._cfg.simulation, "star_flux_adu", 18000.0), 18000.0)
         exp_scale = max(0.05, _finite_float(getattr(self._cfg.camera, "exp_ms", 100.0), 100.0) / 100.0)
         gain_scale = max(0.2, _finite_float(getattr(self._cfg.camera, "gain", 360.0), 360.0) / 360.0)
@@ -661,7 +787,12 @@ class SimulatedCameraStream:
             core_sigma = float(np.clip(base_sigma * (0.82 + 0.62 * bright - 0.14 * faint), 0.42, 3.2))
             halo_sigma = float(np.clip(core_sigma * (2.2 + 2.4 * bright), core_sigma + 0.4, 14.0))
             halo_frac = float(0.018 + 0.11 * bright)
-            radius = int(max(2, min(26, np.ceil(3.3 * halo_sigma if bright > 0.05 else 3.2 * core_sigma))))
+            # Must reach out to where halo_sigma (clipped up to 14.0 above)
+            # has actually decayed, or the box gets truncated mid-halo: every
+            # pixel in it still sits near halo_amp, so after the percentile
+            # stretch the whole box clips to white as a flat square instead
+            # of a fading star. 3.3*14.0 rounds up to 47; 50 keeps margin.
+            radius = int(max(2, min(50, np.ceil(3.3 * halo_sigma if bright > 0.05 else 3.2 * core_sigma))))
 
             xi = int(round(float(x)))
             yi = int(round(float(y)))
@@ -669,7 +800,9 @@ class SimulatedCameraStream:
                 continue
 
             amp = float(base_flux * exp_scale * np.sqrt(gain_scale) * mag_scale)
-            amp = float(np.clip(amp, 90.0, 62000.0))
+            # No floor: a faint star's patch is allowed to sit at an amplitude
+            # the sky noise will bury. Only the saturation ceiling is real.
+            amp = float(np.clip(amp, 0.0, 62000.0))
 
             x0 = max(0, xi - radius)
             x1 = min(w, xi + radius + 1)

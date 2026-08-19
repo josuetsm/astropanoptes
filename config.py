@@ -337,19 +337,84 @@ class SimulationConfig:
     # mechanical offset around this position.
     initial_az_deg: float = 180.0
     initial_alt_deg: float = 45.0
-    random_mount_tilt_deg: float = 1.0
-    random_camera_roll_deg: float = 1.0
+    # Axis non-orthogonality. A real session measured ~1.6 deg on this mount,
+    # so the demo draws from a band that actually contains that value.
+    random_mount_tilt_deg: float = 2.0
+    # Camera roll. Measured around -3.5 deg in a real session; a +/-1 deg demo
+    # made the rotation prior look far easier than it is.
+    random_camera_roll_deg: float = 4.0
 
-    # Simulated camera frame. A smaller frame keeps the demo responsive while
-    # preserving the same plate scale convention used by platesolving.py.
-    frame_w: int = 1280
-    frame_h: int = 720
+    # Cycloidal transmission error: the dominant mechanical effect on this
+    # mount. 45 lobes per output revolution (period = steps_per_rev/45, i.e.
+    # 12800 microsteps = 8 deg of output at 1/64 microstepping). Its amplitude
+    # is drawn in degrees of output; the resulting swing in *locally measured*
+    # scale is amplitude*2*pi/period, about 20% at the top of this band, which
+    # is what made short calibration moves read 87% of nominal while a
+    # full-cycle move read 100.5%.
+    transmission_error_deg_min: float = 0.08
+    transmission_error_deg_max: float = 0.25
+
+    # Backlash consumed when an axis reverses, in microsteps. These pulses move
+    # the motor but not the sky, so a fit that ignores them mismodels every
+    # direction change.
+    backlash_steps_min: int = 5
+    backlash_steps_max: int = 40
+
+    # Simulated camera frame. Matches the real Mars-C sensor (roi_w/roi_h in
+    # CameraConfig) so the demo's field of view is the same as the physical
+    # camera's, not an arbitrarily smaller crop.
+    frame_w: int = 1944
+    frame_h: int = 1096
     fps: float = 8.0
     background_adu: float = 700.0
     noise_adu: float = 18.0
-    star_sigma_px: float = 1.25
-    star_flux_adu: float = 18000.0
+    # Seeing-limited PSF. A real Santiago session measured 5.3" FWHM, which at
+    # 0.66"/px is sigma ~3.4 px. The old 1.25 px default modelled a ~2" night
+    # that this site does not have, making plate solving look far easier than
+    # it is: stars were compact and well separated at any exposure.
+    star_sigma_px: float = 3.0
+    # Brightness of a G=12 star, in ADU, at the reference exposure/gain.
+    # Deliberately *not* a "visible stars" knob: there is no separate
+    # magnitude or star-count cutoff anywhere in the renderer. A star's peak
+    # amplitude is compared against the same sky-background + read noise every
+    # other part of this file already computes, exactly like a real sensor;
+    # whether it rises above that floor is what decides if it is seen, and it
+    # fades in continuously as exposure, gain or sky brightness change instead
+    # of blinking on/off at a threshold.
+    #   sigma_total   = sqrt(background_adu + noise_adu**2) = sqrt(700+18**2) = 32 ADU
+    #   thresh_sigma  = 3.0, same detection threshold SepConfig uses for real frames
+    #   target        = a G~12.2 star (after ~0.5 mag of extinction at 45 deg
+    #                   altitude) sits right at that 3-sigma edge -- picked so
+    #                   that, integrated over the real camera FOV above, the
+    #                   local Gaia density around the demo's default pointing
+    #                   yields ~3-4 stars per frame, matching what a real
+    #                   Santiago session sees (see README.md, "Confianza en
+    #                   cielos contaminados").
+    #   star_flux_adu = thresh_sigma * sigma_total / 10**(-0.4*(12.2-12)) = 96/0.832 = 115
+    star_flux_adu: float = 115.0
+    # Safety cap on how many catalog stars get a patch drawn per frame; not a
+    # visibility mechanism (see star_flux_adu above). Sized well above what
+    # the real FOV actually turns up so it never binds in practice.
     max_render_stars: int = 240
+
+    # --- Light-polluted sky (Santiago) ---
+    # Frame-to-frame seeing wander, as a fraction of star_sigma_px. Turbulence
+    # is what makes lucky-imaging selection worth doing at all.
+    seeing_jitter_frac: float = 0.25
+    # Sky brightness gradient across the frame, as a fraction of background.
+    # Urban skyglow is never flat, and a flat background hides how much a
+    # local-background estimator actually matters.
+    sky_gradient_frac: float = 0.12
+    # Photon (shot) noise on the sky background. Under heavy skyglow this
+    # dominates read noise and, together with star_flux_adu above, is what
+    # buries faint stars -- there is no separate magnitude cutoff.
+    shot_noise_enabled: bool = True
+    # Atmospheric extinction in magnitudes per airmass. Stars low on the
+    # horizon genuinely fade; without this the demo solves near the horizon as
+    # easily as at zenith. This lowers a star's effective brightness before
+    # the background/noise comparison above, so it is one more continuous
+    # contributor to "fading into the sky", not a cutoff of its own.
+    extinction_mag_per_airmass: float = 0.35
 
     # Gaia catalog reuse. Missing cache tiles are not downloaded by the camera
     # simulator; the real plate solver can still download them if configured.

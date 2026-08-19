@@ -192,6 +192,7 @@ def test_demo_star_magnitude_changes_apparent_size() -> None:
     cfg.simulation.frame_w = 220
     cfg.simulation.frame_h = 140
     cfg.simulation.star_sigma_px = 1.25
+    cfg.simulation.extinction_mag_per_airmass = 0.0
     state = SimulationState(cfg=cfg.simulation, kin=MountKinematics(), out_log=None)
     stream = SimulatedCameraStream(state=state, cfg=cfg, observer=ObserverConfig(), out_log=None)
     center = SkyCoord(ra=10.0 * u.deg, dec=-20.0 * u.deg, frame="icrs")
@@ -229,6 +230,7 @@ def test_canopus_is_supplemented_and_rendered_at_field_center() -> None:
     cfg.simulation.seed = 104
     cfg.simulation.random_mount_tilt_deg = 0.0
     cfg.simulation.random_camera_roll_deg = 0.0
+    cfg.simulation.extinction_mag_per_airmass = 0.0
     state = SimulationState(cfg=cfg.simulation, kin=MountKinematics(), out_log=None)
     stream = SimulatedCameraStream(state=state, cfg=cfg, observer=ObserverConfig(), out_log=None)
     canopus = SkyCoord(ra=95.987877 * u.deg, dec=-52.695661 * u.deg, frame="icrs")
