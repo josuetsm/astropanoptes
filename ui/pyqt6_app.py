@@ -25,7 +25,6 @@ from PyQt6.QtWidgets import (
     QSpinBox,
     QSplitter,
     QTabWidget,
-    QTextEdit,
     QToolBar,
     QToolButton,
     QVBoxLayout,
@@ -42,6 +41,13 @@ from app_runner import AppRunner
 from config import AppConfig
 from control_server import DEFAULT_SOCKET_PATH, ControlServer, ControlServerError
 from logging_utils import set_global_log_sink
+from ui.console_panel import ConsolePanel
+from ui.settings_store import (
+    DEFAULT_SETTINGS_PATH,
+    load_settings,
+    save_settings,
+    section,
+)
 from ui.tabs_mixin import ModulesTabsMixin, STACKING_DRIZZLE_SCALES, _set_option_tooltip
 
 
@@ -271,6 +277,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         *,
         enable_control_server: bool = False,
         control_socket_path: Path | str = DEFAULT_SOCKET_PATH,
+        settings_path: Path | str = DEFAULT_SETTINGS_PATH,
     ) -> None:
         super().__init__()
         self.runner = runner
@@ -279,11 +286,10 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._camera_connection_pending: Optional[bool] = None
         self._mount_connection_pending: Optional[bool] = None
         self._control_server: Optional[ControlServer] = None
+        self._settings_path = Path(settings_path)
 
         self.setWindowTitle("AstroPanoptes")
         self.resize(1280, 760)
-
-        self.od_enabled = False
 
         self.overlay_toggles = OverlayToggles(
             show_detections=True,
@@ -301,6 +307,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._build_top_toolbar()
         self._build_docks()
         self._build_menu()
+        self._restore_settings()
 
         self._tick = QTimer(self)
         self._tick.setInterval(100)
@@ -312,7 +319,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._frame_timer.timeout.connect(self._render_frame)
         self._frame_timer.start()
 
-        self._log("PyQt6 UI ready.")
+        self._log("PyQt6 UI ready. Consola activa: escriba 'help' para ver los comandos.")
 
         if enable_control_server:
             self._start_control_server(control_socket_path)
@@ -328,6 +335,8 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._log(f"Control CLI activo: python app.py attach --socket {server.socket_path}")
 
     def closeEvent(self, event) -> None:  # noqa: N802
+        self._save_settings()
+        self.console.shutdown()
         set_global_log_sink(None)
         if self._control_server is not None:
             self._control_server.stop()
@@ -368,24 +377,24 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         _set_option_tooltip(self.live_view, "Imagen live de la cámara. Los overlays se dibujan sobre esta vista.")
         _set_option_tooltip(self.stacked_view, "Imagen resultante del apilado en vivo.")
 
-        self.log = QTextEdit()
-        self.log.setReadOnly(True)
-        self.log.document().setMaximumBlockCount(3000)
-        _set_option_tooltip(self.log, "Registro de eventos, errores y acciones ejecutadas por la aplicación.")
+        self.console = ConsolePanel(self.runner)
+        # `log` se conserva como alias del registro: el resto de la ventana y
+        # los tests lo usan para leer el historial de la sesión.
+        self.log = self.console.view
 
         self._render_cache: dict[str, dict[str, object]] = {
             "live": {"data": None, "pixmap": None, "size": QSize()},
             "stack": {"data": None, "pixmap": None, "size": QSize()},
         }
 
-        self.logs_frame = QGroupBox("Logs")
-        logs_layout = QVBoxLayout(self.logs_frame)
-        logs_layout.setContentsMargins(10, 10, 10, 10)
-        logs_layout.addWidget(self.log)
+        self.console_frame = QGroupBox("Consola")
+        console_layout = QVBoxLayout(self.console_frame)
+        console_layout.setContentsMargins(10, 10, 10, 10)
+        console_layout.addWidget(self.console)
 
         self.central_split = QSplitter(Qt.Orientation.Vertical)
         self.central_split.addWidget(self.view_tabs)
-        self.central_split.addWidget(self.logs_frame)
+        self.central_split.addWidget(self.console_frame)
         self.central_split.setCollapsible(0, False)
         self.central_split.setCollapsible(1, True)
         self.central_split.setSizes([800, 240])
@@ -430,7 +439,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.ch_sync = Chip("Sync")
         self.ch_tracking = Chip("Tracking")
         self.ch_stacking = Chip("Stacking")
-        self.ch_od = Chip("Object Detection")
         self.ch_ps = Chip("Plate Solving")
         self.ch_goto = Chip("GoTo")
         _set_option_tooltip(self.ch_cam, "Estado de conexión de la cámara.")
@@ -438,7 +446,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         _set_option_tooltip(self.ch_sync, "Indica si el modelo GoTo está sincronizado con el cielo.")
         _set_option_tooltip(self.ch_tracking, "Indica si tracking está activo.")
         _set_option_tooltip(self.ch_stacking, "Indica si stacking está activo.")
-        _set_option_tooltip(self.ch_od, "Indica si el overlay de detección de objetos está activo.")
         _set_option_tooltip(self.ch_ps, "Indica si plate solving está ejecutándose.")
         _set_option_tooltip(self.ch_goto, "Indica si una operación GoTo está en curso.")
 
@@ -501,7 +508,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             self.ch_sync,
             self.ch_tracking,
             self.ch_stacking,
-            self.ch_od,
             self.ch_ps,
             self.ch_goto,
         ]:
@@ -581,11 +587,11 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         act_top.setToolTip("Muestra u oculta la barra superior de conexiones y estado.")
         menu_view.addAction(act_top)
 
-        self.act_logs = QAction("Logs", self, checkable=True)
-        self.act_logs.setChecked(True)
-        self.act_logs.setToolTip("Muestra u oculta el panel de logs.")
-        self.act_logs.toggled.connect(self.logs_frame.setVisible)
-        menu_view.addAction(self.act_logs)
+        self.act_console = QAction("Consola", self, checkable=True)
+        self.act_console.setChecked(True)
+        self.act_console.setToolTip("Muestra u oculta la consola (registro y entrada de comandos).")
+        self.act_console.toggled.connect(self.console_frame.setVisible)
+        menu_view.addAction(self.act_console)
 
     def _build_manual_mount_panel(self) -> QWidget:
         card = QFrame()
@@ -766,27 +772,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             self.btn_mount_connection.setText("Connecting mount…")
             self._connect_mount()
 
-    def _download_gaia_current_field(self) -> None:
-        self.runner.request_platesolving_download_current_field()
-        self._log("[gaia] Download current field")
-
-    def _od_start(self) -> None:
-        self.od_enabled = True
-        self.runner.request_live_sep_params(
-            enabled=True,
-            sep_minarea=int(self.sb_od_minarea.value()),
-            sep_thresh_sigma=float(self.ds_od_sigma.value()),
-            max_det=int(self.sb_od_maxdet.value()),
-            sep_bw=int(self.sb_od_bw.value()),
-            sep_bh=int(self.sb_od_bh.value()),
-        )
-        self._log("[od] Start")
-
-    def _od_stop(self) -> None:
-        self.od_enabled = False
-        self.runner.request_live_sep_params(enabled=False)
-        self._log("[od] Stop")
-
     def _tracking_start(self) -> None:
         self.runner.request_tracking_start()
         self._log("[tracking] Start")
@@ -808,12 +793,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             "sidereal_ff_cond_max": float(self.ds_tr_ff_cond.value()),
             "sidereal_ff_hold_s": float(self.ds_tr_ff_hold.value()),
             "sidereal_ff_slew_per_s": float(self.ds_tr_ff_slew.value()),
-            "sep_minarea": int(self.sb_tr_sep_minarea.value()),
-            "sep_thresh_sigma": float(self.ds_tr_sep_sigma.value()),
-            "sep_max_sources": int(self.sb_tr_sep_max_sources.value()),
-            "sep_min_sources": int(self.sb_tr_sep_min_sources.value()),
-            "sep_bw": int(self.sb_tr_sep_bw.value()),
-            "sep_bh": int(self.sb_tr_sep_bh.value()),
         }
         self.runner.request_tracking_params(**params)
         self.cfg.tracking.resp_min = float(params["resp_min"])
@@ -826,7 +805,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._log(
             "[tracking] Apply "
             f"resp_min={params['resp_min']:.3f} ff={int(params['sidereal_ff_enabled'])} "
-            f"gain={params['sidereal_ff_gain']:.3f} sep_sigma={params['sep_thresh_sigma']:.2f}"
+            f"gain={params['sidereal_ff_gain']:.3f}"
         )
 
     def _stacking_start(self) -> None:
@@ -907,42 +886,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             f"mode={color_mode} drizzle=x{int(drizzle_scale)} batch={params['batch_size']} "
             f"median={align_median_k} smooth={params['smooth_k']} max_shift={params['max_shift_px']}"
         )
-
-    def _platesolve_start(self) -> None:
-        if not hasattr(self, "ed_ps_target"):
-            self._log("[plate solving] tab removed; use GoTo panel controls")
-            return
-        target = self.ed_ps_target.text().strip()
-        if not target:
-            self._log("[plate solving] target empty; ignored")
-            return
-        self.runner.request_platesolving_params(
-            search_radius_deg=float(self.ds_ps_radius.value()),
-            search_radius_factor=float(self.ds_ps_radius_factor.value()),
-            max_det=int(self.sb_ps_maxdet.value()),
-            N_det=int(self.sb_ps_ndet.value()),
-            N_seed=int(self.sb_ps_nseeds.value()),
-            min_inliers=int(self.sb_ps_mininl.value()),
-            det_thresh_sigma=float(self.ds_ps_det_sigma.value()),
-            det_minarea=int(self.sb_ps_minarea.value()),
-            point_sigma=float(self.ds_ps_point_sigma.value()),
-            gmax=float(self.ds_ps_gmax.value()),
-            match_max_px=float(self.ds_ps_match_max.value()),
-            match_tol_arcsec=float(self.ds_ps_match_tol.value()),
-            pred_margin_arcsec=float(self.ds_ps_pred_margin.value()),
-            theta_step_deg=float(self.ds_ps_theta_step.value()),
-            theta_refine_span_deg=float(self.ds_ps_theta_refine_span.value()),
-            theta_refine_step_deg=float(self.ds_ps_theta_refine_step.value()),
-            triplet_tol_arcsec=float(self.ds_ps_triplet_tol.value()),
-            triplet_sigma_arcsec=float(self.ds_ps_triplet_sigma.value()),
-            triplet_max_trials=int(self.sb_ps_triplet_trials.value()),
-            max_i_scan=int(self.sb_ps_max_i_scan.value()),
-            guide_n=int(self.sb_ps_guide_n.value()),
-            simbad_radius_arcsec=float(self.ds_ps_simbad.value()),
-            rotation_prior_roll_offset_deg=float(self.runner.get_state().camera.roll_deg),
-        )
-        self.runner.request_platesolving_run(target=target)
-        self._log(f"[plate solving] Solve target={target}")
 
     def _goto_start(self) -> None:
         target = self._build_goto_target()
@@ -1277,7 +1220,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._update_chips_from_state(state)
         self._update_ps_outputs(state)
         self._update_error_banner(state)
-        self._gaia_maybe_refresh(state)
 
     def _render_frame(self) -> None:
         if self.view_tabs.currentIndex() == 0:
@@ -1353,7 +1295,6 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.ch_sync.set_mode("green" if state.goto.synced else "red")
         self.ch_tracking.set_mode("active" if state.tracking.enabled else "neutral")
         self.ch_stacking.set_mode("active" if state.stacking.enabled else "neutral")
-        self.ch_od.set_mode("active" if self.od_enabled else "neutral")
         self.ch_ps.set_mode("active" if state.platesolving.busy else "neutral")
         self.ch_goto.set_mode("active" if state.goto.busy else "neutral")
 
@@ -1466,8 +1407,110 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             return f"{ra} {dec}"
         return {"az_deg": float(self.ds_az.value()), "alt_deg": float(self.ds_alt.value())}
 
+    def _collect_settings(self) -> dict:
+        """Ajustes que vale la pena repetir noche a noche.
+
+        Cámara, tracking y stacking se leen de `runner.cfg`, que es la config
+        viva; `self.cfg` es una copia que AppRunner hace al construirse. Sitio,
+        focal base y barlow solo existen en la UI (la config guarda la focal
+        efectiva), así que esos salen de los widgets.
+        """
+        cfg = self.runner.cfg
+        return {
+            "observer": {
+                "site": self.dd_obs_site.currentText(),
+                "focal_mm": float(self.ds_obs_focal_mm.value()),
+                "pixel_um": float(self.ds_obs_pixel_um.value()),
+                "barlow": int(self._observer_barlow_factor()),
+            },
+            "camera": {
+                "exp_ms": float(cfg.camera.exp_ms),
+                "gain": int(cfg.camera.gain),
+                "offset": int(cfg.camera.offset),
+                "gamma": float(getattr(cfg.camera, "gamma", 1.0)),
+            },
+            "tracking": {
+                "resp_min": float(cfg.tracking.resp_min),
+                "sidereal_ff_enabled": bool(
+                    getattr(cfg.tracking, "sidereal_ff_enabled", True)
+                ),
+            },
+            "stacking": {
+                "color_mode": str(cfg.stacking.color_mode),
+                "bayer_pattern": str(getattr(cfg.stacking, "bayer_pattern", "RGGB")),
+                "drizzle_scale": float(getattr(cfg.stacking, "drizzle_scale", 1.0)),
+            },
+        }
+
+    def _save_settings(self) -> None:
+        try:
+            data = self._collect_settings()
+        except Exception:  # pragma: no cover - nunca debe impedir cerrar
+            return
+        save_settings(data, self._settings_path)
+
+    def _restore_settings(self) -> None:
+        """Repone los ajustes guardados en los widgets y en la sesión."""
+        data = load_settings(self._settings_path)
+        if not data:
+            return
+
+        observer = section(data, "observer")
+        site = observer.get("site")
+        if isinstance(site, str):
+            index = self.dd_obs_site.findText(site)
+            if index >= 0:
+                self.dd_obs_site.setCurrentIndex(index)
+        if isinstance(observer.get("focal_mm"), (int, float)):
+            self.ds_obs_focal_mm.setValue(float(observer["focal_mm"]))
+        if isinstance(observer.get("pixel_um"), (int, float)):
+            self.ds_obs_pixel_um.setValue(float(observer["pixel_um"]))
+        if isinstance(observer.get("barlow"), int):
+            index = self.dd_obs_barlow.findData(int(observer["barlow"]))
+            if index >= 0:
+                self.dd_obs_barlow.setCurrentIndex(index)
+
+        camera = section(data, "camera")
+        if isinstance(camera.get("exp_ms"), (int, float)):
+            self.ds_exp_ms.setValue(float(camera["exp_ms"]))
+        if isinstance(camera.get("gain"), int):
+            self.sb_gain.setValue(int(camera["gain"]))
+        if isinstance(camera.get("offset"), int):
+            self.sb_offset.setValue(int(camera["offset"]))
+        if isinstance(camera.get("gamma"), (int, float)):
+            self.ds_gamma.setValue(float(camera["gamma"]))
+
+        tracking = section(data, "tracking")
+        if isinstance(tracking.get("resp_min"), (int, float)):
+            self.ds_tr_resp_min.setValue(float(tracking["resp_min"]))
+        if isinstance(tracking.get("sidereal_ff_enabled"), bool):
+            self.cb_tr_ff.setChecked(bool(tracking["sidereal_ff_enabled"]))
+
+        stacking = section(data, "stacking")
+        color_mode = stacking.get("color_mode")
+        if isinstance(color_mode, str):
+            self.cb_st_color.setChecked(color_mode.lower() == "rgb")
+        bayer = stacking.get("bayer_pattern")
+        if isinstance(bayer, str):
+            index = self.dd_st_bayer.findText(bayer.upper())
+            if index >= 0:
+                self.dd_st_bayer.setCurrentIndex(index)
+        drizzle = stacking.get("drizzle_scale")
+        if isinstance(drizzle, (int, float)):
+            index = self.dd_st_drizzle.findData(float(drizzle))
+            if index >= 0:
+                self.dd_st_drizzle.setCurrentIndex(index)
+
+        # Los widgets ya reflejan lo guardado; ahora se empuja a la sesión, para
+        # que el runner arranque con lo mismo que muestra la ventana.
+        self._observer_apply()
+        self._camera_apply()
+        self._tracking_apply()
+        self._stacking_apply()
+        self._log(f"[settings] restaurados desde {self._settings_path}")
+
     def _log(self, msg: str) -> None:
-        self.log.append(msg)
+        self.console.append_log(msg)
 
 
 @dataclass

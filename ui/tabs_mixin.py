@@ -1,14 +1,8 @@
 from __future__ import annotations
 
-import datetime as _dt
-import math
-import time
 from typing import TYPE_CHECKING
 
-import numpy as np
-
-from PyQt6.QtCore import QPointF, QRectF, Qt
-from PyQt6.QtGui import QColor, QPainter, QPen
+from PyQt6.QtCore import Qt
 from PyQt6.QtWidgets import (
     QCheckBox,
     QComboBox,
@@ -63,334 +57,6 @@ def _option_label(text: str, tooltip: str) -> QLabel:
 def _add_option_row(form: QFormLayout, label: str, widget: QWidget, tooltip: str) -> None:
     _set_option_tooltip(widget, tooltip)
     form.addRow(_option_label(label, tooltip), widget)
-
-
-class GaiaCoverageMap(QWidget):
-    def __init__(self) -> None:
-        super().__init__()
-        self._coverage: dict[str, object] = {}
-        self.setMinimumHeight(260)
-        self.setToolTip("Mapa horizontal local: azimut 0°=N, 90°=E; altitud respecto del horizonte")
-
-    def set_coverage(self, coverage: dict[str, object]) -> None:
-        self._coverage = dict(coverage)
-        self.update()
-
-    @staticmethod
-    def _map_point(plot: QRectF, az_deg: float, alt_deg: float) -> QPointF:
-        x = plot.left() + ((float(az_deg) % 360.0) / 360.0) * plot.width()
-        y = plot.top() + ((90.0 - float(alt_deg)) / 180.0) * plot.height()
-        return QPointF(x, y)
-
-    def paintEvent(self, event) -> None:  # noqa: N802
-        del event
-        painter = QPainter(self)
-        painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-        painter.fillRect(self.rect(), QColor("#101317"))
-
-        plot = QRectF(self.rect()).adjusted(42.0, 20.0, -18.0, -32.0)
-        if plot.width() <= 0.0 or plot.height() <= 0.0:
-            painter.end()
-            return
-
-        horizon_y = plot.top() + plot.height() * 0.5
-        painter.fillRect(
-            QRectF(plot.left(), horizon_y, plot.width(), plot.bottom() - horizon_y),
-            QColor("#17191d"),
-        )
-
-        painter.setPen(QPen(QColor("#303944"), 1))
-        painter.drawRect(plot)
-        for az in (0.0, 90.0, 180.0, 270.0, 360.0):
-            x = plot.left() + (az / 360.0) * plot.width()
-            painter.drawLine(QPointF(x, plot.top()), QPointF(x, plot.bottom()))
-        for alt in (-60.0, -30.0, 0.0, 30.0, 60.0):
-            y = plot.top() + ((90.0 - alt) / 180.0) * plot.height()
-            painter.drawLine(QPointF(plot.left(), y), QPointF(plot.right(), y))
-
-        painter.setPen(QPen(QColor("#8f9aa6"), 2))
-        painter.drawLine(QPointF(plot.left(), horizon_y), QPointF(plot.right(), horizon_y))
-
-        painter.setPen(QColor("#89939e"))
-        for az, label in (
-            (0.0, "N 0°"),
-            (90.0, "E 90°"),
-            (180.0, "S 180°"),
-            (270.0, "W 270°"),
-            (360.0, "N 360°"),
-        ):
-            x = plot.left() + (az / 360.0) * plot.width()
-            painter.drawText(QPointF(x - 18.0, plot.bottom() + 18.0), label)
-        for alt in (-60.0, 0.0, 60.0):
-            y = plot.top() + ((90.0 - alt) / 180.0) * plot.height()
-            painter.drawText(QPointF(4.0, y + 4.0), f"{alt:+.0f}°")
-
-        az_values = np.asarray(self._coverage.get("tile_az_deg", []), dtype=np.float64)
-        alt_values = np.asarray(self._coverage.get("tile_alt_deg", []), dtype=np.float64)
-        cached = {int(pix) for pix in self._coverage.get("cached_tiles", [])}
-        required = {int(pix) for pix in self._coverage.get("field_required_tiles", [])}
-
-        painter.setPen(Qt.PenStyle.NoPen)
-        painter.setBrush(QColor("#26303a"))
-        for az, alt in zip(az_values, alt_values):
-            point = self._map_point(plot, float(az), float(alt))
-            painter.drawEllipse(point, 0.8, 0.8)
-
-        tile_radius = max(1.6, min(4.0, plot.width() / 360.0 * 1.7))
-        for pix in cached:
-            if pix < 0 or pix >= len(az_values):
-                continue
-            color = QColor("#2aa876") if alt_values[pix] >= 0.0 else QColor("#245b48")
-            painter.setBrush(color)
-            point = self._map_point(plot, az_values[pix], alt_values[pix])
-            painter.drawEllipse(point, tile_radius, tile_radius)
-
-        for pix in required:
-            if pix < 0 or pix >= len(az_values):
-                continue
-            color = QColor("#73e2a7") if pix in cached else QColor("#ff6b6b")
-            painter.setPen(QPen(color, 2))
-            painter.setBrush(Qt.BrushStyle.NoBrush)
-            point = self._map_point(plot, az_values[pix], alt_values[pix])
-            painter.drawEllipse(point, tile_radius + 3.0, tile_radius + 3.0)
-
-        center_az = self._coverage.get("center_az_deg")
-        center_alt = self._coverage.get("center_alt_deg")
-        radius_deg = self._coverage.get("field_radius_deg")
-        if center_az is not None and center_alt is not None:
-            point = self._map_point(plot, float(center_az), float(center_alt))
-            painter.setPen(QPen(QColor("#ffd166"), 2))
-            painter.drawLine(QPointF(point.x() - 6.0, point.y()), QPointF(point.x() + 6.0, point.y()))
-            painter.drawLine(QPointF(point.x(), point.y() - 6.0), QPointF(point.x(), point.y() + 6.0))
-
-            if radius_deg is not None and float(radius_deg) > 0.0:
-                cos_alt = max(0.15, abs(math.cos(math.radians(float(center_alt)))))
-                rx = float(radius_deg) / cos_alt / 360.0 * plot.width()
-                ry = float(radius_deg) / 180.0 * plot.height()
-                painter.setPen(QPen(QColor("#ffd166"), 1, Qt.PenStyle.DashLine))
-                painter.drawEllipse(point, rx, ry)
-
-        painter.end()
-
-
-class GaiaTabMixin:
-    def _tab_gaia(self: "AstroPanoptesWindow") -> QWidget:
-        self.gaia_tab = QWidget()
-        layout = QVBoxLayout(self.gaia_tab)
-        layout.setSpacing(10)
-
-        summary = QGroupBox("Cobertura Gaia local")
-        form = QFormLayout(summary)
-
-        self.lbl_gaia_field_status = QLabel("Campo actual: sin posición")
-        self.lbl_gaia_field_status.setStyleSheet(
-            "QLabel { padding:6px 10px; border-radius:8px; "
-            "background:#24282d; border:1px solid #444b53; color:#e5e7eb; font-weight:600; }"
-        )
-        self.lbl_gaia_tiles = QLabel("--")
-        self.lbl_gaia_area = QLabel("--")
-        self.lbl_gaia_disk = QLabel("--")
-        self.lbl_gaia_field = QLabel("--")
-        self.lbl_gaia_center = QLabel("--")
-        self.lbl_gaia_projection = QLabel("--")
-        self.lbl_gaia_config = QLabel("--")
-        self.lbl_gaia_cache_dir = QLabel("--")
-        self.lbl_gaia_cache_dir.setWordWrap(True)
-
-        self.btn_gaia_refresh = QPushButton("Actualizar cobertura")
-        self.btn_gaia_download = QPushButton("Descargar campo actual")
-        self.btn_gaia_refresh.clicked.connect(lambda: self._refresh_gaia_coverage(force=True))
-        self.btn_gaia_download.clicked.connect(self._gaia_download_current_field)
-
-        actions = QHBoxLayout()
-        actions.addWidget(self.btn_gaia_refresh)
-        actions.addWidget(self.btn_gaia_download)
-        actions.addStretch(1)
-
-        form.addRow(self.lbl_gaia_field_status)
-        form.addRow("Teselas en caché:", self.lbl_gaia_tiles)
-        form.addRow("Área del cielo:", self.lbl_gaia_area)
-        form.addRow("Tamaño en disco:", self.lbl_gaia_disk)
-        form.addRow("Campo actual:", self.lbl_gaia_field)
-        form.addRow("Az/Alt / radio:", self.lbl_gaia_center)
-        form.addRow("Proyección local:", self.lbl_gaia_projection)
-        form.addRow("Configuración:", self.lbl_gaia_config)
-        form.addRow("Directorio:", self.lbl_gaia_cache_dir)
-        form.addRow(actions)
-
-        self.gaia_coverage_map = GaiaCoverageMap()
-        legend = QLabel(
-            "<span style='color:#2aa876'>●</span> tesela cacheada &nbsp;&nbsp; "
-            "<span style='color:#73e2a7'>○</span> requerida y disponible &nbsp;&nbsp; "
-            "<span style='color:#ff6b6b'>○</span> requerida y faltante &nbsp;&nbsp; "
-            "<span style='color:#ffd166'>＋</span> campo actual"
-        )
-        legend.setTextFormat(Qt.TextFormat.RichText)
-
-        layout.addWidget(summary)
-        layout.addWidget(self.gaia_coverage_map, stretch=1)
-        layout.addWidget(legend)
-        self._gaia_last_refresh_t = 0.0
-        self._gaia_last_download_status = None
-        self._gaia_coverage_version = -1
-        return self.gaia_tab
-
-    @staticmethod
-    def _gaia_format_bytes(value: object) -> str:
-        size = float(value or 0.0)
-        units = ("B", "KiB", "MiB", "GiB", "TiB")
-        unit = units[0]
-        for unit in units:
-            if size < 1024.0 or unit == units[-1]:
-                break
-            size /= 1024.0
-        return f"{size:.1f} {unit}"
-
-    def _gaia_download_current_field(self: "AstroPanoptesWindow") -> None:
-        self._download_gaia_current_field()
-        self.lbl_gaia_field_status.setText("Campo actual: descarga solicitada")
-
-    def _gaia_tab_selected(self: "AstroPanoptesWindow", index: int) -> None:
-        is_gaia = self.modules_tabs.widget(index) is self.gaia_tab
-        dock_manual = getattr(self, "dock_manual", None)
-        if dock_manual is not None:
-            if is_gaia:
-                manual_visible = not bool(dock_manual.isHidden())
-                self._manual_visible_before_gaia = manual_visible
-                self._manual_hidden_for_gaia = manual_visible
-                if manual_visible:
-                    dock_manual.setVisible(False)
-            elif bool(getattr(self, "_manual_hidden_for_gaia", False)):
-                dock_manual.setVisible(
-                    bool(getattr(self, "_manual_visible_before_gaia", True))
-                )
-                self._manual_hidden_for_gaia = False
-
-        if is_gaia:
-            self._refresh_gaia_coverage(force=True)
-
-    def _gaia_maybe_refresh(self: "AstroPanoptesWindow", state) -> None:
-        if not hasattr(self, "gaia_tab") or self.modules_tabs.currentWidget() is not self.gaia_tab:
-            return
-        debug = state.platesolving.debug_info or {}
-        download_status = debug.get("status") if isinstance(debug, dict) else None
-        force = (
-            download_status != self._gaia_last_download_status
-            and download_status in {"GAIA_DOWNLOAD_OK", "GAIA_DOWNLOAD_FAILED"}
-        )
-        self._gaia_last_download_status = download_status
-        self.btn_gaia_download.setEnabled(not bool(state.platesolving.busy))
-        self._refresh_gaia_coverage(force=force)
-
-    def _refresh_gaia_coverage(self: "AstroPanoptesWindow", *, force: bool = False) -> None:
-        now = time.monotonic()
-        if force or (now - self._gaia_last_refresh_t) >= 5.0:
-            self._gaia_last_refresh_t = now
-            self.runner.request_gaia_coverage_refresh()
-
-        snapshot = self.runner.get_gaia_coverage_snapshot()
-        coverage = snapshot.get("coverage")
-        if coverage is None:
-            error = snapshot.get("error")
-            if error:
-                self.lbl_gaia_field_status.setText(
-                    f"No se pudo inspeccionar el caché: {error}"
-                )
-            else:
-                self.lbl_gaia_field_status.setText("Calculando cobertura…")
-            if not error:
-                return
-            self.lbl_gaia_field_status.setStyleSheet(
-                "QLabel { padding:6px 10px; border-radius:8px; "
-                "background:#3a1515; border:1px solid #7a2a2a; color:#ffecec; font-weight:600; }"
-            )
-            self._log(f"[gaia] coverage inspection failed: {error}")
-            return
-
-        version = int(snapshot.get("version", 0))
-        if version == int(self._gaia_coverage_version):
-            return
-        self._gaia_coverage_version = version
-
-        cached_count = int(coverage.get("cached_tile_count", 0))
-        total_tiles = int(coverage.get("total_tiles", 0))
-        fraction = float(coverage.get("coverage_fraction", 0.0))
-        area = float(coverage.get("covered_area_sq_deg", 0.0))
-        required = list(coverage.get("field_required_tiles", []))
-        field_cached = list(coverage.get("field_cached_tiles", []))
-        field_missing = list(coverage.get("field_missing_tiles", []))
-
-        tiles_text = f"{cached_count:,} / {total_tiles:,} ({fraction * 100.0:.2f}%)"
-        if bool(coverage.get("bright_catalog_enabled", False)):
-            tiles_text += (
-                f" · Gaia {int(coverage.get('gaia_cached_tile_count', 0)):,}"
-                f" · Hip/Tycho {int(coverage.get('bright_cached_tile_count', 0)):,}"
-            )
-        self.lbl_gaia_tiles.setText(tiles_text)
-        self.lbl_gaia_area.setText(f"{area:,.1f} deg²")
-        disk_text = self._gaia_format_bytes(coverage.get("cached_bytes", 0))
-        newest = coverage.get("newest_mtime")
-        if newest is not None:
-            updated = _dt.datetime.fromtimestamp(float(newest)).strftime("%Y-%m-%d %H:%M")
-            disk_text += f" · última tesela {updated}"
-        self.lbl_gaia_disk.setText(disk_text)
-
-        if required:
-            field_fraction = len(field_cached) / len(required)
-            self.lbl_gaia_field.setText(
-                f"{len(field_cached)} / {len(required)} teselas ({field_fraction * 100.0:.0f}%)"
-                + (f" · faltan {len(field_missing)}" if field_missing else "")
-            )
-            if field_missing:
-                self.lbl_gaia_field_status.setText("Campo actual: cobertura incompleta")
-                status_style = (
-                    "background:#3a1515; border:1px solid #7a2a2a; color:#ffecec;"
-                )
-            else:
-                self.lbl_gaia_field_status.setText("Campo actual: cubierto")
-                status_style = (
-                    "background:#16321a; border:1px solid #2f6b38; color:#e8ffe8;"
-                )
-        else:
-            self.lbl_gaia_field.setText("Sin posición actual")
-            self.lbl_gaia_field_status.setText("Campo actual: sin posición")
-            status_style = "background:#24282d; border:1px solid #444b53; color:#e5e7eb;"
-        self.lbl_gaia_field_status.setStyleSheet(
-            f"QLabel {{ padding:6px 10px; border-radius:8px; {status_style} font-weight:600; }}"
-        )
-
-        center_az = coverage.get("center_az_deg")
-        center_alt = coverage.get("center_alt_deg")
-        radius_deg = coverage.get("field_radius_deg")
-        source = coverage.get("field_source")
-        if center_az is None or center_alt is None or radius_deg is None:
-            self.lbl_gaia_center.setText("--")
-        else:
-            source_text = f" · {source}" if source else ""
-            self.lbl_gaia_center.setText(
-                f"Az {float(center_az):.2f}° · Alt {float(center_alt):+.2f}° · "
-                f"r={float(radius_deg):.3f}°{source_text}"
-            )
-
-        projection_time = str(coverage.get("projection_time_utc", "--")).replace("T", " ")
-        self.lbl_gaia_projection.setText(
-            f"{projection_time} UTC · "
-            f"{float(coverage.get('observer_lat_deg', 0.0)):+.4f}°, "
-            f"{float(coverage.get('observer_lon_deg', 0.0)):+.4f}°"
-        )
-        catalog_text = (
-            f"{coverage.get('table_name', '--')} · G≤{float(coverage.get('gmax', 0.0)):.1f}"
-        )
-        if bool(coverage.get("bright_catalog_enabled", False)):
-            catalog_text += (
-                f" + Hipparcos/Tycho-2 V≤{float(coverage.get('gmax', 0.0)):.1f}"
-            )
-        self.lbl_gaia_config.setText(
-            f"{catalog_text} · NSIDE {int(coverage.get('nside', 0))} · "
-            f"{coverage.get('order', '--')}"
-        )
-        self.lbl_gaia_cache_dir.setText(str(coverage.get("cache_dir", "--")))
-        self.gaia_coverage_map.set_coverage(coverage)
 
 
 class ObserverTabMixin:
@@ -980,32 +646,6 @@ class TrackingTabMixin:
         self.ds_tr_ff_slew.setSuffix(" steps/s²")
         self.ds_tr_ff_slew.setValue(float(getattr(self.cfg.tracking, "sidereal_ff_slew_per_s", 120.0)))
 
-        self.sb_tr_sep_minarea = QSpinBox()
-        self.sb_tr_sep_minarea.setRange(1, 500)
-        self.sb_tr_sep_minarea.setValue(int(self.cfg.sep.minarea))
-
-        self.ds_tr_sep_sigma = QDoubleSpinBox()
-        self.ds_tr_sep_sigma.setRange(0.1, 20.0)
-        self.ds_tr_sep_sigma.setDecimals(2)
-        self.ds_tr_sep_sigma.setSingleStep(0.1)
-        self.ds_tr_sep_sigma.setValue(float(self.cfg.sep.thresh_sigma))
-
-        self.sb_tr_sep_max_sources = QSpinBox()
-        self.sb_tr_sep_max_sources.setRange(1, 5000)
-        self.sb_tr_sep_max_sources.setValue(int(self.cfg.platesolving.max_det))
-
-        self.sb_tr_sep_min_sources = QSpinBox()
-        self.sb_tr_sep_min_sources.setRange(1, 100)
-        self.sb_tr_sep_min_sources.setValue(3)
-
-        self.sb_tr_sep_bw = QSpinBox()
-        self.sb_tr_sep_bw.setRange(4, 512)
-        self.sb_tr_sep_bw.setValue(int(self.cfg.sep.bw))
-
-        self.sb_tr_sep_bh = QSpinBox()
-        self.sb_tr_sep_bh.setRange(4, 512)
-        self.sb_tr_sep_bh.setValue(int(self.cfg.sep.bh))
-
         control_box = QGroupBox("Control")
         control_form = QFormLayout(control_box)
         _add_option_row(
@@ -1050,51 +690,8 @@ class TrackingTabMixin:
             "Límite de cambio por segundo de la velocidad feed-forward para evitar saltos bruscos en la montura.",
         )
 
-        sep_box = QGroupBox("Detección SEP")
-        sep_form = QFormLayout(sep_box)
-        _add_option_row(
-            sep_form,
-            "minarea:",
-            self.sb_tr_sep_minarea,
-            "Cantidad mínima de píxeles conectados sobre el umbral para aceptar una fuente.",
-        )
-        _add_option_row(
-            sep_form,
-            "thresh_sigma:",
-            self.ds_tr_sep_sigma,
-            "Umbral de detección en sigmas sobre el fondo local. Más alto detecta menos fuentes, pero más limpias.",
-        )
-        _add_option_row(
-            sep_form,
-            "max sources:",
-            self.sb_tr_sep_max_sources,
-            "Máximo de fuentes detectadas que se usan para medir deriva y emparejar movimientos.",
-        )
-        _add_option_row(
-            sep_form,
-            "min sources:",
-            self.sb_tr_sep_min_sources,
-            "Mínimo de fuentes requeridas para confiar en una medición de tracking.",
-        )
-        _add_option_row(
-            sep_form,
-            "bw:",
-            self.sb_tr_sep_bw,
-            "Ancho de la malla de fondo usada por SEP para estimar el fondo local.",
-        )
-        _add_option_row(
-            sep_form,
-            "bh:",
-            self.sb_tr_sep_bh,
-            "Alto de la malla de fondo usada por SEP para estimar el fondo local.",
-        )
-
-        columns = QHBoxLayout()
-        columns.addWidget(control_box, stretch=1)
-        columns.addWidget(sep_box, stretch=1)
-
         layout.addLayout(actions)
-        layout.addLayout(columns)
+        layout.addWidget(control_box)
         layout.addStretch(1)
         return widget
 
@@ -1264,86 +861,6 @@ class StackingTabMixin:
 
         layout.addLayout(actions)
         layout.addLayout(columns)
-        layout.addStretch(1)
-        return widget
-
-
-class ObjectDetectionTabMixin:
-    def _tab_od(self: "AstroPanoptesWindow") -> QWidget:
-        widget = QWidget()
-        layout = QVBoxLayout(widget)
-        layout.setSpacing(10)
-
-        box = QGroupBox("Object Detection")
-        form = QFormLayout()
-
-        self.btn_od_start = QPushButton("Start")
-        self.btn_od_stop = QPushButton("Stop")
-        _set_option_tooltip(self.btn_od_start, "Activa el overlay de detección SEP sobre la vista live.")
-        _set_option_tooltip(self.btn_od_stop, "Desactiva el overlay de detección SEP sobre la vista live.")
-
-        row = QHBoxLayout()
-        row.addWidget(self.btn_od_start)
-        row.addWidget(self.btn_od_stop)
-        row.addStretch(1)
-
-        self.btn_od_start.clicked.connect(self._od_start)
-        self.btn_od_stop.clicked.connect(self._od_stop)
-
-        self.sb_od_minarea = QSpinBox()
-        self.sb_od_minarea.setRange(1, 500)
-        self.sb_od_minarea.setValue(self.cfg.sep.minarea)
-
-        self.ds_od_sigma = QDoubleSpinBox()
-        self.ds_od_sigma.setRange(0.1, 20.0)
-        self.ds_od_sigma.setValue(self.cfg.sep.thresh_sigma)
-
-        self.sb_od_maxdet = QSpinBox()
-        self.sb_od_maxdet.setRange(1, 5000)
-        self.sb_od_maxdet.setValue(self.cfg.platesolving.max_det)
-
-        self.sb_od_bw = QSpinBox()
-        self.sb_od_bw.setRange(4, 512)
-        self.sb_od_bw.setValue(self.cfg.sep.bw)
-
-        self.sb_od_bh = QSpinBox()
-        self.sb_od_bh.setRange(4, 512)
-        self.sb_od_bh.setValue(self.cfg.sep.bh)
-
-        form.addRow(row)
-        _add_option_row(
-            form,
-            "minarea:",
-            self.sb_od_minarea,
-            "Cantidad mínima de píxeles conectados sobre el umbral para aceptar una detección.",
-        )
-        _add_option_row(
-            form,
-            "thresh_sigma:",
-            self.ds_od_sigma,
-            "Umbral de detección en sigmas sobre el fondo local. Más alto reduce falsos positivos.",
-        )
-        _add_option_row(
-            form,
-            "max_det:",
-            self.sb_od_maxdet,
-            "Cantidad máxima de detecciones que se muestran y procesan en el overlay.",
-        )
-        _add_option_row(
-            form,
-            "bw:",
-            self.sb_od_bw,
-            "Ancho de la malla de fondo usada por SEP para detección live.",
-        )
-        _add_option_row(
-            form,
-            "bh:",
-            self.sb_od_bh,
-            "Alto de la malla de fondo usada por SEP para detección live.",
-        )
-
-        box.setLayout(form)
-        layout.addWidget(box)
         layout.addStretch(1)
         return widget
 
@@ -1813,36 +1330,50 @@ class ModulesTabsMixin(
     FocuserTabMixin,
     TrackingTabMixin,
     StackingTabMixin,
-    ObjectDetectionTabMixin,
     GoToTabMixin,
-    GaiaTabMixin,
 ):
     def _build_modules_tabs(self: "AstroPanoptesWindow") -> QWidget:
         tabs = QTabWidget()
         pages = (
-            (self._tab_observer(), "Observador"),
-            (self._tab_camera(), "Camera"),
-            (self._tab_focuser(), "Enfoque"),
-            (self._tab_tracking(), "Tracking"),
-            (self._tab_stacking(), "Stacking"),
-            (self._tab_od(), "Object Detection"),
-            (self._tab_goto(), "GoTo"),
+            (
+                self._tab_observer(),
+                "Observador",
+                "Ubicación, escala óptica y prior de rotación para plate solving.",
+            ),
+            (
+                self._tab_camera(),
+                "Camera",
+                "Exposición, ganancia y captura RAW de diagnóstico.",
+            ),
+            (
+                self._tab_focuser(),
+                "Enfoque",
+                "Enfocador motorizado: acercar/alejar manual y búsqueda automática del mejor foco.",
+            ),
+            (
+                self._tab_tracking(),
+                "Tracking",
+                "Control de tracking y alineación RAW16 directa con feed-forward sideral.",
+            ),
+            (
+                self._tab_stacking(),
+                "Stacking",
+                "Live stacking, color, drizzle, alineación y preview del stack.",
+            ),
+            (
+                self._tab_goto(),
+                "GoTo",
+                "Plate Solving y toma manual de muestras, ajuste del modelo GoTo y estrellas esperadas.",
+            ),
         )
-        for page, title in pages:
+        for page, title, tooltip in pages:
             scroll = QScrollArea()
             scroll.setWidgetResizable(True)
             scroll.setFrameShape(QFrame.Shape.NoFrame)
             scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             scroll.setVerticalScrollBarPolicy(Qt.ScrollBarPolicy.ScrollBarAsNeeded)
             scroll.setWidget(page)
-            tabs.addTab(scroll, title)
-        tabs.setTabToolTip(0, "Ubicación, escala óptica y prior de rotación para plate solving.")
-        tabs.setTabToolTip(1, "Exposición, ganancia y captura RAW de diagnóstico.")
-        tabs.setTabToolTip(2, "Enfocador motorizado: acercar/alejar manual y búsqueda automática del mejor foco.")
-        tabs.setTabToolTip(3, "Control de tracking y alineación RAW16 directa con feed-forward sideral.")
-        tabs.setTabToolTip(4, "Live stacking, color, drizzle, alineación y preview del stack.")
-        tabs.setTabToolTip(5, "Overlay de detección SEP sobre la vista live.")
-        tabs.setTabToolTip(6, "Plate Solving y toma manual de muestras, ajuste del modelo GoTo y estrellas esperadas.")
+            tabs.setTabToolTip(tabs.addTab(scroll, title), tooltip)
 
         wrap = QWidget()
         layout = QVBoxLayout(wrap)

@@ -1,5 +1,9 @@
+import json
 import os
+import tempfile
+import time
 import unittest
+from pathlib import Path
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
@@ -16,10 +20,17 @@ from PyQt6.QtWidgets import (
     QToolButton,
 )
 
+from PyQt6.QtCore import QCoreApplication, QEvent, Qt
+from PyQt6.QtGui import QKeyEvent
+
 from app_runner import AppRunner
 from ap_types import Axis, CameraStatus, MountStatus
 from config import AppConfig
 from ui.pyqt6_app import AstroPanoptesWindow
+
+
+def _key_event(key: Qt.Key) -> QKeyEvent:
+    return QKeyEvent(QEvent.Type.KeyPress, key, Qt.KeyboardModifier.NoModifier)
 
 
 class UiRegressionTests(unittest.TestCase):
@@ -28,12 +39,19 @@ class UiRegressionTests(unittest.TestCase):
         cls._app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        # Ruta propia por test: si no, cerrar la ventana pisaría los ajustes
+        # reales del usuario en ~/.astropanoptes/settings.json.
+        self._tmp = tempfile.TemporaryDirectory()
+        self.settings_path = Path(self._tmp.name) / "settings.json"
         self.cfg = AppConfig()
         self.runner = AppRunner(self.cfg)
-        self.window = AstroPanoptesWindow(self.runner, self.cfg)
+        self.window = AstroPanoptesWindow(
+            self.runner, self.cfg, settings_path=self.settings_path
+        )
 
     def tearDown(self) -> None:
         self.window.close()
+        self._tmp.cleanup()
 
     def test_plate_solving_is_available_in_goto_panel(self) -> None:
         labels = [
@@ -241,6 +259,155 @@ class UiRegressionTests(unittest.TestCase):
     def test_download_gaia_field_button_is_removed(self) -> None:
         self.assertFalse(hasattr(self.window, "btn_download_gaia"))
 
+    def test_gaia_coverage_panel_is_removed(self) -> None:
+        for attribute in ("gaia_tab", "gaia_coverage_map", "btn_gaia_refresh"):
+            self.assertFalse(hasattr(self.window, attribute), attribute)
+        labels = [
+            self.window.modules_tabs.tabText(i)
+            for i in range(self.window.modules_tabs.count())
+        ]
+        self.assertNotIn("Gaia", labels)
+
+    def test_object_detection_tab_is_removed(self) -> None:
+        for attribute in ("sb_od_minarea", "ds_od_sigma", "btn_od_start", "ch_od"):
+            self.assertFalse(hasattr(self.window, attribute), attribute)
+        labels = [
+            self.window.modules_tabs.tabText(i)
+            for i in range(self.window.modules_tabs.count())
+        ]
+        self.assertNotIn("Object Detection", labels)
+
+    def test_every_module_tab_has_a_tooltip(self) -> None:
+        tabs = self.window.modules_tabs
+        for index in range(tabs.count()):
+            self.assertTrue(tabs.tabToolTip(index), tabs.tabText(index))
+
+    def _wait_for_console(self, predicate, timeout_s: float = 10.0) -> bool:
+        deadline = time.monotonic() + timeout_s
+        while time.monotonic() < deadline:
+            QCoreApplication.processEvents()
+            if predicate():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def _wait_until(self, predicate, timeout_s: float = 10.0) -> bool:
+        return self._wait_for_console(predicate, timeout_s)
+
+    def test_console_replaces_the_logs_panel(self) -> None:
+        self.assertIs(self.window.log, self.window.console.view)
+        self.assertEqual("Consola", self.window.console_frame.title())
+        self.assertTrue(self.window.act_console.isChecked())
+
+    def test_console_echoes_and_runs_a_command_against_the_session(self) -> None:
+        console = self.window.console
+        console.input.setText("status")
+        console.input.returnPressed.emit()
+
+        self.assertIn("> status", console.view.toPlainText())
+        ran = self._wait_for_console(
+            lambda: "camera" in console.view.toPlainText().lower()
+        )
+        self.assertTrue(ran, console.view.toPlainText())
+
+    def test_console_reports_unknown_commands_without_crashing(self) -> None:
+        console = self.window.console
+        console.run_command("comando-que-no-existe")
+        failed = self._wait_for_console(
+            lambda: "CLI ERROR" in console.view.toPlainText()
+        )
+        self.assertTrue(failed, console.view.toPlainText())
+
+    def test_console_input_keeps_command_history(self) -> None:
+        entry = self.window.console.input
+        for line in ("tracking start", "stacking start"):
+            entry.setText(line)
+            entry.returnPressed.emit()
+
+        entry.keyPressEvent(_key_event(Qt.Key.Key_Up))
+        self.assertEqual("stacking start", entry.text())
+        entry.keyPressEvent(_key_event(Qt.Key.Key_Up))
+        self.assertEqual("tracking start", entry.text())
+        entry.keyPressEvent(_key_event(Qt.Key.Key_Down))
+        self.assertEqual("stacking start", entry.text())
+
+    def test_settings_survive_a_restart(self) -> None:
+        # Los ajustes se leen de `runner.cfg`, así que el runner debe estar
+        # corriendo para que la cola de acciones se drene antes de guardar.
+        self.runner.start()
+        self.addCleanup(self.runner.stop)
+        self.window.dd_obs_site.setCurrentIndex(1)
+        self.window.ds_obs_focal_mm.setValue(1200.0)
+        self.window.dd_obs_barlow.setCurrentIndex(1)
+        self.window.ds_exp_ms.setValue(250.0)
+        self.window.sb_gain.setValue(320)
+        self.window.ds_gamma.setValue(1.4)
+        self.window.cb_st_color.setChecked(True)
+        self.window.dd_st_drizzle.setCurrentIndex(1)
+        self.window._camera_apply()
+        self.assertTrue(
+            self._wait_until(lambda: self.runner.cfg.camera.exp_ms == 250.0),
+            "la cámara no aplicó los parámetros a tiempo",
+        )
+
+        site = self.window.dd_obs_site.currentText()
+        self.window.close()
+        self.assertTrue(self.settings_path.exists())
+
+        runner = AppRunner(AppConfig())
+        window = AstroPanoptesWindow(
+            runner, AppConfig(), settings_path=self.settings_path
+        )
+        try:
+            self.assertEqual(site, window.dd_obs_site.currentText())
+            self.assertAlmostEqual(1200.0, window.ds_obs_focal_mm.value())
+            self.assertEqual(2, window._observer_barlow_factor())
+            self.assertAlmostEqual(250.0, window.ds_exp_ms.value())
+            self.assertEqual(320, window.sb_gain.value())
+            self.assertAlmostEqual(1.4, window.ds_gamma.value())
+            self.assertTrue(window.cb_st_color.isChecked())
+            self.assertEqual(2.0, window.dd_st_drizzle.currentData())
+        finally:
+            window.close()
+
+    def test_restored_settings_reach_the_running_session(self) -> None:
+        self.runner.start()
+        self.addCleanup(self.runner.stop)
+        self.window.ds_exp_ms.setValue(180.0)
+        self.window.sb_gain.setValue(210)
+        self.window._camera_apply()
+        self.assertTrue(
+            self._wait_until(lambda: self.runner.cfg.camera.gain == 210),
+            "la cámara no aplicó los parámetros a tiempo",
+        )
+        self.window.close()
+
+        runner = AppRunner(AppConfig())
+        calls: list[dict] = []
+        runner.request_camera_params = lambda params: calls.append(dict(params))
+        window = AstroPanoptesWindow(
+            runner, AppConfig(), settings_path=self.settings_path
+        )
+        try:
+            self.assertTrue(calls)
+            self.assertAlmostEqual(180.0, calls[-1]["exp_ms"])
+            self.assertEqual(210, calls[-1]["gain"])
+        finally:
+            window.close()
+
+    def test_unusable_settings_file_does_not_block_startup(self) -> None:
+        for payload in ("{ not json", json.dumps({"version": 999, "camera": {"gain": 1}})):
+            self.settings_path.write_text(payload, encoding="utf-8")
+            runner = AppRunner(AppConfig())
+            cfg = AppConfig()
+            window = AstroPanoptesWindow(
+                runner, cfg, settings_path=self.settings_path
+            )
+            try:
+                self.assertEqual(cfg.camera.gain, window.sb_gain.value())
+            finally:
+                window.close()
+
     def test_tracking_tab_applies_exposed_parameters(self) -> None:
         calls: list[dict] = []
         self.runner.request_tracking_params = lambda **kwargs: calls.append(dict(kwargs))
@@ -252,12 +419,6 @@ class UiRegressionTests(unittest.TestCase):
         self.window.ds_tr_ff_cond.setValue(1234.0)
         self.window.ds_tr_ff_hold.setValue(4.5)
         self.window.ds_tr_ff_slew.setValue(88.0)
-        self.window.sb_tr_sep_minarea.setValue(7)
-        self.window.ds_tr_sep_sigma.setValue(4.25)
-        self.window.sb_tr_sep_max_sources.setValue(123)
-        self.window.sb_tr_sep_min_sources.setValue(3)
-        self.window.sb_tr_sep_bw.setValue(32)
-        self.window.sb_tr_sep_bh.setValue(48)
 
         self.window.btn_tr_apply.click()
 
@@ -267,12 +428,7 @@ class UiRegressionTests(unittest.TestCase):
         self.assertFalse(params["sidereal_ff_enabled"])
         self.assertAlmostEqual(params["sidereal_ff_gain"], 0.75)
         self.assertAlmostEqual(params["sidereal_ff_dt_s"], 2.5)
-        self.assertEqual(params["sep_minarea"], 7)
-        self.assertAlmostEqual(params["sep_thresh_sigma"], 4.25)
-        self.assertEqual(params["sep_max_sources"], 123)
-        self.assertEqual(params["sep_min_sources"], 3)
-        self.assertEqual(params["sep_bw"], 32)
-        self.assertEqual(params["sep_bh"], 48)
+        self.assertEqual([], [key for key in params if key.startswith("sep_")])
 
     def test_stacking_tab_applies_exposed_parameters(self) -> None:
         calls: list[dict] = []
@@ -309,7 +465,6 @@ class UiRegressionTests(unittest.TestCase):
     def test_tracking_and_stacking_options_have_tooltips(self) -> None:
         self.assertIn("Respuesta mínima", self.window.ds_tr_resp_min.toolTip())
         self.assertIn("movimiento sideral", self.window.cb_tr_ff.toolTip())
-        self.assertIn("malla de fondo", self.window.sb_tr_sep_bw.toolTip())
         self.assertIn("mosaico Bayer", self.window.dd_st_bayer.toolTip())
         self.assertIn("desplazamientos fraccionales", self.window.cb_st_subpixel.toolTip())
 

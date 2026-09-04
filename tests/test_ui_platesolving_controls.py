@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import tempfile
 import unittest
+from pathlib import Path
 
 from PyQt6.QtWidgets import QApplication
 
@@ -15,12 +17,20 @@ class PlatesolvingControlsTests(unittest.TestCase):
         cls._app = QApplication.instance() or QApplication([])
 
     def setUp(self) -> None:
+        # Ruta propia: al cerrar, la ventana guarda ajustes, y con la ruta por
+        # defecto este test pisaria ~/.astropanoptes/settings.json del usuario.
+        self._tmp = tempfile.TemporaryDirectory()
         self.cfg = AppConfig()
         self.runner = AppRunner(self.cfg)
-        self.window = AstroPanoptesWindow(self.runner, self.cfg)
+        self.window = AstroPanoptesWindow(
+            self.runner,
+            self.cfg,
+            settings_path=Path(self._tmp.name) / "settings.json",
+        )
 
     def tearDown(self) -> None:
         self.window.close()
+        self._tmp.cleanup()
 
     def test_image_source_and_verification_are_exposed(self) -> None:
         """These drive whether a solve succeeds at all, so they belong in the UI."""
