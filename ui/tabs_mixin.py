@@ -33,7 +33,13 @@ OBSERVER_PRESETS = (
     ("San Carlos", {"lat_deg": -36.4248, "lon_deg": -71.9580, "height_m": 161.0}),
     ("Algarrobo", {"lat_deg": -33.3667, "lon_deg": -71.6667, "height_m": 28.0}),
 )
-BARLOW_FACTORS = (1, 2, 3, 4, 5)
+# Los barlows que existen de verdad en este equipo. Ofrecer factores que no se
+# tienen solo invita a dejar la escala mal puesta, y una escala equivocada hace
+# que el plate solving busque un campo que no es -- sin decir por que falla.
+BARLOW_FACTORS = (1, 2, 5)
+# Cada barlow cambia el tiro optico, asi que cada uno tiene su posicion de foco:
+# son los presets que vale la pena tener a un clic.
+FOCUS_PRESET_NAMES = ("x1", "x2", "x5")
 STACKING_DRIZZLE_SCALES = (1.0, 2.0, 3.0)
 
 if TYPE_CHECKING:
@@ -515,7 +521,7 @@ class ObserverTabMixin:
             factor = int(self.dd_obs_barlow.currentData())
         except (TypeError, ValueError):
             factor = 1
-        return max(1, min(5, factor))
+        return factor if factor in BARLOW_FACTORS else 1
 
     def _observer_site_changed(self: "AstroPanoptesWindow", *_args) -> None:
         site = self._observer_site_data()
@@ -647,6 +653,260 @@ class CameraTabMixin:
         box.setLayout(form)
 
         layout.addWidget(box)
+        layout.addStretch(1)
+        return widget
+
+
+class FocuserTabMixin:
+    def _tab_focuser(self: "AstroPanoptesWindow") -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.setSpacing(10)
+
+        cfg = self.cfg.focuser
+
+        # ---- Manual ----
+        manual_box = QGroupBox("Enfoque manual")
+        manual_form = QFormLayout()
+
+        self.sb_focus_step = QSpinBox()
+        self.sb_focus_step.setRange(1, 100_000)
+        self.sb_focus_step.setValue(int(cfg.step_size))
+
+        self.sb_focus_delay = QSpinBox()
+        self.sb_focus_delay.setRange(10, 200_000)
+        self.sb_focus_delay.setValue(int(cfg.delay_us))
+        self.sb_focus_delay.setSuffix(" µs")
+
+        self.dd_focus_profile = QComboBox()
+        self.dd_focus_profile.addItem("Suave (curva S)", "smooth")
+        self.dd_focus_profile.addItem("Directo (sin rampa)", "direct")
+        index = self.dd_focus_profile.findData(str(cfg.profile))
+        if index >= 0:
+            self.dd_focus_profile.setCurrentIndex(index)
+
+        self.cb_focus_invert = QCheckBox("Invertir sentido")
+        self.cb_focus_invert.setChecked(bool(cfg.invert))
+
+        self.sb_focus_backlash = QSpinBox()
+        self.sb_focus_backlash.setRange(0, 20_000)
+        self.sb_focus_backlash.setValue(int(cfg.backlash_steps))
+
+        self.sb_focus_travel = QSpinBox()
+        self.sb_focus_travel.setRange(0, 1_000_000)
+        self.sb_focus_travel.setValue(int(cfg.max_travel_steps))
+
+        self.btn_focus_near = QPushButton("Acercar  ▲")
+        self.btn_focus_far = QPushButton("Alejar  ▼")
+        self.btn_focus_stop = QPushButton("Parar")
+        self.btn_focus_zero = QPushButton("Poner a cero")
+        _set_option_tooltip(
+            self.btn_focus_near,
+            "Mueve el enfocador un paso en el sentido de acercar el foco.",
+        )
+        _set_option_tooltip(
+            self.btn_focus_far,
+            "Mueve el enfocador un paso en el sentido de alejar el foco.",
+        )
+        _set_option_tooltip(
+            self.btn_focus_stop,
+            "Detiene el enfocador y cancela la búsqueda automática, sin tocar la montura.",
+        )
+        _set_option_tooltip(
+            self.btn_focus_zero,
+            "Declara la posición actual como el cero de esta sesión. El enfocador "
+            "no tiene encoder: la posición sólo tiene sentido dentro de la sesión.",
+        )
+        self.btn_focus_near.clicked.connect(lambda: self._focus_move(+1))
+        self.btn_focus_far.clicked.connect(lambda: self._focus_move(-1))
+        self.btn_focus_stop.clicked.connect(self._focus_cancel)
+        self.btn_focus_zero.clicked.connect(self._focus_zero)
+
+        _add_option_row(
+            manual_form,
+            "Paso:",
+            self.sb_focus_step,
+            "Microsteps enviados por cada pulsación de acercar/alejar.",
+        )
+        _add_option_row(
+            manual_form,
+            "Delay:",
+            self.sb_focus_delay,
+            "Retardo mínimo entre microsteps del enfocador: fija su velocidad.",
+        )
+        _add_option_row(
+            manual_form,
+            "Movimiento:",
+            self.dd_focus_profile,
+            "Suave acelera y frena con una curva S; directo aplica de inmediato la velocidad indicada.",
+        )
+        _add_option_row(
+            manual_form,
+            "Sentido:",
+            self.cb_focus_invert,
+            "Marca esto si «acercar» aleja el foco: depende de cómo quedó montado el motor sobre la ruedita.",
+        )
+        _add_option_row(
+            manual_form,
+            "Juego (backlash):",
+            self.sb_focus_backlash,
+            "Microsteps que el acople se traga al invertir el sentido. Se envían "
+            "antes del movimiento útil y no cuentan como recorrido.",
+        )
+        _add_option_row(
+            manual_form,
+            "Recorrido máximo:",
+            self.sb_focus_travel,
+            "Tope de seguridad respecto al cero de sesión. El recorrido útil del "
+            "enfocador es corto y forzarlo contra el tope es lo único que puede romperlo. 0 lo desactiva.",
+        )
+
+        move_row = QHBoxLayout()
+        move_row.addWidget(self.btn_focus_near)
+        move_row.addWidget(self.btn_focus_far)
+        move_row.addWidget(self.btn_focus_stop)
+        manual_form.addRow(move_row)
+        manual_form.addRow(self.btn_focus_zero)
+        manual_box.setLayout(manual_form)
+
+        # ---- Automático ----
+        auto_box = QGroupBox("Búsqueda automática")
+        auto_form = QFormLayout()
+
+        self.sb_focus_coarse_step = QSpinBox()
+        self.sb_focus_coarse_step.setRange(1, 100_000)
+        self.sb_focus_coarse_step.setValue(int(cfg.autofocus_coarse_step))
+
+        self.sb_focus_coarse_points = QSpinBox()
+        self.sb_focus_coarse_points.setRange(3, 99)
+        self.sb_focus_coarse_points.setValue(int(cfg.autofocus_coarse_points))
+
+        self.sb_focus_fine_step = QSpinBox()
+        self.sb_focus_fine_step.setRange(1, 100_000)
+        self.sb_focus_fine_step.setValue(int(cfg.autofocus_fine_step))
+
+        self.sb_focus_fine_points = QSpinBox()
+        self.sb_focus_fine_points.setRange(3, 99)
+        self.sb_focus_fine_points.setValue(int(cfg.autofocus_fine_points))
+
+        self.ds_focus_settle = QDoubleSpinBox()
+        self.ds_focus_settle.setRange(0.0, 30.0)
+        self.ds_focus_settle.setDecimals(2)
+        self.ds_focus_settle.setSingleStep(0.1)
+        self.ds_focus_settle.setValue(float(cfg.autofocus_settle_s))
+        self.ds_focus_settle.setSuffix(" s")
+
+        self.sb_focus_frames = QSpinBox()
+        self.sb_focus_frames.setRange(1, 30)
+        self.sb_focus_frames.setValue(int(cfg.autofocus_frames))
+
+        self.btn_focus_auto = QPushButton("Buscar mejor foco")
+        _set_option_tooltip(
+            self.btn_focus_auto,
+            "Barre el rango grueso, localiza el máximo de nitidez y lo afina. "
+            "Necesita la cámara conectada y capturando.",
+        )
+        self.btn_focus_auto.clicked.connect(self._focus_autofocus)
+
+        _add_option_row(
+            auto_form,
+            "Paso grueso:",
+            self.sb_focus_coarse_step,
+            "Separación entre medidas del primer barrido. Debe ser lo bastante "
+            "grande para cruzar la zona de foco en pocos puntos.",
+        )
+        _add_option_row(
+            auto_form,
+            "Puntos gruesos:",
+            self.sb_focus_coarse_points,
+            "Medidas del primer barrido, centradas en la posición actual. Si el "
+            "máximo cae en un extremo, el barrido se extiende solo.",
+        )
+        _add_option_row(
+            auto_form,
+            "Paso fino:",
+            self.sb_focus_fine_step,
+            "Separación del segundo barrido alrededor del máximo grueso. Marca la precisión final.",
+        )
+        _add_option_row(
+            auto_form,
+            "Puntos finos:",
+            self.sb_focus_fine_points,
+            "Medidas del segundo barrido.",
+        )
+        _add_option_row(
+            auto_form,
+            "Asentamiento:",
+            self.ds_focus_settle,
+            "Espera tras cada movimiento antes de medir, para que el tubo deje de vibrar.",
+        )
+        _add_option_row(
+            auto_form,
+            "Frames por punto:",
+            self.sb_focus_frames,
+            "Se toma la mediana de la nitidez de estos frames. Más frames "
+            "amortiguan el seeing, que en una sola toma puede superar la "
+            "diferencia entre dos posiciones vecinas.",
+        )
+        auto_form.addRow(self.btn_focus_auto)
+        auto_box.setLayout(auto_form)
+
+        # ---- Presets por barlow ----
+        preset_box = QGroupBox("Posiciones guardadas")
+        preset_form = QFormLayout()
+
+        self.btn_focus_home = QPushButton("Homing (retraer hasta el tope)")
+        _set_option_tooltip(
+            self.btn_focus_home,
+            "Retrae el enfocador más allá de su recorrido. El piñón tiene dientes "
+            "rotos en ese extremo, así que patina sin forzar nada y queda siempre "
+            "en el mismo sitio físico. Es el origen que hace que una posición "
+            "guardada signifique lo mismo mañana.",
+        )
+        self.btn_focus_home.clicked.connect(self._focus_home)
+        preset_form.addRow(self.btn_focus_home)
+
+        self.btn_focus_goto_preset = {}
+        self.btn_focus_save_preset = {}
+        for name in FOCUS_PRESET_NAMES:
+            row = QHBoxLayout()
+            go = QPushButton(f"Ir a {name}")
+            save = QPushButton("Guardar aquí")
+            _set_option_tooltip(
+                go, f"Mueve el enfocador a la posición guardada para el barlow {name}."
+            )
+            _set_option_tooltip(
+                save,
+                f"Guarda la posición actual como el foco del barlow {name}. "
+                "Hazlo con la sesión homed, o sólo valdrá hasta que cierres la app.",
+            )
+            go.clicked.connect(lambda _checked=False, n=name: self._focus_preset(n))
+            save.clicked.connect(lambda _checked=False, n=name: self._focus_save_preset(n))
+            row.addWidget(go)
+            row.addWidget(save)
+            self.btn_focus_goto_preset[name] = go
+            self.btn_focus_save_preset[name] = save
+            preset_form.addRow(f"Barlow {name}:", row)
+
+        preset_box.setLayout(preset_form)
+
+        self.btn_focus_apply = QPushButton("Aplicar parámetros")
+        _set_option_tooltip(
+            self.btn_focus_apply,
+            "Guarda estos valores en la configuración del enfocador. Los botones "
+            "manuales y la búsqueda automática ya envían lo que está en pantalla.",
+        )
+        self.btn_focus_apply.clicked.connect(self._focus_apply)
+
+        self.lbl_focus_status = QLabel("Enfocador: sin montura conectada")
+        self.lbl_focus_status.setWordWrap(True)
+        self.lbl_focus_status.setStyleSheet("color:#bbb;")
+
+        layout.addWidget(manual_box)
+        layout.addWidget(preset_box)
+        layout.addWidget(auto_box)
+        layout.addWidget(self.btn_focus_apply)
+        layout.addWidget(self.lbl_focus_status)
         layout.addStretch(1)
         return widget
 
@@ -1270,6 +1530,85 @@ class GoToTabMixin:
         rowps.addWidget(self.sb_goto_ps_mininl)
         rowps.addStretch(1)
 
+        # --- Fuente de imagen y verificacion ---
+        self.dd_ps_source = QComboBox()
+        self.dd_ps_source.addItem("Cuadro vivo", "live")
+        self.dd_ps_source.addItem("Mosaico apilado", "stack")
+        _set_option_tooltip(
+            self.dd_ps_source,
+            "Imagen que resuelve el solver. Con cielo contaminado, el mosaico apilado suele "
+            "ganar: exposiciones cortas mantienen las estrellas puntuales en vez de dejar "
+            "trazas, la señal acumulada saca estrellas más débiles, y el mosaico cubre más "
+            "cielo que un cuadro suelto. Requiere el apilado en marcha.",
+        )
+
+        self.ds_ps_verify_tol = QDoubleSpinBox()
+        self.ds_ps_verify_tol.setRange(1.0, 600.0)
+        self.ds_ps_verify_tol.setDecimals(1)
+        self.ds_ps_verify_tol.setValue(
+            float(getattr(self.cfg.platesolving, "verify_pointing_tol_arcsec", 30.0))
+        )
+        self.ds_ps_verify_tol.setSuffix(" ″")
+        _set_option_tooltip(
+            self.ds_ps_verify_tol,
+            "Diferencia máxima de apuntado admitida al verificar un solve nuevo contra el "
+            "anterior ya confirmado. Si se supera, se descarta el atajo y se rehace el "
+            "solve completo.",
+        )
+
+        self.ds_ps_verify_roll = QDoubleSpinBox()
+        self.ds_ps_verify_roll.setRange(0.1, 45.0)
+        self.ds_ps_verify_roll.setDecimals(2)
+        self.ds_ps_verify_roll.setValue(
+            float(getattr(self.cfg.platesolving, "verify_roll_tol_deg", 3.0))
+        )
+        self.ds_ps_verify_roll.setSuffix(" deg")
+        _set_option_tooltip(
+            self.ds_ps_verify_roll,
+            "Diferencia máxima de giro de campo admitida en esa misma verificación.",
+        )
+
+        self.sb_ps_min_validation = QSpinBox()
+        self.sb_ps_min_validation.setRange(0, 50)
+        self.sb_ps_min_validation.setValue(
+            int(getattr(self.cfg.platesolving, "min_validation_inliers", 2))
+        )
+        _set_option_tooltip(
+            self.sb_ps_min_validation,
+            "Coincidencias exigidas más allá del triplete semilla. Una tripleta aporta 3 por "
+            "construcción y siempre encaja consigo misma, así que un solve de 3 inliers no "
+            "prueba nada por bajo que sea su rms. Ésta es la red de seguridad principal: "
+            "bajarla a 0 deja pasar coincidencias falsas contra el catálogo.",
+        )
+
+        self.cb_ps_temporal = QCheckBox("Confirmación temporal de fuentes")
+        self.cb_ps_temporal.setChecked(
+            bool(getattr(self.cfg.platesolving, "temporal_detection_enabled", True))
+        )
+        _set_option_tooltip(
+            self.cb_ps_temporal,
+            "Exige que una fuente persista en varios cuadros antes de usarla, lo que descarta "
+            "píxeles calientes y rayos cósmicos. Con exposiciones largas la deriva sideral "
+            "puede descorrelacionar las fuentes y dejar el campo sin detecciones; y sobre el "
+            "mosaico apilado no aporta nada, porque el apilado ya promedia varios cuadros.",
+        )
+
+        rowsrc = QHBoxLayout()
+        rowsrc.addWidget(QLabel("Fuente:"))
+        rowsrc.addWidget(self.dd_ps_source)
+        rowsrc.addSpacing(12)
+        rowsrc.addWidget(QLabel("Validación:"))
+        rowsrc.addWidget(self.sb_ps_min_validation)
+        rowsrc.addStretch(1)
+
+        rowcons = QHBoxLayout()
+        rowcons.addWidget(QLabel("Tol. apuntado:"))
+        rowcons.addWidget(self.ds_ps_verify_tol)
+        rowcons.addSpacing(12)
+        rowcons.addWidget(QLabel("Tol. giro:"))
+        rowcons.addWidget(self.ds_ps_verify_roll)
+        rowcons.addStretch(1)
+
         self.btn_goto = QPushButton("GoTo")
         self.btn_cancel = QPushButton("Cancel")
         self.btn_platesolve = QPushButton("Plate Solving")
@@ -1384,6 +1723,9 @@ class GoToTabMixin:
         )
         form.addRow("Plate Solving centro:", self.platesolve_target_frame)
         form.addRow(rowps)
+        form.addRow(rowsrc)
+        form.addRow(rowcons)
+        form.addRow(self.cb_ps_temporal)
         form.addRow(rowb)
         form.addRow("manual samples:", self.lbl_goto_samples)
         expected_row = QHBoxLayout()
@@ -1468,6 +1810,7 @@ class GoToTabMixin:
 class ModulesTabsMixin(
     ObserverTabMixin,
     CameraTabMixin,
+    FocuserTabMixin,
     TrackingTabMixin,
     StackingTabMixin,
     ObjectDetectionTabMixin,
@@ -1479,6 +1822,7 @@ class ModulesTabsMixin(
         pages = (
             (self._tab_observer(), "Observador"),
             (self._tab_camera(), "Camera"),
+            (self._tab_focuser(), "Enfoque"),
             (self._tab_tracking(), "Tracking"),
             (self._tab_stacking(), "Stacking"),
             (self._tab_od(), "Object Detection"),
@@ -1494,10 +1838,11 @@ class ModulesTabsMixin(
             tabs.addTab(scroll, title)
         tabs.setTabToolTip(0, "Ubicación, escala óptica y prior de rotación para plate solving.")
         tabs.setTabToolTip(1, "Exposición, ganancia y captura RAW de diagnóstico.")
-        tabs.setTabToolTip(2, "Control de tracking y alineación RAW16 directa con feed-forward sideral.")
-        tabs.setTabToolTip(3, "Live stacking, color, drizzle, alineación y preview del stack.")
-        tabs.setTabToolTip(4, "Overlay de detección SEP sobre la vista live.")
-        tabs.setTabToolTip(5, "Plate Solving y toma manual de muestras, ajuste del modelo GoTo y estrellas esperadas.")
+        tabs.setTabToolTip(2, "Enfocador motorizado: acercar/alejar manual y búsqueda automática del mejor foco.")
+        tabs.setTabToolTip(3, "Control de tracking y alineación RAW16 directa con feed-forward sideral.")
+        tabs.setTabToolTip(4, "Live stacking, color, drizzle, alineación y preview del stack.")
+        tabs.setTabToolTip(5, "Overlay de detección SEP sobre la vista live.")
+        tabs.setTabToolTip(6, "Plate Solving y toma manual de muestras, ajuste del modelo GoTo y estrellas esperadas.")
 
         wrap = QWidget()
         layout = QVBoxLayout(wrap)

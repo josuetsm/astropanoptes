@@ -78,6 +78,75 @@ class MountConfig:
     slew_delay_us_az: int = 1800
     slew_delay_us_alt: int = 1800
 
+    # Retardo maximo entre microsteps al emular una velocidad de seguimiento.
+    #
+    # Es tentador subirlo para que los pasos salgan repartidos al ritmo pedido
+    # en vez de en rafagas -- suena mejor. Pero un MOVE nuevo sobre un eje
+    # sobrescribe el plan pendiente en el firmware, asi que un lote pausado se
+    # queda a medias cuando llega la orden siguiente. El acumulador ya descuenta
+    # esos pasos como ejecutados, el control se queda corto sin saberlo, y la
+    # realimentacion sube pidiendo cada vez mas: se probo con 500 ms y el
+    # resultado fue que la imagen daba tirones visibles a cada correccion.
+    #
+    # Repartir los pasos de verdad exige emitir por ventanas, sincronizado con
+    # la duracion del lote, no solo alargar el retardo.
+    rate_emul_max_delay_us: int = 50_000
+
+
+@dataclass
+class FocuserConfig:
+    """Enfocador: tercer motor del CNC shield sobre la ruedita de foco.
+
+    No hay encoder ni final de carrera, asi que todo es relativo y limitado por
+    ``max_travel_steps``: el recorrido util del enfocador es corto y forzarlo
+    contra el tope es la unica forma real de romperlo.
+    """
+    enabled: bool = True
+
+    # Movimiento manual (un toque de "acercar"/"alejar").
+    step_size: int = 200
+    delay_us: int = 900
+    profile: str = "smooth"
+    invert: bool = False
+    backlash_steps: int = 0
+
+    # Busqueda automatica. El barrido grueso localiza la V, el fino la afina.
+    autofocus_coarse_step: int = 400
+    autofocus_coarse_points: int = 9
+    autofocus_fine_step: int = 100
+    autofocus_fine_points: int = 7
+    autofocus_settle_s: float = 0.8
+    autofocus_frames: int = 3
+
+    # --- Busqueda guiada por presets ---
+    # Con una posicion conocida no hace falta barrer todo el recorrido: basta
+    # una ventana alrededor. Su ancho sale de la dispersion medida en este
+    # equipo -- el foco cambia de noche a noche con la temperatura -- y no de
+    # una constante. Si el prior falla, se cae a la busqueda general.
+    autofocus_prior_enabled: bool = True
+    autofocus_prior_window_steps: int = 800      # ventana minima sin historial
+    autofocus_prior_window_sigma: float = 4.0    # k * dispersion observada
+    autofocus_prior_max_window_steps: int = 6000
+    autofocus_prior_points: int = 7
+    # Cuan cerca hay que estar de un preset para asumir que es el que esta puesto.
+    autofocus_prior_match_steps: int = 1500
+    history_max: int = 20
+
+    # Tope de seguridad para el recorrido acumulado desde el cero de sesion.
+    # Solo se usa mientras NO hay homing: sin origen conocido no se puede hacer
+    # mejor que limitar simetricamente alrededor de donde estaba al arrancar.
+    max_travel_steps: int = 20000
+
+    # --- Homing aproximado ---
+    # No hay final de carrera, pero el pinon tiene dientes rotos: al retraer del
+    # todo sigue girando en banda sin mover nada. Eso da un cero mecanico
+    # repetible, que es justo lo que hace que una posicion guardada signifique
+    # algo de una sesion a otra.
+    home_travel_steps: int = 32000       # recorrido util (2.5 vueltas a 1/64)
+    home_overshoot_steps: int = 3000     # extra para entrar en la zona de patinaje
+    home_extend_is_positive: bool = True # +1 extiende, -1 retrae hacia el cero
+    presets_path: str = "calibration_frames/focus_presets.json"
+
 
 @dataclass
 class TrackingConfig:
@@ -89,6 +158,12 @@ class TrackingConfig:
     sidereal_ff_cond_max: float = 5_000.0
     sidereal_ff_hold_s: float = 8.0
     sidereal_ff_slew_per_s: float = 120.0
+
+    # Fallos consecutivos de tracking_step tolerados antes de rendirse. Un frame
+    # malo suelto (una alineacion que revienta, una racha de viento) no puede
+    # apagar la sesion: se reinicia la referencia y se sigue. Lo que no puede es
+    # reintentar para siempre si el fallo es permanente.
+    max_consecutive_step_failures: int = 5
 
 
 @dataclass
@@ -152,22 +227,17 @@ class PlatesolvingConfig:
     # short/tight triangles) typically implies a scale far outside this band.
     scale_tol_frac: float = 0.04
 
-    # The first trustworthy position is established from several genuinely
-    # different camera frames: only the first frame performs the expensive
-    # triplet search, and the following frames verify the projected Gaia field
-    # using the previous WCS and the expected sidereal drift. This is the real
-    # safety net for a light-polluted sky like Santiago's, where a single
-    # frame often only has 3-4 real stars (min_inliers below has to be set low
-    # to match): a lone low-inlier solve is cheap to fake by coincidence
-    # against a large catalog, but reproducing the *same* pointing/scale/roll
-    # across independent frames by chance is not. Requiring only 1 (i.e. no
-    # confirmation at all) defeats that net entirely and was what let a false
-    # 3-star match through during real observing.
-    initial_consensus_count: int = 3
-    initial_consensus_timeout_s: float = 20.0
-    consensus_pointing_tol_arcsec: float = 30.0
-    consensus_scale_tol_frac: float = 0.02
-    consensus_roll_tol_deg: float = 3.0
+    # Tolerancias con las que se compara un solve nuevo contra el anterior ya
+    # confirmado (camino rapido de verificacion). No son un consenso: el
+    # consenso inicial sobre varios fotogramas independientes se elimino porque
+    # la estrategia es resolver sobre el mosaico apilado, que es *una* imagen.
+    # Pedirle fotogramas distintos a un mosaico no confirma nada; con el
+    # apilado parado ni siquiera termina. Lo que ocupa su lugar como red de
+    # seguridad es min_validation_inliers, mas abajo.
+    fresh_frame_timeout_s: float = 20.0
+    verify_pointing_tol_arcsec: float = 30.0
+    verify_scale_tol_frac: float = 0.02
+    verify_roll_tol_deg: float = 3.0
     fast_prior_match_radius_px: float = 24.0
     fast_prior_center_shift_px: float = 64.0
     fast_prior_rotation_tol_deg: float = 5.0
@@ -200,8 +270,8 @@ class PlatesolvingConfig:
     # NO_FRAME during that normal transition.
     frame_wait_timeout_s: float = 3.0
     # Hard wall-clock budget for an explicit solve, including temporal frame
-    # collection and independent consensus. Cooperative checkpoints stop the
-    # expensive catalog search without killing its worker thread.
+    # collection. Cooperative checkpoints stop the expensive catalog search
+    # without killing its worker thread.
     # Real observing sessions are weather-limited; a shorter budget matched
     # what actually worked without stalling on a closing sky.
     total_timeout_s: float = 75.0
@@ -245,15 +315,22 @@ class PlatesolvingConfig:
     match_max_px: float = 3.5  # in full-res pixels
     match_tol_arcsec: float = 5.0
     pred_margin_arcsec: float = 25.0
-    # A triplet hypothesis already contributes up to three matches by
-    # construction, so 3 is the structural floor: a field with only 3 real
-    # stars (common under Santiago's light pollution, in this instrument's
-    # narrow ~0.36x0.20 deg FoV) can never produce a "validation" inlier
-    # beyond the seed triplet, no matter how good the detector is. Guarding
-    # against a false 3-star coincidence is initial_consensus_count's job
-    # (above), not this single-frame count's.
-    min_inliers: int = 3
-    min_validation_inliers: int = 0
+    # Un triplete aporta tres emparejamientos por construccion: siempre encaja
+    # consigo mismo. Por eso un solve de 3 inliers no es evidencia de nada por
+    # bajo que sea su rms; de hecho el rms sale ridiculamente bajo justo por
+    # ser un ajuste exacto (se vieron matches falsos con rms de 0.15 px, roll
+    # disparatado y apuntado a grados del real). Lo que convierte un solve en
+    # creible son los inliers de *validacion*: estrellas que confirman la
+    # hipotesis aparte de las tres que la definieron.
+    #
+    # Esta es la red de seguridad que sustituye al consenso multi-fotograma,
+    # ahora que se resuelve sobre el mosaico apilado. El mosaico llega mas
+    # profundo que un fotograma suelto, asi que un acierto real confirma
+    # varias estrellas de sobra: los solves buenos de campo real dieron 7-9
+    # inliers. Un campo demasiado pobre para llegar aqui no es un campo que
+    # convenga creerse.
+    min_inliers: int = 5
+    min_validation_inliers: int = 2
     max_rms_px: float = 2.5
     # The search radius is also the declared pointing uncertainty. A fitted
     # optical center outside that cone is not a valid answer for the request.
@@ -345,8 +422,10 @@ class SimulationConfig:
     random_camera_roll_deg: float = 4.0
 
     # Cycloidal transmission error: the dominant mechanical effect on this
-    # mount. 45 lobes per output revolution (period = steps_per_rev/45, i.e.
-    # 12800 microsteps = 8 deg of output at 1/64 microstepping). Its amplitude
+    # mount. Tantos lobulos por vuelta de salida como reduccion tenga el eje,
+    # asi que el periodo es siempre una vuelta de motor: 12800 microsteps a
+    # 1/64, que son 8 deg de salida en azimut (45:1) y 4 deg en altitud
+    # (90.5:1). Its amplitude
     # is drawn in degrees of output; the resulting swing in *locally measured*
     # scale is amplitude*2*pi/period, about 20% at the top of this band, which
     # is what made short calibration moves read 87% of nominal while a
@@ -359,6 +438,16 @@ class SimulationConfig:
     # direction change.
     backlash_steps_min: int = 5
     backlash_steps_max: int = 40
+
+    # Foco. El demo arranca enfocado por defecto: cualquier desenfoque de
+    # arranque ensancharia las PSF de todas las demas demos (plate solving,
+    # tracking, stacking) y cambiaria resultados que no tienen que ver con el
+    # enfocador. Subiendo esto, el foco real se sortea dentro de
+    # +-focus_best_offset_steps y la busqueda automatica tiene algo que
+    # encontrar; con 0 la curva es plana y no prueba nada.
+    focus_best_offset_steps: int = 0
+    focus_blur_px_per_step: float = 0.010
+    focus_max_defocus_sigma_px: float = 12.0
 
     # Simulated camera frame. Matches the real Mars-C sensor (roi_w/roi_h in
     # CameraConfig) so the demo's field of view is the same as the physical
@@ -415,6 +504,9 @@ class SimulationConfig:
     # the background/noise comparison above, so it is one more continuous
     # contributor to "fading into the sky", not a cutoff of its own.
     extinction_mag_per_airmass: float = 0.35
+    # Faint cutoff: stars dimmer than this are simply not recorded from the
+    # city. Raise it to simulate a darker site.
+    limiting_magnitude: float = 13.5
 
     # Gaia catalog reuse. Missing cache tiles are not downloaded by the camera
     # simulator; the real plate solver can still download them if configured.
@@ -429,6 +521,7 @@ class AppConfig:
     camera: CameraConfig = field(default_factory=CameraConfig)
     preview: PreviewConfig = field(default_factory=PreviewConfig)
     mount: MountConfig = field(default_factory=MountConfig)
+    focuser: FocuserConfig = field(default_factory=FocuserConfig)
     tracking: TrackingConfig = field(default_factory=TrackingConfig)
     stacking: StackingConfig = field(default_factory=StackingConfig)
     sep: SepConfig = field(default_factory=SepConfig)

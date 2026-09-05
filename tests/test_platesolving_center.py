@@ -167,10 +167,9 @@ def test_fast_prior_verification_refits_six_catalog_stars_without_triplets() -> 
 
 def test_fast_prior_verification_respects_a_low_min_inliers_for_sparse_fields() -> None:
     # Regression test: this function used to hardcode a floor of 6 detections
-    # regardless of cfg.min_inliers, which made multi-frame consensus
-    # confirmation (initial_consensus_count) impossible in genuinely
-    # star-poor fields (heavy light pollution, narrow FoV) even when the
-    # single-frame floor was deliberately configured low to match reality.
+    # regardless of cfg.min_inliers, so a field that was deliberately
+    # configured to solve with fewer could never be verified against its own
+    # prior, no matter how good the match was.
     cfg = AppConfig().platesolving
     cfg.pixel_size_m = 1.0e-6
     cfg.focal_m = 0.206265
@@ -299,7 +298,7 @@ def test_fast_prior_verification_rejects_a_far_false_first_solution() -> None:
     assert result.status == "FAST_PRIOR_VALIDATION_FAILED"
 
 
-def test_solution_consensus_handles_continuous_tracking_in_icrs() -> None:
+def test_solution_verification_handles_continuous_tracking_in_icrs() -> None:
     observer = ObserverConfig()
     t0 = Time("2026-06-08T01:00:00", scale="utc")
     t1 = Time("2026-06-08T01:00:30", scale="utc")

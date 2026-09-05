@@ -758,6 +758,9 @@ def chord_radius(theta_rad: float) -> float:
     return float(2.0 * np.sin(float(theta_rad) / 2.0))
 
 
+_ARCSEC_TO_RAD = float(np.pi / (180.0 * 3600.0))
+
+
 def annulus_candidates(
     tree: KDTree,
     V: np.ndarray,
@@ -765,9 +768,11 @@ def annulus_candidates(
     theta_arcsec: float,
     tol_arcsec: float,
 ) -> np.ndarray:
-    theta_min = ((float(theta_arcsec) - float(tol_arcsec)) * u.arcsec).to(u.rad).value
-    theta_max = ((float(theta_arcsec) + float(tol_arcsec)) * u.arcsec).to(u.rad).value
-    theta_min = max(float(theta_min), 0.0)
+    # Plain float arithmetic instead of astropy Quantity conversions: this runs
+    # inside the triplet search's innermost loops, where the unit machinery
+    # costs far more than the geometry it wraps.
+    theta_min = max((float(theta_arcsec) - float(tol_arcsec)) * _ARCSEC_TO_RAD, 0.0)
+    theta_max = (float(theta_arcsec) + float(tol_arcsec)) * _ARCSEC_TO_RAD
 
     r_max = chord_radius(theta_max)
     r_min = chord_radius(theta_min)
@@ -779,6 +784,35 @@ def annulus_candidates(
     dots = V[idxs] @ V[center_idx]
     chord2 = 2.0 - 2.0 * dots
     return idxs[chord2 >= (r_min * r_min)]
+
+
+def annulus_candidates_batch(
+    tree: KDTree,
+    V: np.ndarray,
+    center_idxs: np.ndarray,
+    theta_arcsec: float,
+    tol_arcsec: float,
+) -> List[np.ndarray]:
+    """Annuli for many centres in a single KDTree query.
+
+    Same result as calling :func:`annulus_candidates` per index, but one query
+    instead of N. scikit-learn validates its input array on every call, so with
+    thousands of centres that per-call overhead dwarfs the search itself.
+    """
+    theta_min = max((float(theta_arcsec) - float(tol_arcsec)) * _ARCSEC_TO_RAD, 0.0)
+    theta_max = (float(theta_arcsec) + float(tol_arcsec)) * _ARCSEC_TO_RAD
+    r_max = chord_radius(theta_max)
+    r_min_sq = chord_radius(theta_min) ** 2
+
+    raw = tree.query_radius(V[center_idxs], r=r_max, return_distance=False)
+    out: List[np.ndarray] = []
+    for pos, idxs in enumerate(raw):
+        if idxs.size == 0:
+            out.append(idxs)
+            continue
+        dots = V[idxs] @ V[int(center_idxs[pos])]
+        out.append(idxs[(2.0 - 2.0 * dots) >= r_min_sq])
+    return out
 
 
 def sorted_sides_arcsec_from_pixels(xy3: np.ndarray, arcsec_per_pixel: float) -> np.ndarray:
@@ -794,6 +828,28 @@ def sorted_sides_arcsec_from_coords(coords: SkyCoord, i: int, j: int, k: int) ->
     s2 = coords[j].separation(coords[k]).to_value(u.arcsec)
     s3 = coords[k].separation(coords[i]).to_value(u.arcsec)
     return np.sort(np.array([s1, s2, s3], dtype=np.float64))
+
+
+_RAD_TO_ARCSEC = float(180.0 * 3600.0 / np.pi)
+
+
+def sorted_sides_arcsec_from_vectors(V: np.ndarray, i: int, j: int, k: int) -> np.ndarray:
+    """Triangle sides from unit vectors, without astropy.
+
+    Identical geometry to ``sorted_sides_arcsec_from_coords`` but evaluated on
+    the unit-vector array the triplet search already builds. Indexing a
+    ``SkyCoord`` and calling ``separation`` allocates new frame objects on every
+    call, which is ruinous in the innermost candidate loop.
+    """
+    vi = V[i]
+    vj = V[j]
+    vk = V[k]
+    d = np.array(
+        [float(vi @ vj), float(vj @ vk), float(vk @ vi)],
+        dtype=np.float64,
+    )
+    np.clip(d, -1.0, 1.0, out=d)
+    return np.sort(np.arccos(d) * _RAD_TO_ARCSEC)
 
 
 def triplet_score(img_sides: np.ndarray, cat_sides: np.ndarray, sigma_arcsec: float) -> Tuple[float, float]:
@@ -1244,11 +1300,10 @@ def verify_plate_from_prior(
         )
 
     # This used to be hardcoded to max(6, ...), silently ignoring a lower
-    # cfg.min_inliers. That defeats the whole point of the multi-frame
-    # consensus check (initial_consensus_count) as a substitute safety net in
-    # genuinely star-poor fields (heavy light pollution, narrow FoV): with a
-    # low per-frame floor here, a real single-star or two-star field could
-    # never be confirmed at all, no matter how many frames agreed.
+    # cfg.min_inliers. The floor here is about how many detections the fast
+    # verification needs, not about trusting the solution: what guards against
+    # a coincidental match is min_validation_inliers, i.e. stars that confirm
+    # the hypothesis beyond the three that defined it.
     min_inliers = max(1, int(getattr(cfg, "min_inliers", 6)))
     if img_xy.shape[0] < min_inliers:
         return _failure("FAST_PRIOR_NOT_ENOUGH_DETECTIONS", {"n_det": float(img_xy.shape[0])})
@@ -1956,6 +2011,12 @@ def solve_plate(
     max_trials = int(getattr(cfg, "max_trials", getattr(cfg, "triplet_max_trials", 500)))
 
     candidates: List[Dict[str, Any]] = []
+    # Pull source ids out of the DataFrame once: pandas .iloc in the innermost
+    # candidate loop costs more than the geometry being computed there.
+    if "source_id" in gaia_df.columns:
+        source_ids = np.asarray(gaia_df["source_id"], dtype=np.int64)
+    else:
+        source_ids = np.arange(len(gaia_df), dtype=np.int64)
     if progress_cb:
         progress_cb("platesolving:triplets:start", {"n_triplets": int(len(img_triplets))})
 
@@ -1978,13 +2039,43 @@ def solve_plate(
                 {"phase": "triplets", "triplet": int(triplet_idx)},
             )
         d1, d2, d3 = float(img_sides[0]), float(img_sides[1]), float(img_sides[2])
+        # Annuli depend on the triplet's side lengths, so the memo is per triplet.
+        annulus_cache: Dict[Tuple[int, int], np.ndarray] = {}
 
-        theta_min = ((d3 - tol_arcsec_pairs) * u.arcsec).to(u.rad).value
-        theta_max = ((d3 + tol_arcsec_pairs) * u.arcsec).to(u.rad).value
-        theta_min = max(float(theta_min), 0.0)
+        theta_min = max((d3 - tol_arcsec_pairs) * _ARCSEC_TO_RAD, 0.0)
+        theta_max = (d3 + tol_arcsec_pairs) * _ARCSEC_TO_RAD
 
         r_max = chord_radius(theta_max)
         r_min = chord_radius(theta_min)
+
+        # One batched neighbour query per triplet instead of one per scanned
+        # catalog star. scikit-learn re-validates its input on every call, and
+        # that validation dominated the whole solve when issued tens of
+        # thousands of times.
+        nbrs_batch = tree3.query_radius(V[i_scan], r=r_max, return_distance=False)
+
+        # Resolve which centres survive the pair filter first, then compute
+        # their annuli in one query. Batching over every scanned star instead
+        # would spend most of the work on centres that get discarded here.
+        r_min_sq_pair = r_min * r_min
+        pair_nbrs: Dict[int, np.ndarray] = {}
+        for i_position, i in enumerate(i_scan):
+            cand = nbrs_batch[i_position]
+            cand = cand[cand > i]
+            if cand.size == 0:
+                continue
+            cand = cand[(2.0 - 2.0 * (V[cand] @ V[i])) >= r_min_sq_pair]
+            if cand.size:
+                pair_nbrs[i_position] = cand
+
+        if not pair_nbrs:
+            continue
+        active_positions = np.fromiter(pair_nbrs.keys(), dtype=np.int64)
+        active_idx = np.asarray(i_scan)[active_positions]
+        ann_d1 = annulus_candidates_batch(tree3, V, active_idx, d1, tol_arcsec_pairs)
+        ann_d2 = annulus_candidates_batch(tree3, V, active_idx, d2, tol_arcsec_pairs)
+        ann_i_d1_by_pos = {int(p): ann_d1[n] for n, p in enumerate(active_positions)}
+        ann_i_d2_by_pos = {int(p): ann_d2[n] for n, p in enumerate(active_positions)}
 
         for i_position, i in enumerate(i_scan):
             if progress_cb and i_position % 64 == 0:
@@ -1996,28 +2087,35 @@ def solve_plate(
                         "catalog_index": int(i_position),
                     },
                 )
-            nbrs = tree3.query_radius(V[i:i + 1], r=r_max, return_distance=False)[0]
-            nbrs = nbrs[nbrs > i]  # avoid duplicate pairs
-            if nbrs.size == 0:
+            nbrs = pair_nbrs.get(i_position)
+            if nbrs is None:
                 continue
 
-            dots = V[nbrs] @ V[i]
-            chord2 = 2.0 - 2.0 * dots
-            nbrs = nbrs[chord2 >= (r_min * r_min)]
-            if nbrs.size == 0:
+            # The annuli around i do not depend on j, so they are resolved once
+            # per (triplet, i) instead of once per pair. Recomputing them inside
+            # the pair loop was the single dominant cost of the whole solve.
+            ann_i_d1 = ann_i_d1_by_pos[i_position]
+            ann_i_d2 = ann_i_d2_by_pos[i_position]
+            if ann_i_d1.size == 0 and ann_i_d2.size == 0:
                 continue
 
             for j in nbrs:
-                candA = np.intersect1d(
-                    annulus_candidates(tree3, V, int(i), d1, tol_arcsec_pairs),
-                    annulus_candidates(tree3, V, int(j), d2, tol_arcsec_pairs),
-                    assume_unique=False
-                )
-                candB = np.intersect1d(
-                    annulus_candidates(tree3, V, int(i), d2, tol_arcsec_pairs),
-                    annulus_candidates(tree3, V, int(j), d1, tol_arcsec_pairs),
-                    assume_unique=False
-                )
+                # Annuli around j are reused across the triplets that share the
+                # same side lengths, so memoise them per (index, side).
+                jj = int(j)
+                key_d2 = (jj, 1)
+                ann_j_d2 = annulus_cache.get(key_d2)
+                if ann_j_d2 is None:
+                    ann_j_d2 = annulus_candidates(tree3, V, jj, d2, tol_arcsec_pairs)
+                    annulus_cache[key_d2] = ann_j_d2
+                key_d1 = (jj, 0)
+                ann_j_d1 = annulus_cache.get(key_d1)
+                if ann_j_d1 is None:
+                    ann_j_d1 = annulus_candidates(tree3, V, jj, d1, tol_arcsec_pairs)
+                    annulus_cache[key_d1] = ann_j_d1
+
+                candA = np.intersect1d(ann_i_d1, ann_j_d2, assume_unique=False)
+                candB = np.intersect1d(ann_i_d2, ann_j_d1, assume_unique=False)
                 ks = np.union1d(candA, candB)
                 if ks.size == 0:
                     continue
@@ -2026,7 +2124,7 @@ def solve_plate(
                     continue
 
                 for k in ks:
-                    cat_sides = sorted_sides_arcsec_from_coords(coords, int(i), int(j), int(k))
+                    cat_sides = sorted_sides_arcsec_from_vectors(V, int(i), int(j), int(k))
                     score, err_max = triplet_score(img_sides, cat_sides, sigma_arcsec=sigma_arcsec)
                     if err_max <= tol_arcsec_pairs:
                         candidates.append({
@@ -2035,9 +2133,9 @@ def solve_plate(
                             "img_triplet": (int(a), int(b), int(c)),
                             "gaia_idx": (int(i), int(j), int(k)),
                             "gaia_source_id": (
-                                int(gaia_df["source_id"].iloc[int(i)]) if "source_id" in gaia_df.columns else int(i),
-                                int(gaia_df["source_id"].iloc[int(j)]) if "source_id" in gaia_df.columns else int(j),
-                                int(gaia_df["source_id"].iloc[int(k)]) if "source_id" in gaia_df.columns else int(k),
+                                int(source_ids[int(i)]),
+                                int(source_ids[int(j)]),
+                                int(source_ids[int(k)]),
                             ),
                         })
 
@@ -2560,9 +2658,7 @@ def _build_platesolving_debug_info(result: Any) -> Dict[str, Any]:
         "match_tol_arcsec": metrics.get("match_tol_arcsec"),
         "fast_prior": metrics.get("fast_prior"),
         "continuous_prior": metrics.get("continuous_prior"),
-        "consensus_count": metrics.get("consensus_count"),
-        "consensus_requested": metrics.get("consensus_requested"),
-        "consensus_pointing_arcsec": metrics.get("consensus_pointing_arcsec"),
+        "verify_pointing_arcsec": metrics.get("verify_pointing_arcsec"),
     }
     return info
 
@@ -2803,161 +2899,6 @@ class PlatesolvingWorker(BaseWorker):
         )
         return detections, detections.reference_frame, latest_time
 
-    def _confirm_initial_solution(
-        self,
-        first: PlatesolvingResult,
-        first_frame: np.ndarray,
-        *,
-        target: Any,
-        cfg: PlatesolvingConfig,
-        sep_cfg: SepConfig,
-        observer: ObserverConfig,
-        diagnostics: Optional[DiagnosticSession] = None,
-    ) -> Tuple[PlatesolvingResult, np.ndarray]:
-        requested = max(1, int(getattr(cfg, "initial_consensus_count", 3)))
-        if requested <= 1 or not bool(first.success):
-            return first, first_frame
-        timeout_s = max(0.2, float(getattr(cfg, "initial_consensus_timeout_s", 8.0)))
-        per_frame_timeout = timeout_s / float(max(1, requested - 1))
-        accepted: List[PlatesolvingResult] = [first]
-        previous_frame = first_frame
-        prior = first
-        max_pointing = 0.0
-        max_scale = 0.0
-        max_roll = 0.0
-
-        for confirmation_idx in range(2, requested + 1):
-            self._raise_if_aborted()
-            fresh = self._wait_for_distinct_frame(previous_frame, timeout_s=per_frame_timeout)
-            if fresh is None:
-                metrics = dict(getattr(prior, "metrics", {}) or {})
-                metrics.update(
-                    {
-                        "consensus_count": float(len(accepted)),
-                        "consensus_requested": float(requested),
-                    }
-                )
-                return (
-                    replace(
-                        prior,
-                        success=False,
-                        status="INITIAL_CONSENSUS_NO_NEW_FRAME",
-                        metrics=metrics,
-                    ),
-                    previous_frame,
-                )
-            current_frame, current_time = fresh
-            confirmation_temporal: Optional[TemporalDetections] = None
-            if bool(getattr(cfg, "temporal_detection_enabled", True)):
-                (
-                    confirmation_temporal,
-                    current_frame,
-                    current_time,
-                ) = self._collect_temporal_detections(
-                    current_frame,
-                    cfg=cfg,
-                    sep_cfg=sep_cfg,
-                    diagnostics=diagnostics,
-                )
-            if diagnostics is not None:
-                diagnostics.save_raw(
-                    f"consensus_{confirmation_idx}",
-                    current_frame,
-                    metadata={
-                        "obstime_unix": float(current_time.unix),
-                        "temporal_frames": (
-                            int(confirmation_temporal.frame_count)
-                            if confirmation_temporal is not None
-                            else 1
-                        ),
-                        "temporal_confirmed": (
-                            int(confirmation_temporal.xy.shape[0])
-                            if confirmation_temporal is not None
-                            else None
-                        ),
-                    },
-                )
-            verified = verify_plate_from_prior(
-                current_frame,
-                prior=prior,
-                target=target,
-                cfg=cfg,
-                sep_cfg=sep_cfg,
-                observer=observer,
-                obstime=current_time,
-                progress_cb=None,
-                temporal_detections=confirmation_temporal,
-            )
-            self._raise_if_aborted()
-            consistency = platesolving_solutions_consistent(
-                first,
-                verified,
-                observer=observer,
-                pointing_tol_arcsec=float(getattr(cfg, "consensus_pointing_tol_arcsec", 30.0)),
-                scale_tol_frac=float(getattr(cfg, "consensus_scale_tol_frac", 0.02)),
-                roll_tol_deg=float(getattr(cfg, "consensus_roll_tol_deg", 3.0)),
-            )
-            if diagnostics is not None:
-                diagnostics.record(
-                    "platesolving_consensus",
-                    confirmation_index=int(confirmation_idx),
-                    result=verified,
-                    consistency=consistency,
-                )
-            if not bool(verified.success) or not bool(consistency.get("ok", False)):
-                metrics = dict(getattr(verified, "metrics", {}) or {})
-                metrics.update(
-                    {
-                        "consensus_count": float(len(accepted)),
-                        "consensus_requested": float(requested),
-                        "consensus_pointing_arcsec": float(consistency.get("pointing_arcsec", float("inf"))),
-                        "consensus_scale_frac": float(consistency.get("scale_frac", float("inf"))),
-                        "consensus_roll_deg": float(consistency.get("roll_deg", float("inf"))),
-                    }
-                )
-                return (
-                    replace(
-                        verified,
-                        success=False,
-                        status="INITIAL_CONSENSUS_MISMATCH",
-                        metrics=metrics,
-                    ),
-                    current_frame,
-                )
-            max_pointing = max(max_pointing, float(consistency["pointing_arcsec"]))
-            max_scale = max(max_scale, float(consistency["scale_frac"]))
-            max_roll = max(max_roll, float(consistency["roll_deg"]))
-            accepted.append(verified)
-            prior = verified
-            previous_frame = current_frame
-            log_info(
-                self._out_log,
-                "Platesolving: fast independent confirmation "
-                f"{confirmation_idx}/{requested} inliers={verified.n_inliers} "
-                f"rms_px={verified.rms_px:.3f} mount_delta={float(consistency['pointing_arcsec']):.2f}arcsec",
-            )
-
-        metrics = dict(getattr(prior, "metrics", {}) or {})
-        metrics.update(
-            {
-                "consensus_count": float(len(accepted)),
-                "consensus_requested": float(requested),
-                "consensus_pointing_arcsec": float(max_pointing),
-                "consensus_scale_frac": float(max_scale),
-                "consensus_roll_deg": float(max_roll),
-            }
-        )
-        return (
-            replace(
-                prior,
-                status="OK_CONSENSUS",
-                overlay=list(first.overlay),
-                guides=list(first.guides),
-                metrics=metrics,
-            ),
-            first_frame,
-        )
-
     def _solve_or_verify(
         self,
         raw16: np.ndarray,
@@ -2986,7 +2927,7 @@ class PlatesolvingWorker(BaseWorker):
             ):
                 fresh = self._wait_for_distinct_frame(
                     raw16,
-                    timeout_s=float(getattr(cfg, "initial_consensus_timeout_s", 8.0)),
+                    timeout_s=float(getattr(cfg, "fresh_frame_timeout_s", 8.0)),
                 )
                 if fresh is not None:
                     raw16, obstime = fresh
@@ -3011,9 +2952,9 @@ class PlatesolvingWorker(BaseWorker):
                 prior,
                 fast,
                 observer=observer,
-                pointing_tol_arcsec=float(getattr(cfg, "consensus_pointing_tol_arcsec", 30.0)),
-                scale_tol_frac=float(getattr(cfg, "consensus_scale_tol_frac", 0.02)),
-                roll_tol_deg=float(getattr(cfg, "consensus_roll_tol_deg", 3.0)),
+                pointing_tol_arcsec=float(getattr(cfg, "verify_pointing_tol_arcsec", 30.0)),
+                scale_tol_frac=float(getattr(cfg, "verify_scale_tol_frac", 0.02)),
+                roll_tol_deg=float(getattr(cfg, "verify_roll_tol_deg", 3.0)),
             )
             if diagnostics is not None:
                 diagnostics.record(
@@ -3026,16 +2967,13 @@ class PlatesolvingWorker(BaseWorker):
                 metrics.update(
                     {
                         "continuous_prior": 1.0,
-                        "consensus_count": float(
-                            max(3, int((getattr(prior, "metrics", {}) or {}).get("consensus_count", 3)))
-                        ),
-                        "consensus_pointing_arcsec": float(consistency["pointing_arcsec"]),
+                        "verify_pointing_arcsec": float(consistency["pointing_arcsec"]),
                     }
                 )
                 return replace(fast, status="OK_FAST_CONTINUOUS", metrics=metrics), raw16
             log_info(
                 self._out_log,
-                "Platesolving: previous field no longer continuous; running full solve and new consensus",
+                "Platesolving: previous field no longer continuous; running full solve",
             )
 
         full = solve_plate(
@@ -3050,15 +2988,7 @@ class PlatesolvingWorker(BaseWorker):
         )
         if diagnostics is not None:
             diagnostics.record("platesolving_full_solve", result=full)
-        return self._confirm_initial_solution(
-            full,
-            raw16,
-            target=target,
-            cfg=cfg,
-            sep_cfg=sep_cfg,
-            observer=observer,
-            diagnostics=diagnostics,
-        )
+        return full, raw16
 
     def _handle_request(self, request: Dict[str, Any]) -> None:
         diagnostics: Optional[DiagnosticSession] = None

@@ -30,6 +30,9 @@ FIRMWARE_MOVE_MAX_RATE_STEPS_S = 12_000.0
 FIRMWARE_MOVE_SMOOTH_START_RATE_STEPS_S = 400.0
 FIRMWARE_MOVE_SMOOTH_MAX_ACCEL_STEPS_S2 = 4_000.0
 _SMOOTHERSTEP_MAX_DERIVATIVE = 1.875
+# Mirrors TEST_MAX_RATE_STEPS_S in the firmware: TEST runs the same profile
+# without the telescope's rate clamp, for motors with a different reduction.
+FIRMWARE_TEST_MAX_RATE_STEPS_S = 200_000.0
 
 
 def normalize_move_profile(profile: str) -> str:
@@ -44,11 +47,13 @@ def firmware_move_period_us(
     total_steps: int,
     remaining_steps: int,
     profile: str = "smooth",
+    *,
+    max_rate_steps_s: float = FIRMWARE_MOVE_MAX_RATE_STEPS_S,
 ) -> int:
     """Mirror the selectable, rate-limited firmware MOVE profile."""
     move_profile = normalize_move_profile(profile)
     requested_period = max(1, int(target_delay_us) + int(STEP_PULSE_US))
-    safe_min_period = int(math.ceil(1.0e6 / FIRMWARE_MOVE_MAX_RATE_STEPS_S))
+    safe_min_period = int(math.ceil(1.0e6 / float(max_rate_steps_s)))
     target_period = max(requested_period, safe_min_period)
     total = max(0, int(total_steps))
     remaining = max(0, int(remaining_steps))
@@ -103,6 +108,8 @@ def estimate_firmware_move_duration_s(
     steps: int,
     min_delay_us: int,
     profile: str = "smooth",
+    *,
+    max_rate_steps_s: float = FIRMWARE_MOVE_MAX_RATE_STEPS_S,
 ) -> float:
     """Estimate one firmware MOVE using the selected profile."""
     total = max(0, int(steps))
@@ -111,12 +118,13 @@ def estimate_firmware_move_duration_s(
     move_profile = normalize_move_profile(profile)
     if move_profile == "direct":
         period_sum_us = total * firmware_move_period_us(
-            min_delay_us, total, total, profile=move_profile
+            min_delay_us, total, total, profile=move_profile,
+            max_rate_steps_s=max_rate_steps_s,
         )
     else:
         requested_period = max(1, int(min_delay_us) + int(STEP_PULSE_US))
         safe_min_period = int(
-            math.ceil(1.0e6 / FIRMWARE_MOVE_MAX_RATE_STEPS_S)
+            math.ceil(1.0e6 / float(max_rate_steps_s))
         )
         target_period = max(requested_period, safe_min_period)
         target_rate = 1.0e6 / float(target_period)
@@ -139,6 +147,7 @@ def estimate_firmware_move_duration_s(
                 total,
                 total - completed,
                 profile=move_profile,
+                max_rate_steps_s=max_rate_steps_s,
             )
             for completed in range(ramp_count)
         )
@@ -148,6 +157,7 @@ def estimate_firmware_move_duration_s(
             total,
             total - ramp_count,
             profile=move_profile,
+            max_rate_steps_s=max_rate_steps_s,
         )
         period_sum_us = (2 * edge_sum_us) + (center_count * center_period)
     return float(period_sum_us / 1.0e6)
@@ -233,9 +243,14 @@ def resolve_common_microsteps(az_div: int, alt_div: int, *, default_ms: int = 64
     return int(FIXED_MICROSTEPS)
 
 
+MOUNT_AXIS_FW: dict[Axis, str] = {Axis.AZ: "A", Axis.ALT: "B"}
+FOCUS_AXIS_FW = "C"
+FIRMWARE_AXES: tuple[str, ...] = ("A", "B", "C")
+
+
 def _axis_to_fw(axis: Axis) -> str:
-    # Firmware: A=AZ, B=ALT
-    return "A" if axis == Axis.AZ else "B"
+    # Firmware: A=AZ, B=ALT, C=FOCUS
+    return MOUNT_AXIS_FW.get(axis, "A")
 
 
 def _dir_to_fw(direction: int) -> str:
@@ -299,6 +314,8 @@ class ArduinoController:
         self._ser: Optional[serial.Serial] = None
         self._lock = threading.Lock()
         self._move_profiles_supported: Optional[bool] = None
+        self._focuser_supported: Optional[bool] = None
+        self._test_mode_supported: Optional[bool] = None
 
     def _blueutil_path(self) -> str:
         found = str(shutil.which("blueutil") or "")
@@ -558,6 +575,8 @@ class ArduinoController:
 
                     self._ser = ser
                     self._move_profiles_supported = None
+                    self._focuser_supported = None
+                    self._test_mode_supported = None
                     self.cfg.port = target_port
                 except Exception as e:
                     self._ser = None
@@ -617,6 +636,8 @@ class ArduinoController:
             )
         self._ser = None
         self._move_profiles_supported = None
+        self._focuser_supported = None
+        self._test_mode_supported = None
 
     def close(self) -> None:
         with self._lock:
@@ -691,7 +712,7 @@ class ArduinoController:
             return response.startswith("OK MS")
         if verb == "DEBUG":
             return response.startswith("OK DEBUG")
-        if verb in {"ENABLE", "STOP", "MOVE"}:
+        if verb in {"ENABLE", "STOP", "MOVE", "TEST"}:
             return response == "OK"
         return True
 
@@ -755,8 +776,36 @@ class ArduinoController:
     def enable(self, on: bool) -> str:
         return self.send(f"ENABLE {1 if on else 0}", timeout_s=0.80, reset_input=False)
 
-    def stop(self) -> str:
-        return self.send("STOP", timeout_s=0.80, reset_input=False)
+    def stop(self, axis: Optional[str] = None) -> str:
+        """Detiene todos los ejes, o solo uno.
+
+        Parar un eje suelto permite interrumpir el enfocador sin abortar un
+        slew en curso (y al reves), que es justo lo que hace falta cuando el
+        autofoco corre mientras la montura sigue apuntando.
+        """
+        if axis is None:
+            return self.send("STOP", timeout_s=0.80, reset_input=False)
+        ax = str(axis).strip().upper()
+        if ax not in FIRMWARE_AXES:
+            raise ValueError(f"eje desconocido para STOP: {axis!r}")
+        return self.send(f"STOP {ax}", timeout_s=0.80, reset_input=False)
+
+    def _refresh_capabilities(self) -> str:
+        status = self.status().upper()
+        self._move_profiles_supported = "MOVEPROFILES=1" in status
+        self._focuser_supported = "FOCUS=1" in status
+        self._test_mode_supported = "TESTMODE=1" in status
+        return status
+
+    def supports_focuser(self) -> bool:
+        if self._focuser_supported is None:
+            self._refresh_capabilities()
+        return bool(self._focuser_supported)
+
+    def supports_test_mode(self) -> bool:
+        if self._test_mode_supported is None:
+            self._refresh_capabilities()
+        return bool(self._test_mode_supported)
 
     def move(
         self,
@@ -765,12 +814,20 @@ class ArduinoController:
         steps: int,
         delay_us: int,
         profile: str = "smooth",
+        *,
+        unlimited: bool = False,
     ) -> str:
+        """MOVE de observacion, o TEST si ``unlimited``.
+
+        ``unlimited`` manda el mismo movimiento por el comando TEST, que corre
+        sin el tope de MOVE_MAX_RATE_STEPS_S. Es para banco de pruebas con
+        motores de otra reduccion; no para el tren de la montura.
+        """
         axis = (axis or "").strip().upper()
         direction = (direction or "").strip().upper()
 
-        if axis not in ("A", "B"):
-            axis = "A"
+        if axis not in FIRMWARE_AXES:
+            raise ValueError(f"eje desconocido: {axis!r} (esperado A, B o C)")
         if direction not in ("FWD", "REV"):
             direction = "FWD"
 
@@ -778,8 +835,28 @@ class ArduinoController:
         delay_i = max(0, int(delay_us))
         profile_i = normalize_move_profile(profile).upper()
         if self._move_profiles_supported is not True:
-            status = self.status().upper()
-            self._move_profiles_supported = "MOVEPROFILES=1" in status
+            self._refresh_capabilities()
+        if axis == FOCUS_AXIS_FW and not self._focuser_supported:
+            raise RuntimeError(
+                "el firmware no declara FOCUS=1; flashea el firmware con el "
+                "tercer eje antes de usar el enfocador"
+            )
+        if unlimited:
+            if not self._test_mode_supported:
+                raise RuntimeError(
+                    "el firmware no declara TESTMODE=1; flashea el firmware "
+                    "actualizado antes de usar el modo de prueba"
+                )
+            est_s = estimate_firmware_move_duration_s(
+                steps_i,
+                delay_i,
+                profile=profile_i.lower(),
+                max_rate_steps_s=FIRMWARE_TEST_MAX_RATE_STEPS_S,
+            )
+            return self.send(
+                f"TEST {axis} {direction} {steps_i} {delay_i} {profile_i}",
+                timeout_s=float(max(3.50, est_s + 1.5)),
+            )
         if not self._move_profiles_supported:
             if profile_i != "DIRECT":
                 raise RuntimeError(
@@ -870,6 +947,22 @@ class ArduinoMount:
     def stop(self) -> str:
         return self.ctrl.stop()
 
+    def stop_axis(self, axis_fw: str) -> str:
+        """Detiene un solo eje del firmware ('A', 'B' o 'C')."""
+        return self.ctrl.stop(str(axis_fw))
+
+    def supports_focuser(self) -> bool:
+        try:
+            return bool(self.ctrl.supports_focuser())
+        except Exception:
+            return False
+
+    def supports_test_mode(self) -> bool:
+        try:
+            return bool(self.ctrl.supports_test_mode())
+        except Exception:
+            return False
+
     def set_microsteps(self, az_div: int, alt_div: int) -> str:
         return self.ctrl.set_microsteps(int(az_div), int(alt_div))
 
@@ -945,6 +1038,77 @@ class ArduinoMount:
                 profile=move_profile,
             )
             # Small safety margin for serial/firmware jitter.
+            if wait_s > 0.0:
+                time.sleep(wait_s + 0.05)
+        return resp
+
+
+    def focus_steps(
+        self,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        *,
+        profile: str = "smooth",
+        blocking: bool = True,
+    ) -> str:
+        """Mueve el enfocador (eje C del firmware).
+
+        No lleva ``stop_before_move``: el enfocador es independiente de la
+        montura, y mandar STOP global aqui abortaria un slew o el tracking.
+        """
+        if int(steps) <= 0 or int(delay_us) <= 0:
+            return ""
+        move_profile = normalize_move_profile(profile)
+        resp = self.ctrl.move(
+            FOCUS_AXIS_FW,
+            _dir_to_fw(int(direction)),
+            int(steps),
+            int(delay_us),
+            profile=move_profile,
+        )
+        if bool(blocking):
+            wait_s = estimate_firmware_move_duration_s(
+                int(steps), int(delay_us), profile=move_profile
+            )
+            if wait_s > 0.0:
+                time.sleep(wait_s + 0.05)
+        return resp
+
+    def test_steps(
+        self,
+        axis_fw: str,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        *,
+        profile: str = "smooth",
+        blocking: bool = True,
+    ) -> str:
+        """Movimiento de banco sin el tope de velocidad de MOVE.
+
+        Existe para probar motores con otra reduccion, no el tren de la
+        montura: a 200000 pasos/s el motor del telescopio simplemente perderia
+        pasos. El firmware aplica el mismo perfil de aceleracion y frenado.
+        """
+        if int(steps) <= 0 or int(delay_us) < 0:
+            return ""
+        move_profile = normalize_move_profile(profile)
+        resp = self.ctrl.move(
+            str(axis_fw).strip().upper(),
+            _dir_to_fw(int(direction)),
+            int(steps),
+            int(delay_us),
+            profile=move_profile,
+            unlimited=True,
+        )
+        if bool(blocking):
+            wait_s = estimate_firmware_move_duration_s(
+                int(steps),
+                int(delay_us),
+                profile=move_profile,
+                max_rate_steps_s=FIRMWARE_TEST_MAX_RATE_STEPS_S,
+            )
             if wait_s > 0.0:
                 time.sleep(wait_s + 0.05)
         return resp

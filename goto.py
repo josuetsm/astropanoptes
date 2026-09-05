@@ -1266,13 +1266,18 @@ class MountKinematics:
     belt_pitch_m: float = 0.002  # GT2
 
     # Direct mechanical reduction. 45.0 means motor:axis = 45:1.
+    # Los dos ejes no son iguales: altitud lleva 90.5:1, asi que su paso
+    # nominal es la mitad que el de azimut (1.12" frente a 2.25" a 1/64).
     gear_reduction_az: float | None = 45.0
-    gear_reduction_alt: float | None = 45.0
+    gear_reduction_alt: float | None = 90.5
 
-    # A 45-lobe cycloidal reducer repeats its first-order transmission error
-    # once per motor revolution: 45 cycles per full output revolution.
-    transmission_lobes_az: int = 45
-    transmission_lobes_alt: int = 45
+    # Un reductor cicloidal repite su error de transmision de primer orden una
+    # vez por vuelta de motor, o sea tantos ciclos por vuelta de salida como
+    # indique su reduccion. Va como float justamente porque 90.5 no es entero:
+    # redondear a 90 correria el periodo un 0.55% y desfasaria el modelo
+    # periodico a las pocas vueltas.
+    transmission_lobes_az: float = 45.0
+    transmission_lobes_alt: float = 90.5
 
     # Ring radii (meters), used only when gear_reduction_* is None.
     ring_radius_m_az: float = 0.24
@@ -1318,14 +1323,14 @@ class MountKinematics:
         return float(sign / spd)
 
     def transmission_error_period_steps(self, axis: Axis) -> float:
-        lobes = int(
+        lobes = float(
             self.transmission_lobes_az
             if axis == Axis.AZ
             else self.transmission_lobes_alt
         )
-        if lobes <= 0:
+        if not math.isfinite(lobes) or lobes <= 0.0:
             raise ValueError("invalid transmission_lobes")
-        return float(self.steps_per_axis_rev(axis) / float(lobes))
+        return float(self.steps_per_axis_rev(axis) / lobes)
 
 
 @dataclass
@@ -1360,16 +1365,18 @@ class GoToModel:
     # Hard limit for mount base tilts (NS/OE components of the global rotation).
     max_tilt_ns_oe_deg: float = 2.0
 
-    # The fitted step matrix is only a small correction around the known 45:1
-    # mechanics. In particular, a fit must never reverse either configured
+    # The fitted step matrix is only a small correction around the known
+    # mechanics (45:1 in AZ, 90.5:1 in ALT). In particular, a fit must never
+    # reverse either configured
     # axis. Coupling is limited because large sky rotations belong in
     # R_mount_to_world, not in the motor scale matrix.
     max_step_scale_deviation_frac: float = 0.10
     max_step_axis_coupling_frac: float = 0.05
 
     # A fitted axis needs enough physical travel to distinguish scale from
-    # plate-solve noise/backlash.  At the default 45:1 and 1/64 microstepping,
-    # 0.25 deg corresponds to 400 microsteps.
+    # plate-solve noise/backlash. El umbral va en grados, asi que no depende de
+    # la reduccion: a 1/64 son 400 microsteps en azimut (45:1) y 800 en altitud
+    # (90.5:1).
     min_fit_axis_span_deg: float = 0.25
 
     # Even a mechanically plausible matrix is not accepted when the samples
@@ -1382,9 +1389,9 @@ class GoToModel:
     fit_outlier_sigma: float = 3.0
     fit_outlier_floor_arcsec: float = 10.0
 
-    # First-order cycloidal transmission-error model. The nominal ratio stays
-    # 45:1; these bounded periodic offsets account for local acceleration and
-    # deceleration of the output within each lobe cycle.
+    # First-order cycloidal transmission-error model. La reduccion nominal de
+    # cada eje no se toca; estos desplazamientos periodicos acotados recogen la
+    # aceleracion y deceleracion local de la salida dentro de cada lobulo.
     # Eight points leave useful residual degrees of freedom after fitting the
     # two global step columns plus sine/cosine. Six points proved too easy to
     # overfit when plate solutions carried unrelated offsets.
@@ -1556,7 +1563,7 @@ class GoToModel:
         return J
 
     def is_J_within_mechanical_limits(self, candidate: np.ndarray) -> bool:
-        """Return whether ``candidate`` is already inside the 45:1 envelope.
+        """Return whether ``candidate`` is already inside the mechanical envelope.
 
         This is intentionally separate from ``constrain_J_to_mechanics``:
         constraining is a final safety net for prediction, while a newly fitted
@@ -2764,6 +2771,46 @@ class GoToModel:
         self._log_manual_sample_csv(sample_idx=n_samples, az_alt_world=az_alt, roll_sample=roll_sample)
         return n_samples
 
+    def _roll_only_continuity_report(
+        self,
+        roll_deg: Optional[float],
+        reference_roll_deg: Optional[float],
+    ) -> Dict[str, Any]:
+        """Continuidad cuando no hay muestra previa con la que comparar.
+
+        Sin muestra anterior no existe movimiento que contrastar, pero el roll
+        de la camara si tiene referencia: es mecanico y sobrevive al reset del
+        modelo. Comprobarlo impide que la primera muestra tras un reset entre
+        sin ningun control.
+        """
+        out: Dict[str, Any] = {
+            "ok": True,
+            "has_reference": False,
+            "motion_ok": True,
+            "roll_ok": True,
+        }
+        reference = reference_roll_deg
+        if reference is None and int(self.model_roll_samples) > 0:
+            candidate = float(self.model_roll_deg)
+            if np.isfinite(candidate):
+                reference = candidate
+        if reference is None or roll_deg is None:
+            return out
+        if not (np.isfinite(float(roll_deg)) and np.isfinite(float(reference))):
+            return out
+        jump = roll_axis_distance_deg(float(roll_deg), float(reference))
+        tol = max(0.0, float(self.manual_sample_roll_tolerance_deg))
+        roll_ok = bool(tol <= 0.0 or jump <= tol)
+        out.update(
+            {
+                "ok": bool(roll_ok),
+                "roll_ok": bool(roll_ok),
+                "roll_jump_deg": float(jump),
+                "roll_tolerance_deg": float(tol),
+            }
+        )
+        return out
+
     def manual_sample_continuity_report(
         self,
         az_alt_deg: np.ndarray,
@@ -2784,12 +2831,7 @@ class GoToModel:
 
         if reference_steps is None or reference_az_alt_deg is None:
             if not self._manual_steps_abs or not self._manual_az_alt_abs:
-                return {
-                    "ok": True,
-                    "has_reference": False,
-                    "motion_ok": True,
-                    "roll_ok": True,
-                }
+                return self._roll_only_continuity_report(roll_deg, reference_roll_deg)
             ref_steps = _as_array2(self._manual_steps_abs[-1])
             ref_world = _as_array2(self._manual_az_alt_abs[-1])
             if reference_roll_deg is None and self._manual_roll_deg_abs:
@@ -2973,9 +3015,11 @@ class GoToModel:
         self.last_solve_time = 0.0
         self.R_mount_to_world = np.eye(3, dtype=np.float64)
 
-        self.model_roll_deg = 0.0
-        self.model_roll_err_deg = 0.0
-        self.model_roll_samples = 0
+        # El roll de la camara se conserva a proposito. Es como esta montada la
+        # camara en el enfocador, no donde apunta el tubo: resetear el modelo de
+        # apuntado no la gira. Si se borrase, la primera muestra tras el reset
+        # entraria sin ninguna comprobacion, que es exactamente cuando un solve
+        # falso se cuela entero. Un ajuste nuevo lo recalcula de todos modos.
         self.model_pitch_deg = 0.0
         self.model_pitch_err_deg = 0.0
         self.model_yaw_deg = 0.0
@@ -3474,8 +3518,8 @@ class GoToModel:
                 # Fit the long-term scale/coupling and the bounded cycloidal
                 # term in the same regression. Fitting J first would let a
                 # partial transmission-error cycle masquerade as a different
-                # gearbox ratio, which is precisely what the fixed 45:1
-                # mechanical baseline must prevent.
+                # gearbox ratio, which is precisely what the fixed mechanical
+                # baseline of each axis must prevent.
                 solve_ok = True
                 for output_idx, axis in enumerate((Axis.AZ, Axis.ALT)):
                     columns: List[np.ndarray] = [
@@ -4490,7 +4534,7 @@ class GoToController:
             if not self.model.is_J_within_mechanical_limits(J_motion):
                 log_error(
                     None,
-                    "GoTo: refusing MOVE with model outside 45:1 mechanical limits",
+                    "GoTo: refusing MOVE with model outside mechanical limits",
                     None,
                     throttle_s=5.0,
                     throttle_key="goto_unsafe_model",
@@ -5055,7 +5099,7 @@ class GoToController:
                 if not self.model.is_J_within_mechanical_limits(J):
                     log_error(
                         None,
-                        "GoTo: calibration model outside 45:1 limits; resetting mechanics",
+                        "GoTo: calibration model outside mechanical limits; resetting mechanics",
                         None,
                         throttle_s=5.0,
                         throttle_key="goto_calib_unsafe_J",
@@ -6409,17 +6453,8 @@ class GoToWorker(BaseWorker):
         )
         result = replace(result, obstime_unix=float(obstime.unix))
         self._diagnostics_record("autocal_platesolve_full", result=result)
-        if bool(result.success) and not bool(self._initial_solution_confirmed):
-            result, result_frame = self._autocal_confirm_initial_solution(
-                result,
-                first_frame=result_frame,
-                target=target,
-                platesolving_cfg=ps_cfg,
-                sep_cfg=sep_cfg,
-                observer=observer,
-            )
-            if bool(result.success):
-                self._initial_solution_confirmed = True
+        if bool(result.success):
+            self._initial_solution_confirmed = True
         debug_jpeg = _render_platesolving_debug_jpeg(
             result_frame,
             list(getattr(result, "overlay", []) or []),
@@ -6496,150 +6531,6 @@ class GoToWorker(BaseWorker):
                 f"target_offset={float(metrics.get('target_offset_deg', float('nan'))):.4f}deg",
             )
         return result
-
-    def _autocal_confirm_initial_solution(
-        self,
-        first: PlatesolvingResult,
-        *,
-        first_frame: np.ndarray,
-        target: Any,
-        platesolving_cfg: PlatesolvingConfig,
-        sep_cfg: SepConfig,
-        observer: ObserverConfig,
-    ) -> Tuple[PlatesolvingResult, np.ndarray]:
-        requested = max(1, int(getattr(platesolving_cfg, "initial_consensus_count", 3)))
-        if requested <= 1:
-            return first, first_frame
-        timeout_s = max(
-            0.2,
-            float(getattr(platesolving_cfg, "initial_consensus_timeout_s", 8.0)),
-        )
-        # Skip the frame currently exposed by latest(): it may be the one used
-        # by the expensive first solve.  The returned frames are sequence-unique.
-        frames = self._autocal_capture_frames(
-            n_frames=requested - 1,
-            timeout_s=timeout_s,
-            skip_frames=1,
-            diagnostic_stage="autocal_platesolve_consensus",
-        )
-        if len(frames) < requested - 1:
-            metrics = dict(getattr(first, "metrics", {}) or {})
-            metrics.update(
-                {
-                    "consensus_count": 1.0,
-                    "consensus_requested": float(requested),
-                }
-            )
-            return (
-                replace(
-                    first,
-                    success=False,
-                    status="INITIAL_CONSENSUS_NO_NEW_FRAME",
-                    metrics=metrics,
-                ),
-                first_frame,
-            )
-
-        prior = first
-        result_frame = first_frame
-        max_pointing = 0.0
-        max_scale = 0.0
-        max_roll = 0.0
-        for idx, frame in enumerate(frames, start=2):
-            frame_time = self._autocal_frame_obstime(frame)
-            verified = verify_plate_from_prior(
-                frame.raw16,
-                prior=prior,
-                target=target,
-                cfg=platesolving_cfg,
-                sep_cfg=sep_cfg,
-                observer=observer,
-                obstime=frame_time,
-                progress_cb=None,
-            )
-            consistency = platesolving_solutions_consistent(
-                first,
-                verified,
-                observer=observer,
-                pointing_tol_arcsec=float(
-                    getattr(platesolving_cfg, "consensus_pointing_tol_arcsec", 30.0)
-                ),
-                scale_tol_frac=float(
-                    getattr(platesolving_cfg, "consensus_scale_tol_frac", 0.02)
-                ),
-                roll_tol_deg=float(
-                    getattr(platesolving_cfg, "consensus_roll_tol_deg", 3.0)
-                ),
-            )
-            self._diagnostics_record(
-                "autocal_platesolve_consensus",
-                confirmation_index=int(idx),
-                result=verified,
-                consistency=consistency,
-            )
-            if not bool(verified.success) or not bool(consistency.get("ok", False)):
-                metrics = dict(getattr(verified, "metrics", {}) or {})
-                metrics.update(
-                    {
-                        "consensus_count": float(idx - 1),
-                        "consensus_requested": float(requested),
-                        "consensus_pointing_arcsec": float(
-                            consistency.get("pointing_arcsec", float("inf"))
-                        ),
-                        "consensus_scale_frac": float(
-                            consistency.get("scale_frac", float("inf"))
-                        ),
-                        "consensus_roll_deg": float(
-                            consistency.get("roll_deg", float("inf"))
-                        ),
-                    }
-                )
-                log_error(
-                    self._out_log,
-                    "Platesolving: initial independent confirmation rejected "
-                    f"frame={idx}/{requested} status={verified.status} "
-                    f"mount_delta={float(consistency.get('pointing_arcsec', float('inf'))):.2f}arcsec",
-                )
-                return (
-                    replace(
-                        verified,
-                        success=False,
-                        status="INITIAL_CONSENSUS_MISMATCH",
-                        metrics=metrics,
-                    ),
-                    frame.raw16,
-                )
-            max_pointing = max(max_pointing, float(consistency["pointing_arcsec"]))
-            max_scale = max(max_scale, float(consistency["scale_frac"]))
-            max_roll = max(max_roll, float(consistency["roll_deg"]))
-            prior = verified
-            result_frame = frame.raw16
-            log_info(
-                self._out_log,
-                "Platesolving: fast independent confirmation "
-                f"{idx}/{requested} inliers={verified.n_inliers} rms_px={verified.rms_px:.3f} "
-                f"mount_delta={float(consistency['pointing_arcsec']):.2f}arcsec",
-            )
-
-        metrics = dict(getattr(prior, "metrics", {}) or {})
-        metrics.update(
-            {
-                "consensus_count": float(requested),
-                "consensus_requested": float(requested),
-                "consensus_pointing_arcsec": float(max_pointing),
-                "consensus_scale_frac": float(max_scale),
-                "consensus_roll_deg": float(max_roll),
-            }
-        )
-        return (
-            replace(
-                prior,
-                status="OK_CONSENSUS",
-                guides=list(first.guides),
-                metrics=metrics,
-            ),
-            result_frame,
-        )
 
     def _autocal_axis_rates(self, axis: Axis, rate: float) -> Tuple[float, float]:
         if axis == Axis.AZ:
@@ -9037,7 +8928,7 @@ class GoToWorker(BaseWorker):
 def make_default_goto_controller_for_your_mount() -> GoToController:
     """Factory using the mechanical parameters you provided.
 
-    AZ/ALT: 45:1 motor-to-axis mechanical reduction.
+    AZ: 45:1, ALT: 90.5:1 motor-to-axis mechanical reduction.
     Microstepping defaults to 1/64.
     """
     kin = MountKinematics(
@@ -9045,7 +8936,7 @@ def make_default_goto_controller_for_your_mount() -> GoToController:
         microsteps_az=64,
         microsteps_alt=64,
         gear_reduction_az=45.0,
-        gear_reduction_alt=45.0,
+        gear_reduction_alt=90.5,
         axis_sign_az=+1,
         axis_sign_alt=+1,
     )

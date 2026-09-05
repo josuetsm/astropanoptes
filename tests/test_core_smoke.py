@@ -33,6 +33,25 @@ from stacking import StackEngine, StackingWorker
 from tracking import _AlignmentMeasurement, make_tracking_state, tracking_step, tracking_set_params
 
 
+
+def _j_around_nominal(model, *, az_scale, alt_scale, az_per_alt, alt_per_az):
+    """Matriz J con desviaciones relativas a la escala nominal de cada eje.
+
+    Escribir aqui numeros absolutos (0.00068, 0.00060...) ataba los tests a que
+    ambos ejes fueran 45:1. Altitud es 90.5:1, asi que su nominal es la mitad y
+    aquellos valores quedaban al doble, fuera del sobre mecanico.
+    """
+    nom_az = abs(float(model.kin.deg_per_step(Axis.AZ)))
+    nom_alt = abs(float(model.kin.deg_per_step(Axis.ALT)))
+    return np.array(
+        [
+            [nom_az * az_scale, nom_alt * az_per_alt],
+            [nom_az * alt_per_az, nom_alt * alt_scale],
+        ],
+        dtype=np.float64,
+    )
+
+
 def _tracking_star_frame() -> np.ndarray:
     raw = np.zeros((32, 32), dtype=np.uint16)
     raw[6:9, 6:9] = 60_000
@@ -454,12 +473,30 @@ class CoreSmokeTests(unittest.TestCase):
             err_deg = abs(self._wrap_deg_180(float(theta) - float(theta_ref)))
             self.assertLess(err_deg, 1.0)
 
-    def test_mount_kinematics_defaults_use_45_to_1_reduction(self) -> None:
+    def test_mount_kinematics_defaults_match_each_axis_reduction(self) -> None:
+        """Los ejes no son iguales: 45:1 en azimut, 90.5:1 en altitud."""
         kin = MountKinematics()
         self.assertAlmostEqual(kin.gear_reduction(Axis.AZ), 45.0, places=9)
-        self.assertAlmostEqual(kin.gear_reduction(Axis.ALT), 45.0, places=9)
+        self.assertAlmostEqual(kin.gear_reduction(Axis.ALT), 90.5, places=9)
         self.assertAlmostEqual(kin.steps_per_axis_rev(Axis.AZ), 200.0 * 64.0 * 45.0, places=6)
-        self.assertAlmostEqual(kin.steps_per_axis_rev(Axis.ALT), 200.0 * 64.0 * 45.0, places=6)
+        self.assertAlmostEqual(kin.steps_per_axis_rev(Axis.ALT), 200.0 * 64.0 * 90.5, places=6)
+        # Altitud avanza la mitad de cielo por paso que azimut.
+        self.assertAlmostEqual(
+            abs(kin.deg_per_step(Axis.ALT)) * 3600.0, 1.1188, places=3
+        )
+
+    def test_transmission_error_period_is_one_motor_revolution_on_both_axes(self) -> None:
+        """El reductor cicloidal repite su error una vez por vuelta de motor.
+
+        Con 90.5 lobulos en altitud, redondear a entero correria el periodo un
+        0.55% y el modelo periodico se desfasaria a las pocas vueltas.
+        """
+        kin = MountKinematics()
+        one_motor_rev = 200.0 * 64.0
+        for axis in (Axis.AZ, Axis.ALT):
+            self.assertAlmostEqual(
+                kin.transmission_error_period_steps(axis), one_motor_rev, places=6
+            )
 
     def test_goto_model_smoke(self) -> None:
         kin = MountKinematics(
@@ -476,7 +513,8 @@ class CoreSmokeTests(unittest.TestCase):
 
     def test_goto_model_manual_fit_reports_params_and_errors(self) -> None:
         model = GoToModel()
-        j_true = np.array([[0.00068, 0.00002], [-0.000015, 0.00060]], dtype=np.float64)
+        j_true = _j_around_nominal(model, az_scale=1.088, alt_scale=0.960,
+                                   az_per_alt=0.032, alt_per_az=-0.024)
         base_steps = np.array([5200.0, -2100.0], dtype=np.float64)
         base_az_alt = np.array([121.5, 38.25], dtype=np.float64)
         theta_true = 17.0
@@ -653,9 +691,13 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertEqual(model.last_solve_time, 0.0)
         np.testing.assert_allclose(model.ref_steps, model.steps_est)
         np.testing.assert_allclose(model.ref_az_alt_deg, np.zeros(2, dtype=np.float64))
-        self.assertEqual(model.model_roll_deg, 0.0)
-        self.assertEqual(model.model_roll_err_deg, 0.0)
-        self.assertEqual(model.model_roll_samples, 0)
+        # El roll de camara sobrevive a proposito: es como esta montada la
+        # camara en el enfocador, y resetear el modelo de apuntado no la gira.
+        # Sin el, la primera muestra tras el reset entraria sin ninguna
+        # comprobacion, que es cuando se colo un solve falso en cielo real.
+        # Ver tests/test_sample_guards.py.
+        self.assertEqual(model.model_roll_deg, 5.0)
+        self.assertEqual(model.model_roll_samples, 1)
         self.assertEqual(model.model_fit_samples, 0)
         self.assertEqual(model.model_fit_rms_az_deg, 0.0)
         self.assertEqual(model.model_fit_rms_alt_deg, 0.0)
@@ -677,7 +719,13 @@ class CoreSmokeTests(unittest.TestCase):
                 source_model.steps_est = np.array([1350.0, 1780.0], dtype=np.float64)
                 source_model.add_manual_sample(np.array([121.2, 44.7], dtype=np.float64), theta_deg=6.0)
 
-                J_restore = np.array([[0.00067, 0.00002], [-0.000015, 0.00060]], dtype=np.float64)
+                J_restore = _j_around_nominal(
+                    source_model,
+                    az_scale=1.072,
+                    alt_scale=0.960,
+                    az_per_alt=0.032,
+                    alt_per_az=-0.024,
+                )
                 R_restore = _rotvec_deg_to_rotation_matrix(np.array([0.3, -0.2, 0.7], dtype=np.float64))
 
                 source_model.J_deg_per_step = J_restore.copy()
@@ -834,7 +882,8 @@ class CoreSmokeTests(unittest.TestCase):
     def test_goto_model_manual_fit_rejects_outlier_sample(self) -> None:
         model = GoToModel()
         model.init_from_mechanics()
-        j_true = np.array([[0.00068, 0.00003], [-0.000025, 0.00060]], dtype=np.float64)
+        j_true = _j_around_nominal(model, az_scale=1.088, alt_scale=0.960,
+                                   az_per_alt=0.048, alt_per_az=-0.040)
         base_steps = np.array([4200.0, -1700.0], dtype=np.float64)
         base_az_alt = np.array([223.0, 58.5], dtype=np.float64)
         deltas = np.array(
@@ -876,7 +925,8 @@ class CoreSmokeTests(unittest.TestCase):
     def test_goto_model_manual_fit_rejects_central_reference_outlier(self) -> None:
         model = GoToModel()
         model.init_from_mechanics()
-        j_true = np.array([[0.00068, 0.000025], [-0.00002, 0.00061]], dtype=np.float64)
+        j_true = _j_around_nominal(model, az_scale=1.088, alt_scale=0.976,
+                                   az_per_alt=0.040, alt_per_az=-0.032)
         base_steps = np.array([0.0, 0.0], dtype=np.float64)
         base_az_alt = np.array([210.0, 40.0], dtype=np.float64)
         deltas = np.array(
@@ -919,7 +969,8 @@ class CoreSmokeTests(unittest.TestCase):
     def test_goto_model_calibration_fit_rejects_outlier_sample(self) -> None:
         model = GoToModel()
         model.init_from_mechanics()
-        j_true = np.array([[0.00068, 0.000025], [-0.00002, 0.00060]], dtype=np.float64)
+        j_true = _j_around_nominal(model, az_scale=1.088, alt_scale=0.960,
+                                   az_per_alt=0.040, alt_per_az=-0.032)
         steps = np.array(
             [
                 [-900.0, -500.0],
@@ -1065,10 +1116,27 @@ class CoreSmokeTests(unittest.TestCase):
             )
 
         self.assertTrue(status.ok)
-        self.assertEqual(status.status, "OK")
         self.assertEqual(status.iters, 1)
         self.assertEqual(len(moves), 2)
-        np.testing.assert_allclose(model.steps_est, [12800.0, 12800.0])
+
+        # 8 grados en cada eje, contados con la reduccion de cada uno. Antes
+        # esto eran 12800 pasos en ambos porque los dos ejes eran 45:1 y la
+        # division salia exacta; en altitud (90.5:1) son 25742.06, y el resto
+        # de redondeo deja 0.067", por encima de la tolerancia de 0.01" que
+        # pide este test. Ese "OK" exacto era un accidente aritmetico, no una
+        # garantia: lo que se puede exigir es que no sobre ni falte mas de un
+        # microstep.
+        expected = np.array(
+            [
+                8.0 / abs(float(model.kin.deg_per_step(Axis.AZ))),
+                8.0 / abs(float(model.kin.deg_per_step(Axis.ALT))),
+            ]
+        )
+        np.testing.assert_allclose(model.steps_est, expected, atol=1.0)
+        self.assertIn(status.status, ("OK", "OK_MODEL"))
+        one_microstep_arcsec = abs(float(model.kin.deg_per_step(Axis.ALT))) * 3600.0
+        self.assertLessEqual(abs(status.err_az_arcsec), one_microstep_arcsec)
+        self.assertLessEqual(abs(status.err_alt_arcsec), one_microstep_arcsec)
 
     def test_goto_rejects_large_move_before_model_fit(self) -> None:
         model = GoToModel()

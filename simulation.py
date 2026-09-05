@@ -154,6 +154,14 @@ class SimulationState:
         self._last_direction = np.zeros(2, dtype=np.float64)
         self._backlash_pending = np.zeros(2, dtype=np.float64)
 
+        # --- Foco ---
+        # El enfocador arranca en cero y el foco real esta en otro lado: eso es
+        # lo que la busqueda tiene que encontrar. El desenfoque ensancha la PSF
+        # igual que en el telescopio, asi que la metrica de nitidez ve una V.
+        focus_span = abs(int(getattr(cfg, "focus_best_offset_steps", 1200)))
+        self.focus_best_steps = float(self._rng.integers(-focus_span, focus_span + 1)) if focus_span > 0 else 0.0
+        self._focus_steps = 0.0
+
         self._az_deg = (float(cfg.initial_az_deg) + self.mount_tilt_az_deg) % 360.0
         self._alt_deg = float(np.clip(float(cfg.initial_alt_deg) + self.mount_tilt_alt_deg, 1.0, 89.0))
 
@@ -166,7 +174,8 @@ class SimulationState:
                 f"camera_roll_error={self.camera_roll_error_deg:+.3f} deg "
                 f"transmission_error=({self.transmission_amp_deg[0]:.3f},"
                 f"{self.transmission_amp_deg[1]:.3f}) deg "
-                f"backlash=({int(self.backlash_steps[0])},{int(self.backlash_steps[1])}) steps"
+                f"backlash=({int(self.backlash_steps[0])},{int(self.backlash_steps[1])}) steps "
+                f"foco_real={int(self.focus_best_steps):+d} pasos"
             ),
         )
 
@@ -266,6 +275,27 @@ class SimulationState:
             self._alt_deg = float(np.clip(self._alt_deg + float(d_altaz[1]), 1.0, 89.0))
             return float(self._az_deg), float(self._alt_deg)
 
+    def apply_focus_move(self, direction: int, steps: int) -> float:
+        with self._lock:
+            self._focus_steps += float(int(direction) * int(steps))
+            return float(self._focus_steps)
+
+    def focus_steps_position(self) -> float:
+        with self._lock:
+            return float(self._focus_steps)
+
+    def defocus_sigma_px(self) -> float:
+        """Ensanchamiento de la PSF por desenfoque, en pixeles.
+
+        Lineal con la distancia al foco, como el circulo de confusion de un
+        sistema optico: al doble de recorrido, el doble de borroso.
+        """
+        with self._lock:
+            offset = abs(float(self._focus_steps) - float(self.focus_best_steps))
+        blur = abs(_finite_float(getattr(self.cfg, "focus_blur_px_per_step", 0.010), 0.010))
+        cap = abs(_finite_float(getattr(self.cfg, "focus_max_defocus_sigma_px", 12.0), 12.0))
+        return float(min(offset * blur, cap))
+
     def snapshot_altaz(self) -> Tuple[float, float]:
         with self._lock:
             return float(self._az_deg), float(self._alt_deg)
@@ -317,9 +347,53 @@ class SimulatedMount:
     def stop(self) -> str:
         return "OK SIM STOP"
 
+    def stop_axis(self, axis_fw: str) -> str:
+        return f"OK SIM STOP {str(axis_fw).upper()}"
+
+    def supports_focuser(self) -> bool:
+        return True
+
+    def supports_test_mode(self) -> bool:
+        return True
+
     def set_microsteps(self, az_div: int, alt_div: int) -> str:
         self._state.set_microsteps(int(az_div), int(alt_div))
         return "OK SIM MS"
+
+    def focus_steps(
+        self,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        *,
+        profile: str = "smooth",
+        blocking: bool = True,
+    ) -> str:
+        if not self.is_connected():
+            raise RuntimeError("simulated mount not connected")
+        if int(steps) <= 0:
+            return "OK SIM FOCUS skipped"
+        self._state.apply_focus_move(int(direction), int(steps))
+        if bool(blocking):
+            wait_s = self._estimate_move_duration_s(
+                int(steps), int(delay_us), profile=profile
+            )
+            if wait_s > 0.0:
+                time.sleep(min(wait_s + 0.02, 0.25))
+        return "OK SIM FOCUS"
+
+    def test_steps(
+        self,
+        axis_fw: str,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        *,
+        profile: str = "smooth",
+        blocking: bool = True,
+    ) -> str:
+        _ = (axis_fw, direction, steps, delay_us, profile, blocking)
+        return "OK SIM TEST"
 
     @staticmethod
     def _estimate_move_duration_s(
@@ -771,6 +845,7 @@ class SimulatedCameraStream:
         if jitter > 0.0:
             base_sigma = float(base_sigma * (1.0 + self._rng.normal(0.0, jitter * 0.5)))
             base_sigma = float(np.clip(base_sigma, 0.45, 12.0))
+        defocus_sigma = float(self._state.defocus_sigma_px())
         base_flux = _finite_float(getattr(self._cfg.simulation, "star_flux_adu", 18000.0), 18000.0)
         exp_scale = max(0.05, _finite_float(getattr(self._cfg.camera, "exp_ms", 100.0), 100.0) / 100.0)
         gain_scale = max(0.2, _finite_float(getattr(self._cfg.camera, "gain", 360.0), 360.0) / 360.0)
@@ -785,6 +860,17 @@ class SimulatedCameraStream:
             # Real PSF size is mostly optical, but bright stars look wider in
             # raw frames because their wings and saturation stay above noise.
             core_sigma = float(np.clip(base_sigma * (0.82 + 0.62 * bright - 0.14 * faint), 0.42, 3.2))
+            defocus_dim = 1.0
+            if defocus_sigma > 0.0:
+                # En cuadratura: el desenfoque es una convolucion independiente
+                # del seeing, no un reemplazo suyo.
+                focused_sigma = core_sigma
+                core_sigma = float(np.hypot(core_sigma, defocus_sigma))
+                # El desenfoque reparte el mismo flujo en mas area, no anade
+                # luz: el pico cae como sigma^2. Sin esta correccion una
+                # estrella desenfocada seria mas brillante que enfocada y la
+                # curva de foco saldria al reves.
+                defocus_dim = float((focused_sigma / core_sigma) ** 2)
             halo_sigma = float(np.clip(core_sigma * (2.2 + 2.4 * bright), core_sigma + 0.4, 14.0))
             halo_frac = float(0.018 + 0.11 * bright)
             # Must reach out to where halo_sigma (clipped up to 14.0 above)
@@ -799,7 +885,7 @@ class SimulatedCameraStream:
             if xi < -radius or yi < -radius or xi >= w + radius or yi >= h + radius:
                 continue
 
-            amp = float(base_flux * exp_scale * np.sqrt(gain_scale) * mag_scale)
+            amp = float(base_flux * exp_scale * np.sqrt(gain_scale) * mag_scale * defocus_dim)
             # No floor: a faint star's patch is allowed to sit at an amplitude
             # the sky noise will bury. Only the saturation ceiling is real.
             amp = float(np.clip(amp, 0.0, 62000.0))

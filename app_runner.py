@@ -10,7 +10,7 @@ import time
 from pathlib import Path
 import datetime as _dt
 
-from dataclasses import replace
+from dataclasses import asdict, replace
 from typing import Optional, Any, Callable, Dict, List, Tuple, Sequence
 
 import cv2
@@ -33,7 +33,7 @@ from ap_types import (
     TrackingMode,
     TrackingStatus,
 )
-from config import AppConfig, PlatesolvingConfig, SepConfig
+from config import AppConfig, FocuserConfig, PlatesolvingConfig, SepConfig
 from actions import (
     Action,
     ActionType,
@@ -49,6 +49,17 @@ from actions import (
     goto_fit_model,
     goto_reset,
     goto_restore_last_log,
+    focuser_autofocus,
+    focuser_cancel,
+    focuser_delete_preset,
+    focuser_home,
+    focuser_preset,
+    focuser_save_preset,
+    focuser_goto,
+    focuser_move,
+    focuser_reset_defaults,
+    focuser_set_params,
+    focuser_zero,
     goto_cancel,
     goto_list_samples,
     goto_prune_outliers,
@@ -90,6 +101,7 @@ from transmission_error import (
     gain_from_tracking_matrix,
 )
 from mount_arduino import (
+    FOCUS_AXIS_FW,
     ArduinoMount,
     estimate_firmware_move_duration_s,
     resolve_common_microsteps,
@@ -130,7 +142,20 @@ from goto import (
     roll_axis_distance_deg,
 )
 from mount_arduino import MountMoveWorker
+from focuser import FocuserWorker
 from workers import BaseWorker, SaveWorker
+
+
+# Emision de pasos por ventanas (ver _fit_steps_in_emission_window).
+# Cadencia real del firmware: 1e6 / (delay_us + pulse_us), con pulse_us ~= 3.
+_RATE_EMUL_PULSE_US = 3.0
+# Solo se llena parte de la ventana: el ciclo siguiente llega con jitter (lo
+# marca la camara, no un reloj), y un lote que ocupe la ventana entera se queda
+# a medias en cuanto un fotograma se adelanta.
+_RATE_EMUL_WINDOW_FRAC = 0.8
+# Un intervalo mayor no es una cadencia de control, es una pausa: no sirve para
+# estimar cuanto tiempo hay hasta el MOVE siguiente.
+_RATE_EMUL_MAX_PERIOD_S = 5.0
 
 
 def _perf() -> float:
@@ -279,7 +304,7 @@ class AppRunner:
             microsteps_az=int(self.cfg.mount.ms_az),
             microsteps_alt=int(self.cfg.mount.ms_alt),
             gear_reduction_az=45.0,
-            gear_reduction_alt=45.0,
+            gear_reduction_alt=90.5,
             axis_sign_az=+1,
             axis_sign_alt=_axis_sign_from_invert(self.cfg.mount.invert_alt),
         )
@@ -320,6 +345,14 @@ class AppRunner:
             operation_finished=lambda: self._finish_operation("mount_move"),
             out_log=self.out_log,
         )
+        self._focuser_worker = FocuserWorker(
+            get_mount=lambda: self._mount,
+            get_cfg=lambda: self.cfg.focuser,
+            get_frame=self._get_latest_frame,
+            publish_state=self._update_state,
+            operation_finished=lambda: self._finish_operation("focuser"),
+            out_log=self.out_log,
+        )
         self._manual_move_active_until_s: Dict[str, float] = {
             Axis.AZ.value: 0.0,
             Axis.ALT.value: 0.0,
@@ -329,6 +362,8 @@ class AppRunner:
         self._rate_emul_acc_az: float = 0.0
         self._rate_emul_acc_alt: float = 0.0
         self._rate_emul_active: bool = False
+        self._rate_emul_period_s: Optional[float] = None
+        self._tracking_step_failures: int = 0
         self._tracking_last_frame_token: Optional[float] = None
         self._tracking_last_output: Optional[Any] = None
         self._tracking_last_cmd_az: float = 0.0
@@ -369,12 +404,14 @@ class AppRunner:
             "platesolving": 0,
             "goto": 0,
             "mount_move": 0,
+            "focuser": 0,
             "camera_record": 0,
         }
         self._operation_finished = {
             "platesolving": 0,
             "goto": 0,
             "mount_move": 0,
+            "focuser": 0,
             "camera_record": 0,
         }
         # State + outputs (thread-safe)
@@ -550,16 +587,25 @@ class AppRunner:
         scale = float((info or {}).get("drizzle_scale", 1.0) or 1.0)
         if np.isfinite(scale) and scale > 1.0:
             cfg.focal_m = float(cfg.focal_m) * scale
-        # A mosaic covers more sky than one frame; widen the cone accordingly so
-        # a fitted center near the mosaic edge is not rejected as out of range.
+        # A mosaic covers more sky than one frame, so its fitted center can sit
+        # further from the requested target than a single frame's would. Only
+        # the *acceptance margin* is widened for that, never search_radius_deg:
+        # the radius sets how much catalog gets loaded and searched, so growing
+        # it costs roughly the square of the growth. The pointing uncertainty
+        # that the radius represents does not change just because frames were
+        # stacked.
         if info is not None:
             ch, cw = info.get("canvas", (0, 0))
             fh, fw = info.get("frame_shape", (0, 0))
             if fh > 0 and fw > 0 and ch >= fh and cw >= fw:
                 grow = max(float(ch) / float(fh), float(cw) / float(fw))
-                radius = getattr(cfg, "search_radius_deg", None)
-                if radius is not None and np.isfinite(grow) and grow > 1.0:
-                    cfg.search_radius_deg = float(radius) * min(grow, 3.0)
+                if np.isfinite(grow) and grow > 1.0:
+                    scale_arcsec_px = 206265.0 * float(cfg.pixel_size_m) / float(cfg.focal_m)
+                    half_diag_px = 0.5 * float(np.hypot(cw, ch))
+                    extra_deg = (half_diag_px * scale_arcsec_px / 3600.0) * (1.0 - 1.0 / grow)
+                    margin = float(getattr(cfg, "max_center_offset_margin_deg", 0.0) or 0.0)
+                    cfg.max_center_offset_margin_deg = margin + float(np.clip(extra_deg, 0.0, 5.0))
+
         return cfg
 
     def _get_sep_cfg_snapshot(self) -> SepConfig:
@@ -777,6 +823,65 @@ class AppRunner:
             self._tracking_ff_cached = self._tracking_feedforward_rate(now_t=t_eval)
             self._tracking_ff_last_compute_t = float(t_eval)
         return self._tracking_ff_cached
+
+    def _tracking_nominal_calibration(self) -> Optional[np.ndarray]:
+        """Calibracion de partida a partir de la mecanica, sin saber el apuntado.
+
+        Seguir la imagen no necesita saber a donde apunta el tubo. La rotacion
+        de campo hace falta para pasar a ICRS, pero el lazo de seguimiento vive
+        en el plano de la camara contra los ejes alt-az: basta con cuantos
+        pixeles mueve un paso de cada eje y con como esta girada la camara.
+        Ambas cosas se conocen de antemano.
+
+        Lo unico que no se sabe sin apuntado es el escorzo del azimut, cos(alt).
+        Se toma 1.0, que es su valor maximo, y por tanto sobreestima cuanto
+        mueve un paso de azimut. Sobreestimar la respuesta hace que el lazo
+        mande *menos* pasos de los necesarios: corrige despacio, nunca se pasa.
+        Subestimarla seria lo peligroso. La autocalibracion RLS ajusta el factor
+        en cuanto hay movimiento medido.
+        """
+        try:
+            scale = 206265.0 * float(self.cfg.platesolving.pixel_size_m) / float(
+                self.cfg.platesolving.focal_m
+            )
+            if (not np.isfinite(scale)) or scale <= 1e-9:
+                return None
+
+            th = np.deg2rad(float(self.cfg.camera.roll_deg))
+            R = np.array(
+                [[float(np.cos(th)), -float(np.sin(th))], [float(np.sin(th)), float(np.cos(th))]],
+                dtype=np.float64,
+            )
+
+            cos_alt = 1.0
+            pointing = self._tracking_pointing_altaz()
+            if pointing is not None:
+                cos_alt = float(np.cos(np.deg2rad(float(pointing[1]))))
+                cos_alt = float(np.clip(cos_alt, 0.05, 1.0))
+
+            J = np.asarray(self._goto.model.J_deg_per_step, dtype=np.float64).reshape(2, 2)
+            A = np.zeros((2, 2), dtype=np.float64)
+            for col in range(2):
+                # Si el tubo se mueve +1 paso, las estrellas se mueven al reves.
+                q_arcsec = np.array(
+                    [-float(J[0, col]) * 3600.0 * cos_alt, -float(J[1, col]) * 3600.0],
+                    dtype=np.float64,
+                )
+                A[:, col] = (q_arcsec / float(scale)) @ R
+
+            det = float(np.linalg.det(A))
+            if (not np.isfinite(det)) or abs(det) < 1e-6:
+                return None
+            return np.column_stack([A, np.zeros(2, dtype=np.float64)])
+        except Exception as exc:
+            log_error(
+                self.out_log,
+                "Tracking: failed to build nominal calibration",
+                exc,
+                throttle_s=5.0,
+                throttle_key="tracking_nominal_calib",
+            )
+            return None
 
     def _tracking_seed_calibration_from_pointing(self) -> bool:
         try:
@@ -1084,6 +1189,9 @@ class AppRunner:
         # detener mount move worker
         self._mount_move_worker.stop()
         self._mount_move_worker.join(timeout=2.0)
+        self._focuser_worker.cancel()
+        self._focuser_worker.stop()
+        self._focuser_worker.join(timeout=2.0)
 
         thr = self._thr
         if thr is not None:
@@ -1348,6 +1456,46 @@ class AppRunner:
     def request_mount_stop(self) -> None:
         self.enqueue(mount_stop())
 
+    # -------------------------
+    # Focuser
+    # -------------------------
+    def request_focuser_move(self, direction: int, steps: Optional[int] = None) -> None:
+        step_size = int(self.cfg.focuser.step_size if steps is None else steps)
+        self.enqueue(focuser_move(int(direction), step_size))
+
+    def request_focuser_goto(self, position: int) -> None:
+        self.enqueue(focuser_goto(int(position)))
+
+    def request_focuser_zero(self) -> None:
+        self.enqueue(focuser_zero())
+
+    def request_focuser_home(self) -> None:
+        self.enqueue(focuser_home())
+
+    def request_focuser_preset(self, name: str) -> None:
+        self.enqueue(focuser_preset(name))
+
+    def request_focuser_save_preset(self, name: str, position: Optional[int] = None) -> None:
+        self.enqueue(focuser_save_preset(name, position))
+
+    def request_focuser_delete_preset(self, name: str) -> None:
+        self.enqueue(focuser_delete_preset(name))
+
+    def get_focus_presets(self) -> Dict[str, Dict[str, Any]]:
+        return self._focuser_worker.presets.load()
+
+    def request_focuser_autofocus(self, params: Optional[Dict[str, Any]] = None) -> None:
+        self.enqueue(focuser_autofocus(params or {}))
+
+    def request_focuser_cancel(self) -> None:
+        self.enqueue(focuser_cancel())
+
+    def request_focuser_params(self, **kwargs: Any) -> None:
+        self.enqueue(focuser_set_params(**kwargs))
+
+    def request_focuser_reset_defaults(self) -> None:
+        self.enqueue(focuser_reset_defaults())
+
     def cancel_platesolving(self) -> None:
         """Cooperatively cancel the currently running explicit plate solve."""
         self._platesolving_worker.cancel_current()
@@ -1485,6 +1633,16 @@ class AppRunner:
                 return
             self._tracking_last_output = out
             self._tracking_worker_error = None
+            # Solo un paso completado corta la racha de fallos. Resetear el
+            # contador en el bucle de control no serviria: corre mucho mas rapido
+            # que el worker, y la mayoria de sus vueltas ven "todavia sin error"
+            # simplemente porque la respuesta no ha llegado.
+            self._tracking_step_failures = 0
+
+    def _note_tracking_step_failure(self) -> int:
+        with self._tracking_result_lock:
+            self._tracking_step_failures += 1
+            return int(self._tracking_step_failures)
 
     def _tracking_result_snapshot(self) -> Tuple[Optional[Any], Optional[Exception]]:
         with self._tracking_result_lock:
@@ -1537,6 +1695,9 @@ class AppRunner:
                     "error_px": float(np.hypot(out.x_hat, out.y_hat)),
                     "lock_conf": float(out.lock_conf),
                     "fail_count": int(out.fail_count),
+                    "anchor_px": float(getattr(out, "anchor_px", 0.0)),
+                    "anchor_chained": bool(getattr(out, "anchor_chained", False)),
+                    "anchor_lost": bool(getattr(out, "anchor_lost", False)),
                     "last_error": (
                         f"measurement invalid: {out.measurement_reason}"
                         if (not out.ok and int(out.fail_count) >= 2)
@@ -1577,6 +1738,46 @@ class AppRunner:
                     "lock_conf": 0.0,
                     "fail_count": 0,
                     "last_error": None,
+                }
+            }
+        )
+
+    def _publish_tracking_waiting(self, reason: str) -> None:
+        """Tracking pedido por el usuario, pero sin con que medir todavia.
+
+        ``enabled`` se conserva porque es la intencion del usuario, no una
+        medida. Esta rama publicaba antes el mismo apagado que TRACKING_STOP, y
+        el efecto era que activar tracking sin camara se deshacia solo en la
+        primera vuelta del bucle de control: el boton parecia no hacer nada y el
+        estado quedaba en "off", indistinguible de no haberlo pulsado nunca.
+
+        Manteniendolo encendido, el tracking arranca por si solo en cuanto
+        aparece lo que falta, y mientras tanto el motivo queda a la vista.
+        """
+        self._update_state(
+            {
+                "tracking": {
+                    "enabled": True,
+                    "status": TrackingStatus.PAUSED,
+                    "mode": TrackingMode.IDLE,
+                    "ff_enabled": bool(
+                        getattr(self.cfg.tracking, "sidereal_ff_enabled", True)
+                    ),
+                    "ff_ready": False,
+                    "rate_az": 0.0,
+                    "rate_alt": 0.0,
+                    "rate_fb_az": 0.0,
+                    "rate_fb_alt": 0.0,
+                    "rate_ff_az": 0.0,
+                    "rate_ff_alt": 0.0,
+                    "n_det": 0,
+                    "measurement_valid": False,
+                    "measurement_reason": reason,
+                    "measurement_source": "none",
+                    "error_x_px": 0.0,
+                    "error_y_px": 0.0,
+                    "error_px": 0.0,
+                    "lock_conf": 0.0,
                 }
             }
         )
@@ -1639,6 +1840,37 @@ class AppRunner:
             self._rate_emul_acc_az = 0.0
             self._rate_emul_acc_alt = 0.0
             self._rate_emul_active = False
+            self._rate_emul_period_s = None
+
+    def _note_rate_emul_period(self, dt: float) -> None:
+        """Estimacion suavizada del periodo entre emisiones consecutivas."""
+        d = float(dt)
+        if not np.isfinite(d) or d <= 0.0 or d > _RATE_EMUL_MAX_PERIOD_S:
+            return
+        prev = self._rate_emul_period_s
+        self._rate_emul_period_s = d if prev is None else (0.7 * float(prev) + 0.3 * d)
+
+    def _fit_steps_in_emission_window(self, steps: int, delay_us: int) -> int:
+        """Recorta el lote a los pasos que caben enteros en la ventana.
+
+        Un MOVE que siga en vuelo cuando llegue el siguiente pierde sus pasos
+        pendientes sin avisar (el firmware asigna el plan en vez de sumarlo),
+        y esos pasos ya se habrian contado. Emitir solo lo que termina a
+        tiempo mantiene el contador de pasos fiel a la mecanica.
+        """
+        n = int(steps)
+        if n == 0:
+            return 0
+        window_s = self._rate_emul_period_s
+        if window_s is None:
+            # Primer ciclo: no hay ningun MOVE en vuelo al que adelantarse.
+            return n
+        budget_us = float(window_s) * 1.0e6 * _RATE_EMUL_WINDOW_FRAC
+        per_step_us = max(1.0, float(delay_us) + _RATE_EMUL_PULSE_US)
+        room = int(budget_us // per_step_us)
+        if room <= 0:
+            return 0
+        return int(max(-room, min(room, n)))
 
     def _is_manual_move_active(self) -> bool:
         if self._mount_move_worker.is_busy():
@@ -1655,8 +1887,15 @@ class AppRunner:
             base = int(self.cfg.mount.slew_delay_us_az if axis == Axis.AZ else self.cfg.mount.slew_delay_us_alt)
             return max(1, base)
         # Firmware cadence ~= 1e6 / (delay_us + pulse_us), pulse_us ~= 3.
+        #
+        # El tope importa: si es mas bajo que el retardo que pide la velocidad,
+        # los pasos acumulados salen mas rapido de lo debido y el movimiento se
+        # vuelve una sucesion de rafagas con silencios en medio, en vez de un
+        # arrastre parejo. A ritmo sideral esta montura pide ~200 ms entre
+        # pasos; un tope de 50 ms forzaba 20 pasos/s.
         delay = int(round((1.0e6 / rate_abs) - 3.0))
-        return max(1, min(delay, 50000))
+        max_delay = max(1, int(getattr(self.cfg.mount, "rate_emul_max_delay_us", 500_000)))
+        return max(1, min(delay, max_delay))
 
     def _send_move_steps_direct(self, *, axis: Axis, signed_steps: int, delay_us: int) -> None:
         if self._mount is None or signed_steps == 0:
@@ -1733,11 +1972,29 @@ class AppRunner:
             if dt > 0.0:
                 self._rate_emul_acc_az += az_cmd * dt
                 self._rate_emul_acc_alt += alt_cmd * dt
+                self._note_rate_emul_period(dt)
 
             step_az = int(np.trunc(self._rate_emul_acc_az))
             step_alt = int(np.trunc(self._rate_emul_acc_alt))
             step_az = int(max(-400, min(400, step_az)))
             step_alt = int(max(-400, min(400, step_alt)))
+
+            delay_az = self._rate_to_delay_us(abs(az_cmd), axis=Axis.AZ)
+            delay_alt = self._rate_to_delay_us(abs(alt_cmd), axis=Axis.ALT)
+
+            # El firmware ASIGNA el plan pendiente (g_moveRem[ax] = steps), no lo
+            # acumula: un MOVE nuevo descarta los pasos que el anterior todavia
+            # no habia ejecutado. Como aqui se contabiliza lo *comandado*, esos
+            # pasos descartados corrompen el contador de pasos del modelo GoTo,
+            # que deja de corresponder a la mecanica.
+            #
+            # El lote se dimensiona con el dt del ciclo *anterior*, asi que un
+            # ciclo lento produce un lote grande que el ciclo rapido siguiente
+            # machaca a media ejecucion. Por eso solo se emite lo que cabe
+            # entero en la ventana estimada: lo que no cabe se queda en el
+            # acumulador y sale en el ciclo siguiente, sin perderse ni contarse.
+            step_az = self._fit_steps_in_emission_window(step_az, delay_az)
+            step_alt = self._fit_steps_in_emission_window(step_alt, delay_alt)
 
             self._rate_emul_acc_az -= float(step_az)
             self._rate_emul_acc_alt -= float(step_alt)
@@ -1745,9 +2002,6 @@ class AppRunner:
 
             if step_az == 0 and step_alt == 0:
                 return 0, 0
-
-            delay_az = self._rate_to_delay_us(abs(az_cmd), axis=Axis.AZ)
-            delay_alt = self._rate_to_delay_us(abs(alt_cmd), axis=Axis.ALT)
 
         try:
             if step_az != 0:
@@ -2722,7 +2976,9 @@ class AppRunner:
             except Exception as exc:
                 log_error(self.out_log, "Mount: disconnect failed", exc)
         self._mount = None
+        self._focuser_worker.cancel()
         self._update_state({"mount": {"connected": False, "status": MountStatus.DISCONNECTED}})
+        self._update_state({"focuser": {"supported": False, "moving": False}})
         self._release_simulation_if_idle()
 
     def _connect_mount(self, port: str, baudrate: int) -> None:
@@ -2738,6 +2994,7 @@ class AppRunner:
                 self._mount_set_microsteps(self.cfg.mount.ms_az, self.cfg.mount.ms_alt)
                 snap = sim_state.snapshot()
                 self._update_state({"mount": {"connected": True, "status": MountStatus.OK, "last_error": None}})
+                self._publish_focuser_support()
                 log_info(
                     self.out_log,
                     (
@@ -2758,6 +3015,7 @@ class AppRunner:
             # Ensure microstep settings are applied on every connect so manual speed is consistent.
             self._mount_set_microsteps(self.cfg.mount.ms_az, self.cfg.mount.ms_alt)
             self._update_state({"mount": {"connected": True, "status": MountStatus.OK, "last_error": None}})
+            self._publish_focuser_support()
             log_info(self.out_log, f"Mount: connected ({msg})")
         except Exception as exc:
             self._shutdown_mount()
@@ -3378,14 +3636,51 @@ class AppRunner:
 
                     out, tracking_error = self._tracking_result_snapshot()
                     if tracking_error is not None:
+                        # Un frame que revienta no puede terminar la sesion. Antes
+                        # esto apagaba el tracking con la primera excepcion, y como
+                        # apagado deja de enviar frames, no habia forma de que se
+                        # recuperara solo: una alineacion fallida suelta mataba una
+                        # noche entera de seguimiento. Peor aun, la vuelta siguiente
+                        # publicaba "off" encima del ERROR y borraba la senal de que
+                        # algo habia pasado.
+                        failures = self._note_tracking_step_failure()
+                        limit = max(
+                            1,
+                            int(
+                                getattr(
+                                    self.cfg.tracking,
+                                    "max_consecutive_step_failures",
+                                    5,
+                                )
+                            ),
+                        )
+                        # Reinicia la referencia: si el fallo vino de un keyframe
+                        # corrupto, insistir con el mismo no sirve de nada.
                         self._invalidate_tracking_pipeline()
+                        give_up = failures >= limit
                         self._update_state(
                             {
                                 "tracking": {
-                                    "enabled": False,
-                                    "status": TrackingStatus.ERROR,
+                                    "enabled": not give_up,
+                                    "status": (
+                                        TrackingStatus.ERROR
+                                        if give_up
+                                        else TrackingStatus.RUNNING
+                                    ),
                                     "mode": TrackingMode.IDLE,
-                                    "last_error": "tracking step failed",
+                                    "measurement_valid": False,
+                                    "measurement_reason": (
+                                        "step_failed"
+                                        if give_up
+                                        else "step_failed_retrying"
+                                    ),
+                                    "rate_az": 0.0,
+                                    "rate_alt": 0.0,
+                                    "last_error": (
+                                        f"tracking step failed {failures} times in a row"
+                                        if give_up
+                                        else None
+                                    ),
                                 }
                             }
                         )
@@ -3401,7 +3696,10 @@ class AppRunner:
                             )
                         log_error(
                             self.out_log,
-                            "Tracking: step failed",
+                            (
+                                f"Tracking: step failed {failures}/{limit}"
+                                + ("; giving up" if give_up else "; retrying")
+                            ),
                             tracking_error,
                             throttle_s=2.0,
                             throttle_key="tracking_step",
@@ -3479,7 +3777,15 @@ class AppRunner:
                 self._tracking_last_cmd_az = 0.0
                 self._tracking_last_cmd_alt = 0.0
                 if publish_state:
-                    self._publish_tracking_off()
+                    if tracking_on:
+                        self._publish_tracking_waiting(
+                            "no_mount" if self._mount is None else "no_camera"
+                        )
+                    elif self.get_state().tracking.status != TrackingStatus.ERROR:
+                        # Un tracking detenido por errores conserva su estado: si
+                        # se publicara "off" encima, el motivo desapareceria y
+                        # quedaria igual que si nunca se hubiera activado.
+                        self._publish_tracking_off()
 
             section_end = _perf()
             perf_sections["tracking_ms"] = (section_end - section_t) * 1000.0
@@ -3765,6 +4071,7 @@ class AppRunner:
                 self._update_state(
                     {"goto": {"synced": False, "pointing_valid": False}}
                 )
+            self._focuser_worker.cancel()
             self._mount_stop()
             self._tracking_keyframe_reset()
             return
@@ -3790,6 +4097,8 @@ class AppRunner:
             log_info(self.out_log, "Mount: RESET_DEFAULTS")
             return
 
+        if self._handle_focuser_action(t, p):
+            return
         if self._handle_tracking_action(t, p):
             return
         if self._handle_stacking_action(t, p):
@@ -3802,6 +4111,171 @@ class AppRunner:
         # ---- Otros ----
         log_info(self.out_log, f"Unknown or unhandled action type: {t}")
 
+    def _handle_focuser_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
+        if t == ActionType.FOCUSER_MOVE:
+            if not self._focuser_ready():
+                return True
+            self._start_operation("focuser")
+            self._focuser_worker.request(
+                kind="move",
+                direction=int(p.get("direction", 1)),
+                steps=int(p.get("steps", self.cfg.focuser.step_size)),
+            )
+            return True
+
+        if t == ActionType.FOCUSER_GOTO:
+            if not self._focuser_ready():
+                return True
+            self._start_operation("focuser")
+            self._focuser_worker.request(kind="goto", position=int(p.get("position", 0)))
+            return True
+
+        if t == ActionType.FOCUSER_ZERO:
+            self._focuser_worker.zero()
+            log_info(self.out_log, "Focuser: posicion puesta a cero")
+            return True
+
+        if t == ActionType.FOCUSER_HOME:
+            if not self._focuser_ready():
+                return True
+            self._start_operation("focuser")
+            self._focuser_worker.request(kind="home")
+            return True
+
+        if t == ActionType.FOCUSER_PRESET:
+            if not self._focuser_ready():
+                return True
+            self._start_operation("focuser")
+            self._focuser_worker.request(kind="preset", name=str(p.get("name", "")))
+            return True
+
+        if t == ActionType.FOCUSER_SAVE_PRESET:
+            name = str(p.get("name", "")).strip()
+            raw_position = p.get("position", None)
+            position = (
+                self._focuser_worker.position
+                if raw_position is None
+                else int(raw_position)
+            )
+            homed = bool(self._focuser_worker.homed)
+            try:
+                self._focuser_worker.presets.save(
+                    name,
+                    position,
+                    homed=homed,
+                    session=self._focuser_worker.session_id,
+                )
+            except OSError as exc:
+                log_error(self.out_log, "Focuser: no se pudo guardar el preset", exc)
+                return True
+            log_info(
+                self.out_log,
+                f"Focuser: preset {name!r} guardado en {position:+d} "
+                + ("(con homing)" if homed else "(SIN homing: solo vale en esta sesion)"),
+            )
+            return True
+
+        if t == ActionType.FOCUSER_DELETE_PRESET:
+            name = str(p.get("name", "")).strip()
+            try:
+                removed = self._focuser_worker.presets.delete(name)
+            except OSError as exc:
+                log_error(self.out_log, "Focuser: no se pudo borrar el preset", exc)
+                return True
+            log_info(
+                self.out_log,
+                f"Focuser: preset {name!r} " + ("borrado" if removed else "no existia"),
+            )
+            return True
+
+        if t == ActionType.FOCUSER_AUTOFOCUS:
+            if not self._focuser_ready():
+                return True
+            if self._cam_stream is None:
+                self._update_state(
+                    {"focuser": {"autofocus": "failed", "last_error": "camera not connected"}}
+                )
+                log_info(self.out_log, "Focuser: autofoco necesita la camara conectada")
+                return True
+            self._start_operation("focuser")
+            self._focuser_worker.request(kind="autofocus", params=dict(p.get("params") or {}))
+            return True
+
+        if t == ActionType.FOCUSER_CANCEL:
+            self._focuser_worker.cancel()
+            if self._mount is not None and self._mount.is_connected():
+                try:
+                    # Solo el eje del enfocador: un STOP global aqui abortaria
+                    # el slew o el tracking que esten corriendo en paralelo.
+                    self._mount.stop_axis(FOCUS_AXIS_FW)
+                except Exception as exc:
+                    log_error(self.out_log, "Focuser: stop failed", exc)
+            return True
+
+        if t == ActionType.FOCUSER_SET_PARAMS:
+            self._apply_focuser_params(p if isinstance(p, dict) else {})
+            return True
+
+        if t == ActionType.RESET_FOCUSER_DEFAULTS:
+            self.cfg.focuser = FocuserConfig()
+            self._publish_focuser_config()
+            log_info(self.out_log, "Focuser: RESET_DEFAULTS")
+            return True
+
+        return False
+
+    def _publish_focuser_support(self) -> None:
+        """Anota si el firmware cargado trae el tercer eje.
+
+        Lo decide el propio firmware por STATUS, no la configuracion: con un
+        firmware viejo los controles de enfoque no deben ofrecerse como si
+        fueran a funcionar.
+        """
+        supported = False
+        if self._mount is not None:
+            try:
+                supported = bool(self._mount.supports_focuser())
+            except Exception as exc:
+                log_error(self.out_log, "Focuser: capability probe failed", exc)
+        self._update_state({"focuser": {"supported": supported}})
+        if not supported:
+            log_info(
+                self.out_log,
+                "Focuser: el firmware no declara FOCUS=1 (enfocador no disponible)",
+            )
+
+    def _focuser_ready(self) -> bool:
+        if self._mount is None or not self._mount.is_connected():
+            self._update_state(
+                {"focuser": {"last_error": "mount not connected", "moving": False}}
+            )
+            log_info(
+                self.out_log,
+                "Focuser: la montura no esta conectada",
+                throttle_s=5.0,
+                throttle_key="focuser_no_mount",
+            )
+            return False
+        return True
+
+    def _apply_focuser_params(self, params: Dict[str, Any]) -> None:
+        for name, value in params.items():
+            if not hasattr(self.cfg.focuser, name):
+                log_info(self.out_log, f"Focuser: parametro desconocido {name!r}")
+                continue
+            current = getattr(self.cfg.focuser, name)
+            try:
+                setattr(self.cfg.focuser, name, type(current)(value))
+            except (TypeError, ValueError):
+                log_info(self.out_log, f"Focuser: valor invalido para {name!r}: {value!r}")
+        self._publish_focuser_config()
+
+    def _publish_focuser_config(self) -> None:
+        log_info(
+            self.out_log,
+            "Focuser: SET_PARAMS " + _format_params(asdict(self.cfg.focuser)),
+        )
+
     def _handle_tracking_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
         if t == ActionType.TRACKING_START:
             seeded = self._tracking_seed_calibration_from_pointing()
@@ -3811,8 +4285,26 @@ class AppRunner:
                     and self._tracking_state.auto.A_pinv is not None
                 )
                 if (not seeded) and (not auto_ready):
-                    auto_reset(self._tracking_state, src="auto")
+                    # El seguimiento no puede exigir calibrar antes. Sin
+                    # apuntado conocido -app recien abierta, o tras un
+                    # `goto reset`- la siembra por geometria no sale, y hasta
+                    # ahora eso dejaba A_pinv en None: el lazo se quedaba mudo
+                    # y no movia nada. La mecanica se conoce, asi que se empieza
+                    # con la escala nominal y la RLS la va corrigiendo sola.
+                    theta_nom = self._tracking_nominal_calibration()
+                    if theta_nom is not None:
+                        auto_reset(self._tracking_state, src="nominal", theta=theta_nom)
+                        seeded = True
+                        log_info(
+                            self.out_log,
+                            "Tracking: calibracion nominal desde la mecanica "
+                            f"A=[[{theta_nom[0,0]:+.4f},{theta_nom[0,1]:+.4f}],"
+                            f"[{theta_nom[1,0]:+.4f},{theta_nom[1,1]:+.4f}]]",
+                        )
+                    else:
+                        auto_reset(self._tracking_state, src="auto")
             self._invalidate_tracking_pipeline()
+            self._tracking_step_failures = 0
             self._tracking_last_cmd_az = 0.0
             self._tracking_last_cmd_alt = 0.0
             self._reset_tracking_feedforward_cache()
@@ -3977,6 +4469,32 @@ class AppRunner:
                 auto_reset(self._tracking_state, src="auto")
             self._tracking_keyframe_reset()
             log_info(self.out_log, "Tracking: AUTO_RESET")
+            return True
+
+        if t == ActionType.TRACKING_SET_CALIB:
+            # Calibracion medida fuera de la app: mover un eje una cantidad
+            # conocida y ver cuanto se corre la imagen. Es la unica via cuando
+            # el campo no tiene estrellas suficientes para resolverlo -- con un
+            # planeta brillante saturando, autocal falla por ERR_PLATESOLVING y
+            # sin calibracion el control comanda cero por mucho error que mida.
+            try:
+                theta = np.asarray(p.get("theta"), dtype=np.float64).reshape(2, 3)
+            except (TypeError, ValueError) as exc:
+                log_error(self.out_log, "Tracking: matriz de calibracion invalida", exc)
+                return True
+            with self._tracking_state_lock:
+                auto_reset(self._tracking_state, src="manual", theta=theta)
+                ok = bool(self._tracking_state.auto.ok)
+                det = float(self._tracking_state.auto.detA)
+                cond = float(self._tracking_state.auto.condA)
+            self._update_state({"tracking": {"calib_src": "manual" if ok else "none",
+                                             "calib_det": det}})
+            log_info(
+                self.out_log,
+                f"Tracking: calibracion manual instalada ok={ok} det={det:.4f} "
+                f"cond={cond:.1f} A=[[{theta[0,0]:+.3f},{theta[0,1]:+.3f}],"
+                f"[{theta[1,0]:+.3f},{theta[1,1]:+.3f}]]",
+            )
             return True
 
         if t == ActionType.TRACKING_CALIB_AZ:

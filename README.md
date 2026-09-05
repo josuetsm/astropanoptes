@@ -34,7 +34,8 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 - `gaia_cache.py`: catálogo combinado Gaia DR3 + Hipparcos/Tycho-2, caché HEALPix,
   credenciales y resolución de nombres.
 - `simulation.py`: modo demo sin hardware; simula cámara, montura, tracking/GoTo y campos estelares Gaia.
-- `mount_arduino.py`: driver de montura vía serial (puerto SPP), comandos `PING/ENABLE/STOP/MOVE/STATUS`; `MS 64` se conserva como handshake compatible.
+- `mount_arduino.py`: driver de montura vía serial (puerto SPP), comandos `PING/ENABLE/STOP/MOVE/TEST/STATUS`; `MS 64` se conserva como handshake compatible.
+- `focuser.py`: métrica de nitidez y búsqueda automática de foco sobre el tercer motor.
 - `mount_firmware/mount_firmware.ino`: firmware ESP32 para la montura (lado microcontrolador).
 - `logging_utils.py`: logging liviano a stdout o sink global de la UI.
 
@@ -96,13 +97,44 @@ Este README describe **toda la estructura del repositorio** y explica cada módu
 
 - **`mount_arduino.py`**
   - Conexión serial y protocolo con firmware ESP32 vía Bluetooth Classic SPP.
-  - Comandos: `PING`, `ENABLE`, `STOP`, `MOVE`, `STATUS`, `DEBUG`; `MS 64` existe únicamente como handshake legado sin efecto físico.
+  - Comandos: `PING`, `ENABLE`, `STOP [eje]`, `MOVE`, `TEST`, `STATUS`, `DEBUG`; `MS 64` existe únicamente como handshake legado sin efecto físico.
   - GoTo y movimientos manuales usan un solo `MOVE` por eje para aprovechar la aceleración/frenado simétricos del firmware cargado; `delay_us` es el retardo mínimo (velocidad máxima).
-  - El microstepping no es configurable por software: ambos drivers están cableados permanentemente a 1/64.
+  - El microstepping no es configurable por software: los tres drivers están cableados permanentemente a 1/64.
+  - `ArduinoMount.focus_steps()` mueve el enfocador (eje `C`) sin mandar `STOP`
+    global, de modo que enfocar no aborta un slew ni el tracking.
+  - `ArduinoMount.test_steps()` usa el comando `TEST`, idéntico a `MOVE` pero sin
+    el tope de velocidad. Es para banco con otros motores; en el tren del
+    telescopio sólo produciría pérdida de pasos.
+
+- **`focuser.py`**
+  - Métrica de nitidez y búsqueda automática del mejor foco.
+  - La métrica es energía de gradiente normalizada por la **suma de cuadrados**
+    de la señal. Así no cambia si se toca ganancia o exposición a mitad del
+    barrido, ni si varía el número de estrellas: con N fuentes, numerador y
+    denominador crecen igual y N se cancela. Normalizar por el cuadrado de la
+    suma la dejaba valiendo 1/N, y bastaba que una estrella saliera del campo
+    para que la nitidez subiera sola. Se mide sobre un solo plano del mosaico
+    Bayer (si no, se mediría el patrón de color) y con fondo por cajas de SEP
+    (si no, el gradiente de cielo de Santiago se confundiría con ruido y dejaría
+    la máscara vacía).
+  - La búsqueda es una V en dos etapas, grueso y fino, siempre recorridas en el
+    mismo sentido para que el juego del acople no entre en la curva. Si el
+    máximo cae en un extremo, el barrido se extiende hasta encerrarlo.
+  - Sólo se miden frames cuya integración empezó después del movimiento; el
+    frame que ya estaba en el buffer corresponde a la posición anterior.
 
 - **`mount_firmware/mount_firmware.ino`**
-  - Firmware actual de ESP32 (nombre BT: `AstroPanoptes-ESP32`).
-  - Pines controlados: `EN=21`, `AZ STEP/DIR=33/25`, `ALT STEP/DIR=26/27`; MS no tiene pines asignados en el firmware.
+  - Firmware actual de ESP32 (nombre BT: `AstroPanoptes-ESP32`), tres ejes:
+    `A`=AZ, `B`=ALT, `C`=enfocador.
+  - Pines controlados: `EN=21`, `AZ STEP/DIR=33/25`, `ALT STEP/DIR=26/27`,
+    `FOCUS STEP/DIR=14/13`. **Verifica los pines del enfocador contra tu cableado
+    del CNC shield antes de flashear**: son los únicos que no vienen de una
+    sesión real y unos pines equivocados fallan en silencio.
+  - `MOVE` sigue limitado a `MOVE_MAX_RATE_STEPS_S` (12000 pasos/s). `TEST` corre
+    el mismo perfil de aceleración y frenado sin ese tope, para probar motores
+    con otra reducción; no usarlo sobre el telescopio.
+  - `STOP` sin argumento detiene los tres ejes; `STOP C` detiene sólo el
+    enfocador.
 
 ### 5) Stacking, plate solving y GoTo
 - **`stacking.py`**
@@ -134,14 +166,33 @@ python scripts/stack_raw_recordings.py raw_output/raw_*.npy \
     trazas por deriva sideral, la señal acumulada saca estrellas más débiles, y
     el mosaico cubre más cielo que un frame suelto — el detector entrega muchas
     más fuentes utilizables, que es justo lo que necesita la búsqueda de tripletas.
-    El runner corrige automáticamente dos cosas al usar esta fuente: la escala de
-    placa se divide por el factor drizzle, y la época del solve es el instante del
+    El runner corrige automáticamente tres cosas al usar esta fuente. La escala de
+    placa se divide por el factor drizzle. La época del solve es el instante del
     **frame de referencia** del stack (no "ahora"), porque los frames se alinean
     sobre él; usar la hora actual desplazaría el centro por toda la deriva
-    acumulada durante el apilado. Con `platesolving source live` se vuelve al frame
-    vivo.
+    acumulada durante el apilado. Y el mosaico se **re-centra sobre el frame de
+    referencia**: con la montura parada el lienzo crece alejándose de él, de modo
+    que su centro geométrico se aparta del apuntado por la mitad de la deriva
+    acumulada, y el solver da por hecho que la imagen está centrada en el objetivo
+    pedido. El re-centrado se hace rellenando de forma simétrica, nunca
+    recortando, así que no se pierde nada del cielo extra que capturó el mosaico.
+    Con `platesolving source live` se vuelve al frame vivo.
   - Usa caché en `~/.cache/gaia_cones` por defecto.
   - Observador por defecto: **Estación Central, Santiago** (`ObserverConfig()`); se puede cambiar desde la pestaña `Observador` o con `platesolving set observer_lat_deg=... observer_lon_deg=... observer_height_m=...`.
+  - **Rendimiento de la búsqueda de tripletas.** El costo estaba dominado por
+    llamadas repetidas al KD-tree, no por la geometría. Cuatro correcciones,
+    medidas con perfilado y verificadas como numéricamente equivalentes:
+    los anillos alrededor de `i` no dependen del vecino `j`, así que se calculan
+    una vez por `(tripleta, i)` en vez de una vez por par, y los de `j` se
+    memorizan; la consulta de vecinos se hace **en lote** por tripleta en lugar
+    de una por estrella de catálogo (scikit-learn revalida su entrada en cada
+    llamada, y ese coste dominaba el solve completo); los lados del triángulo
+    se calculan con productos punto sobre los vectores unitarios que ya existen,
+    sin construir objetos `SkyCoord`; y los `source_id` se extraen a un array
+    numpy en vez de indexar el `DataFrame` en el bucle más interno.
+    Medido sobre un campo de Santiago (9 estrellas, catálogo de 4000):
+    **4,16 s → 0,98 s**. El caso que hacía timeout (radio 6°, catálogo de
+    12 000) baja a 24 s.
   - Los defaults de `PlatesolvingConfig` (`search_radius_deg=3`, `N_seed=8`, `max_i_scan=5000`, `triplet_max_trials=1500`, `rotation_prior_enable=False`, `total_timeout_s=75`, `download_missing_tiles=False`, `bright_catalog_enabled=False`) son los que resolvieron campos reales de forma repetible en sesiones de observación; `platesolving download` sigue permitiendo traer teselas puntuales aunque `download_missing_tiles` esté en `False` por defecto.
   - **Confianza en cielos contaminados (Santiago).** Bajo contaminación lumínica fuerte y con este FoV angosto (~0.36°×0.20°) un cuadro suele tener solo 3–4 estrellas reales. Por eso el umbral por cuadro es bajo (`min_inliers=3`, el piso estructural: una tripleta semilla aporta 3 coincidencias por construcción, así que un campo de 3 estrellas nunca puede producir un `min_validation_inliers` mayor) y la garantía contra falsos positivos recae en el **consenso multi-cuadro** (`initial_consensus_count=3`): una coincidencia falsa de 3 estrellas contra un catálogo grande es fácil por azar en un cuadro, pero reproducir el *mismo* centro/escala/rotación en cuadros independientes no lo es. Bajar `initial_consensus_count` a 1 desactiva esa red y permite aceptar soluciones falsas.
   - Hipparcos y Tycho-2 completos pueden descargarse directamente desde CDS y
@@ -285,6 +336,128 @@ mount move alt 1 30000 10 direct
 El valor `delay_us` solicita una velocidad, pero ya no puede saltarse el límite
 de 12 000 microsteps/s. Con `smooth`, la rampa comienza aproximadamente en
 400 microsteps/s y limita la aceleración a 4 000 microsteps/s².
+
+### Comprobar los ejes antes de empezar
+
+Un TMC2209 en STEP/DIR no tiene realimentación: el firmware emite los pulsos y
+responde `OK` aunque al otro lado no haya motor. Un cable suelto, un driver sin
+corriente o un Vref a cero son **indistinguibles de un eje sano** desde el
+software, y se llevan la noche entera sin que nada lo delate.
+
+```bash
+python scripts/check_axes.py
+```
+
+Mueve cada eje una cantidad conocida y mide cuánto se desplazó realmente el
+campo, con el mismo alineador que usa el tracking. Tres detalles que hacen que la
+medida signifique algo:
+
+- **Descuenta la deriva sideral.** Sin seguimiento el cielo se corre 22 px/s a x1
+  y 90 px/s a x5; en los segundos que dura la prueba eso puede superar al propio
+  movimiento comandado, y un eje muerto parecería vivo. Se mide primero una
+  referencia sin mover nada.
+- **Corrige por cos(altitud).** En alt-az el azimut desplaza el campo
+  Δaz·cos(alt); cerca del cenit un eje sano movería muy poco cielo y saldría como
+  muerto. Se puede indicar la altitud con `--alt-deg`.
+- **Dimensiona el movimiento según la escala.** Tiene que quedar solape entre las
+  dos imágenes: a x1, 400 pasos corren el campo 1354 px, más que el alto del
+  sensor, y no habría nada que correlacionar.
+
+También detecta el error inverso: si el campo se mueve **más** de lo previsto, la
+escala óptica configurada no es la que hay montada — típicamente el barlow puesto
+no es el seleccionado en la pestaña Observador. Ese error es igual de silencioso:
+el plate solving busca a una escala equivocada y falla sin decir por qué.
+
+### Enfocador
+
+El tercer motor del CNC shield va directo a la ruedita de foco del telescopio.
+La pestaña **Enfoque** de la GUI y el comando `focus` de la consola controlan lo
+mismo:
+
+```text
+focus in 300          # acercar 300 microsteps
+focus out             # alejar el paso configurado
+focus auto            # buscar el mejor foco (necesita la cámara capturando)
+focus cancel          # parar el enfocador sin tocar la montura
+focus status
+focus set autofocus_frames=5 autofocus_fine_step=60
+```
+
+La búsqueda automática hace un barrido grueso alrededor de la posición actual,
+lo extiende si el máximo cae en un extremo, y afina alrededor del vértice
+interpolado. Todos los barridos se recorren en el mismo sentido y la posición
+final se aproxima también desde ese lado, para que el juego del acople no entre
+en la medida.
+
+#### Homing aproximado y posiciones por barlow
+
+No hay final de carrera, pero el piñón tiene dientes rotos en el extremo
+retraído: al pasarse del recorrido sigue girando en banda sin forzar nada.
+`focus home` usa eso — retrae `home_travel_steps + home_overshoot_steps` — y deja
+un cero mecánico repetible. Es lo que hace que una posición guardada signifique
+lo mismo mañana.
+
+```text
+focus home            # retrae hasta patinar; posición 0 = retraído
+focus save x2         # guarda la posición actual como el foco del barlow x2
+focus goto x2         # vuelve a ella
+focus presets         # lista lo guardado, con su origen y su fecha
+focus forget x2
+```
+
+Los presets viven en `calibration_frames/focus_presets.json` (fuera de git) y
+cada uno recuerda **con qué origen** se guardó. Un preset guardado con homing no
+se aplica en una sesión sin homing, y uno guardado sin homing no se aplica en
+otra sesión: en ambos casos el número describiría un cero que ya no existe, y
+aplicarlo movería el enfocador a cualquier sitio. La app lo dice en vez de
+moverse.
+
+El tope de recorrido también depende de esto. Con homing el rango es
+`0..home_travel_steps`, que protege los dos extremos de verdad. Sin homing no se
+sabe dónde está el enfocador dentro de su carrera, y sólo queda limitar
+simétricamente con `max_travel_steps` alrededor del punto de partida.
+
+`focus zero` **no** es homing: pone el cero donde esté el enfocador ahora, lo
+cual sirve dentro de la sesión y nada más.
+
+#### Búsqueda guiada
+
+Con un preset conocido la búsqueda no barre todo el recorrido: usa una ventana
+alrededor de lo que ya sabe.
+
+```text
+focus goto x2
+focus auto          # deduce que el barlow puesto es x2 y busca ahí
+focus auto x5       # o se le dice explícitamente
+```
+
+El foco cambia de una noche a otra —el tubo se dilata con la temperatura— así
+que el nominal guardado es un punto de partida, no la respuesta. Cada autofoco
+exitoso se anota en el historial del preset, y de ahí salen dos cosas:
+
+- **El centro** de la ventana es la mediana del historial reciente, no el
+  nominal. Así el prior sigue la deriva estacional solo, sin tocar el número que
+  guardó el usuario.
+- **El ancho** es `k · dispersión medida` en este equipo, con un mínimo. Cuánto
+  se mueve el foco de una noche a otra sólo lo sabe el historial; ponerlo como
+  constante sería inventarlo.
+
+Si la ventana no acaba encerrando el máximo —el foco se movió más de lo que la
+dispersión hacía esperar, o cambió algo del tren óptico— la búsqueda **cae sola
+a la general**. Devolver el mejor punto de una ventana que no contiene el máximo
+daría un foco malo con aire de éxito.
+
+Sin presets, o sin homing, la búsqueda es la general de siempre.
+
+```text
+focus presets
+  x1         +12800  (homed)  7 noches, centro +12870, dispersion +-140
+  x2         +15200  (homed)  3 noches, centro +15245, dispersion +-90
+  x5         +18400  (homed)  sin historial
+```
+
+`focus auto` necesita señal medible. Si el campo está demasiado oscuro para el
+umbral de detección, se reporta como fallo en vez de aceptar un máximo de ruido.
 
 Para una sesión automatizada, se puede repetir `-c`:
 

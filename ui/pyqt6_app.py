@@ -956,8 +956,19 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.runner.request_goto_cancel()
         self._log("[goto] Cancel")
 
+    def _apply_platesolving_source_and_verification(self) -> None:
+        """Push the image source and verification settings to the solver."""
+        self.runner.request_platesolving_params(
+            source=str(self.dd_ps_source.currentData() or "live"),
+            verify_pointing_tol_arcsec=float(self.ds_ps_verify_tol.value()),
+            verify_roll_tol_deg=float(self.ds_ps_verify_roll.value()),
+            min_validation_inliers=int(self.sb_ps_min_validation.value()),
+            temporal_detection_enabled=bool(self.cb_ps_temporal.isChecked()),
+        )
+
     def _goto_platesolve(self) -> None:
         ps_mode = self._platesolve_mode_value()
+        self._apply_platesolving_source_and_verification()
         params = {
             "autocal_solve_radius_deg": float(self.ds_goto_ps_radius.value()),
             "autocal_solve_gmax": float(self.ds_goto_ps_gmax.value()),
@@ -979,7 +990,9 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._log(
             "[goto] Plate Solving "
             f"mode={ps_mode}{target_txt} "
-            f"radius={self.ds_goto_ps_radius.value():.2f}deg; "
+            f"radius={self.ds_goto_ps_radius.value():.2f}deg "
+            f"fuente={self.dd_ps_source.currentData()} "
+            f"validacion={int(self.sb_ps_min_validation.value())}; "
             "exposición/ganancia preservadas"
         )
 
@@ -1039,6 +1052,134 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.runner.request_mount_stop()
         self._log("[manual] STOP")
 
+    # -------------------------
+    # Enfocador
+    # -------------------------
+    def _focus_params_from_ui(self) -> dict:
+        return {
+            "step_size": int(self.sb_focus_step.value()),
+            "delay_us": int(self.sb_focus_delay.value()),
+            "profile": str(self.dd_focus_profile.currentData() or "smooth"),
+            "invert": bool(self.cb_focus_invert.isChecked()),
+            "backlash_steps": int(self.sb_focus_backlash.value()),
+            "max_travel_steps": int(self.sb_focus_travel.value()),
+            "autofocus_coarse_step": int(self.sb_focus_coarse_step.value()),
+            "autofocus_coarse_points": int(self.sb_focus_coarse_points.value()),
+            "autofocus_fine_step": int(self.sb_focus_fine_step.value()),
+            "autofocus_fine_points": int(self.sb_focus_fine_points.value()),
+            "autofocus_settle_s": float(self.ds_focus_settle.value()),
+            "autofocus_frames": int(self.sb_focus_frames.value()),
+        }
+
+    def _focus_apply(self) -> None:
+        params = self._focus_params_from_ui()
+        self.runner.request_focuser_params(**params)
+        self._log(f"[focus] parámetros aplicados: {params}")
+
+    def _focus_move(self, direction: int) -> None:
+        # Los controles manuales se envían con los valores que están en pantalla,
+        # sin obligar a pulsar «Aplicar» antes de cada toque.
+        self.runner.request_focuser_params(**self._focus_params_from_ui())
+        steps = int(self.sb_focus_step.value())
+        self.runner.request_focuser_move(int(direction), steps)
+        self._log(f"[focus] {'acercar' if direction >= 0 else 'alejar'} {steps} pasos")
+
+    def _focus_autofocus(self) -> None:
+        self.runner.request_focuser_params(**self._focus_params_from_ui())
+        self.runner.request_focuser_autofocus({})
+        self._log("[focus] búsqueda automática de foco")
+
+    def _focus_cancel(self) -> None:
+        self.runner.request_focuser_cancel()
+        self._log("[focus] cancelar / parar enfocador")
+
+    def _focus_zero(self) -> None:
+        self.runner.request_focuser_zero()
+        self._log("[focus] posición puesta a cero")
+
+    def _focus_home(self) -> None:
+        self.runner.request_focuser_params(**self._focus_params_from_ui())
+        self.runner.request_focuser_home()
+        self._log("[focus] homing contra la zona de patinaje")
+
+    def _focus_preset(self, name: str) -> None:
+        self.runner.request_focuser_params(**self._focus_params_from_ui())
+        self.runner.request_focuser_preset(name)
+        self._log(f"[focus] ir al preset {name}")
+
+    def _focus_save_preset(self, name: str) -> None:
+        self.runner.request_focuser_save_preset(name)
+        self._log(f"[focus] guardar posición actual como {name}")
+
+    def _update_focuser_from_state(self, state) -> None:
+        focuser = getattr(state, "focuser", None)
+        if focuser is None or not hasattr(self, "lbl_focus_status"):
+            return
+
+        available = bool(state.mount.connected and focuser.supported)
+        for name in (
+            "btn_focus_near",
+            "btn_focus_far",
+            "btn_focus_zero",
+            "btn_focus_auto",
+            "btn_focus_home",
+        ):
+            button = getattr(self, name, None)
+            if button is not None:
+                button.setEnabled(available and not focuser.moving)
+        presets = self.runner.get_focus_presets() if available else {}
+        for preset_name, button in getattr(self, "btn_focus_goto_preset", {}).items():
+            entry = presets.get(preset_name)
+            usable = entry is not None and bool(entry["homed"]) == bool(focuser.homed)
+            button.setEnabled(available and not focuser.moving and usable)
+            if entry is None:
+                button.setToolTip(f"Todavía no hay posición guardada para {preset_name}.")
+            elif not usable:
+                button.setToolTip(
+                    f"El preset {preset_name} se guardó con otro origen "
+                    f"({'homed' if entry['homed'] else 'sin homing'}). "
+                    "Haz homing, o vuelve a guardarlo."
+                )
+            else:
+                button.setToolTip(f"Ir a {int(entry['position']):+d} pasos.")
+        for button in getattr(self, "btn_focus_save_preset", {}).values():
+            button.setEnabled(available and not focuser.moving)
+        if hasattr(self, "btn_focus_auto"):
+            self.btn_focus_auto.setEnabled(
+                available
+                and focuser.autofocus != "running"
+                and bool(state.camera.connected)
+            )
+
+        if not state.mount.connected:
+            text = "Enfocador: sin montura conectada"
+        elif not focuser.supported:
+            text = (
+                "Enfocador: el firmware cargado no declara el tercer eje "
+                "(flashea mount_firmware actualizado)"
+            )
+        else:
+            parts = [f"posición {focuser.position:+d}"]
+            parts.append("homed" if focuser.homed else "sin homing")
+            if focuser.moving:
+                parts.append("moviendo")
+            if focuser.autofocus == "running":
+                stage = focuser.autofocus_stage or "buscando"
+                parts.append(f"autofoco: {stage}")
+            elif focuser.autofocus == "done" and focuser.best_position is not None:
+                parts.append(
+                    f"mejor foco {focuser.best_position:+d} "
+                    f"(nitidez {focuser.best_metric:.0f})"
+                )
+            elif focuser.autofocus in {"failed", "cancelled"}:
+                parts.append(f"autofoco: {focuser.autofocus}")
+            if focuser.last_metric > 0.0:
+                parts.append(f"nitidez actual {focuser.last_metric:.0f}")
+            if focuser.last_error:
+                parts.append(f"error: {focuser.last_error}")
+            text = "Enfocador: " + " · ".join(parts)
+        self.lbl_focus_status.setText(text)
+
     def _on_tick(self) -> None:
         state = self.runner.get_state()
 
@@ -1061,10 +1202,19 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
                 if str(getattr(tracking, "calib_src", "none")) != "none"
                 else "feedback: unavailable"
             )
+            # El error es contra la referencia original, no contra el keyframe de
+            # trabajo: ese siempre marca casi cero justo tras refrescarse.
+            if bool(getattr(tracking, "anchor_lost", False)):
+                anchor_text = " | ref: perdida"
+            elif bool(getattr(tracking, "anchor_chained", False)):
+                anchor_text = f" | ref: +{float(getattr(tracking, 'anchor_px', 0.0)):.0f} px"
+            else:
+                anchor_text = ""
             self.lbl_drift.setText(
                 f"tracking error: {float(tracking.error_px):.2f} px | "
                 f"drift: {float(tracking.vx):.2f}/{float(tracking.vy):.2f} px/s | "
                 f"lock: {100.0 * float(tracking.lock_conf):.0f}% | {control_text}"
+                f"{anchor_text}"
             )
         else:
             reason_labels = {
@@ -1075,6 +1225,8 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
                 "estimator_disagreement": "ambiguous match",
                 "shift_out_of_range": "shift out of range",
                 "lost_lock": "lock lost; reacquiring",
+                "no_camera": "waiting for the camera",
+                "no_mount": "waiting for the mount",
                 "off": "off",
             }
             reason = str(getattr(tracking, "measurement_reason", "low_confidence"))
@@ -1195,6 +1347,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
 
     def _update_chips_from_state(self, state) -> None:
         self._update_connection_buttons(state)
+        self._update_focuser_from_state(state)
         self.ch_cam.set_mode("green" if state.camera.connected else "red")
         self.ch_mount.set_mode("green" if state.mount.connected else "red")
         self.ch_sync.set_mode("green" if state.goto.synced else "red")
