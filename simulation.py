@@ -129,12 +129,20 @@ class SimulationState:
         # A*sin(2*pi*s/P + phase), so the locally measured scale swings by
         # A*2*pi/P around nominal: a move much shorter than one lobe measures
         # that local slope instead of the mean scale.
-        amp_lo = abs(_finite_float(getattr(cfg, "transmission_error_deg_min", 0.08), 0.08))
-        amp_hi = abs(_finite_float(getattr(cfg, "transmission_error_deg_max", 0.25), 0.25))
-        if amp_hi < amp_lo:
-            amp_lo, amp_hi = amp_hi, amp_lo
+        # Por eje: el cicloidal impreso de azimut riza mucho, el planetario
+        # comprado de altitud casi nada. Un rango comun para los dos describia
+        # una montura que no es esta.
+        def _amp(axis_suffix: str, lo_default: float, hi_default: float) -> float:
+            lo = abs(_finite_float(
+                getattr(cfg, f"transmission_error_deg_min_{axis_suffix}", lo_default), lo_default))
+            hi = abs(_finite_float(
+                getattr(cfg, f"transmission_error_deg_max_{axis_suffix}", hi_default), hi_default))
+            if hi < lo:
+                lo, hi = hi, lo
+            return float(self._rng.uniform(lo, hi))
+
         self.transmission_amp_deg = np.array(
-            [self._rng.uniform(amp_lo, amp_hi), self._rng.uniform(amp_lo, amp_hi)],
+            [_amp("az", 0.08, 0.25), _amp("alt", 0.002, 0.02)],
             dtype=np.float64,
         )
         self.transmission_phase_rad = np.array(
@@ -145,10 +153,15 @@ class SimulationState:
         # --- Backlash ---
         # Slack taken up when an axis reverses: the motor turns but the sky
         # does not move until the pending amount is consumed.
-        bl_lo = int(max(0, getattr(cfg, "backlash_steps_min", 5)))
-        bl_hi = int(max(bl_lo, getattr(cfg, "backlash_steps_max", 40)))
+        # Tambien por eje, y al reves que el rizado: el planetario de altitud es
+        # el que trae el juego, del orden de 15-60 arcmin en la salida.
+        def _slack(axis_suffix: str, lo_default: int, hi_default: int) -> float:
+            lo = int(max(0, getattr(cfg, f"backlash_steps_min_{axis_suffix}", lo_default)))
+            hi = int(max(lo, getattr(cfg, f"backlash_steps_max_{axis_suffix}", hi_default)))
+            return float(self._rng.integers(lo, hi + 1))
+
         self.backlash_steps = np.array(
-            [self._rng.integers(bl_lo, bl_hi + 1), self._rng.integers(bl_lo, bl_hi + 1)],
+            [_slack("az", 0, 40), _slack("alt", 800, 3200)],
             dtype=np.float64,
         )
         self._last_direction = np.zeros(2, dtype=np.float64)

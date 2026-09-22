@@ -300,6 +300,17 @@ class PlatesolvingConfig:
     retries: int = 3
     backoff_s: float = 3.0
 
+    # Catalog depth relative to what the image resolves. The cone is loaded at
+    # gmax, but only its brightest stars can ever match: the solver compares the
+    # N_det brightest detections, so stars fainter than the image reaches just
+    # multiply spurious triplets and cost (the search is ~quadratic in catalog
+    # size). The cap is a density: factor * N_det stars per field-of-view worth
+    # of sky, so it follows the search radius and the FOV instead of being a
+    # fixed magnitude. Measured on a real field, 1.5 keeps the solve well above
+    # min_inliers while cutting a 94 s solve to a few seconds. Set to 0 to load
+    # the cone at full depth.
+    catalog_density_factor: float = 1.5
+
     # Solve (Option C)
     theta_step_deg: float = 15.0
     theta_refine_step_deg: float = 3.0
@@ -430,14 +441,29 @@ class SimulationConfig:
     # scale is amplitude*2*pi/period, about 20% at the top of this band, which
     # is what made short calibration moves read 87% of nominal while a
     # full-cycle move read 100.5%.
-    transmission_error_deg_min: float = 0.08
-    transmission_error_deg_max: float = 0.25
+    #
+    # Los dos ejes no comparten mecanica y sus errores dominantes son opuestos:
+    # azimut lleva un cicloidal *impreso en 3D*, que casi no tiene juego pero
+    # riza mucho; altitud lleva un planetario comprado, que apenas riza pero
+    # tiene el juego concentrado en el engrane. Sortear el mismo rango para los
+    # dos hacia que la simulacion no se pareciera a esta montura en particular,
+    # y un test cerrado contra ella no probaba lo que hacia falta.
+    transmission_error_deg_min_az: float = 0.08
+    transmission_error_deg_max_az: float = 0.25
+    transmission_error_deg_min_alt: float = 0.002
+    transmission_error_deg_max_alt: float = 0.02
 
     # Backlash consumed when an axis reverses, in microsteps. These pulses move
     # the motor but not the sky, so a fit that ignores them mismodels every
     # direction change.
-    backlash_steps_min: int = 5
-    backlash_steps_max: int = 40
+    # Por eje, por la misma razon: el cicloidal impreso de azimut cierra casi
+    # sin juego, mientras el planetario de altitud trae el tipico de un
+    # reductor comercial -- del orden de 15-60 arcmin en la salida, que a
+    # 0.00031 deg/paso son entre 800 y 3200 microsteps.
+    backlash_steps_min_az: int = 0
+    backlash_steps_max_az: int = 40
+    backlash_steps_min_alt: int = 800
+    backlash_steps_max_alt: int = 3200
 
     # Foco. El demo arranca enfocado por defecto: cualquier desenfoque de
     # arranque ensancharia las PSF de todas las demas demos (plate solving,

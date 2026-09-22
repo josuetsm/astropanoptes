@@ -48,6 +48,39 @@ def _odd_ksize(v: int, *, minimum: int = 1) -> int:
     return k
 
 
+SOLID_COVERAGE_FRACTION = 0.85
+
+
+def flatten_mosaic_border(
+    mean_u16: np.ndarray, wgt: Optional[np.ndarray]
+) -> Tuple[np.ndarray, int]:
+    """Set the partly covered canvas edge to the sky level, for the detector.
+
+    As the field drifts, the canvas edge becomes a staircase between covered
+    and empty pixels. SEP reads those steps as sources, and because they are
+    bright relative to the sky they crowd out real stars from the brightest-N
+    list the solver actually uses. Measured on two real drifted stacks: 12 of
+    the 30 brightest "detections" were border artefacts on one (4 inliers ->
+    14), and 26 of 30 on another, where the solve only reached 16 inliers once
+    they were suppressed.
+
+    Returns the flattened image together with the sky level, which is also what
+    any padding around the result must use: a zero border reintroduces exactly
+    the hard edge removed here.
+    """
+    solid: Optional[np.ndarray] = None
+    if wgt is not None and wgt.size:
+        w_max = float(wgt.max())
+        if w_max > 0.0:
+            covered = wgt >= SOLID_COVERAGE_FRACTION * w_max
+            if covered.any():
+                solid = covered
+    sky_level = int(np.median(mean_u16[solid] if solid is not None else mean_u16))
+    if solid is not None and not solid.all():
+        mean_u16 = np.where(solid, mean_u16, sky_level).astype(np.uint16)
+    return mean_u16, sky_level
+
+
 def _bayer_to_gray_code(pattern: str) -> int:
     return _BAYER_TO_GRAY_CODE.get(str(pattern).upper(), cv2.COLOR_BAYER_RG2GRAY)
 
@@ -665,13 +698,11 @@ class StackEngine:
             # border artefacts, and removing them took the solve from 4 inliers
             # to 14. Partly-covered pixels are set to the sky level instead of
             # zero, so no hard edge is introduced either.
-            if wgt is not None and wgt.size:
-                w_max = float(wgt.max())
-                if w_max > 0.0:
-                    solid = wgt >= 0.85 * w_max
-                    if solid.any() and not solid.all():
-                        sky = np.median(mean_u16[solid])
-                        mean_u16 = np.where(solid, mean_u16, sky).astype(np.uint16)
+            #
+            # The sky level it returns is also what the re-centring pad below
+            # must use: padding with zeros would frame the image in black and
+            # put back exactly the hard edge this flattening removes.
+            mean_u16, sky_level = flatten_mosaic_border(mean_u16, wgt)
 
             scale = float(eng.drizzle_scale)
             ref_cx = (float(eng.ref_origin_x) + float(eng.frame_w) * 0.5) * scale
@@ -683,7 +714,10 @@ class StackEngine:
             pad_b = int(round(max(0.0, 2.0 * ref_cy - h)))
             if pad_l or pad_r or pad_t or pad_b:
                 mean_u16 = np.pad(
-                    mean_u16, ((pad_t, pad_b), (pad_l, pad_r)), mode="constant"
+                    mean_u16,
+                    ((pad_t, pad_b), (pad_l, pad_r)),
+                    mode="constant",
+                    constant_values=sky_level,
                 )
                 if wgt is not None:
                     wgt = np.pad(wgt, ((pad_t, pad_b), (pad_l, pad_r)), mode="constant")

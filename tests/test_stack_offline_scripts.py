@@ -1,12 +1,18 @@
 from __future__ import annotations
 
+import json
+import os
+import time
+
 import numpy as np
+import pytest
 
 from scripts.combine_raw_stacks import (
     _largest_valid_rectangle,
     _nearest_accepted_position,
 )
 from scripts.stack_raw_recordings import _combine_common_field, _common_bounds
+from scripts.solve_saved_stack import _to_time, load_sidecar, load_weight
 
 
 def test_largest_valid_rectangle_removes_partial_coverage_corners() -> None:
@@ -68,3 +74,58 @@ def test_cfa_reconstruction_has_no_bayer_checkerboard() -> None:
         assert rgb.shape == (24, 32, 3)
         expected = np.array([1000, 2000, 3000], dtype=np.uint16)
         np.testing.assert_array_equal(rgb, np.broadcast_to(expected, rgb.shape))
+
+
+@pytest.fixture
+def santiago_tz():
+    """Fija la zona a Chile continental para la duracion del test."""
+    previous = os.environ.get("TZ")
+    os.environ["TZ"] = "America/Santiago"
+    time.tzset()
+    try:
+        yield
+    finally:
+        if previous is None:
+            os.environ.pop("TZ", None)
+        else:
+            os.environ["TZ"] = previous
+        time.tzset()
+
+
+def test_saved_stack_epoch_follows_daylight_saving(santiago_tz) -> None:
+    """El nombre lleva hora local, y Chile cambia de huso en septiembre.
+
+    Con el desfase fijo de -4 que habia, una captura de mediados de septiembre
+    se fechaba una hora tarde. Una hora son 15 grados de angulo horario: el
+    solver buscaba el campo a 15 grados de donde estaba y solo encontraba
+    coincidencias falsas.
+    """
+    invierno = _to_time("20260831", "220736")   # UTC-4
+    verano = _to_time("20260915", "222845")     # UTC-3 (DST)
+
+    assert invierno.iso.startswith("2026-09-01 02:07:36")
+    assert verano.iso.startswith("2026-09-16 01:28:45")
+
+
+def test_sidecar_and_weight_are_read_from_the_saved_stack(tmp_path) -> None:
+    """Lo que escribe "stacking save" es lo que el solve offline debe leer."""
+    raw_path = tmp_path / "stack_20260915_222845_az258p87_altp39p41_raw.npy"
+    np.save(raw_path, np.zeros((4, 4), dtype=np.uint16))
+    wgt = np.full((4, 4), 2.0, dtype=np.float32)
+    np.save(tmp_path / "stack_20260915_222845_az258p87_altp39p41_wgt.npy", wgt)
+    meta = {"obstime_unix": 1789522125.0, "drizzle_scale": 2.0, "pointing_az_deg": 258.87}
+    (tmp_path / "stack_20260915_222845_az258p87_altp39p41.json").write_text(
+        json.dumps(meta), encoding="utf-8"
+    )
+
+    assert load_sidecar(raw_path) == meta
+    np.testing.assert_array_equal(load_weight(raw_path), wgt)
+
+
+def test_missing_sidecar_is_not_an_error(tmp_path) -> None:
+    """Los stacks anteriores al sidecar siguen resolviendose por el nombre."""
+    raw_path = tmp_path / "stack_20260831_220736_az098p13_altp51p38_raw.npy"
+    np.save(raw_path, np.zeros((4, 4), dtype=np.uint16))
+
+    assert load_sidecar(raw_path) == {}
+    assert load_weight(raw_path) is None

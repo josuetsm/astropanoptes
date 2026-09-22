@@ -1138,6 +1138,43 @@ def _gaia_load_df(
     return df
 
 
+def _limit_catalog_depth(
+    df: pd.DataFrame,
+    *,
+    cfg: PlatesolvingConfig,
+    arcsec_per_px: float,
+    width: int,
+    height: int,
+    radius_deg: float,
+) -> pd.DataFrame:
+    """Keep the brightest stars, at about the density the image itself reaches.
+
+    The matcher only ever uses the ``N_det`` brightest detections, so catalog
+    stars far fainter than those cannot match anything. They are not free: the
+    triplet search is roughly quadratic in catalog size, and every extra star
+    multiplies the spurious triplets that crowd out the true one before
+    ``triplet_max_trials`` validations run out.
+
+    Measured on a real 0.47 x 0.50 deg field with the default 3 deg cone: the
+    full G<=15 catalog (34084 stars) solved in 94 s, capped to 4000 in 7 s, and
+    both landed on the same centre and rotation. Below ~1000 stars the field
+    stops being covered, so the cap keeps a floor.
+    """
+    factor = float(getattr(cfg, "catalog_density_factor", 1.5))
+    n_det = int(getattr(cfg, "N_det", 30))
+    if factor <= 0.0 or n_det <= 0 or "phot_g_mean_mag" not in df.columns:
+        return df
+    field_deg2 = (float(width) * arcsec_per_px / 3600.0) * (float(height) * arcsec_per_px / 3600.0)
+    cone_deg2 = float(np.pi * float(radius_deg) ** 2)
+    if field_deg2 <= 0.0 or cone_deg2 <= field_deg2:
+        return df
+    keep = int(np.ceil(factor * n_det * cone_deg2 / field_deg2))
+    keep = max(keep, int(max(8, 3 * n_det)))
+    if keep >= len(df):
+        return df
+    return df.nsmallest(keep, "phot_g_mean_mag").reset_index(drop=True)
+
+
 def _configured_plate_scale_arcsec_per_px(cfg: PlatesolvingConfig) -> float:
     if hasattr(cfg, "pixel_size_m") and hasattr(cfg, "focal_m"):
         return float(206265.0 * float(cfg.pixel_size_m) / float(cfg.focal_m))
@@ -1934,7 +1971,21 @@ def solve_plate(
             metrics={"err": 1.0},
         )
 
-    if len(gaia_df) < int(max(8, 3 * img_xy_all.shape[0])):
+    gaia_df = _limit_catalog_depth(
+        gaia_df,
+        cfg=cfg,
+        arcsec_per_px=arcsec_per_px,
+        width=w,
+        height=h,
+        radius_deg=radius_deg,
+    )
+
+    # The guard belongs against the detections the solver will actually use
+    # (N_det of them, truncated below), not against every source SEP returned:
+    # max_det is 250 by default, which demanded 750 catalog stars for a search
+    # that never looks at more than the brightest 30 detections.
+    n_det_used = int(min(int(getattr(cfg, "N_det", 30)), img_xy_all.shape[0]))
+    if len(gaia_df) < int(max(8, 3 * n_det_used)):
         return PlatesolvingResult(
             success=False,
             status="GAIA_TOO_SMALL",

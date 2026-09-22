@@ -67,11 +67,24 @@ class TestEmissionWindow:
         r._note_rate_emul_period(0.30)
         assert r._fit_steps_in_emission_window(3, 1000) == 3
 
-    def test_nothing_is_emitted_when_a_single_step_would_overrun(self) -> None:
-        """Mejor esperar que mandar un paso que se va a quedar a medias."""
+    def test_a_single_step_longer_than_the_window_still_goes_out(self) -> None:
+        """Esperar a que quepa era esperar para siempre.
+
+        A ritmo sideral esta montura pide ~100 ms entre pasos y la ventana
+        del lazo son ~16 ms: ningun paso cabe jamas. Recortando a cero el
+        acumulador crecia sin emitir nunca, el estado publicaba velocidades
+        sanas y la montura no recibia un solo MOVE -- el seguimiento parecia
+        andar y la imagen derivaba a ritmo sideral entero. Sale un paso, y de
+        que no lo pise el siguiente se encarga la reserva de linea por eje.
+        """
         r = _runner()
         r._note_rate_emul_period(0.010)
-        assert r._fit_steps_in_emission_window(5, 50_000) == 0
+        assert r._fit_steps_in_emission_window(5, 50_000) == 1
+
+    def test_a_single_step_keeps_its_sign_when_it_does_not_fit(self) -> None:
+        r = _runner()
+        r._note_rate_emul_period(0.010)
+        assert r._fit_steps_in_emission_window(-5, 50_000) == -1
 
     def test_zero_stays_zero(self) -> None:
         r = _runner()
@@ -117,3 +130,79 @@ class TestNoStepsAreLost:
         # El ciclo siguiente arranca con ese resto en el acumulador y lo saca
         # entero si cabe; en ningun caso se pierde.
         assert r._fit_steps_in_emission_window(remainder, delay_us) > 0
+
+
+class _FakeMount:
+    """Registra los MOVE que recibe, sin hardware detras."""
+
+    def __init__(self) -> None:
+        self.moves: list[tuple[str, int, int, int]] = []
+
+    def move_steps(self, *, axis, direction, steps, delay_us, **kwargs) -> None:
+        self.moves.append((axis.value, int(direction), int(steps), int(delay_us)))
+
+    def stop(self) -> None:
+        pass
+
+
+def _emitting_runner(monkeypatch, clock: list[float]) -> tuple[AppRunner, _FakeMount]:
+    """AppRunner minimo capaz de ejecutar la emulacion de velocidad."""
+    import threading
+
+    from config import AppConfig
+
+    r = AppRunner.__new__(AppRunner)
+    r.cfg = AppConfig()
+    r._mount = _FakeMount()
+    r._rate_emul_lock = threading.Lock()
+    r._rate_emul_last_t = None
+    r._rate_emul_acc_az = 0.0
+    r._rate_emul_acc_alt = 0.0
+    r._rate_emul_active = False
+    r._rate_emul_period_s = None
+    r._rate_emul_busy_until_az = 0.0
+    r._rate_emul_busy_until_alt = 0.0
+    r._is_manual_move_active = lambda: False
+    monkeypatch.setattr(app_runner, "_perf", lambda: clock[0])
+    return r, r._mount
+
+
+class TestSiderealRateActuallyReachesTheMount:
+    """La regresion que dejaba la montura quieta con el tracking en verde."""
+
+    def test_a_sidereal_rate_emits_moves(self, monkeypatch) -> None:
+        clock = [0.0]
+        r, mount = _emitting_runner(monkeypatch, clock)
+        rate = 10.0  # pasos/s: el orden del sideral en esta montura
+        for _ in range(600):  # 10 s de lazo a 60 Hz
+            clock[0] += 1.0 / 60.0
+            r._mount_rate_safe(-rate, 0.0)
+        assert mount.moves, "el lazo no mando ni un MOVE a ritmo sideral"
+        emitted = sum(steps for _, _, steps, _ in mount.moves)
+        # 10 s a 10 pasos/s = ~100 pasos. La reserva de linea puede diferir
+        # alguno al ciclo siguiente, no perderlo.
+        assert 80 <= emitted <= 100
+
+    def test_a_move_is_never_sent_over_one_still_in_flight(self, monkeypatch) -> None:
+        clock = [0.0]
+        r, mount = _emitting_runner(monkeypatch, clock)
+        # Rate alto: el acumulador llena un paso mucho antes de que termine
+        # el MOVE anterior, que es cuando el firmware descartaria el resto.
+        rate = 300.0
+        for _ in range(600):
+            clock[0] += 1.0 / 60.0
+            r._mount_rate_safe(rate, 0.0)
+        t = 0.0
+        for _, _, steps, delay_us in mount.moves:
+            assert t <= clock[0]
+            t += _batch_duration_s(steps, delay_us)
+        assert t <= clock[0] + 1e-6, "los MOVE emitidos no caben en el tiempo transcurrido"
+
+    def test_the_axes_reserve_their_line_independently(self, monkeypatch) -> None:
+        clock = [0.0]
+        r, mount = _emitting_runner(monkeypatch, clock)
+        for _ in range(600):
+            clock[0] += 1.0 / 60.0
+            r._mount_rate_safe(-10.0, 6.0)
+        axes = {axis for axis, _, _, _ in mount.moves}
+        assert axes == {"az", "alt"}, f"algun eje se quedo sin emitir: {axes}"

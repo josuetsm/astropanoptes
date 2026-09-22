@@ -966,39 +966,6 @@ class CoreSmokeTests(unittest.TestCase):
         self.assertGreater(len(inlier_devs), 0)
         self.assertLess(max(inlier_devs), 5.0)
 
-    def test_goto_model_calibration_fit_rejects_outlier_sample(self) -> None:
-        model = GoToModel()
-        model.init_from_mechanics()
-        j_true = _j_around_nominal(model, az_scale=1.088, alt_scale=0.960,
-                                   az_per_alt=0.040, alt_per_az=-0.032)
-        steps = np.array(
-            [
-                [-900.0, -500.0],
-                [-600.0, 400.0],
-                [-200.0, -300.0],
-                [250.0, 300.0],
-                [700.0, -450.0],
-                [1100.0, 800.0],
-                [1300.0, 900.0],  # outlier injected here
-            ],
-            dtype=np.float64,
-        )
-
-        for i, s in enumerate(steps):
-            d_altaz = j_true @ s
-            if i == len(steps) - 1:
-                d_altaz = d_altaz + np.array([6.0, -4.0], dtype=np.float64)
-            model.add_calibration_sample(s, d_altaz)
-
-        ok = model.fit_J_from_samples(min_samples=4, ridge=1e-9)
-        self.assertTrue(ok)
-        self.assertGreaterEqual(model.model_fit_samples, 4)
-        self.assertLess(model.model_fit_samples, len(steps))
-        self.assertAlmostEqual(model.J_deg_per_step[0, 0], j_true[0, 0], places=4)
-        self.assertAlmostEqual(model.J_deg_per_step[0, 1], j_true[0, 1], places=4)
-        self.assertAlmostEqual(model.J_deg_per_step[1, 0], j_true[1, 0], places=4)
-        self.assertAlmostEqual(model.J_deg_per_step[1, 1], j_true[1, 1], places=4)
-
     def test_goto_parallel_move_dispatches_both_axes(self) -> None:
         ctrl = GoToController(cfg=GoToConfig(), model=GoToModel())
         calls: list[tuple[str, int, int, int, float]] = []

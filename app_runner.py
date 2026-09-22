@@ -158,6 +158,12 @@ _RATE_EMUL_WINDOW_FRAC = 0.8
 _RATE_EMUL_MAX_PERIOD_S = 5.0
 
 
+def _batch_duration_s(steps: int, delay_us: float) -> float:
+    """Cuanto tarda la montura en ejecutar un lote de MOVE."""
+    return abs(int(steps)) * (float(delay_us) + _RATE_EMUL_PULSE_US) / 1.0e6
+
+
+
 def _perf() -> float:
     return time.perf_counter()
 
@@ -363,6 +369,8 @@ class AppRunner:
         self._rate_emul_acc_alt: float = 0.0
         self._rate_emul_active: bool = False
         self._rate_emul_period_s: Optional[float] = None
+        self._rate_emul_busy_until_az: float = 0.0
+        self._rate_emul_busy_until_alt: float = 0.0
         self._tracking_step_failures: int = 0
         self._tracking_last_frame_token: Optional[float] = None
         self._tracking_last_output: Optional[Any] = None
@@ -1841,6 +1849,8 @@ class AppRunner:
             self._rate_emul_acc_alt = 0.0
             self._rate_emul_active = False
             self._rate_emul_period_s = None
+            self._rate_emul_busy_until_az = 0.0
+            self._rate_emul_busy_until_alt = 0.0
 
     def _note_rate_emul_period(self, dt: float) -> None:
         """Estimacion suavizada del periodo entre emisiones consecutivas."""
@@ -1869,7 +1879,14 @@ class AppRunner:
         per_step_us = max(1.0, float(delay_us) + _RATE_EMUL_PULSE_US)
         room = int(budget_us // per_step_us)
         if room <= 0:
-            return 0
+            # Un paso mas largo que la ventana no es un lote que se pueda
+            # partir: o sale entero o no sale nunca. A ritmo sideral esta
+            # montura pide ~100 ms entre pasos y la ventana son ~16 ms, asi
+            # que recortar a cero dejaba el acumulador creciendo sin emitir
+            # jamas: el lazo publicaba velocidades sanas y por el cable no
+            # salia un solo MOVE. Que a ese paso no lo pise el siguiente lo
+            # garantiza la reserva de linea por eje, no este recorte.
+            room = 1
         return int(max(-room, min(room, n)))
 
     def _is_manual_move_active(self) -> bool:
@@ -1995,6 +2012,23 @@ class AppRunner:
             # acumulador y sale en el ciclo siguiente, sin perderse ni contarse.
             step_az = self._fit_steps_in_emission_window(step_az, delay_az)
             step_alt = self._fit_steps_in_emission_window(step_alt, delay_alt)
+
+            # Reserva de linea: mientras el MOVE anterior de este eje siga en
+            # vuelo no se manda otro, porque el firmware lo descartaria a
+            # medias y aqui ya se habrian contado sus pasos. Es la misma
+            # proteccion que buscaba el recorte por ventana, pero medida
+            # contra la emision real y no contra el periodo del lazo: a ritmo
+            # lento las emisiones quedan mas separadas que la duracion del
+            # lote, asi que la linea esta libre y el paso sale.
+            if now < float(self._rate_emul_busy_until_az):
+                step_az = 0
+            if now < float(self._rate_emul_busy_until_alt):
+                step_alt = 0
+
+            if step_az != 0:
+                self._rate_emul_busy_until_az = now + _batch_duration_s(step_az, delay_az)
+            if step_alt != 0:
+                self._rate_emul_busy_until_alt = now + _batch_duration_s(step_alt, delay_alt)
 
             self._rate_emul_acc_az -= float(step_az)
             self._rate_emul_acc_alt -= float(step_alt)
@@ -3293,27 +3327,12 @@ class AppRunner:
     # -------------------------
     # Stacking save helper
     # -------------------------
-    def _stacking_capture_basename(self, basename: str) -> str:
-        prefix = str(basename).strip() or "stack"
-        safe_prefix = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in prefix)
-        safe_prefix = safe_prefix.strip("_") or "stack"
+    def _current_pointing_az_alt(self) -> tuple[float, float]:
+        """Current pointing in degrees, or NaNs when it cannot be read.
 
-        capture_dt = _dt.datetime.now()
-        fr = self._get_latest_frame()
-        if fr is not None:
-            t_wall = self._frame_wall_t(fr)
-            if t_wall is not None:
-                try:
-                    capture_dt = _dt.datetime.fromtimestamp(float(t_wall))
-                except (OSError, OverflowError, ValueError) as exc:
-                    log_error(
-                        self.out_log,
-                        "Stacking: invalid frame wall timestamp; using current time",
-                        exc,
-                        throttle_s=5.0,
-                        throttle_key="stacking_capture_timestamp",
-                    )
-
+        Shared by the capture file name and the saved sidecar so both describe
+        the same pointing.
+        """
         az = float("nan")
         alt = float("nan")
         try:
@@ -3348,6 +3367,31 @@ class AppRunner:
             if bool(getattr(st.goto, "pointing_valid", False)):
                 az = float(st.goto.pointing_az_deg) % 360.0
                 alt = float(np.clip(float(st.goto.pointing_alt_deg), -90.0, 90.0))
+
+        return az, alt
+
+    def _stacking_capture_basename(self, basename: str) -> str:
+        prefix = str(basename).strip() or "stack"
+        safe_prefix = "".join(ch if (ch.isalnum() or ch in ("-", "_")) else "_" for ch in prefix)
+        safe_prefix = safe_prefix.strip("_") or "stack"
+
+        capture_dt = _dt.datetime.now()
+        fr = self._get_latest_frame()
+        if fr is not None:
+            t_wall = self._frame_wall_t(fr)
+            if t_wall is not None:
+                try:
+                    capture_dt = _dt.datetime.fromtimestamp(float(t_wall))
+                except (OSError, OverflowError, ValueError) as exc:
+                    log_error(
+                        self.out_log,
+                        "Stacking: invalid frame wall timestamp; using current time",
+                        exc,
+                        throttle_s=5.0,
+                        throttle_key="stacking_capture_timestamp",
+                    )
+
+        az, alt = self._current_pointing_az_alt()
 
         def _coord_token(value: float, *, signed: bool) -> str:
             if not np.isfinite(value):
@@ -3384,7 +3428,7 @@ class AppRunner:
         """
         eng = self._stacking
         try:
-            raw, _ = eng.get_stack_snapshot(mean_dtype=np.float32, wgt_dtype=np.float32)
+            raw, wgt = eng.get_stack_snapshot(mean_dtype=np.float32, wgt_dtype=np.float32)
             if raw is None:
                 log_info(self.out_log, "Stacking: save skipped (no data)")
                 return
@@ -3402,6 +3446,32 @@ class AppRunner:
             # Save raw stack
             raw_path = os.path.join(out_dir, f"{final_basename}_raw.npy")
             np.save(raw_path, raw)
+
+            # Save what the solver needs to reproduce this mosaic offline.
+            #
+            # The raw mosaic alone is not solvable: its ragged border reads as
+            # the brightest "stars" in the frame, and the epoch was only
+            # recoverable by parsing the local timestamp out of the file name,
+            # which guesses wrong across a DST change (one hour is 15 degrees
+            # of hour angle, and the solve then lands nowhere). The weight map
+            # lets the border be flattened exactly as the live path does, and
+            # the sidecar records the epoch as UTC so nothing has to be
+            # reverse-engineered.
+            if wgt is not None:
+                np.save(os.path.join(out_dir, f"{final_basename}_wgt.npy"), wgt)
+            info = eng.get_stack_for_solve() or {}
+            pt_az, pt_alt = self._current_pointing_az_alt()
+            meta = {
+                "obstime_unix": info.get("obstime_unix"),
+                "last_time_unix": info.get("last_time_unix"),
+                "drizzle_scale": float(info.get("drizzle_scale", 1.0) or 1.0),
+                "frames": info.get("frames"),
+                "pad_offset_xy": info.get("pad_offset_xy"),
+                "pointing_az_deg": None if not np.isfinite(pt_az) else float(pt_az),
+                "pointing_alt_deg": None if not np.isfinite(pt_alt) else float(pt_alt),
+            }
+            with open(os.path.join(out_dir, f"{final_basename}.json"), "w", encoding="utf-8") as fh:
+                json.dump(meta, fh, ensure_ascii=False, indent=2, sort_keys=True)
 
             # Save logarithmic PNG (uint16)
             img = np.log(raw.astype(np.float64) + 1.0)

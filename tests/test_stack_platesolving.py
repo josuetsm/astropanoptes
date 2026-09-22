@@ -12,6 +12,7 @@ from stacking import (
     StackingWorker,
     _bayer_to_gray_code,
     _bayer_to_rgb_code,
+    flatten_mosaic_border,
 )
 
 
@@ -246,3 +247,59 @@ def test_stack_source_never_widens_the_search_radius() -> None:
         assert float(got.max_center_offset_margin_deg) >= 0.0
     finally:
         runner.stop()
+
+
+def test_recentring_pad_continues_the_sky_instead_of_framing_in_black() -> None:
+    """Regression: the pad undid the border flattening it was paired with.
+
+    Flattening sets the partly covered edge to the sky level precisely so the
+    detector sees no step. Padding the result with zeros then drew a hard black
+    frame around it, which is the same artefact again, one ring further out.
+    """
+    st = _stacker()
+    st.add_frame(_frame(), t_unix=1000.0)
+    for i in range(1, 6):
+        st.add_frame(_frame(shift=(5 * i, 6 * i)), t_unix=1000.0 + i)
+
+    raw = st.get_mean_u16()
+    wgt = st.wgt
+    assert wgt is not None
+    sky = int(np.median(raw[wgt >= 0.85 * float(wgt.max())]))
+
+    info = _solve_info(st)
+    assert info is not None
+    img = info["image"]
+    ox, oy = info["pad_offset_xy"]
+    # el offset puede ser (0,0) y aun asi haber relleno: cae abajo/derecha
+    assert img.shape != raw.shape, "este caso debe necesitar relleno"
+
+    # el relleno esta al nivel del cielo, no en negro
+    pad = np.ones(img.shape, dtype=bool)
+    pad[oy:oy + raw.shape[0], ox:ox + raw.shape[1]] = False
+    assert pad.any()
+    assert np.all(img[pad] == sky)
+    assert float(img[pad].std()) == 0.0
+
+
+def test_border_flattening_is_shared_with_the_offline_path() -> None:
+    """El script offline y el solve en vivo deben aplanar igual, no parecido."""
+    st = _stacker()
+    st.add_frame(_frame(), t_unix=1000.0)
+    for i in range(1, 6):
+        st.add_frame(_frame(shift=(5 * i, 6 * i)), t_unix=1000.0 + i)
+
+    raw = st.get_mean_u16()
+    wgt = st.wgt
+    assert wgt is not None
+
+    flat, sky = flatten_mosaic_border(raw, wgt)
+    partial = wgt < 0.85 * float(wgt.max())
+    assert partial.any()
+    assert np.all(flat[partial] == sky)
+    np.testing.assert_array_equal(flat[~partial], raw[~partial])
+
+    info = _solve_info(st)
+    assert info is not None
+    ox, oy = info["pad_offset_xy"]
+    inner = info["image"][oy:oy + raw.shape[0], ox:ox + raw.shape[1]]
+    np.testing.assert_array_equal(inner, flat)

@@ -80,6 +80,7 @@ from mount_arduino import estimate_firmware_move_duration_s
 from workers import BaseWorker
 from imaging import ensure_raw16_bayer, estimate_sensor_drift_from_stack
 from goto_diagnostics import DiagnosticSession
+from pointing.kinematics import MountKinematics
 from sep_utils import sep_detect_from_raw16, estimate_shift_from_objects
 
 import astropy.units as u
@@ -1251,89 +1252,6 @@ def pick_bright_start_star(
 # ============================================================
 
 @dataclass
-class MountKinematics:
-    """Mechanical parameters used to compute an initial steps/deg model."""
-
-    # Stepper
-    motor_full_steps_per_rev: int = 200
-
-    # Microstepping dividers (what the firmware sets on MS pins: 8/16/32/64)
-    microsteps_az: int = 64
-    microsteps_alt: int = 64
-
-    # Belt / pulleys
-    motor_pulley_teeth: int = 20
-    belt_pitch_m: float = 0.002  # GT2
-
-    # Direct mechanical reduction. 45.0 means motor:axis = 45:1.
-    # Los dos ejes no son iguales: altitud lleva 90.5:1, asi que su paso
-    # nominal es la mitad que el de azimut (1.12" frente a 2.25" a 1/64).
-    gear_reduction_az: float | None = 45.0
-    gear_reduction_alt: float | None = 90.5
-
-    # Un reductor cicloidal repite su error de transmision de primer orden una
-    # vez por vuelta de motor, o sea tantos ciclos por vuelta de salida como
-    # indique su reduccion. Va como float justamente porque 90.5 no es entero:
-    # redondear a 90 correria el periodo un 0.55% y desfasaria el modelo
-    # periodico a las pocas vueltas.
-    transmission_lobes_az: float = 45.0
-    transmission_lobes_alt: float = 90.5
-
-    # Ring radii (meters), used only when gear_reduction_* is None.
-    ring_radius_m_az: float = 0.24
-    ring_radius_m_alt: float = 0.235
-
-    # Optional sign convention adjustments (because FWD/REV wiring might invert)
-    # +1 means: positive steps => increasing AZ/ALT in degrees.
-    axis_sign_az: int = +1
-    axis_sign_alt: int = +1
-
-    def ring_teeth(self, axis: Axis) -> float:
-        r = float(self.ring_radius_m_az if axis == Axis.AZ else self.ring_radius_m_alt)
-        return float((2.0 * math.pi * r) / float(self.belt_pitch_m))
-
-    def gear_reduction(self, axis: Axis) -> float:
-        explicit = self.gear_reduction_az if axis == Axis.AZ else self.gear_reduction_alt
-        if explicit is not None:
-            ratio = float(explicit)
-        else:
-            ratio = float(self.ring_teeth(axis)) / float(self.motor_pulley_teeth)
-        if ratio <= 0.0:
-            raise ValueError("invalid gear_reduction")
-        return float(ratio)
-
-    def microsteps_per_motor_rev(self, axis: Axis) -> int:
-        ms = int(self.microsteps_az if axis == Axis.AZ else self.microsteps_alt)
-        return int(self.motor_full_steps_per_rev) * ms
-
-    def steps_per_axis_rev(self, axis: Axis) -> float:
-        """Microsteps per full 360° axis revolution."""
-        mu = float(self.microsteps_per_motor_rev(axis))
-        return float(mu * self.gear_reduction(axis))
-
-    def steps_per_deg(self, axis: Axis) -> float:
-        return float(self.steps_per_axis_rev(axis) / 360.0)
-
-    def deg_per_step(self, axis: Axis) -> float:
-        spd = float(self.steps_per_deg(axis))
-        if spd <= 0:
-            raise ValueError("invalid steps_per_deg")
-        sign = int(self.axis_sign_az if axis == Axis.AZ else self.axis_sign_alt)
-        sign = +1 if sign >= 0 else -1
-        return float(sign / spd)
-
-    def transmission_error_period_steps(self, axis: Axis) -> float:
-        lobes = float(
-            self.transmission_lobes_az
-            if axis == Axis.AZ
-            else self.transmission_lobes_alt
-        )
-        if not math.isfinite(lobes) or lobes <= 0.0:
-            raise ValueError("invalid transmission_lobes")
-        return float(self.steps_per_axis_rev(axis) / lobes)
-
-
-@dataclass
 class GoToModel:
     """Internal pointing model.
 
@@ -1421,8 +1339,6 @@ class GoToModel:
     last_solve_time: float = 0.0
 
     # Calibration samples (for updating J)
-    _calib_steps: List[np.ndarray] = field(default_factory=list, repr=False)
-    _calib_daltaz: List[np.ndarray] = field(default_factory=list, repr=False)
 
     # Manual calibration samples (absolute measurements)
     _manual_steps_abs: List[np.ndarray] = field(default_factory=list, repr=False)
@@ -2095,8 +2011,6 @@ class GoToModel:
 
         prev_steps = self.steps_est.copy()
 
-        self._calib_steps.clear()
-        self._calib_daltaz.clear()
         self._manual_steps_abs.clear()
         self._manual_az_alt_abs.clear()
         self._manual_roll_deg_abs.clear()
@@ -2505,231 +2419,6 @@ class GoToModel:
         self.last_solve_steps_est = self.steps_est.copy()
         self.last_solve_time = time.time()
         return bool(updated_steps)
-
-    def add_calibration_sample(self, dsteps: np.ndarray, daltaz_deg: np.ndarray) -> None:
-        self._calib_steps.append(_as_array2(dsteps))
-        self._calib_daltaz.append(_as_array2(daltaz_deg))
-
-    def fit_J_from_samples(self, *, min_samples: int = 3, ridge: float = 1e-12) -> bool:
-        """Least squares fit of J using accumulated calibration samples.
-
-        We solve D = S @ B and set J = B^T (so that d = J @ s).
-
-        Returns True if an update was applied.
-        """
-        self.last_fit_reason = "RUNNING"
-        if len(self._calib_steps) < int(min_samples):
-            self.last_fit_reason = "INSUFFICIENT_SAMPLES"
-            self._log_fit_csv(
-                fit_kind="calibration",
-                ok=False,
-                reason="INSUFFICIENT_SAMPLES",
-                min_samples=int(min_samples),
-                ridge=float(ridge),
-                total_samples=int(len(self._calib_steps)),
-                used_samples=0,
-            )
-            return False
-        S_all = np.stack(self._calib_steps, axis=0).astype(np.float64)  # (N,2)
-        D_all = np.stack(self._calib_daltaz, axis=0).astype(np.float64)  # (N,2)
-        n_all = int(S_all.shape[0])
-
-        def _solve_with_mask(mask: np.ndarray) -> Optional[Dict[str, Any]]:
-            idx = np.flatnonzero(mask)
-            n_use = int(idx.size)
-            if n_use < int(min_samples):
-                return None
-
-            S = S_all[idx, :]
-            D = D_all[idx, :]
-
-            mechanical = self.mechanical_J()
-            span_steps = np.ptp(S, axis=0)
-            span_deg = np.array(
-                [
-                    abs(float(mechanical[0, 0])) * float(span_steps[0]),
-                    abs(float(mechanical[1, 1])) * float(span_steps[1]),
-                ],
-                dtype=np.float64,
-            )
-            min_span_deg = max(0.0, float(self.min_fit_axis_span_deg))
-            if np.any(~np.isfinite(span_deg)) or np.any(span_deg < min_span_deg):
-                return None
-
-            # Ridge-regularized least squares: minimize ||S B - D||^2 + ridge||B||^2
-            # Implemented by augmenting S and D.
-            if ridge > 0:
-                lam = float(ridge)
-                S_aug = np.vstack([S, math.sqrt(lam) * np.eye(2)])
-                D_aug = np.vstack([D, np.zeros((2, 2), dtype=np.float64)])
-            else:
-                S_aug, D_aug = S, D
-
-            B, *_ = np.linalg.lstsq(S_aug, D_aug, rcond=None)
-            J_unconstrained = np.asarray(B.T, dtype=np.float64).copy()
-            J_new = self.constrain_J_to_mechanics(J_unconstrained)
-            B = J_new.T
-
-            if not np.all(np.isfinite(J_new)):
-                return None
-            det_J = float(np.linalg.det(J_new))
-            if (not np.isfinite(det_J)) or abs(det_J) < 1e-12:
-                return None
-            try:
-                cond_J = float(np.linalg.cond(J_new))
-            except np.linalg.LinAlgError:
-                return None
-            if (not np.isfinite(cond_J)) or cond_J > 1e10:
-                return None
-
-            pred_use = S @ B
-            res_use = D - pred_use
-            pred_all = S_all @ B
-            res_all = D_all - pred_all
-            return {
-                "mask": mask.copy(),
-                "n_use": n_use,
-                "J_new": J_new,
-                "J_unconstrained": J_unconstrained,
-                "res_use": res_use,
-                "res_all": res_all,
-            }
-
-        mask = np.ones(n_all, dtype=bool)
-        fit = _solve_with_mask(mask)
-        if fit is None:
-            self.last_fit_reason = "DEGENERATE_MODEL"
-            self._log_fit_csv(
-                fit_kind="calibration",
-                ok=False,
-                reason="DEGENERATE_MODEL",
-                min_samples=int(min_samples),
-                ridge=float(ridge),
-                total_samples=int(n_all),
-                used_samples=0,
-            )
-            return False
-
-        # Robust outlier rejection on total residual norm using MAD scale.
-        min_keep = max(int(min_samples), 3)
-        if n_all >= max(min_keep + 2, 5):
-            for _ in range(3):
-                res_all = np.asarray(fit["res_all"], dtype=np.float64)
-                res_norm = np.hypot(res_all[:, 0], res_all[:, 1])
-                finite = np.isfinite(res_norm)
-                if int(np.sum(finite)) < min_keep:
-                    break
-
-                med = float(np.median(res_norm[finite]))
-                mad = float(np.median(np.abs(res_norm[finite] - med)))
-                sigma = float(1.4826 * mad)
-                floor = float(max(0.0, self.fit_outlier_floor_arcsec) / 3600.0)
-                thr = med + float(max(0.0, self.fit_outlier_sigma)) * sigma
-                thr = max(floor, float(thr if np.isfinite(thr) else 0.0))
-
-                new_mask = finite & (res_norm <= thr)
-                if int(np.sum(new_mask)) < min_keep:
-                    idx_f = np.flatnonzero(finite)
-                    order = idx_f[np.argsort(res_norm[idx_f])]
-                    keep = order[:min_keep]
-                    new_mask = np.zeros_like(mask, dtype=bool)
-                    new_mask[keep] = True
-
-                if np.array_equal(new_mask, mask):
-                    # Fallback: if one sample is clearly separated, prune the worst.
-                    idx_f = np.flatnonzero(finite & mask)
-                    if int(idx_f.size) <= min_keep:
-                        break
-                    worst = int(idx_f[np.argmax(res_norm[idx_f])])
-                    worst_res = float(res_norm[worst])
-                    med_ref = max(float(med), floor)
-                    if not (np.isfinite(worst_res) and worst_res > max(3.0 * floor, 2.0 * med_ref)):
-                        break
-                    new_mask = mask.copy()
-                    new_mask[worst] = False
-
-                fit_new = _solve_with_mask(new_mask)
-                if fit_new is None:
-                    break
-                mask = new_mask
-                fit = fit_new
-
-        if not self.is_J_within_mechanical_limits(fit["J_unconstrained"]):
-            # Distinguish "the gearing is wrong" from "the samples are too
-            # short to measure the mean scale". With moves well under one
-            # cycloidal lobe the fit reads the local slope of the transmission
-            # error, which alone can exceed the envelope on perfect hardware.
-            coverage = self.manual_phase_coverage(mask)
-            short_travel = float(coverage.get("min", 0.0)) < 0.5
-            reason = (
-                "MODEL_FIT_PHASE_COVERAGE_TOO_SHORT"
-                if short_travel
-                else "MODEL_OUTSIDE_MECHANICAL_LIMITS"
-            )
-            self.last_fit_reason = reason
-            self.last_fit_phase_coverage = dict(coverage)
-            self._log_fit_csv(
-                fit_kind="calibration",
-                ok=False,
-                reason=reason,
-                min_samples=int(min_samples),
-                ridge=float(ridge),
-                total_samples=int(n_all),
-                used_samples=int(fit["n_use"]),
-            )
-            return False
-
-        res = np.asarray(fit["res_use"], dtype=np.float64)
-        fit_rms_arcsec = float(
-            np.sqrt(np.mean(np.square(res[:, 0]) + np.square(res[:, 1]))) * 3600.0
-        )
-        max_rms = max(0.0, float(self.max_model_fit_rms_arcsec))
-        if (
-            not np.isfinite(fit_rms_arcsec)
-            or (max_rms > 0.0 and fit_rms_arcsec > max_rms)
-        ):
-            self.last_fit_reason = "FIT_RMS_TOO_HIGH"
-            self._log_fit_csv(
-                fit_kind="calibration",
-                ok=False,
-                reason="FIT_RMS_TOO_HIGH",
-                min_samples=int(min_samples),
-                ridge=float(ridge),
-                total_samples=int(n_all),
-                used_samples=int(fit["n_use"]),
-            )
-            return False
-
-        self.J_deg_per_step = np.asarray(fit["J_new"], dtype=np.float64).copy()
-        self.J00_err = 0.0
-        self.J01_err = 0.0
-        self.J10_err = 0.0
-        self.J11_err = 0.0
-        self.model_non_orthogonality_deg = _non_orthogonality_deg_from_J(self.J_deg_per_step)
-        self.model_non_orthogonality_err_deg = 0.0
-        self.model_fit_samples = int(fit["n_use"])
-        self.model_fit_rms_az_deg = float(np.sqrt(np.mean(np.square(res[:, 0]))))
-        self.model_fit_rms_alt_deg = float(np.sqrt(np.mean(np.square(res[:, 1]))))
-        self.model_fit_rms_arcsec = fit_rms_arcsec
-        n_out = int(n_all - int(fit["n_use"]))
-        if n_out > 0:
-            log_info(
-                None,
-                f"GoTo: calibration fit rejected outliers={n_out}/{n_all}",
-                throttle_s=0.2,
-                throttle_key="goto_fit_calib_outliers",
-            )
-        self._log_fit_csv(
-            fit_kind="calibration",
-            ok=True,
-            reason="OK",
-            min_samples=int(min_samples),
-            ridge=float(ridge),
-            total_samples=int(n_all),
-            used_samples=int(fit["n_use"]),
-        )
-        self.last_fit_reason = "OK"
-        return True
 
     def add_manual_sample(
         self,
@@ -4989,257 +4678,6 @@ class GoToController:
     # Calibration (blocking)
     # -------------------------
 
-    def calibrate_blocking(
-        self,
-        *,
-        get_live_frame: GetFrameFn,
-        platesolving_cfg: PlatesolvingConfig,
-        move_steps: MoveStepsFn,
-        stop: Optional[StopFn] = None,
-        tracking_pause: Optional[Callable[[bool], Any]] = None,
-        tracking_keyframe_reset: Optional[Callable[[], Any]] = None,
-        n_samples: int = 3,
-        max_radius_deg: float = 1.0,
-        obstime: Optional[Time] = None,
-        diagnostics: Optional[DiagnosticSession] = None,
-    ) -> Dict[str, Any]:
-        """Refine the model J (including cross-coupling) via randomized dithers.
-
-        Preconditions:
-          - You should have synced once with a successful plate-solve.
-
-        Procedure:
-          - For each sample:
-              * choose a random direction and radius within max_radius_deg
-              * convert to steps using current J
-              * move
-              * plate-solve near predicted center
-              * measure delta AltAz
-              * add sample
-          - Fit J via least squares
-
-        Returns a dict with summary + fitted matrix.
-        """
-        out: Dict[str, Any] = {
-            "ok": False,
-            "n_samples": 0,
-            "J_deg_per_step": None,
-            "status": "RUNNING",
-        }
-
-        if not self.model.synced:
-            out["status"] = "ERR_NOT_SYNCED"
-            return out
-
-        calib_platesolving_cfg = replace(
-            platesolving_cfg,
-            search_radius_deg=1.0,
-            gmax=15.0,
-            nside=16,
-        )
-
-        # Disable tracking while calibrating
-        was_tracking = False
-        if tracking_pause is not None:
-            try:
-                tracking_pause(True)
-                was_tracking = True
-            except Exception as exc:
-                log_error(None, "GoTo: failed to pause tracking (calibration)", exc)
-
-        try:
-            if obstime is None:
-                obstime = _now_time()
-
-            # Need a starting solve to define a baseline altaz.
-            altaz0 = self.model.current_az_alt_deg()
-            if altaz0 is None:
-                out["status"] = "ERR_NO_CURRENT"
-                return out
-
-            # Ensure we have a recent solve; if not, do one near prediction.
-            # (This keeps calibration stable if you manually moved without a new solve.)
-            if self.model.last_solve_az_alt_deg is None:
-                altaz_pred = self.model.predict_az_alt_deg()
-                sol0 = self._platesolving_live(
-                    get_live_frame=get_live_frame,
-                    target_for_solver={"az_deg": float(altaz_pred[0]), "alt_deg": float(altaz_pred[1])},
-                    platesolving_cfg=calib_platesolving_cfg,
-                    radius_deg_seq=(1.0,),
-                    obstime=obstime,
-                    diagnostics=diagnostics,
-                )
-                if not bool(getattr(sol0, "success", False)):
-                    out["status"] = "ERR_PLATESOLVING_BASE"
-                    return out
-                altaz0 = platesolving_center_to_altaz_deg(
-                    float(sol0.center_ra_deg),
-                    float(sol0.center_dec_deg),
-                    observer=self.cfg.observer,
-                    obstime=obstime,
-                )
-                self.model.apply_plate_solve(altaz0)
-
-            # Run samples
-            max_radius = float(max_radius_deg)
-            if max_radius <= 0.0:
-                out["status"] = "ERR_BAD_RADIUS"
-                return out
-            total_samples = int(max(1, n_samples))
-
-            for _ in range(total_samples):
-                # Random direction + radius (uniform over area)
-                ang = random.uniform(0.0, 2.0 * math.pi)
-                radius = math.sqrt(random.random()) * max_radius
-
-                daz_mount_deg = radius * math.cos(ang)
-                dalt_mount_deg = radius * math.sin(ang)
-
-                J = np.asarray(self.model.J_deg_per_step, dtype=np.float64)
-                if not self.model.is_J_within_mechanical_limits(J):
-                    log_error(
-                        None,
-                        "GoTo: calibration model outside mechanical limits; resetting mechanics",
-                        None,
-                        throttle_s=5.0,
-                        throttle_key="goto_calib_unsafe_J",
-                    )
-                    self.model.init_from_mechanics()
-                    J = self.model.J_deg_per_step
-                try:
-                    invJ = np.linalg.inv(J)
-                except np.linalg.LinAlgError as exc:
-                    log_error(None, "GoTo: singular J matrix during calibration; resetting mechanics", exc, throttle_s=5.0, throttle_key="goto_calib_invJ")
-                    # fall back to diagonal mechanics
-                    self.model.init_from_mechanics()
-                    J = self.model.J_deg_per_step
-                    invJ = np.linalg.inv(J)
-
-                dsteps = invJ @ np.array([daz_mount_deg, dalt_mount_deg], dtype=np.float64)
-
-                # Commanded steps are integers; use the same for prediction + sampling
-                dsteps = np.array([float(int(round(dsteps[0]))), float(int(round(dsteps[1])))], dtype=np.float64)
-                if int(dsteps[0]) == 0 and int(dsteps[1]) == 0:
-                    continue
-
-                # Predict and enforce ALT safe range by flipping ALT sign if needed
-                altaz_cur = self.model.current_az_alt_deg()
-                if altaz_cur is None:
-                    out["status"] = "ERR_NO_CURRENT"
-                    return out
-                altaz_cur_mount = self.model._world_to_mount_altaz(altaz_cur)
-
-                pred_after_mount = altaz_cur_mount.copy()
-                d_mount_pred = J @ dsteps
-                pred_after_mount[0] = _wrap_deg_360(float(pred_after_mount[0]) + float(d_mount_pred[0]))
-                pred_after_mount[1] = float(pred_after_mount[1]) + float(d_mount_pred[1])
-                pred_after = self.model._mount_to_world_altaz(pred_after_mount)
-                if pred_after[1] < float(self.cfg.alt_min_deg) or pred_after[1] > float(self.cfg.alt_max_deg):
-                    # flip the ALT component
-                    dsteps[1] *= -1.0
-                    d_mount_pred = J @ dsteps
-                    pred_after_mount[0] = _wrap_deg_360(float(altaz_cur_mount[0]) + float(d_mount_pred[0]))
-                    pred_after_mount[1] = float(altaz_cur_mount[1]) + float(d_mount_pred[1])
-                    pred_after = self.model._mount_to_world_altaz(pred_after_mount)
-
-                if stop is not None:
-                    try:
-                        stop()
-                    except Exception as exc:
-                        log_error(None, "GoTo: stop failed before calibration move", exc)
-
-                # Move
-                steps_before = self.model.steps_est.copy()
-                self._exec_steps(move_steps, Axis.AZ, float(dsteps[0]), delay_us=int(self.cfg.slew_delay_us_az))
-                self._exec_steps(move_steps, Axis.ALT, float(dsteps[1]), delay_us=int(self.cfg.slew_delay_us_alt))
-
-                if stop is not None:
-                    try:
-                        stop()
-                    except Exception as exc:
-                        log_error(None, "GoTo: stop failed after calibration move", exc)
-
-                time.sleep(max(0.0, float(self.cfg.settle_s)))
-
-                # Plate-solve near predicted center (recommended)
-                altaz_pred = self.model.predict_az_alt_deg()
-                solve_obstime = _now_time()
-                sol = self._platesolving_live(
-                    get_live_frame=get_live_frame,
-                    target_for_solver={"az_deg": float(altaz_pred[0]), "alt_deg": float(altaz_pred[1])},
-                    platesolving_cfg=calib_platesolving_cfg,
-                    radius_deg_seq=(1.0,),
-                    obstime=solve_obstime,
-                    diagnostics=diagnostics,
-                )
-                if not bool(getattr(sol, "success", False)):
-                    # skip sample
-                    continue
-
-                altaz_new = platesolving_center_to_altaz_deg(
-                    float(sol.center_ra_deg),
-                    float(sol.center_dec_deg),
-                    observer=self.cfg.observer,
-                    obstime=_platesolving_result_obstime(sol, fallback=solve_obstime),
-                )
-                continuity = self.model.manual_sample_continuity_report(
-                    altaz_new,
-                    reference_steps=steps_before,
-                    reference_az_alt_deg=altaz_cur,
-                )
-                if not bool(continuity.get("ok", False)):
-                    log_error(
-                        None,
-                        "GoTo: calibration rejected implausible plate-solve "
-                        f"dsteps=[{float(continuity.get('dsteps_az', 0.0)):+.0f},"
-                        f"{float(continuity.get('dsteps_alt', 0.0)):+.0f}] "
-                        f"motion={float(continuity.get('observed_motion_deg', float('nan'))):.4f}deg "
-                        f"limit={float(continuity.get('motion_limit_deg', float('nan'))):.4f}deg",
-                    )
-                    continue
-
-                # Measured mount-frame delta (J is modeled in mount frame).
-                altaz_new_mount = self.model._world_to_mount_altaz(altaz_new)
-                daltaz_meas_mount = np.array(
-                    [
-                        _wrap_deg_180(float(altaz_new_mount[0]) - float(altaz_cur_mount[0])),
-                        float(altaz_new_mount[1]) - float(altaz_cur_mount[1]),
-                    ],
-                    dtype=np.float64,
-                )
-
-                # Measured step delta (what we commanded this sample)
-                dsteps_meas = np.array([float(dsteps[0]), float(dsteps[1])], dtype=np.float64)
-
-                self.model.add_calibration_sample(dsteps_meas, daltaz_meas_mount)
-                self.model.apply_plate_solve(altaz_new)
-
-            # Fit
-            ok = self.model.fit_J_from_samples(min_samples=3)
-            out["ok"] = bool(ok)
-            out["n_samples"] = int(len(self.model._calib_steps))
-            out["J_deg_per_step"] = self.model.J_deg_per_step.copy().tolist()
-            out["status"] = "OK" if ok else "ERR_INSUFFICIENT_SAMPLES"
-            return out
-
-        finally:
-            # Restore tracking
-            if was_tracking and tracking_pause is not None:
-                try:
-                    tracking_pause(False)
-                except Exception as exc:
-                    log_error(None, "GoTo: failed to resume tracking (calibration)", exc)
-                if tracking_keyframe_reset is not None:
-                    try:
-                        tracking_keyframe_reset()
-                    except Exception as exc:
-                        log_error(None, "GoTo: failed to reset tracking keyframe (calibration)", exc)
-
-
-# ============================================================
-# Worker (threaded orchestration)
-# ============================================================
-
 def _perf() -> float:
     return time.perf_counter()
 
@@ -6667,409 +6105,6 @@ class GoToWorker(BaseWorker):
         )
         return _AutocalJResult(col=col, ok_count=len(cols), resp_low=resp_low, missing_frames=0)
 
-    def _goto_calibrate_right_scan_blocking(self, params: Dict[str, Any]) -> Dict[str, Any]:
-        out: Dict[str, Any] = {
-            "ok": False,
-            "status": "RUNNING",
-            "steps_done": 0,
-            "solves_ok": 0,
-            "fit_updates": 0,
-            "n_samples": 0,
-        }
-
-        st = self._get_state()
-        if not bool(st.camera.connected):
-            out["status"] = "ERR_NO_CAMERA"
-            return out
-        if not bool(st.mount.connected):
-            out["status"] = "ERR_NO_MOUNT"
-            return out
-
-        goto_cfg = self._get_goto_cfg()
-        mount_cfg = self._get_mount_cfg()
-        platesolving_cfg = self._get_platesolving_cfg()
-        sep_cfg = self._get_sep_cfg()
-        observer = _observer_without_refraction(self._get_observer())
-
-        ps_overrides: Dict[str, Any] = {}
-        if "N_seed" in params:
-            ps_overrides["N_seed"] = int(params.get("N_seed"))
-        if "min_inliers" in params:
-            ps_overrides["min_inliers"] = int(params.get("min_inliers"))
-        if ps_overrides:
-            try:
-                platesolving_cfg = replace(platesolving_cfg, **ps_overrides)
-            except Exception as exc:
-                log_error(
-                    self._out_log,
-                    f"GoTo: invalid right-scan platesolving overrides ({ps_overrides})",
-                    exc,
-                )
-
-        scan_steps = int(params.get("scan_steps", 10))
-        scan_step_microsteps = int(params.get("scan_step_microsteps", 300))
-        scan_ps_radius_deg = float(params.get("scan_ps_radius_deg", 0.5))
-        scan_ps_gmax = float(params.get("scan_ps_gmax", getattr(platesolving_cfg, "gmax", 15.0)))
-        scan_theta_tol_deg = float(params.get("scan_theta_tol_deg", 20.0))
-        scan_fit_min_samples = int(params.get("scan_fit_min_samples", 3))
-        scan_fit_ridge = float(params.get("scan_fit_ridge", 1e-12))
-        scan_sync_latest = bool(params.get("scan_sync_latest", True))
-        scan_direction = str(params.get("scan_direction", "right")).strip().lower()
-        delay_us = int(
-            params.get(
-                "delay_us",
-                getattr(goto_cfg, "slew_delay_us", getattr(goto_cfg, "slew_delay_us_az", 1200)),
-            )
-        )
-        settle_s = float(params.get("settle_s", goto_cfg.settle_s))
-
-        if scan_steps < 1:
-            out["status"] = "ERR_SCAN_STEPS"
-            return out
-        if scan_step_microsteps < 1:
-            out["status"] = "ERR_SCAN_STEP_SIZE"
-            return out
-        if not np.isfinite(scan_ps_radius_deg) or scan_ps_radius_deg <= 0.0:
-            out["status"] = "ERR_SCAN_PS_RADIUS"
-            return out
-        if not np.isfinite(scan_ps_gmax) or scan_ps_gmax <= 0.0:
-            out["status"] = "ERR_SCAN_PS_GMAX"
-            return out
-        if not np.isfinite(scan_theta_tol_deg) or scan_theta_tol_deg <= 0.0:
-            out["status"] = "ERR_SCAN_THETA_TOL"
-            return out
-        if scan_fit_min_samples < 2:
-            scan_fit_min_samples = 2
-        if not np.isfinite(scan_fit_ridge) or scan_fit_ridge < 0.0:
-            scan_fit_ridge = 1e-12
-        if delay_us < 50:
-            delay_us = 50
-        if settle_s < 0.0:
-            settle_s = 0.0
-
-        scan_axis: Optional[Axis] = None
-        move_dir = 0
-        if scan_direction in ("right", "+", "az+"):
-            scan_axis = Axis.AZ
-            move_dir = +1
-        elif scan_direction in ("left", "-", "az-"):
-            scan_axis = Axis.AZ
-            move_dir = -1
-        elif scan_direction in ("up", "alt+"):
-            scan_axis = Axis.ALT
-            move_dir = +1
-        elif scan_direction in ("down", "alt-"):
-            scan_axis = Axis.ALT
-            move_dir = -1
-        else:
-            out["status"] = "ERR_SCAN_DIRECTION"
-            return out
-
-        if scan_axis == Axis.AZ and bool(getattr(mount_cfg, "invert_az", False)):
-            move_dir *= -1
-        if scan_axis == Axis.ALT and bool(getattr(mount_cfg, "invert_alt", False)):
-            move_dir *= -1
-        signed_step = float(move_dir * scan_step_microsteps)
-
-        def _coerce_altaz(raw_target: Any) -> Optional[Tuple[float, float]]:
-            try:
-                if isinstance(raw_target, dict):
-                    if "az_deg" in raw_target and "alt_deg" in raw_target:
-                        az = float(raw_target.get("az_deg"))
-                        alt = float(raw_target.get("alt_deg"))
-                    elif "az" in raw_target and "alt" in raw_target:
-                        az = float(raw_target.get("az"))
-                        alt = float(raw_target.get("alt"))
-                    else:
-                        return None
-                else:
-                    arr = np.asarray(raw_target, dtype=np.float64).reshape(-1)
-                    if arr.size < 2:
-                        return None
-                    az = float(arr[0])
-                    alt = float(arr[1])
-            except Exception:
-                return None
-            if not np.isfinite(az) or not np.isfinite(alt):
-                return None
-            az = _wrap_deg_360(az)
-            alt = float(np.clip(alt, goto_cfg.alt_min_deg, goto_cfg.alt_max_deg))
-            return (az, alt)
-
-        def _current_altaz() -> Optional[Tuple[float, float]]:
-            model_altaz = self._goto.model.current_az_alt_deg()
-            if model_altaz is not None:
-                parsed = _coerce_altaz(model_altaz)
-                if parsed is not None:
-                    return parsed
-            st_now = self._get_state()
-            if bool(getattr(st_now.goto, "pointing_valid", False)):
-                parsed = _coerce_altaz(
-                    {
-                        "az_deg": float(getattr(st_now.goto, "pointing_az_deg", 0.0)),
-                        "alt_deg": float(getattr(st_now.goto, "pointing_alt_deg", 0.0)),
-                    }
-                )
-                if parsed is not None:
-                    return parsed
-            if bool(getattr(st_now.platesolving, "last_ok", False)):
-                try:
-                    az_alt = platesolving_center_to_altaz_deg(
-                        float(getattr(st_now.platesolving, "center_ra_deg", 0.0)),
-                        float(getattr(st_now.platesolving, "center_dec_deg", 0.0)),
-                        observer=observer,
-                        obstime=Time.now(),
-                    )
-                    parsed = _coerce_altaz(az_alt)
-                    if parsed is not None:
-                        return parsed
-                except Exception as exc:
-                    log_error(self._out_log, "GoTo: right-scan failed to decode last platesolve center", exc)
-            if bool(getattr(self._goto.model, "synced", False)):
-                try:
-                    parsed = _coerce_altaz(self._goto.model.predict_az_alt_deg())
-                    if parsed is not None:
-                        return parsed
-                except Exception as exc:
-                    log_error(
-                        self._out_log,
-                        "GoTo: right-scan failed to predict model AltAz",
-                        exc,
-                        throttle_s=5.0,
-                        throttle_key="goto_right_scan_model_altaz",
-                    )
-            return None
-
-        def _theta_dist_mod180(a_deg: float, b_deg: float) -> float:
-            d = abs((float(a_deg) - float(b_deg)) % 180.0)
-            return float(min(d, 180.0 - d))
-
-        theta_ref: Optional[float] = None
-        continuity_steps: Optional[np.ndarray] = None
-        continuity_altaz: Optional[np.ndarray] = None
-        continuity_roll: Optional[float] = None
-
-        def _solve_near_altaz(az_deg: float, alt_deg: float, *, label: str, step_idx: int) -> Optional[PlatesolvingResult]:
-            if self._op_cancel.is_set():
-                out["status"] = "CANCELLED"
-                return None
-            frames = self._autocal_capture_frames(n_frames=1, timeout_s=1.5)
-            if not frames:
-                out["status"] = f"ERR_SCAN_NO_FRAME_STEP_{step_idx}"
-                return None
-            frame = frames[0]
-            obstime = self._autocal_frame_obstime(frame)
-            try:
-                target_icrs = parse_target_to_icrs(
-                    {"az_deg": float(az_deg), "alt_deg": float(alt_deg)},
-                    observer=observer,
-                    obstime=obstime,
-                ).icrs
-                target = (float(target_icrs.ra.deg), float(target_icrs.dec.deg))
-            except Exception as exc:
-                out["status"] = f"ERR_SCAN_TARGET_STEP_{step_idx}"
-                log_error(self._out_log, "GoTo: right-scan failed to transform AltAz -> ICRS", exc)
-                return None
-
-            log_info(
-                self._out_log,
-                "GoTo: right-scan platesolve "
-                f"{label} step={step_idx} target_az={float(az_deg):.3f} target_alt={float(alt_deg):.3f} "
-                f"target_ra={float(target[0]):.6f} target_dec={float(target[1]):.6f} "
-                f"radius={scan_ps_radius_deg:.2f}",
-            )
-            result = self._autocal_run_platesolve(
-                frame.raw16,
-                target=target,
-                platesolving_cfg=platesolving_cfg,
-                sep_cfg=sep_cfg,
-                observer=observer,
-                obstime=obstime,
-                solve_radius_deg=scan_ps_radius_deg,
-                solve_gmax=scan_ps_gmax,
-            )
-            if not bool(getattr(result, "success", False)):
-                out["status"] = f"ERR_SCAN_PLATESOLVING_STEP_{step_idx}"
-                return None
-            return result
-
-        def _consume_solution(
-            result: PlatesolvingResult,
-            *,
-            step_idx: int,
-            update_model: bool = True,
-        ) -> bool:
-            nonlocal theta_ref, continuity_steps, continuity_altaz, continuity_roll
-            theta = float(getattr(result, "theta_deg", float("nan")))
-            if not np.isfinite(theta):
-                out["status"] = f"ERR_SCAN_THETA_STEP_{step_idx}"
-                return False
-            if theta_ref is None:
-                theta_ref = theta
-            else:
-                dtheta = _theta_dist_mod180(theta, float(theta_ref))
-                if dtheta > float(scan_theta_tol_deg):
-                    out["status"] = f"ERR_SCAN_THETA_INCONSISTENT_STEP_{step_idx}"
-                    log_error(
-                        self._out_log,
-                        "GoTo: right-scan theta inconsistent "
-                        f"step={step_idx} theta={theta:.3f} theta_ref={float(theta_ref):.3f} dtheta={dtheta:.3f}",
-                    )
-                    return False
-
-            solve_obstime = _platesolving_result_obstime(result)
-            az_alt = platesolving_center_to_altaz_deg(
-                float(result.center_ra_deg),
-                float(result.center_dec_deg),
-                observer=observer,
-                obstime=solve_obstime,
-            )
-            roll_sample = self._roll_sample_from_solution(
-                result,
-                observer=observer,
-                obstime=solve_obstime,
-            )
-            if continuity_steps is None or continuity_altaz is None:
-                continuity = {"ok": True, "has_reference": False}
-            else:
-                continuity = self._check_manual_sample_continuity(
-                    az_alt,
-                    roll_deg=roll_sample,
-                    context=f"right-scan step={step_idx}",
-                    reference_steps=continuity_steps,
-                    reference_az_alt_deg=continuity_altaz,
-                    reference_roll_deg=continuity_roll,
-                )
-            if not bool(continuity.get("ok", False)):
-                self._invalidate_platesolving_after_continuity_rejection(result)
-                out["status"] = f"ERR_SCAN_CONTINUITY_STEP_{step_idx}"
-                return False
-
-            continuity_steps = self._goto.model.steps_est.copy()
-            continuity_altaz = np.asarray(az_alt, dtype=np.float64).copy()
-            continuity_roll = float(roll_sample) if np.isfinite(roll_sample) else None
-
-            if not update_model:
-                return True
-
-            n_samples = int(
-                self._goto.model.add_manual_sample(
-                    az_alt,
-                    roll_deg=roll_sample,
-                    source=(self._diagnostics.path_str if self._diagnostics is not None else None),
-                )
-            )
-            out["n_samples"] = n_samples
-            out["solves_ok"] = int(out["solves_ok"]) + 1
-            self._publish_state(
-                {
-                    "goto": {
-                        "manual_samples": n_samples,
-                        "autocal_az_deg": float(az_alt[0]),
-                        "autocal_alt_deg": float(az_alt[1]),
-                        "autocal_radius_deg": float(scan_ps_radius_deg),
-                    }
-                }
-            )
-
-            fit_ok = bool(
-                self._goto.model.fit_J_from_manual_samples(
-                    min_samples=int(max(2, scan_fit_min_samples)),
-                    ridge=float(scan_fit_ridge),
-                )
-            )
-            if fit_ok:
-                out["fit_updates"] = int(out["fit_updates"]) + 1
-                if scan_sync_latest:
-                    _ = bool(self._goto.model.sync_from_latest_manual_sample())
-                self._publish_j_matrix_state()
-                self._publish_state({"goto": {"synced": bool(getattr(self._goto.model, "synced", False))}})
-                self._log_model_fit_state(prefix="GoTo: right-scan fit update")
-            return True
-
-        log_info(
-            self._out_log,
-            "GoTo: right-scan calibration start "
-            f"steps={scan_steps} microsteps={scan_step_microsteps} axis={scan_axis.value} dir={scan_direction} "
-            f"cmd_dir={move_dir:+d} ps_radius={scan_ps_radius_deg:.2f} theta_tol={scan_theta_tol_deg:.1f}",
-        )
-
-        altaz0 = _current_altaz()
-        if altaz0 is None:
-            out["status"] = "ERR_SCAN_NO_CURRENT"
-            return out
-
-        self._publish_state({"goto": {"status": GotoStatus.RUNNING, "reason": "CALIBRATE_RIGHT_SCAN_BASE"}})
-        base_result = _solve_near_altaz(float(altaz0[0]), float(altaz0[1]), label="base", step_idx=0)
-        if base_result is None:
-            return out
-        if not _consume_solution(base_result, step_idx=0, update_model=False):
-            return out
-
-        for step_idx in range(1, int(scan_steps) + 1):
-            if self._op_cancel.is_set():
-                out["status"] = "CANCELLED"
-                return out
-
-            self._publish_state(
-                {"goto": {"status": GotoStatus.RUNNING, "reason": f"CALIBRATE_RIGHT_SCAN_MOVE_{step_idx}"}}
-            )
-            self._exec_steps(
-                self._move_steps,
-                scan_axis,
-                signed_steps=signed_step,
-                delay_us=int(delay_us),
-            )
-            try:
-                self._stop_mount()
-            except Exception as exc:
-                log_error(
-                    self._out_log,
-                    "GoTo: right-scan stop failed after scan move",
-                    exc,
-                    throttle_s=5.0,
-                    throttle_key="goto_right_scan_stop_after_move",
-                )
-            if settle_s > 0.0:
-                time.sleep(float(settle_s))
-
-            altaz_est = _current_altaz()
-            if altaz_est is None:
-                out["status"] = f"ERR_SCAN_NO_CURRENT_STEP_{step_idx}"
-                return out
-
-            self._publish_state(
-                {"goto": {"status": GotoStatus.RUNNING, "reason": f"CALIBRATE_RIGHT_SCAN_SOLVE_{step_idx}"}}
-            )
-            result = _solve_near_altaz(float(altaz_est[0]), float(altaz_est[1]), label="scan", step_idx=step_idx)
-            if result is None:
-                return out
-            if not _consume_solution(result, step_idx=step_idx):
-                return out
-            out["steps_done"] = int(step_idx)
-
-        out["ok"] = True
-        out["status"] = "OK"
-        self._publish_state(
-            {
-                "goto": {
-                    "status": GotoStatus.OK,
-                    "reason": None,
-                    "autocal_last_ok": True,
-                    "autocal_status": GotoAutocalStatus.OK,
-                    "autocal_reason": "RIGHT_SCAN_READY",
-                    "synced": bool(getattr(self._goto.model, "synced", False)),
-                }
-            }
-        )
-        log_info(
-            self._out_log,
-            "GoTo: right-scan calibration OK "
-            f"steps_done={out['steps_done']} solves_ok={out['solves_ok']} "
-            f"fit_updates={out['fit_updates']} samples={out['n_samples']}",
-        )
-        return out
-
     def _goto_autocalibrate_blocking(self, params: Dict[str, Any]) -> Dict[str, Any]:
         out: Dict[str, Any] = {
             "ok": False,
@@ -7182,7 +6217,6 @@ class GoToWorker(BaseWorker):
         else:
             autocal_ps_mode = "drift"
         autocal_ps_target_raw = params.get("autocal_ps_target", None)
-        manual_only = bool(params.get("manual_only", True))
         tune_exposure = _autocal_should_tune_exposure(
             params,
             autocal_ps_mode=autocal_ps_mode,
@@ -7464,99 +6498,51 @@ class GoToWorker(BaseWorker):
 
             out["platesolving_result"] = platesolving_result
 
-            if manual_only:
-                solve_obstime = _platesolving_result_obstime(platesolving_result)
-                az_alt = platesolving_center_to_altaz_deg(
-                    float(platesolving_result.center_ra_deg),
-                    float(platesolving_result.center_dec_deg),
-                    observer=observer,
-                    obstime=solve_obstime,
+            solve_obstime = _platesolving_result_obstime(platesolving_result)
+            az_alt = platesolving_center_to_altaz_deg(
+                float(platesolving_result.center_ra_deg),
+                float(platesolving_result.center_dec_deg),
+                observer=observer,
+                obstime=solve_obstime,
+            )
+            roll_sample = self._roll_sample_from_solution(
+                platesolving_result,
+                observer=observer,
+                obstime=solve_obstime,
+            )
+            continuity = self._check_manual_sample_continuity(
+                az_alt,
+                roll_deg=roll_sample,
+                context=f"autocal mode={autocal_ps_mode}",
+            )
+            if not bool(continuity.get("ok", False)):
+                out["platesolving_result"] = self._invalidate_platesolving_after_continuity_rejection(
+                    platesolving_result
                 )
-                roll_sample = self._roll_sample_from_solution(
-                    platesolving_result,
-                    observer=observer,
-                    obstime=solve_obstime,
-                )
-                continuity = self._check_manual_sample_continuity(
+                out["status"] = "ERR_SAMPLE_CONTINUITY"
+                return out
+            n_samples = int(
+                self._goto.model.add_manual_sample(
                     az_alt,
                     roll_deg=roll_sample,
-                    context=f"autocal mode={autocal_ps_mode}",
+                    source=(self._diagnostics.path_str if self._diagnostics is not None else None),
                 )
-                if not bool(continuity.get("ok", False)):
-                    out["platesolving_result"] = self._invalidate_platesolving_after_continuity_rejection(
-                        platesolving_result
-                    )
-                    out["status"] = "ERR_SAMPLE_CONTINUITY"
-                    return out
-                n_samples = int(
-                    self._goto.model.add_manual_sample(
-                        az_alt,
-                        roll_deg=roll_sample,
-                        source=(self._diagnostics.path_str if self._diagnostics is not None else None),
-                    )
-                )
-                self._publish_state(
-                    {
-                        "goto": {
-                            "status": GotoStatus.OK,
-                            "reason": None,
-                            "autocal_last_ok": True,
-                            "autocal_status": GotoAutocalStatus.OK,
-                            "autocal_reason": "MANUAL_SAMPLE",
-                            "manual_samples": n_samples,
-                        }
-                    }
-                )
-                out["ok"] = True
-                out["status"] = "OK_MANUAL_SAMPLE"
-                out["manual_samples"] = n_samples
-                return out
-
-            self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "SYNC"}})
-            ok_sync = bool(self._goto.sync_from_platesolving(platesolving_result))
+            )
             self._publish_state(
                 {
                     "goto": {
-                        "synced": ok_sync,
-                        "status": GotoStatus.OK if ok_sync else GotoStatus.FAIL,
-                        "reason": None if ok_sync else "SYNC_FAILED",
-                    }
-                }
-            )
-            if not ok_sync:
-                out["status"] = "ERR_SYNC"
-                return out
-
-            self._publish_state(
-                {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "CALIBRATE_J"}}
-            )
-
-            def _get_live_frame_for_calib() -> Optional[np.ndarray]:
-                return self._get_live_raw16()
-
-            calib_out = self._goto.calibrate_blocking(
-                get_live_frame=_get_live_frame_for_calib,
-                move_steps=self._move_steps,
-                stop=self._stop_mount,
-                platesolving_cfg=platesolving_cfg,
-                n_samples=int(params.get("calib_samples", goto_cfg.calib_samples)),
-                max_radius_deg=float(params.get("calib_max_radius_deg", goto_cfg.calib_max_radius_deg)),
-            )
-            if not bool(calib_out.get("ok", False)):
-                out["status"] = "ERR_CALIBRATE_J"
-                return out
-
-            out["ok"] = True
-            out["status"] = "OK"
-            self._publish_state(
-                {
-                    "goto": {
+                        "status": GotoStatus.OK,
+                        "reason": None,
                         "autocal_last_ok": True,
                         "autocal_status": GotoAutocalStatus.OK,
-                        "autocal_reason": "READY",
+                        "autocal_reason": "MANUAL_SAMPLE",
+                        "manual_samples": n_samples,
                     }
                 }
             )
+            out["ok"] = True
+            out["status"] = "OK_MANUAL_SAMPLE"
+            out["manual_samples"] = n_samples
             return out
 
         self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "DRIFT"}})
@@ -8130,102 +7116,52 @@ class GoToWorker(BaseWorker):
 
         out["platesolving_result"] = platesolving_result
 
-        manual_only = bool(params.get("manual_only", True))
-        if manual_only:
-            solve_obstime = _platesolving_result_obstime(platesolving_result)
-            az_alt = platesolving_center_to_altaz_deg(
-                float(platesolving_result.center_ra_deg),
-                float(platesolving_result.center_dec_deg),
-                observer=observer,
-                obstime=solve_obstime,
+        solve_obstime = _platesolving_result_obstime(platesolving_result)
+        az_alt = platesolving_center_to_altaz_deg(
+            float(platesolving_result.center_ra_deg),
+            float(platesolving_result.center_dec_deg),
+            observer=observer,
+            obstime=solve_obstime,
+        )
+        roll_sample = self._roll_sample_from_solution(
+            platesolving_result,
+            observer=observer,
+            obstime=solve_obstime,
+        )
+        continuity = self._check_manual_sample_continuity(
+            az_alt,
+            roll_deg=roll_sample,
+            context="autocal drift",
+        )
+        if not bool(continuity.get("ok", False)):
+            out["platesolving_result"] = self._invalidate_platesolving_after_continuity_rejection(
+                platesolving_result
             )
-            roll_sample = self._roll_sample_from_solution(
-                platesolving_result,
-                observer=observer,
-                obstime=solve_obstime,
-            )
-            continuity = self._check_manual_sample_continuity(
+            out["status"] = "ERR_SAMPLE_CONTINUITY"
+            return out
+        n_samples = int(
+            self._goto.model.add_manual_sample(
                 az_alt,
                 roll_deg=roll_sample,
-                context="autocal drift",
+                source=(self._diagnostics.path_str if self._diagnostics is not None else None),
             )
-            if not bool(continuity.get("ok", False)):
-                out["platesolving_result"] = self._invalidate_platesolving_after_continuity_rejection(
-                    platesolving_result
-                )
-                out["status"] = "ERR_SAMPLE_CONTINUITY"
-                return out
-            n_samples = int(
-                self._goto.model.add_manual_sample(
-                    az_alt,
-                    roll_deg=roll_sample,
-                    source=(self._diagnostics.path_str if self._diagnostics is not None else None),
-                )
-            )
-            self._publish_state(
-                {
-                    "goto": {
-                        "status": GotoStatus.OK,
-                        "reason": None,
-                        "autocal_last_ok": True,
-                        "autocal_status": GotoAutocalStatus.OK,
-                        "autocal_reason": "MANUAL_SAMPLE",
-                        "manual_samples": n_samples,
-                    }
-                }
-            )
-            out["ok"] = True
-            out["status"] = "OK_MANUAL_SAMPLE"
-            out["manual_samples"] = n_samples
-            return out
-
-        self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "SYNC"}})
-        ok_sync = bool(self._goto.sync_from_platesolving(platesolving_result))
+        )
         self._publish_state(
             {
                 "goto": {
-                    "synced": ok_sync,
-                    "status": GotoStatus.OK if ok_sync else GotoStatus.FAIL,
-                    "reason": None if ok_sync else "SYNC_FAILED",
-                }
-            }
-        )
-        if not ok_sync:
-            out["status"] = "ERR_SYNC"
-            return out
-
-        self._publish_state(
-            {"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "CALIBRATE_J"}}
-        )
-
-        def _get_live_frame_for_calib() -> Optional[np.ndarray]:
-            return self._get_live_raw16()
-
-        calib_out = self._goto.calibrate_blocking(
-            get_live_frame=_get_live_frame_for_calib,
-            move_steps=self._move_steps,
-            stop=self._stop_mount,
-            platesolving_cfg=platesolving_cfg,
-            n_samples=int(params.get("calib_samples", goto_cfg.calib_samples)),
-            max_radius_deg=float(params.get("calib_max_radius_deg", goto_cfg.calib_max_radius_deg)),
-        )
-        if not bool(calib_out.get("ok", False)):
-            out["status"] = "ERR_CALIBRATE_J"
-            return out
-
-        out["ok"] = True
-        out["status"] = "OK"
-        self._publish_state(
-            {
-                "goto": {
+                    "status": GotoStatus.OK,
+                    "reason": None,
                     "autocal_last_ok": True,
                     "autocal_status": GotoAutocalStatus.OK,
-                    "autocal_reason": "READY",
+                    "autocal_reason": "MANUAL_SAMPLE",
+                    "manual_samples": n_samples,
                 }
             }
         )
+        out["ok"] = True
+        out["status"] = "OK_MANUAL_SAMPLE"
+        out["manual_samples"] = n_samples
         return out
-
     def _roll_sample_from_solution(
         self,
         result: PlatesolvingResult,
@@ -8511,87 +7447,6 @@ class GoToWorker(BaseWorker):
                         self._out_log,
                         f"GoTo: ERR status={status.status} iters={status.iters} err_arcsec={err_norm:.2f}",
                     )
-
-            elif kind == "calibrate":
-                strategy = str(params.get("strategy", "default")).strip().lower()
-
-                if strategy in ("right_scan", "scan_right", "right", "direction_scan", "dir_scan"):
-                    calib_out = self._goto_calibrate_right_scan_blocking(params)
-                    calib_ok = bool(calib_out.get("ok", False))
-                    calib_status = str(calib_out.get("status", "UNKNOWN"))
-                    diagnostic_status = f"CALIBRATE_RIGHT_SCAN_{calib_status}"
-                    self._diagnostics_record(
-                        "calibration_result",
-                        strategy="right_scan",
-                        result=calib_out,
-                        model_after=self._diagnostics_model_snapshot(),
-                    )
-                    calib_samples = int(calib_out.get("n_samples", 0))
-                    self._publish_state(
-                        {
-                            "goto": {
-                                "status": GotoStatus.OK if calib_ok else GotoStatus.FAIL,
-                                "reason": f"CALIBRATE_RIGHT_SCAN_{calib_status}",
-                            }
-                        }
-                    )
-                    log_info(
-                        self._out_log,
-                        "GoTo: CALIBRATE_RIGHT_SCAN "
-                        f"status={calib_status} ok={calib_ok} "
-                        f"steps_done={int(calib_out.get('steps_done', 0))} "
-                        f"solves_ok={int(calib_out.get('solves_ok', 0))} "
-                        f"samples={calib_samples}",
-                    )
-                    self._publish_j_matrix_state()
-                    return
-
-                if "n_samples" not in params and "samples" in params:
-                    params["n_samples"] = params.get("samples")
-                if "max_radius_deg" not in params and "radius_deg" in params:
-                    params["max_radius_deg"] = params.get("radius_deg")
-
-                delay_us = int(params.get("delay_us", goto_cfg.slew_delay_us))
-                n_samples = int(params.get("n_samples", goto_cfg.calib_samples))
-                max_radius_deg = float(params.get("max_radius_deg", goto_cfg.calib_max_radius_deg))
-
-                self._goto.cfg = replace(
-                    self._goto.cfg,
-                    slew_delay_us_az=delay_us,
-                    slew_delay_us_alt=delay_us,
-                )
-
-                calib_out = self._goto.calibrate_blocking(
-                    get_live_frame=self._get_live_raw16,
-                    move_steps=self._move_steps,
-                    stop=self._stop_mount,
-                    platesolving_cfg=platesolving_cfg,
-                    n_samples=n_samples,
-                    max_radius_deg=max_radius_deg,
-                    diagnostics=self._diagnostics,
-                )
-                calib_ok = bool(calib_out.get("ok", False))
-                calib_status = str(calib_out.get("status", "UNKNOWN"))
-                diagnostic_status = f"CALIBRATE_{calib_status}"
-                self._diagnostics_record(
-                    "calibration_result",
-                    strategy="default",
-                    result=calib_out,
-                    model_after=self._diagnostics_model_snapshot(),
-                )
-                calib_samples = int(calib_out.get("n_samples", 0))
-                self._publish_state(
-                    {
-                        "goto": {
-                            "status": GotoStatus.OK if calib_ok else GotoStatus.FAIL,
-                            "reason": f"CALIBRATE_{calib_status}",
-                        }
-                    }
-                )
-                log_info(
-                    self._out_log,
-                    f"GoTo: CALIBRATE status={calib_status} ok={calib_ok} samples={calib_samples}",
-                )
 
             elif kind == "autocal":
                 self._publish_state({"goto": {"autocal_status": GotoAutocalStatus.RUNNING, "autocal_reason": "RUNNING"}})
