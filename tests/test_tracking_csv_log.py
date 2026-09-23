@@ -42,7 +42,14 @@ def _runner(log_enabled: bool = True, log_hz: float = 1.0) -> AppRunner:
     r = AppRunner.__new__(AppRunner)
     r.cfg = type("Cfg", (), {"tracking": TrackingConfig(log_enabled=log_enabled, log_hz=log_hz)})()
     r._tracking_log_t_last = 0.0
+    r._tracking_log_pending_steps_az = 0
+    r._tracking_log_pending_steps_alt = 0
     r._current_pointing_az_alt = lambda: (123.4, 56.7)
+    r._goto = type(
+        "Goto",
+        (),
+        {"model": type("Model", (), {"steps_est": [1000.0, -250.0]})()},
+    )()
     return r
 
 
@@ -74,6 +81,8 @@ class TestTrackingCsvLog:
             rate_fb_alt=-30.0,
             rate_ff_az=-30.0,
             rate_ff_alt=5.0,
+            move_steps_az=3,
+            move_steps_alt=-1,
         )
         path = _log_path(_isolated_log_dir)
         assert os.path.exists(path)
@@ -85,6 +94,12 @@ class TestTrackingCsvLog:
         assert float(row["rate_cmd_az"]) == 90.0
         assert float(row["error_px"]) == pytest.approx((2.0**2 + 1.0**2) ** 0.5)
         assert float(row["pointing_az_deg"]) == 123.4
+        # move_steps_* son los pasos que de verdad salieron hacia la montura;
+        # steps_est_* es la posicion acumulada del modelo tras aplicarlos.
+        assert int(row["move_steps_az"]) == 3
+        assert int(row["move_steps_alt"]) == -1
+        assert float(row["steps_est_az"]) == 1000.0
+        assert float(row["steps_est_alt"]) == -250.0
 
     def test_disabled_writes_nothing(self, _isolated_log_dir) -> None:
         r = _runner(log_enabled=False)
@@ -125,6 +140,49 @@ class TestTrackingCsvLog:
         t[0] += 1.0
         r._maybe_log_tracking_sample(_sample_output(), **kwargs)
         assert len(_read_rows(_log_path(_isolated_log_dir))) == 2
+
+    def test_move_steps_accumulate_across_throttled_cycles(
+        self, _isolated_log_dir, monkeypatch
+    ) -> None:
+        """Un MOVE emitido entre dos filas muestreadas no puede desaparecer:
+        el lazo de control corre mas rapido que log_hz, asi que dos ciclos
+        con movimiento real pueden caer entre la misma fila si no se suman.
+        """
+        r = _runner(log_hz=1.0)
+        t = [2000.0]
+        monkeypatch.setattr(app_runner, "_now_s", lambda: t[0])
+
+        kwargs = dict(
+            frame_t=10.0,
+            ff_ready=True,
+            rate_cmd_az=0.0,
+            rate_cmd_alt=0.0,
+            rate_fb_az=0.0,
+            rate_fb_alt=0.0,
+            rate_ff_az=0.0,
+            rate_ff_alt=0.0,
+        )
+        # Primera llamada: sin fila previa, escribe de inmediato.
+        r._maybe_log_tracking_sample(_sample_output(), move_steps_az=4, move_steps_alt=1, **kwargs)
+        rows = _read_rows(_log_path(_isolated_log_dir))
+        assert len(rows) == 1
+        assert int(rows[0]["move_steps_az"]) == 4
+
+        # Dos ciclos con movimiento real, ambos dentro de la ventana de
+        # cadencia: ninguno escribe fila propia, pero sus pasos no se pierden.
+        t[0] += 0.1
+        r._maybe_log_tracking_sample(_sample_output(), move_steps_az=6, move_steps_alt=-2, **kwargs)
+        t[0] += 0.1
+        r._maybe_log_tracking_sample(_sample_output(), move_steps_az=3, move_steps_alt=0, **kwargs)
+        assert len(_read_rows(_log_path(_isolated_log_dir))) == 1
+
+        # La siguiente fila que si se escribe carga la suma acumulada.
+        t[0] += 1.0
+        r._maybe_log_tracking_sample(_sample_output(), move_steps_az=0, move_steps_alt=0, **kwargs)
+        rows = _read_rows(_log_path(_isolated_log_dir))
+        assert len(rows) == 2
+        assert int(rows[1]["move_steps_az"]) == 9
+        assert int(rows[1]["move_steps_alt"]) == -2
 
     def test_schema_change_archives_the_old_file_instead_of_mixing_columns(
         self, _isolated_log_dir

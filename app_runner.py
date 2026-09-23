@@ -164,8 +164,11 @@ def _batch_duration_s(steps: int, delay_us: float) -> float:
     return abs(int(steps)) * (float(delay_us) + _RATE_EMUL_PULSE_US) / 1.0e6
 
 
-# Muestras de tracking para debug/analisis offline (ver _log_tracking_sample).
-# Fija, a diferencia de los logs de goto.py: este archivo no se relee para
+# Muestras de tracking para debug/analisis offline (ver
+# _maybe_log_tracking_sample). rate_* es lo comandado; move_steps_az/alt es
+# lo que de verdad salio hacia la montura, acumulado desde la fila anterior
+# para que un MOVE emitido entre dos muestras no desaparezca del log. Fija,
+# a diferencia de los logs de goto.py: este archivo no se relee para
 # restaurar estado al arrancar, asi que un cambio de esquema no necesita
 # migrar filas viejas -- solo se archiva el CSV anterior para no mezclar
 # columnas con significados distintos bajo el mismo encabezado.
@@ -202,6 +205,10 @@ _TRACKING_SAMPLE_CSV_FIELDS = [
     "rate_ff_alt",
     "rate_cmd_az",
     "rate_cmd_alt",
+    "move_steps_az",
+    "move_steps_alt",
+    "steps_est_az",
+    "steps_est_alt",
     "pointing_az_deg",
     "pointing_alt_deg",
 ]
@@ -460,6 +467,8 @@ class AppRunner:
         self._tracking_ff_last_compute_t: Optional[float] = None
         self._tracking_ff_cached: Tuple[float, float, bool] = (0.0, 0.0, False)
         self._tracking_log_t_last: float = 0.0
+        self._tracking_log_pending_steps_az: int = 0
+        self._tracking_log_pending_steps_alt: int = 0
         self._stacking_last_frame_token: Optional[float] = None
         self._tracking_worker = _CoalescingCallbackWorker(
             name="TrackingWorker",
@@ -1747,7 +1756,17 @@ class AppRunner:
         rate_fb_alt: float,
         rate_ff_az: float,
         rate_ff_alt: float,
+        move_steps_az: int = 0,
+        move_steps_alt: int = 0,
     ) -> None:
+        # Un MOVE puede salir en cualquier ciclo del lazo de control, no solo
+        # en el que le toca escribir fila (el lazo corre mas rapido que
+        # log_hz). Acumular aqui, antes del recorte por cadencia, es lo que
+        # evita que un paso real quede fuera del log solo por no haber caido
+        # justo en el instante muestreado.
+        self._tracking_log_pending_steps_az += int(move_steps_az)
+        self._tracking_log_pending_steps_alt += int(move_steps_alt)
+
         if not bool(getattr(self.cfg.tracking, "log_enabled", True)):
             return
         log_hz = _finite_float(getattr(self.cfg.tracking, "log_hz", 1.0), 1.0)
@@ -1757,8 +1776,19 @@ class AppRunner:
         if (now - float(self._tracking_log_t_last)) < (1.0 / log_hz):
             return
         self._tracking_log_t_last = now
+        pending_steps_az = int(self._tracking_log_pending_steps_az)
+        pending_steps_alt = int(self._tracking_log_pending_steps_alt)
+        self._tracking_log_pending_steps_az = 0
+        self._tracking_log_pending_steps_alt = 0
 
         pt_az, pt_alt = self._current_pointing_az_alt()
+        try:
+            steps_est = self._goto.model.steps_est
+            steps_est_az = float(steps_est[0])
+            steps_est_alt = float(steps_est[1])
+        except Exception:
+            steps_est_az = float("nan")
+            steps_est_alt = float("nan")
         _append_tracking_csv_log_row(
             {
                 "ts_unix": now,
@@ -1792,6 +1822,10 @@ class AppRunner:
                 "rate_ff_alt": float(rate_ff_alt),
                 "rate_cmd_az": float(rate_cmd_az),
                 "rate_cmd_alt": float(rate_cmd_alt),
+                "move_steps_az": pending_steps_az,
+                "move_steps_alt": pending_steps_alt,
+                "steps_est_az": None if not np.isfinite(steps_est_az) else float(steps_est_az),
+                "steps_est_alt": None if not np.isfinite(steps_est_alt) else float(steps_est_alt),
                 "pointing_az_deg": None if not np.isfinite(pt_az) else float(pt_az),
                 "pointing_alt_deg": None if not np.isfinite(pt_alt) else float(pt_alt),
             }
@@ -3954,8 +3988,12 @@ class AppRunner:
                     rate_cmd_alt = float(rate_fb_alt + rate_ff_alt)
                     rate_cmd_az, rate_cmd_alt = self._clip_tracking_rate_pair(rate_cmd_az, rate_cmd_alt)
 
+                    move_steps_az = 0
+                    move_steps_alt = 0
                     try:
-                        self._tracking_rate_safe(float(rate_cmd_az), float(rate_cmd_alt))
+                        move_steps_az, move_steps_alt = self._tracking_rate_safe(
+                            float(rate_cmd_az), float(rate_cmd_alt)
+                        )
                         self._tracking_last_cmd_az = float(rate_cmd_az)
                         self._tracking_last_cmd_alt = float(rate_cmd_alt)
                     except Exception as exc:
@@ -3979,6 +4017,8 @@ class AppRunner:
                         rate_fb_alt=float(rate_fb_alt),
                         rate_ff_az=float(rate_ff_az),
                         rate_ff_alt=float(rate_ff_alt),
+                        move_steps_az=int(move_steps_az),
+                        move_steps_alt=int(move_steps_alt),
                     )
 
                     if publish_state:
