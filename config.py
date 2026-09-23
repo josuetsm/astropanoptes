@@ -165,6 +165,14 @@ class TrackingConfig:
     # reintentar para siempre si el fallo es permanente.
     max_consecutive_step_failures: int = 5
 
+    # Muestreo a disco de cada ciclo de tracking (error medido, tasas
+    # comandadas, fuente de calibracion, etc.) para poder debuggear o analizar
+    # una sesion despues, sin depender de lo que haya quedado en pantalla.
+    # Desacoplado de state_publish_hz: la UI puede refrescar rapido sin que el
+    # CSV crezca a ese mismo ritmo en sesiones de varias horas.
+    log_enabled: bool = True
+    log_hz: float = 1.0
+
 
 @dataclass
 class StackingConfig:

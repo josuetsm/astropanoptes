@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import os
+import csv
 import json
 import queue
 import collections
@@ -162,6 +163,83 @@ def _batch_duration_s(steps: int, delay_us: float) -> float:
     """Cuanto tarda la montura en ejecutar un lote de MOVE."""
     return abs(int(steps)) * (float(delay_us) + _RATE_EMUL_PULSE_US) / 1.0e6
 
+
+# Muestras de tracking para debug/analisis offline (ver _log_tracking_sample).
+# Fija, a diferencia de los logs de goto.py: este archivo no se relee para
+# restaurar estado al arrancar, asi que un cambio de esquema no necesita
+# migrar filas viejas -- solo se archiva el CSV anterior para no mezclar
+# columnas con significados distintos bajo el mismo encabezado.
+_TRACKING_CSV_LOG_LOCK = threading.Lock()
+_TRACKING_SAMPLE_CSV_FIELDS = [
+    "ts_unix",
+    "ts_utc",
+    "frame_t",
+    "mode",
+    "ok",
+    "measurement_reason",
+    "measurement_source",
+    "calib_src",
+    "det_a",
+    "n_det",
+    "resp",
+    "abs_resp",
+    "dx_px",
+    "dy_px",
+    "vx_px_s",
+    "vy_px_s",
+    "error_x_px",
+    "error_y_px",
+    "error_px",
+    "lock_conf",
+    "fail_count",
+    "anchor_px",
+    "anchor_chained",
+    "anchor_lost",
+    "ff_ready",
+    "rate_fb_az",
+    "rate_fb_alt",
+    "rate_ff_az",
+    "rate_ff_alt",
+    "rate_cmd_az",
+    "rate_cmd_alt",
+    "pointing_az_deg",
+    "pointing_alt_deg",
+]
+
+
+def _tracking_logs_dir() -> str:
+    v = str(os.environ.get("ASTROPANOPTES_TRACKING_LOG_DIR", "")).strip()
+    if v:
+        return v
+    return os.path.join("stack_output", "tracking_logs")
+
+
+def _append_tracking_csv_log_row(row: Dict[str, Any]) -> None:
+    try:
+        log_dir = _tracking_logs_dir()
+        os.makedirs(log_dir, exist_ok=True)
+        path = os.path.join(log_dir, "tracking_samples.csv")
+        with _TRACKING_CSV_LOG_LOCK:
+            if os.path.exists(path) and os.path.getsize(path) > 0:
+                with open(path, "r", newline="", encoding="utf-8") as existing:
+                    header = next(csv.reader(existing), [])
+                if header != _TRACKING_SAMPLE_CSV_FIELDS:
+                    stale_suffix = time.strftime(".%Y%m%dT%H%M%SZ.old", time.gmtime())
+                    os.replace(path, path + stale_suffix)
+            write_header = (not os.path.exists(path)) or (os.path.getsize(path) <= 0)
+            with open(path, "a", newline="", encoding="utf-8") as f:
+                writer = csv.DictWriter(f, fieldnames=_TRACKING_SAMPLE_CSV_FIELDS, extrasaction="ignore")
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(dict(row))
+    except Exception as exc:
+        log_error(
+            None,
+            "Tracking: failed to append CSV log (tracking_samples.csv)",
+            exc,
+            throttle_s=5.0,
+            throttle_key="tracking_csv_log",
+        )
 
 
 def _perf() -> float:
@@ -381,6 +459,7 @@ class AppRunner:
         self._tracking_ff_last_valid_t: Optional[float] = None
         self._tracking_ff_last_compute_t: Optional[float] = None
         self._tracking_ff_cached: Tuple[float, float, bool] = (0.0, 0.0, False)
+        self._tracking_log_t_last: float = 0.0
         self._stacking_last_frame_token: Optional[float] = None
         self._tracking_worker = _CoalescingCallbackWorker(
             name="TrackingWorker",
@@ -1655,6 +1734,68 @@ class AppRunner:
     def _tracking_result_snapshot(self) -> Tuple[Optional[Any], Optional[Exception]]:
         with self._tracking_result_lock:
             return self._tracking_last_output, self._tracking_worker_error
+
+    def _maybe_log_tracking_sample(
+        self,
+        out: TrackingOutput,
+        *,
+        frame_t: float,
+        ff_ready: bool,
+        rate_cmd_az: float,
+        rate_cmd_alt: float,
+        rate_fb_az: float,
+        rate_fb_alt: float,
+        rate_ff_az: float,
+        rate_ff_alt: float,
+    ) -> None:
+        if not bool(getattr(self.cfg.tracking, "log_enabled", True)):
+            return
+        log_hz = _finite_float(getattr(self.cfg.tracking, "log_hz", 1.0), 1.0)
+        if log_hz <= 0.0:
+            return
+        now = float(_now_s())
+        if (now - float(self._tracking_log_t_last)) < (1.0 / log_hz):
+            return
+        self._tracking_log_t_last = now
+
+        pt_az, pt_alt = self._current_pointing_az_alt()
+        _append_tracking_csv_log_row(
+            {
+                "ts_unix": now,
+                "ts_utc": time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(now)),
+                "frame_t": float(frame_t),
+                "mode": str(out.mode),
+                "ok": int(bool(out.ok)),
+                "measurement_reason": str(out.measurement_reason),
+                "measurement_source": str(out.measurement_source),
+                "calib_src": str(out.calib_src),
+                "det_a": float(out.detA),
+                "n_det": int(out.n_det),
+                "resp": float(out.resp),
+                "abs_resp": float(out.abs_resp),
+                "dx_px": float(out.dx),
+                "dy_px": float(out.dy),
+                "vx_px_s": float(out.vx),
+                "vy_px_s": float(out.vy),
+                "error_x_px": float(out.x_hat),
+                "error_y_px": float(out.y_hat),
+                "error_px": float(np.hypot(out.x_hat, out.y_hat)),
+                "lock_conf": float(out.lock_conf),
+                "fail_count": int(out.fail_count),
+                "anchor_px": float(getattr(out, "anchor_px", 0.0)),
+                "anchor_chained": int(bool(getattr(out, "anchor_chained", False))),
+                "anchor_lost": int(bool(getattr(out, "anchor_lost", False))),
+                "ff_ready": int(bool(ff_ready)),
+                "rate_fb_az": float(rate_fb_az),
+                "rate_fb_alt": float(rate_fb_alt),
+                "rate_ff_az": float(rate_ff_az),
+                "rate_ff_alt": float(rate_ff_alt),
+                "rate_cmd_az": float(rate_cmd_az),
+                "rate_cmd_alt": float(rate_cmd_alt),
+                "pointing_az_deg": None if not np.isfinite(pt_az) else float(pt_az),
+                "pointing_alt_deg": None if not np.isfinite(pt_alt) else float(pt_alt),
+            }
+        )
 
     def _publish_tracking_output(
         self,
@@ -3827,6 +3968,18 @@ class AppRunner:
                             }
                         )
                         log_error(self.out_log, "Tracking: mount MOVE failed", exc, throttle_s=2.0, throttle_key="tracking_mount_move")
+
+                    self._maybe_log_tracking_sample(
+                        out,
+                        frame_t=float(frame_t),
+                        ff_ready=bool(ff_ready),
+                        rate_cmd_az=float(rate_cmd_az),
+                        rate_cmd_alt=float(rate_cmd_alt),
+                        rate_fb_az=float(rate_fb_az),
+                        rate_fb_alt=float(rate_fb_alt),
+                        rate_ff_az=float(rate_ff_az),
+                        rate_ff_alt=float(rate_ff_alt),
+                    )
 
                     if publish_state:
                         self._publish_tracking_output(
