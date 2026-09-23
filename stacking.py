@@ -15,6 +15,7 @@ from imaging import ensure_raw16_bayer
 from logging_utils import log_error
 from preview import stretch_to_u8
 from raw_alignment import build_raw_alignment_signature, estimate_raw_translation
+from sep_utils import repair_bad_pixels
 from workers import BaseWorker
 
 # ============================================================
@@ -45,6 +46,39 @@ def _odd_ksize(v: int, *, minimum: int = 1) -> int:
     if (k % 2) == 0:
         k += 1
     return k
+
+
+SOLID_COVERAGE_FRACTION = 0.85
+
+
+def flatten_mosaic_border(
+    mean_u16: np.ndarray, wgt: Optional[np.ndarray]
+) -> Tuple[np.ndarray, int]:
+    """Set the partly covered canvas edge to the sky level, for the detector.
+
+    As the field drifts, the canvas edge becomes a staircase between covered
+    and empty pixels. SEP reads those steps as sources, and because they are
+    bright relative to the sky they crowd out real stars from the brightest-N
+    list the solver actually uses. Measured on two real drifted stacks: 12 of
+    the 30 brightest "detections" were border artefacts on one (4 inliers ->
+    14), and 26 of 30 on another, where the solve only reached 16 inliers once
+    they were suppressed.
+
+    Returns the flattened image together with the sky level, which is also what
+    any padding around the result must use: a zero border reintroduces exactly
+    the hard edge removed here.
+    """
+    solid: Optional[np.ndarray] = None
+    if wgt is not None and wgt.size:
+        w_max = float(wgt.max())
+        if w_max > 0.0:
+            covered = wgt >= SOLID_COVERAGE_FRACTION * w_max
+            if covered.any():
+                solid = covered
+    sky_level = int(np.median(mean_u16[solid] if solid is not None else mean_u16))
+    if solid is not None and not solid.all():
+        mean_u16 = np.where(solid, mean_u16, sky_level).astype(np.uint16)
+    return mean_u16, sky_level
 
 
 def _bayer_to_gray_code(pattern: str) -> int:
@@ -112,6 +146,11 @@ class LiveMosaicStackerGray:
         # "now", to convert the fitted center between AltAz and ICRS.
         self.ref_time_unix: Optional[float] = None
         self.last_time_unix: Optional[float] = None
+        # Top-left corner of the reference frame inside the canvas. Frames are
+        # aligned onto the first one, so this is the only anchor that ties the
+        # growing mosaic back to a real pointing.
+        self.ref_origin_x = 0
+        self.ref_origin_y = 0
 
     def reset(self) -> None:
         self.sum = None
@@ -128,6 +167,8 @@ class LiveMosaicStackerGray:
         self.n = 0
         self.ref_time_unix = None
         self.last_time_unix = None
+        self.ref_origin_x = 0
+        self.ref_origin_y = 0
 
     def has_data(self) -> bool:
         return self.sum is not None and self.wgt is not None and self.n > 0
@@ -195,6 +236,10 @@ class LiveMosaicStackerGray:
 
             self.pos_x += float(pad_l)
             self.pos_y += float(pad_t)
+            # Padding on the left/top shifts every existing pixel, including
+            # the reference frame's anchor.
+            self.ref_origin_x += int(pad_l)
+            self.ref_origin_y += int(pad_t)
 
             x0 += pad_l
             y0 += pad_t
@@ -632,15 +677,65 @@ class StackEngine:
                 return None
             if mean_u16.ndim == 3:
                 mean_u16 = mean_u16.mean(axis=2).astype(np.uint16)
+
+            # Re-centre on the reference frame without discarding anything.
+            #
+            # Plate solving is told "this image is centred near <target>", and
+            # the target corresponds to where the telescope pointed when the
+            # reference frame was taken. With the mount parked the canvas grows
+            # away from that frame, so the mosaic's geometric centre drifts off
+            # the pointing by half the accumulated drift and biases the fit.
+            # Padding symmetrically around the reference frame's centre puts the
+            # image centre back on the pointing while keeping every pixel of the
+            # extra sky the mosaic captured.
+            # Flatten the ragged mosaic border before it reaches the detector.
+            #
+            # As the field drifts, the canvas edge becomes a staircase between
+            # covered and empty pixels. SEP reads those steps as sources, and
+            # because they are bright relative to the sky they crowd out real
+            # stars from the brightest-N list the solver actually uses. Measured
+            # on a real drifted stack: 12 of the 30 brightest "detections" were
+            # border artefacts, and removing them took the solve from 4 inliers
+            # to 14. Partly-covered pixels are set to the sky level instead of
+            # zero, so no hard edge is introduced either.
+            #
+            # The sky level it returns is also what the re-centring pad below
+            # must use: padding with zeros would frame the image in black and
+            # put back exactly the hard edge this flattening removes.
+            mean_u16, sky_level = flatten_mosaic_border(mean_u16, wgt)
+
+            scale = float(eng.drizzle_scale)
+            ref_cx = (float(eng.ref_origin_x) + float(eng.frame_w) * 0.5) * scale
+            ref_cy = (float(eng.ref_origin_y) + float(eng.frame_h) * 0.5) * scale
+            h, w = mean_u16.shape[:2]
+            pad_l = int(round(max(0.0, w - 2.0 * ref_cx)))
+            pad_r = int(round(max(0.0, 2.0 * ref_cx - w)))
+            pad_t = int(round(max(0.0, h - 2.0 * ref_cy)))
+            pad_b = int(round(max(0.0, 2.0 * ref_cy - h)))
+            if pad_l or pad_r or pad_t or pad_b:
+                mean_u16 = np.pad(
+                    mean_u16,
+                    ((pad_t, pad_b), (pad_l, pad_r)),
+                    mode="constant",
+                    constant_values=sky_level,
+                )
+                if wgt is not None:
+                    wgt = np.pad(wgt, ((pad_t, pad_b), (pad_l, pad_r)), mode="constant")
+
             return {
                 "image": np.ascontiguousarray(mean_u16),
                 "weight": None if wgt is None else np.ascontiguousarray(wgt),
                 "obstime_unix": eng.ref_time_unix,
                 "last_time_unix": eng.last_time_unix,
-                "drizzle_scale": float(eng.drizzle_scale),
+                "drizzle_scale": scale,
                 "frames": int(eng.n),
                 "canvas": (int(eng.canvas_h), int(eng.canvas_w)),
                 "frame_shape": (int(eng.frame_h), int(eng.frame_w)),
+                "solve_shape": (int(mean_u16.shape[0]), int(mean_u16.shape[1])),
+                "reference_center_xy": (float(ref_cx), float(ref_cy)),
+                # Where the mosaic sits inside the padded image, so callers can
+                # map back to canvas coordinates.
+                "pad_offset_xy": (int(pad_l), int(pad_t)),
             }
 
     def get_latest_stack_frame(
@@ -684,7 +779,15 @@ class StackEngine:
 
             for item in batch:
                 try:
-                    raw16_work = ensure_raw16_bayer(item["raw16"])
+                    # Repair defective pixels *before* stacking, not after.
+                    #
+                    # A hot pixel is fixed on the sensor while the field drifts,
+                    # so alignment smears it into a streak across the mosaic.
+                    # The detector's 3x3 median erases an isolated sample but
+                    # leaves a streak almost untouched (~99% survives), which is
+                    # why defects reach the solver when the source is a stack
+                    # even though single frames look clean.
+                    raw16_work = repair_bad_pixels(ensure_raw16_bayer(item["raw16"]))
                     if self._live_gray.add_frame(raw16_work, t_unix=item.get("t")):
                         used += 1
                     else:

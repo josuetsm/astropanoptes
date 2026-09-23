@@ -26,8 +26,17 @@ def _isolate_goto_csv_logs(monkeypatch, tmp_path) -> None:
 def test_manual_fit_is_idempotent_with_noisy_samples() -> None:
     model = GoToModel()
     model.init_from_mechanics()
+    # Desviaciones pequenas alrededor de la escala nominal de *cada* eje. Antes
+    # estaban escritas a pelo (6.87e-4 / 6.82e-4), lo que ataba el test a que
+    # ambos ejes fueran 45:1; con altitud a 90.5:1 ese 6.82e-4 se sale del
+    # doble del nominal y el ajuste lo rechaza, con razon.
+    nom_az = abs(float(model.kin.deg_per_step(Axis.AZ)))
+    nom_alt = abs(float(model.kin.deg_per_step(Axis.ALT)))
     j_true = np.array(
-        [[6.87e-4, 5.8e-6], [4.6e-6, 6.82e-4]],
+        [
+            [nom_az * 1.0992, nom_alt * 0.0093],
+            [nom_az * 0.0074, nom_alt * 1.0912],
+        ],
         dtype=np.float64,
     )
     base_steps = np.array([40_000.0, -40_000.0], dtype=np.float64)
@@ -99,16 +108,30 @@ def test_manual_sample_continuity_rejects_multi_degree_jump_after_200_steps() ->
     assert bool(plausible["roll_ok"])
 
 
-def test_45_to_1_model_envelope_is_tight_and_signed() -> None:
+def _nominal_diag(model: GoToModel) -> np.ndarray:
+    """Escala nominal de cada eje, derivada de su propia reduccion.
+
+    Azimut y altitud no comparten reduccion (45:1 frente a 90.5:1), asi que
+    fijar aqui un 1/1600 para ambos volveria a atar el test al hardware viejo.
+    """
+    return np.diag(
+        [
+            abs(float(model.kin.deg_per_step(Axis.AZ))),
+            abs(float(model.kin.deg_per_step(Axis.ALT))),
+        ]
+    )
+
+
+def test_model_envelope_is_tight_and_signed() -> None:
     model = GoToModel()
     model.init_from_mechanics()
     mechanical = model.mechanical_J()
 
     np.testing.assert_allclose(
-        mechanical,
-        np.diag([1.0 / 1600.0, 1.0 / 1600.0]),
-        rtol=0.0,
-        atol=1e-15,
+        np.abs(mechanical),
+        _nominal_diag(model),
+        rtol=1e-12,
+        atol=1e-18,
     )
     assert model.is_J_within_mechanical_limits(mechanical)
 
@@ -125,7 +148,7 @@ def test_45_to_1_model_envelope_is_tight_and_signed() -> None:
     assert not model.is_J_within_mechanical_limits(coupled)
 
 
-def test_45_lobe_period_is_one_motor_revolution_at_fixed_microstepping() -> None:
+def test_lobe_period_is_one_motor_revolution_at_fixed_microstepping() -> None:
     model = GoToModel()
     model.init_from_mechanics()
 
@@ -133,7 +156,7 @@ def test_45_lobe_period_is_one_motor_revolution_at_fixed_microstepping() -> None
     assert model.kin.transmission_error_period_steps(Axis.ALT) == pytest.approx(12_800.0)
 
 
-def test_periodic_transmission_model_keeps_global_45_to_1_and_inverts_locally() -> None:
+def test_periodic_transmission_model_keeps_global_scale_and_inverts_locally() -> None:
     model = GoToModel()
     model.init_from_mechanics()
     model.periodic_coeff_deg = np.array(
@@ -148,14 +171,14 @@ def test_periodic_transmission_model_keeps_global_45_to_1_and_inverts_locally() 
 
     np.testing.assert_allclose(recovered, intended_steps, rtol=0.0, atol=1e-3)
     np.testing.assert_allclose(
-        model.mechanical_J(),
-        np.diag([1.0 / 1600.0, 1.0 / 1600.0]),
-        rtol=0.0,
-        atol=1e-15,
+        np.abs(model.mechanical_J()),
+        _nominal_diag(model),
+        rtol=1e-12,
+        atol=1e-18,
     )
 
 
-def test_manual_fit_separates_cycloidal_error_from_global_45_to_1_scale() -> None:
+def test_manual_fit_separates_cycloidal_error_from_global_scale() -> None:
     model = GoToModel()
     model.init_from_mechanics()
     mechanical = model.mechanical_J().copy()
@@ -298,7 +321,7 @@ def test_restore_rejects_fit_that_conflicts_with_nominal_kinematics() -> None:
     assert not bool(result["loaded_fit"])
     assert restored.model_fit_samples == 0
     assert restored.kin.gear_reduction_az == pytest.approx(45.0)
-    assert restored.kin.gear_reduction_alt == pytest.approx(45.0)
+    assert restored.kin.gear_reduction_alt == pytest.approx(90.5)
     assert restored.kin.microsteps_az == 64
     assert restored.kin.microsteps_alt == 64
 

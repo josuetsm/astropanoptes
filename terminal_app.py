@@ -18,7 +18,7 @@ from typing import Any, Callable, Iterable, Optional, TextIO
 import numpy as np
 
 from actions import Action, ActionType
-from ap_types import Axis
+from ap_types import Axis, TrackingStatus
 from app_runner import AppRunner
 from config import AppConfig
 
@@ -389,7 +389,15 @@ HELP_TEXT = """Comandos principales:
   camera record [SEG] [CARPETA] [NOMBRE] | stop
   mount connect [PUERTO] [BAUD] | disconnect | stop | sync
   mount move az|alt DIRECCIÓN PASOS [DELAY_US] [smooth|direct]
+  focus in|out [PASOS]             Acerca o aleja el foco (tercer motor)
+  focus auto [PRESET] [nombre=valor ...]   Busca el foco; con preset, dirigida
+  focus cancel | focus goto POS|PRESET
+  focus home                       Homing aproximado contra la zona de patinaje
+  focus save NOMBRE [POS] | focus presets | focus forget NOMBRE
+  focus zero                       Cero de sesión (no es homing)
+  focus status | focus set nombre=valor ...
   tracking start|stop | set nombre=valor ...
+  tracking why                     Por qué el tracking no mueve la montura
   stacking start|stop|reset | set nombre=valor ...
   stacking save [CARPETA] [NOMBRE] [FORMATO]
   solve OBJETIVO                   Plate solve por nombre o coordenadas
@@ -564,6 +572,8 @@ class TerminalApp:
             "move": "mount_move",
             "record": "camera_record",
             "raw": "camera_record",
+            "focus": "focuser",
+            "autofocus": "focuser",
         }
         name = aliases.get(args[0].lower(), args[0].lower())
         if len(args) >= 2:
@@ -604,6 +614,7 @@ class TerminalApp:
                 section_name = {
                     "mount_move": "mount",
                     "camera_record": "camera",
+                    "focuser": "focuser",
                 }.get(name, name)
                 section = getattr(state, section_name)
                 payload = {
@@ -834,7 +845,222 @@ class TerminalApp:
             )
         self._print("OK")
 
+    def _focus(self, args: list[str]) -> None:
+        if not args:
+            raise CommandError(
+                "uso: focus in|out [PASOS] | auto [...] | cancel | home | "
+                "goto POS|PRESET | save NOMBRE [POS] | presets | forget NOMBRE | "
+                "zero | status | set nombre=valor ..."
+            )
+        operation = args[0].lower()
+        cfg = self.runner.cfg.focuser
+
+        if operation in {"in", "acercar", "near"}:
+            steps = int(args[1]) if len(args) >= 2 else int(cfg.step_size)
+            self._mark_operation_pending("focuser")
+            self.runner.request_focuser_move(+1, steps)
+        elif operation in {"out", "alejar", "far"}:
+            steps = int(args[1]) if len(args) >= 2 else int(cfg.step_size)
+            self._mark_operation_pending("focuser")
+            self.runner.request_focuser_move(-1, steps)
+        elif operation in {"auto", "autofocus", "buscar"}:
+            # "focus auto x2" fija el preset; sin nombre se deduce del preset
+            # mas cercano a la posicion actual.
+            rest = list(args[1:])
+            if rest and "=" not in rest[0]:
+                params = _parse_assignments(rest[1:])
+                params["preset"] = rest[0]
+            else:
+                params = _parse_assignments(rest)
+            self._mark_operation_pending("focuser")
+            self.runner.request_focuser_autofocus(params)
+        elif operation in {"cancel", "cancelar"}:
+            self.runner.request_focuser_cancel()
+        elif operation == "goto":
+            if len(args) != 2:
+                raise CommandError("uso: focus goto POSICION|NOMBRE_DE_PRESET")
+            self._mark_operation_pending("focuser")
+            try:
+                self.runner.request_focuser_goto(int(args[1]))
+            except ValueError:
+                # No es un numero: se interpreta como preset, que es como se
+                # escribe en la practica ("focus goto x2").
+                self.runner.request_focuser_preset(args[1])
+        elif operation in {"zero", "cero"}:
+            self.runner.request_focuser_zero()
+        elif operation in {"home", "homing"}:
+            self._mark_operation_pending("focuser")
+            self.runner.request_focuser_home()
+        elif operation in {"save", "guardar"}:
+            if not (2 <= len(args) <= 3):
+                raise CommandError("uso: focus save NOMBRE [POSICION]")
+            position = int(args[2]) if len(args) == 3 else None
+            self.runner.request_focuser_save_preset(args[1], position)
+        elif operation in {"forget", "olvidar", "borrar"}:
+            if len(args) != 2:
+                raise CommandError("uso: focus forget NOMBRE")
+            self.runner.request_focuser_delete_preset(args[1])
+        elif operation in {"presets", "lista"}:
+            presets = self.runner.get_focus_presets()
+            if not presets:
+                self._print("(no hay presets de foco guardados)")
+                return
+            homed = bool(self.runner.get_state().focuser.homed)
+            from focuser import FocusPresets
+
+            for name in sorted(presets):
+                entry = presets[name]
+                mark = "" if bool(entry["homed"]) == homed else "   <- origen distinto al actual"
+                origin = "homed" if entry["homed"] else "sin homing"
+                center, spread = FocusPresets.prior(entry)
+                n = len(entry.get("history", []))
+                if spread is None:
+                    learned = f"{n} medida(s)" if n else "sin historial"
+                else:
+                    learned = f"{n} noches, centro {center:+d}, dispersion +-{spread:.0f}"
+                self._print(
+                    f"  {name:<8} {int(entry['position']):+8d}  ({origin})  {learned}{mark}"
+                )
+            return
+        elif operation in {"load", "usar", "aplicar"}:
+            if len(args) != 2:
+                raise CommandError("uso: focus load NOMBRE")
+            self._mark_operation_pending("focuser")
+            self.runner.request_focuser_preset(args[1])
+        elif operation in {"status", "estado"}:
+            self._print(
+                json.dumps(
+                    _jsonable(self.runner.get_state().focuser),
+                    ensure_ascii=False,
+                    sort_keys=True,
+                )
+            )
+            return
+        elif operation == "set":
+            params = _parse_assignments(args[1:])
+            if not params:
+                raise CommandError("uso: focus set nombre=valor ...")
+            self.runner.request_focuser_params(**params)
+        elif operation in {"reset", "defaults"}:
+            self.runner.request_focuser_reset_defaults()
+        else:
+            raise CommandError(f"operación de enfocador desconocida: {operation!r}")
+        self._print("OK")
+
+    def _tracking_calib(self, args: list[str]) -> None:
+        if len(args) not in (4, 6):
+            raise CommandError(
+                "uso: tracking calib A00 A01 A10 A11 [b0 b1]   "
+                "(px/s por paso/s; columnas = ejes az, alt)"
+            )
+        values = [float(v) for v in args]
+        from actions import tracking_set_calib
+
+        self.runner.enqueue(tracking_set_calib(*values))
+
+    def _tracking_why(self) -> None:
+        """Por que el tracking no esta moviendo la montura.
+
+        El tracking puede estar encendido y comandando exactamente cero sin que
+        nada en la ventana lo delate: el chip queda verde y los motores quietos.
+        Esto recorre las compuertas en orden y dice cual es la que falta.
+        """
+        state = self.runner.get_state()
+        tracking = state.tracking
+        rate_az = float(tracking.rate_az)
+        rate_alt = float(tracking.rate_alt)
+        moving = max(abs(rate_az), abs(rate_alt)) > 1e-6
+
+        def row(label: str, value: str) -> None:
+            self._print(f"  {label:.<30} {value}")
+
+        self._print("tracking: por que no mueve")
+        row("montura conectada", "si" if state.mount.connected else "NO")
+        row("camara conectada", "si" if state.camera.connected else "NO")
+        row(
+            "tracking activado",
+            f"si ({tracking.status.value})" if tracking.enabled else "NO",
+        )
+        row(
+            "medida valida",
+            "si" if tracking.measurement_valid
+            else f"NO  ({tracking.measurement_reason})",
+        )
+        row("fuentes detectadas", str(int(tracking.n_det)))
+        row("calibracion", str(tracking.calib_src))
+        if bool(getattr(tracking, "anchor_lost", False)):
+            row("referencia original", "PERDIDA (fuera de campo)")
+        elif bool(getattr(tracking, "anchor_chained", False)):
+            row(
+                "referencia original",
+                f"encadenada, a {float(getattr(tracking, 'anchor_px', 0.0)):.1f} px",
+            )
+        else:
+            row("referencia original", "en uso")
+        row(
+            "montura sincronizada",
+            "si" if state.goto.synced else "NO  -> sin feed-forward",
+        )
+        row("feed-forward listo", "si" if tracking.ff_ready else "NO")
+        row("velocidad comandada", f"{rate_az:+.4f} / {rate_alt:+.4f} pasos/s")
+
+        self._print("")
+        if not state.mount.connected:
+            self._print("  => Falta conectar la montura.")
+        elif not state.camera.connected:
+            self._print(
+                "  => Falta conectar la camara. El tracking es en lazo cerrado:\n"
+                "     mide la deriva de las estrellas en la imagen, sin imagen no\n"
+                "     tiene de donde sacar la correccion."
+            )
+        elif tracking.status == TrackingStatus.ERROR:
+            self._print(
+                f"  => El tracking se detuvo por errores: {tracking.last_error}.\n"
+                "     Vuelve a activarlo; si se corta de nuevo enseguida, el fallo\n"
+                "     es permanente y hay que mirar el log."
+            )
+        elif not tracking.enabled:
+            self._print("  => El tracking no esta activado ('tracking start').")
+        elif moving:
+            period = 1.0 / max(abs(rate_az), abs(rate_alt))
+            self._print(
+                f"  => Esta comandando. A esta velocidad es un microstep cada\n"
+                f"     {period:.1f} s: no lo vas a ver ni oir moverse. Si quieres\n"
+                f"     comprobarlo, mira 'get tracking.rate_az', no los motores."
+            )
+        elif not tracking.measurement_valid and not tracking.ff_ready:
+            self._print(
+                f"  => No hay medida valida ({tracking.measurement_reason}) y el\n"
+                "     feed-forward esta inactivo por falta de sync. Sin ninguna de\n"
+                "     las dos, el tracking comanda cero y no manda ni un MOVE.\n"
+                "     Necesitas estrellas que pueda seguir, o un plate solve que\n"
+                "     sincronice la montura."
+            )
+        elif bool(getattr(tracking, "anchor_lost", False)):
+            self._print(
+                "  => Esta siguiendo, pero la referencia original quedo fuera de\n"
+                "     campo y ya no se puede volver a ella. Lo que ves ahora es\n"
+                "     estabilizacion sobre el campo actual, no el objetivo inicial."
+            )
+        elif not tracking.measurement_valid:
+            self._print(
+                f"  => Sin medida ({tracking.measurement_reason}); corriendo solo\n"
+                "     con feed-forward sideral."
+            )
+        else:
+            self._print(
+                "  => Medida valida pero velocidad cero: no hay deriva que\n"
+                "     corregir en este instante."
+            )
+
     def _tracking(self, args: list[str]) -> None:
+        if args and args[0].lower() in {"why", "porque", "diagnose", "diag"}:
+            self._tracking_why()
+            return
+        if args and args[0].lower() in {"calib", "calibracion"}:
+            self._tracking_calib(args[1:])
+            self._print("OK")
+            return
         if not args:
             raise CommandError("uso: tracking start|stop|set ...")
         operation = args[0].lower()
@@ -1031,6 +1257,8 @@ class TerminalApp:
                 self._camera(args)
             elif command == "mount":
                 self._mount(args)
+            elif command in {"focus", "focuser", "foco"}:
+                self._focus(args)
             elif command in {"stop", "emergency-stop", "estop"}:
                 self._emergency_stop()
                 self._print("OK")

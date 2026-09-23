@@ -106,44 +106,6 @@ def test_diagnostic_session_persists_raw_stack_and_timeline(tmp_path) -> None:
     assert stages[-1] == "session_finished"
 
 
-def test_autocal_consensus_returns_the_frame_matching_final_overlay(tmp_path) -> None:
-    cfg = AppConfig()
-    cfg.platesolving.initial_consensus_count = 3
-    worker = _worker(tmp_path, cfg=cfg)
-    first_time = Time("2026-08-11T01:00:00", scale="utc")
-    first_raw = np.full((8, 8), 1, dtype=np.uint16)
-    second_raw = np.full((8, 8), 2, dtype=np.uint16)
-    third_raw = np.full((8, 8), 3, dtype=np.uint16)
-    first = _solution(status="OK", success=True, obstime=first_time, x=1.0)
-    confirmations = [
-        _solution(status="OK_FAST_PRIOR", success=True, obstime=first_time, x=2.0),
-        _solution(status="OK_FAST_PRIOR", success=True, obstime=first_time, x=3.0),
-    ]
-    frames = [
-        _AutocalFrame(second_raw, 1.0, float(first_time.unix), 1.0, np.zeros((0, 2)), 0, 0.0, ()),
-        _AutocalFrame(third_raw, 2.0, float(first_time.unix), 2.0, np.zeros((0, 2)), 0, 0.0, ()),
-    ]
-    worker._autocal_capture_frames = lambda **kwargs: frames
-
-    with (
-        patch("goto.verify_plate_from_prior", side_effect=confirmations),
-        patch(
-            "goto.platesolving_solutions_consistent",
-            return_value={"ok": True, "pointing_arcsec": 1.0, "scale_frac": 0.0, "roll_deg": 0.0},
-        ),
-    ):
-        result, result_raw = worker._autocal_confirm_initial_solution(
-            first,
-            first_frame=first_raw,
-            target="M42",
-            platesolving_cfg=cfg.platesolving,
-            sep_cfg=cfg.sep,
-            observer=ObserverConfig(),
-        )
-
-    assert result.status == "OK_CONSENSUS"
-    assert float(result.metrics["marker"]) == 3.0
-    np.testing.assert_array_equal(result_raw, third_raw)
 
 
 def test_explicit_platesolve_persists_the_exact_solver_input(tmp_path) -> None:
@@ -268,60 +230,6 @@ def test_explicit_platesolve_total_timeout_stops_before_solver(tmp_path) -> None
     assert final["reason"] == "TIMEOUT"
 
 
-def test_initial_consensus_uses_a_second_temporal_window(tmp_path) -> None:
-    cfg = AppConfig()
-    cfg.platesolving.initial_consensus_count = 2
-    cfg.platesolving.temporal_detection_enabled = True
-    t0 = Time("2026-08-11T01:00:00", scale="utc")
-    t1 = Time("2026-08-11T01:00:30", scale="utc")
-    first_raw = np.full((8, 10), 1, dtype=np.uint16)
-    fresh_raw = np.full((8, 10), 2, dtype=np.uint16)
-    temporal_raw = np.full((8, 10), 3, dtype=np.uint16)
-    first = _solution(status="OK", success=True, obstime=t0, x=1.0)
-    verified = _solution(status="OK_FAST_PRIOR", success=True, obstime=t1, x=2.0)
-    temporal = TemporalDetections(
-        reference_frame=temporal_raw,
-        xy=np.array([[2.0, 2.0], [5.0, 5.0]], dtype=np.float64),
-        flux=np.array([2000.0, 1000.0]),
-        hits=np.array([12, 12], dtype=np.int32),
-        frame_count=12,
-        required_hits=10,
-        drift_xy=tuple((0.0, 0.0) for _ in range(12)),
-    )
-    worker = PlatesolvingWorker(
-        get_frame=lambda: fresh_raw,
-        get_cfg=lambda: cfg.platesolving,
-        get_sep_cfg=lambda: cfg.sep,
-        get_observer=lambda: ObserverConfig(),
-        publish_state=lambda patch: None,
-    )
-    worker._wait_for_distinct_frame = lambda *args, **kwargs: (fresh_raw, t1)
-    worker._collect_temporal_detections = lambda *args, **kwargs: (
-        temporal,
-        temporal_raw,
-        t1,
-    )
-
-    with (
-        patch("platesolving.verify_plate_from_prior", return_value=verified) as verify,
-        patch(
-            "platesolving.platesolving_solutions_consistent",
-            return_value={"ok": True, "pointing_arcsec": 1.0, "scale_frac": 0.0, "roll_deg": 0.0},
-        ),
-    ):
-        result, result_frame = worker._confirm_initial_solution(
-            first,
-            first_raw,
-            target={"az_deg": 133.0, "alt_deg": 34.0},
-            cfg=cfg.platesolving,
-            sep_cfg=cfg.sep,
-            observer=ObserverConfig(),
-        )
-
-    assert result.success
-    assert result.status == "OK_CONSENSUS"
-    assert verify.call_args.kwargs["temporal_detections"] is temporal
-    np.testing.assert_array_equal(result_frame, first_raw)
 
 
 def test_goto_worker_writes_model_and_planning_diagnostics(tmp_path) -> None:

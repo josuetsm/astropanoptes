@@ -30,6 +30,17 @@ class KeyframeConfig:
     abs_blend_beta: float = 0.35
     keyframe_refresh_px: float = 2.5
 
+    # --- Ancla ---
+    # El keyframe de trabajo se refresca para no perder correlacion cuando el
+    # cielo rota y el seeing cambia. El ancla no: es la referencia original, la
+    # posicion a la que hay que volver. Sin esa distincion, cada refresco corre
+    # el objetivo unos pixeles y la montura acaba siguiendo un blanco que se
+    # aleja solo, convencida de que el error es cero.
+    anchor_recover_s: float = 3.0          # cadencia base del cierre de lazo
+    anchor_recover_max_s: float = 60.0     # tope del backoff si el ancla no aparece
+    anchor_max_offset_px: float = 1500.0   # mas alla, el ancla ya no esta en el campo
+    anchor_close_px: float = 2.0           # residuo para volver a adoptar el ancla
+
 
 @dataclass
 class PIConfig:
@@ -146,6 +157,16 @@ class TrackingState:
     abs_last_t: Optional[float] = None
     abs_resp_last: float = 0.0
 
+    # anchor: referencia original y offset acumulado ancla -> keyframe de trabajo
+    anchor_signature: Optional[RawAlignmentSignature] = None
+    anchor_dx: float = 0.0
+    anchor_dy: float = 0.0
+    anchor_chained: bool = False
+    anchor_next_t: Optional[float] = None
+    anchor_backoff_s: float = 0.0
+    anchor_resp_last: float = 0.0
+    anchor_lost: bool = False
+
     # PI integral
     eint_x: float = 0.0
     eint_y: float = 0.0
@@ -186,6 +207,9 @@ class TrackingOutput:
     measurement_source: str = "none"
     lock_conf: float = 0.0
     fail_count: int = 0
+    anchor_px: float = 0.0
+    anchor_chained: bool = False
+    anchor_lost: bool = False
 
 
 @dataclass(frozen=True)
@@ -673,10 +697,16 @@ def _estimate_alignment(
         use_subpixel=bool(state.cfg.align.use_subpixel),
         max_profile_disagreement_px=float(state.cfg.rate.source_profile_disagree_px),
     )
+    dx = float(result.dx)
+    dy = float(result.dy)
+    # Una medida no finita que se acepte envenena x_hat y de ahi todo lo demas:
+    # el error nunca vuelve a ser un numero y el control queda mudo para siempre.
+    if not (np.isfinite(dx) and np.isfinite(dy)):
+        return _AlignmentMeasurement(ok=False, reason="non_finite_shift")
     return _AlignmentMeasurement(
         ok=bool(result.ok),
-        dx=float(result.dx),
-        dy=float(result.dy),
+        dx=dx,
+        dy=dy,
         resp=float(result.response),
         source="raw_profile",
         reason=str(result.reason),
@@ -818,7 +848,31 @@ def make_tracking_state(cfg: Optional[TrackingConfig] = None) -> TrackingState:
     return st
 
 
-def reset_tracker(state: TrackingState, *, now_t: float, mode: str = "STABILIZE") -> None:
+def reset_tracker(
+    state: TrackingState,
+    *,
+    now_t: float,
+    mode: str = "STABILIZE",
+    keep_anchor: bool = False,
+) -> None:
+    """Reinicia el tracker.
+
+    ``keep_anchor`` distingue los dos motivos por los que se llega aqui. Si el
+    objetivo cambio -- un GoTo, un movimiento manual -- hay que olvidarlo todo.
+    Si solo se perdio el enganche, el objetivo sigue siendo el mismo y tirar el
+    ancla equivaldria a aceptar como bueno el sitio donde quedo apuntando.
+    """
+    anchor = (
+        (
+            state.anchor_signature,
+            float(state.anchor_dx) + float(state.x_hat),
+            float(state.anchor_dy) + float(state.y_hat),
+            bool(state.anchor_chained),
+            bool(state.anchor_lost),
+        )
+        if keep_anchor
+        else None
+    )
     state.prev_signature = None
     state.prev_t = None
     state.fail = 0
@@ -845,6 +899,61 @@ def reset_tracker(state: TrackingState, *, now_t: float, mode: str = "STABILIZE"
     state.abs_last_t = None
     state.abs_resp_last = 0.0
 
+    state.anchor_signature = None
+    state.anchor_dx = 0.0
+    state.anchor_dy = 0.0
+    state.anchor_chained = False
+    state.anchor_next_t = None
+    state.anchor_backoff_s = 0.0
+    state.anchor_resp_last = 0.0
+    state.anchor_lost = False
+
+    if anchor is not None:
+        signature, dx, dy, chained, lost = anchor
+        state.anchor_signature = signature
+        # El error acumulado hasta el momento de la perdida no se descarta: es
+        # la distancia que hay que deshacer para volver al objetivo original.
+        state.anchor_dx = float(dx)
+        state.anchor_dy = float(dy)
+        state.anchor_chained = bool(chained or signature is not None)
+        state.anchor_lost = bool(lost)
+        state.anchor_next_t = float(now_t)
+
+
+def rechain_keyframe(
+    state: TrackingState,
+    *,
+    signature: Optional[RawAlignmentSignature],
+    now_t: float,
+) -> None:
+    """Adopta un keyframe de trabajo nuevo sin soltar el ancla.
+
+    El error medido contra el keyframe viejo se suma al offset acumulado, de
+    modo que la distancia total al ancla se conserva a traves del cambio. Es la
+    diferencia entre estabilizarse sobre una referencia fresca y olvidar donde
+    habia que estar.
+    """
+    state.anchor_dx = float(state.anchor_dx) + float(state.x_hat)
+    state.anchor_dy = float(state.anchor_dy) + float(state.y_hat)
+    state.key_signature = signature
+    state.key_t = float(now_t)
+    state.x_hat = 0.0
+    state.y_hat = 0.0
+    # El integral se conserva a proposito: el error contra el ancla no cambia al
+    # encadenar, solo cambia contra que se mide. Vaciarlo aqui lo dejaria a cero
+    # en cada refresco estable -- que en regimen ocurre continuamente -- y el
+    # termino integral no llegaria nunca a corregir la deriva lenta.
+    state.abs_last_t = float(now_t)
+    state.abs_resp_last = 0.0
+    if state.anchor_signature is None:
+        # Sin ancla previa, el primer keyframe la define.
+        state.anchor_signature = signature
+        state.anchor_dx = 0.0
+        state.anchor_dy = 0.0
+        state.anchor_chained = False
+    else:
+        state.anchor_chained = state.anchor_signature is not signature
+
 
 def reset_keyframe(
     state: TrackingState,
@@ -860,6 +969,16 @@ def reset_keyframe(
     state.eint_y = 0.0
     state.abs_last_t = float(now_t)
     state.abs_resp_last = 0.0
+    # Un keyframe puesto explicitamente define un objetivo nuevo: el ancla pasa
+    # a ser este. Los refrescos periodicos usan rechain_keyframe, que la respeta.
+    state.anchor_signature = signature
+    state.anchor_dx = 0.0
+    state.anchor_dy = 0.0
+    state.anchor_chained = False
+    state.anchor_next_t = None
+    state.anchor_backoff_s = 0.0
+    state.anchor_resp_last = 0.0
+    state.anchor_lost = False
 
 
 def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
@@ -1148,7 +1267,13 @@ def tracking_step(
         failed_frames = int(state.fail)
         state.rate_az = 0.0
         state.rate_alt = 0.0
-        reset_tracker(state, now_t=now_t, mode="STABILIZE")
+        reset_tracker(state, now_t=now_t, mode="STABILIZE", keep_anchor=True)
+        # La referencia fresca es solo para volver a engancharse; el objetivo
+        # sigue siendo el ancla, y la distancia hasta ella se conserva.
+        if signature.has_signal:
+            state.key_signature = signature
+            state.key_t = float(now_t)
+            state.abs_last_t = float(now_t)
         return TrackingOutput(
             ok=False,
             mode=state.current_mode,
@@ -1182,14 +1307,91 @@ def tracking_step(
             state.x_hat = (1.0 - beta) * state.x_hat + beta * float(abs_measurement.dx)
             state.y_hat = (1.0 - beta) * state.y_hat + beta * float(abs_measurement.dy)
 
+    # Cierre de lazo contra el ancla. Va despues de acumular el incremento:
+    # medida absoluta e incremento describen el mismo movimiento, y aplicar la
+    # primera antes de sumar el segundo lo contaba dos veces. Solo cuando el keyframe de trabajo ya no
+    # es la referencia original: mientras no haya cadena, la correccion absoluta
+    # de arriba ya mide contra el ancla y esto no cuesta nada. Cuando si la hay,
+    # es una alineacion extra cada anchor_recover_s, no por frame, y con backoff
+    # si el ancla no aparece -- no tiene sentido insistir cada pocos segundos
+    # contra una referencia que el campo ya dejo atras.
+    if (
+        state.anchor_chained
+        and state.anchor_signature is not None
+        and not state.anchor_lost
+        and signature.has_signal
+    ):
+        if state.anchor_next_t is None or now_t >= float(state.anchor_next_t):
+            total_x = float(state.anchor_dx) + float(state.x_hat)
+            total_y = float(state.anchor_dy) + float(state.y_hat)
+            if float(np.hypot(total_x, total_y)) > float(
+                state.cfg.keyframe.anchor_max_offset_px
+            ):
+                # El ancla quedo fuera del campo: seguir persiguiendola seria
+                # comandar un desplazamiento grande sobre un offset que ya nadie
+                # puede verificar.
+                state.anchor_lost = True
+                # A partir de aqui el control mide contra la referencia de
+                # trabajo. El integral venia acumulado sobre el error al ancla,
+                # que es otra magnitud: arrastrarlo daria una patada al cambiar.
+                state.eint_x = 0.0
+                state.eint_y = 0.0
+            else:
+                anchor_meas = _estimate_alignment(
+                    state,
+                    reference=state.anchor_signature,
+                    current=signature,
+                    center_dx=float(total_x),
+                    center_dy=float(total_y),
+                    search_radius_px=float(state.cfg.keyframe.abs_max_px),
+                    max_displacement_px=float(
+                        state.cfg.keyframe.anchor_max_offset_px
+                    ),
+                )
+                state.anchor_resp_last = float(anchor_meas.resp)
+                base = max(0.5, float(state.cfg.keyframe.anchor_recover_s))
+                if anchor_meas.ok:
+                    # La medida directa manda sobre el offset encadenado, que
+                    # solo es una suma de estimaciones sin verificar.
+                    state.anchor_dx = float(anchor_meas.dx) - float(state.x_hat)
+                    state.anchor_dy = float(anchor_meas.dy) - float(state.y_hat)
+                    state.anchor_backoff_s = 0.0
+                    if float(np.hypot(anchor_meas.dx, anchor_meas.dy)) <= float(
+                        state.cfg.keyframe.anchor_close_px
+                    ):
+                        # Volvimos: el ancla vuelve a ser el keyframe de trabajo
+                        # y la cadena se colapsa.
+                        state.key_signature = state.anchor_signature
+                        state.x_hat = float(anchor_meas.dx)
+                        state.y_hat = float(anchor_meas.dy)
+                        state.anchor_dx = 0.0
+                        state.anchor_dy = 0.0
+                        state.anchor_chained = False
+                else:
+                    state.anchor_backoff_s = min(
+                        float(state.cfg.keyframe.anchor_recover_max_s),
+                        max(base, float(state.anchor_backoff_s) * 2.0),
+                    )
+                state.anchor_next_t = float(now_t) + max(
+                    base, float(state.anchor_backoff_s)
+                )
+
+
     # control (compute rates) - only if tracking_enabled
     calib_pinv, b_use, src, detA = _get_A_pinv_use(state)
     state.calib_src_last = src
 
     if tracking_enabled and calib_pinv is not None:
         # PI over position error x_hat/y_hat (como tu script)
-        ex = float(state.x_hat)
-        ey = float(state.y_hat)
+        # Error contra el ancla: es el que hay que anular para volver al
+        # objetivo original. Si el ancla se perdio, solo queda estabilizar
+        # sobre la referencia de trabajo.
+        if state.anchor_lost:
+            ex = float(state.x_hat)
+            ey = float(state.y_hat)
+        else:
+            ex = float(state.x_hat) + float(state.anchor_dx)
+            ey = float(state.y_hat) + float(state.anchor_dy)
 
         upd = float(state.cfg.rate.update_s)
         dt_ctrl = clamp(dt, 0.0, max(4.0 * upd, 0.05))
@@ -1267,12 +1469,24 @@ def tracking_step(
         # keyframe refresh when stable
         e_mag = float(np.hypot(ex, ey))
         if (e_mag <= float(state.cfg.keyframe.keyframe_refresh_px)) and (float(state.abs_resp_last) >= float(state.cfg.keyframe.abs_resp_min)):
-            reset_keyframe(state, signature=signature, now_t=now_t)
+            # Refrescar mantiene la correlacion viva, pero antes redefinia el
+            # objetivo: cada refresco corria el blanco unos pixeles y la montura
+            # seguia un punto que se alejaba solo, con error cero en pantalla.
+            rechain_keyframe(state, signature=signature, now_t=now_t)
 
     else:
         # no calib -> hold rates at 0
         state.rate_az = 0.0
         state.rate_alt = 0.0
+
+    # El error que se reporta es el que importa: la distancia al objetivo
+    # original, no al keyframe de trabajo -- que por construccion siempre tiene
+    # el error cerca de cero justo despues de un refresco.
+    if state.anchor_lost:
+        err_x, err_y = float(state.x_hat), float(state.y_hat)
+    else:
+        err_x = float(state.x_hat) + float(state.anchor_dx)
+        err_y = float(state.y_hat) + float(state.anchor_dy)
 
     return TrackingOutput(
         ok=bool(good_inc),
@@ -1283,8 +1497,8 @@ def tracking_step(
         vx=float(state.vx_inst),
         vy=float(state.vy_inst),
         abs_resp=float(state.abs_resp_last),
-        x_hat=float(state.x_hat),
-        y_hat=float(state.y_hat),
+        x_hat=float(err_x),
+        y_hat=float(err_y),
         rate_az=float(state.rate_az),
         rate_alt=float(state.rate_alt),
         calib_src=str(src),
@@ -1294,4 +1508,7 @@ def tracking_step(
         measurement_source=str(measurement_source),
         lock_conf=float(state.lock_conf),
         fail_count=int(state.fail),
+        anchor_px=float(np.hypot(state.anchor_dx, state.anchor_dy)),
+        anchor_chained=bool(state.anchor_chained),
+        anchor_lost=bool(state.anchor_lost),
     )

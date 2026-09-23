@@ -262,3 +262,39 @@ class TerminalAppTests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+def test_tracking_why_names_the_gate_that_is_blocking() -> None:
+    """El tracking puede estar encendido y comandando cero sin que nada lo delate.
+
+    El chip queda verde y los motores quietos, que es indistinguible de que
+    este roto. Este comando existe para decir cual de las compuertas falta.
+    """
+    import io
+
+    from app_runner import AppRunner
+    from config import AppConfig
+    from terminal_app import TerminalApp
+
+    cfg = AppConfig()
+    cfg.simulation.enabled = True
+    cfg.simulation.seed = 3
+
+    out = io.StringIO()
+    runner = AppRunner(cfg)
+    terminal = TerminalApp(runner, output=out, error_output=out)
+    runner.start()
+    try:
+        terminal.execute_line("mount connect")
+        terminal.execute_line("wait mount.connected true 10")
+        out.truncate(0)
+        out.seek(0)
+        terminal.execute_line("tracking why")
+        text = out.getvalue()
+    finally:
+        terminal.close()
+        runner.stop()
+
+    assert "camara conectada" in text
+    assert "Falta conectar la camara" in text
+    assert not terminal.had_error
