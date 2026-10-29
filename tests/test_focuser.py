@@ -994,3 +994,43 @@ def test_axis_check_sizes_the_test_move_for_the_optics() -> None:
         shift = steps * deg_per_step * 3600.0 / arcsec_px
         assert shift < 1096, f"x{barlow}: {shift:.0f} px no deja solape"
         assert steps >= mod.MIN_TEST_STEPS, f"x{barlow}: {steps} pasos se los come el juego"
+
+
+def _poor_field(sigma_px: float) -> np.ndarray:
+    """Dos estrellas debiles y un pixel caliente, como el campo de esa noche."""
+    rng = np.random.default_rng(3)
+    h, w = 480, 640
+    img = rng.normal(100.0, 25.0, (h, w))
+    yy, xx = np.mgrid[:h, :w]
+    for x, y, flux in ((160, 120, 6.0e4), (400, 300, 4.0e4)):
+        img += flux / (2 * np.pi * sigma_px**2) * np.exp(-((xx - x) ** 2 + (yy - y) ** 2) / (2 * sigma_px**2))
+    # Fila par, columna impar: cae en el plano verde que mide la metrica.
+    img[200, 301] = 31856
+    return np.clip(img, 0, 65535).astype(np.uint16)
+
+
+def test_a_hot_pixel_does_not_flatten_the_focus_curve() -> None:
+    """La noche del 2026-10-28: un pixel a 31856 ADU dejaba la curva en +-1 %.
+
+    Sin reparar, este campo da una razon de 1.04 entre foco y desenfoque."""
+    assert focus_metric(_poor_field(1.2)) > 2.0 * focus_metric(_poor_field(3.5))
+
+
+def test_a_flat_curve_fails_and_returns_to_the_start(monkeypatch) -> None:
+    mount = _FakeFocusMount()
+    cfg = FocuserConfig(delay_us=100)
+    worker, published = _worker(mount, cfg)
+    # Lo que media esa noche: casi lo mismo en todas las posiciones.
+    monkeypatch.setattr("focuser.focus_metric", lambda img: 13000.0 + (mount.position % 7))
+    start = worker.position
+
+    _run(
+        worker,
+        kind="autofocus",
+        params={"coarse_step": 300, "coarse_points": 5, "fine_step": 60, "fine_points": 3, "settle_s": 0.0, "frames": 1},
+    )
+
+    last = [p["focuser"] for p in published if "focuser" in p][-1]
+    assert last["autofocus"] == "failed"
+    assert "plana" in str(last["last_error"])
+    assert worker.position == start

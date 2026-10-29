@@ -418,7 +418,7 @@ def estimate_shift_from_phase_alignment(
         window = cv2.createHanningWindow((int(w), int(h)), cv2.CV_32F)
         (dx, dy), resp = cv2.phaseCorrelate(ref_f, cur_f, window)
     except Exception as exc:
-        log_error(None, "Tracking: phase correlation failed", exc, throttle_s=2.0, throttle_key="tracking_phase_corr")
+        log_error(None, "Tracking: falló la correlación de fase", exc, throttle_s=2.0, throttle_key="tracking_phase_corr")
         return 0.0, 0.0, 0.0
 
     if not np.isfinite(dx) or not np.isfinite(dy) or not np.isfinite(resp):
@@ -741,7 +741,7 @@ def auto_reset(state: TrackingState, *, src: str = "none", theta: Optional[np.nd
     try:
         a.condA = float(np.linalg.cond(a.A))
     except Exception as exc:
-        log_error(None, "Tracking: failed to compute condition number", exc, throttle_s=10.0, throttle_key="tracking_cond")
+        log_error(None, "Tracking: no se pudo calcular el número de condición", exc, throttle_s=10.0, throttle_key="tracking_cond")
         a.condA = 1e9
     a.last_upd_t = None
 
@@ -770,7 +770,7 @@ def _auto_recompute_pinv(state: TrackingState) -> None:
     try:
         cond = float(np.linalg.cond(a.A))
     except Exception as exc:
-        log_error(None, "Tracking: failed to compute condition number (auto)", exc, throttle_s=10.0, throttle_key="tracking_cond_auto")
+        log_error(None, "Tracking: no se pudo calcular el número de condición (autocalibración)", exc, throttle_s=10.0, throttle_key="tracking_cond_auto")
         cond = 1e9
     a.condA = cond
 
@@ -781,7 +781,7 @@ def _auto_recompute_pinv(state: TrackingState) -> None:
         a.A_pinv = compute_A_pinv_dls(a.A, lam_eff)
         a.ok = True
     except Exception as exc:
-        log_error(None, "Tracking: failed to compute A_pinv (auto)", exc, throttle_s=10.0, throttle_key="tracking_pinv_auto")
+        log_error(None, "Tracking: no se pudo calcular la pseudoinversa de A (autocalibración)", exc, throttle_s=10.0, throttle_key="tracking_pinv_auto")
         a.A_pinv = None
         a.ok = False
 
@@ -1043,9 +1043,9 @@ def tracking_set_params(state: TrackingState, **kwargs: Any) -> None:
             elif k in ("source_profile_disagree_px", "rate_source_profile_disagree_px"):
                 cfg.rate.source_profile_disagree_px = float(v)
             else:
-                log_error(None, f"Tracking: unknown param {k}", ValueError(f"unknown param {k}"), throttle_s=5.0, throttle_key=f"tracking_param_unknown_{k}")
+                log_error(None, f"Tracking: parámetro desconocido {k}", ValueError(f"unknown param {k}"), throttle_s=5.0, throttle_key=f"tracking_param_unknown_{k}")
         except Exception as exc:
-            log_error(None, f"Tracking: failed to apply param {k}", exc, throttle_s=5.0, throttle_key=f"tracking_param_{k}")
+            log_error(None, f"Tracking: no se pudo aplicar el parámetro {k}", exc, throttle_s=5.0, throttle_key=f"tracking_param_{k}")
             continue
 
 

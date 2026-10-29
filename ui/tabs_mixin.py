@@ -230,11 +230,11 @@ class ObserverTabMixin:
         self.cfg.platesolving.rotation_prior_roll_offset_deg = roll_offset_deg
 
         self._log(
-            "[observer] apply "
-            f"site={self.dd_obs_site.currentText()} lat={site['lat_deg']:.4f} lon={site['lon_deg']:.4f} "
-            f"alt={site['height_m']:.0f}m focal={base_focal_mm:.1f}mm barlow=x{barlow_factor} "
-            f"effective={effective_focal_mm:.1f}mm pixel={pixel_um:.1f}um "
-            f"rot_prior={int(rotation_prior_enable)} tol={rotation_prior_tol_deg:.1f}deg roll={roll_offset_deg:+.2f}deg"
+            "[observer] aplicar "
+            f"sitio={self.dd_obs_site.currentText()} lat={site['lat_deg']:.4f}° lon={site['lon_deg']:.4f}° "
+            f"altura={site['height_m']:.0f}m focal={base_focal_mm:.1f}mm barlow=x{barlow_factor} "
+            f"focal_efectiva={effective_focal_mm:.1f}mm píxel={pixel_um:.1f}µm "
+            f"prior_giro={int(rotation_prior_enable)} tolerancia={rotation_prior_tol_deg:.1f}° giro={roll_offset_deg:+.2f}°"
         )
 
 

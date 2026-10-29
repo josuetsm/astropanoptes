@@ -75,7 +75,7 @@ from platesolving import (
     _build_platesolving_debug_info,
     _render_platesolving_debug_jpeg,
 )
-from logging_utils import log_error, log_info
+from logging_utils import log_debug, log_error, log_info
 from mount_arduino import estimate_firmware_move_duration_s
 from workers import BaseWorker
 from imaging import ensure_raw16_bayer, estimate_sensor_drift_from_stack
@@ -264,7 +264,7 @@ def _append_csv_log_row(filename: str, fieldnames: Sequence[str], row: Dict[str,
                 writer.writerow(dict(row))
     except Exception as exc:
         key = f"goto_csv_log_{str(filename).replace('.', '_')}"
-        log_error(None, f"GoTo: failed to append CSV log ({filename})", exc, throttle_s=5.0, throttle_key=key)
+        log_error(None, f"GoTo: no se pudo añadir la fila al log CSV ({filename})", exc, throttle_s=5.0, throttle_key=key)
 
 
 # ============================================================
@@ -618,20 +618,20 @@ def _drift_to_az_alt(
     C = math.cos(phi)
     S = math.sin(phi)
     if abs(C) < 1e-12:
-        log_error(None, "GoTo: drift_to_az_alt degenerate (cos(phi) ~ 0)")
+        log_error(None, "GoTo: deriva a az/alt degenerada (cos(latitud) ~ 0)")
         return []
 
     omega = float(omega_arcsec_s)
     scale = float(scale_arcsec_per_px)
     if omega <= 0.0 or scale <= 0.0:
-        log_error(None, "GoTo: drift_to_az_alt invalid omega/scale")
+        log_error(None, "GoTo: deriva a az/alt con omega o escala inválidas")
         return []
 
     u = (float(vy) * scale) / (omega * C)
     q = (float(vx) * scale) / omega
 
     if abs(u) > 1.0 + 1e-9:
-        log_error(None, "GoTo: drift_to_az_alt no physical solution (|sin(az)| > 1)")
+        log_error(None, "GoTo: deriva a az/alt sin solución física (|sin(az)| > 1)")
         return []
     u = float(max(-1.0, min(1.0, u)))
 
@@ -664,7 +664,7 @@ def _drift_to_az_alt(
                 sols.append((az_deg, alt_deg))
 
     if not sols:
-        log_error(None, "GoTo: drift_to_az_alt no physical solution")
+        log_error(None, "GoTo: deriva a az/alt sin solución física")
         return []
 
     def _circ_dist_deg(a: float, b: float) -> float:
@@ -781,13 +781,13 @@ def _drift_to_az_alt_refracted(
     C = math.cos(phi)
     S = math.sin(phi)
     if abs(C) < 1e-12:
-        log_error(None, "GoTo: drift_to_az_alt_refracted degenerate (cos(phi) ~ 0)")
+        log_error(None, "GoTo: deriva a az/alt con refracción degenerada (cos(latitud) ~ 0)")
         return []
 
     omega = float(omega_arcsec_s)
     scale = float(scale_arcsec_per_px)
     if omega <= 0.0 or scale <= 0.0:
-        log_error(None, "GoTo: drift_to_az_alt_refracted invalid omega/scale")
+        log_error(None, "GoTo: deriva a az/alt con refracción: omega o escala inválidas")
         return []
 
     def _wrap360(a_deg: float) -> float:
@@ -889,7 +889,7 @@ def _drift_to_az_alt_refracted(
         sort_by_forward_err=False,
     )
     if not base:
-        log_error(None, "GoTo: drift_to_az_alt_refracted no base solutions")
+        log_error(None, "GoTo: deriva a az/alt con refracción sin soluciones base")
         return []
 
     seeds_true: List[Tuple[float, float]] = []
@@ -912,7 +912,7 @@ def _drift_to_az_alt_refracted(
             sols.append((_wrap360(az_deg), float(alt_app_deg)))
 
     if not sols:
-        log_error(None, "GoTo: drift_to_az_alt_refracted no solutions after refinement")
+        log_error(None, "GoTo: deriva a az/alt con refracción sin soluciones tras refinar")
         return []
 
     uniq: List[Tuple[float, float]] = []
@@ -2343,7 +2343,7 @@ class GoToModel:
                 obstime=t0 + dt * u.s,
             )
         except Exception as exc:
-            log_error(None, "GoTo: sidereal world-rate prediction failed", exc, throttle_s=5.0, throttle_key="goto_sidereal_world_rate")
+            log_error(None, "GoTo: falló la predicción de la velocidad sideral", exc, throttle_s=5.0, throttle_key="goto_sidereal_world_rate")
             return None
 
         daz = _wrap_deg_180(float(altaz_1[0]) - az0)
@@ -2405,12 +2405,12 @@ class GoToModel:
                     steps_from=self.ref_steps,
                 )
             except np.linalg.LinAlgError as exc:
-                log_error(None, "GoTo: failed to reconcile steps from plate-solve", exc, throttle_s=5.0, throttle_key="goto_steps_reconcile")
+                log_error(None, "GoTo: no se pudieron reconciliar los pasos con el plate solve", exc, throttle_s=5.0, throttle_key="goto_steps_reconcile")
                 dsteps = None
 
             if dsteps is not None:
                 if not np.all(np.isfinite(dsteps)):
-                    log_error(None, "GoTo: non-finite steps from plate-solve reconciliation", None, throttle_s=5.0, throttle_key="goto_steps_reconcile_nan")
+                    log_error(None, "GoTo: la reconciliación de pasos con el plate solve dio valores no finitos", None, throttle_s=5.0, throttle_key="goto_steps_reconcile_nan")
                 else:
                     self.steps_est = self.ref_steps + dsteps
                     updated_steps = True
@@ -3624,7 +3624,7 @@ class GoToModel:
         if n_out > 0:
             log_info(
                 None,
-                f"GoTo: manual fit rejected outliers={n_out}/{n}",
+                f"GoTo: el ajuste manual descartó {n_out} de {n} muestras atípicas",
                 throttle_s=0.2,
                 throttle_key="goto_fit_manual_outliers",
             )
@@ -4060,13 +4060,13 @@ class GoToController:
                 except Exception as exc:
                     log_info(
                         None,
-                        f"GoTo: failed to apply platesolving radius override ({rad}); using default",
+                        f"GoTo: no se pudo aplicar el radio de plate solve ({rad}); se usa el de por defecto",
                         throttle_s=5.0,
                         throttle_key="goto_radius_fallback",
                     )
                     log_error(
                         None,
-                        "GoTo: platesolving config override failed",
+                        "GoTo: falló la configuración propia del plate solve",
                         exc,
                         throttle_s=5.0,
                         throttle_key="goto_radius_fallback_exc",
@@ -4142,7 +4142,7 @@ class GoToController:
                 tracking_pause(True)
                 was_tracking = True
             except Exception as exc:
-                log_error(None, "GoTo: failed to pause tracking", exc)
+                log_error(None, "GoTo: no se pudo pausar el tracking", exc)
 
         try:
             if obstime is None:
@@ -4155,7 +4155,7 @@ class GoToController:
                     obstime=obstime,
                 )
             except Exception as exc:
-                log_error(None, f"GoTo: failed to resolve target {target!r}", exc)
+                log_error(None, f"GoTo: no se pudo resolver el objetivo {target!r}", exc)
                 st.status = "ERR_TARGET_RESOLVE"
                 if diagnostics is not None:
                     diagnostics.record("goto_rejected", reason=st.status, error=repr(exc))
@@ -4223,7 +4223,7 @@ class GoToController:
             if not self.model.is_J_within_mechanical_limits(J_motion):
                 log_error(
                     None,
-                    "GoTo: refusing MOVE with model outside mechanical limits",
+                    "GoTo: MOVE rechazado: el modelo está fuera de los límites mecánicos",
                     None,
                     throttle_s=5.0,
                     throttle_key="goto_unsafe_model",
@@ -4243,7 +4243,7 @@ class GoToController:
             except np.linalg.LinAlgError as exc:
                 log_error(
                     None,
-                    "GoTo: singular J matrix during solve",
+                    "GoTo: matriz J singular al resolver",
                     exc,
                     throttle_s=5.0,
                     throttle_key="goto_invJ",
@@ -4400,11 +4400,11 @@ class GoToController:
             st.iters = 1
             log_info(
                 None,
-                "GoTo: model move "
-                f"dist={float(math.hypot(daz, dalt)):.3f}deg "
+                "GoTo: movimiento por modelo "
+                f"distancia={float(math.hypot(daz, dalt)):.3f}° "
                 f"dsteps=[{int(round(float(dsteps[0]))):+d},{int(round(float(dsteps[1]))):+d}] "
-                f"delay_us=[AZ={int(delay_us_az)},ALT={int(delay_us_alt)}] "
-                f"eta={float((arrival_time - command_time).to_value(u.s)):.2f}s",
+                f"retardo_us=[az={int(delay_us_az)},alt={int(delay_us_alt)}] "
+                f"llegada_en={float((arrival_time - command_time).to_value(u.s)):.2f}s",
                 throttle_s=0.02,
                 throttle_key="goto_model_move",
             )
@@ -4465,12 +4465,12 @@ class GoToController:
                 try:
                     tracking_pause(False)
                 except Exception as exc:
-                    log_error(None, "GoTo: failed to resume tracking", exc)
+                    log_error(None, "GoTo: no se pudo reanudar el tracking", exc)
                 if tracking_keyframe_reset is not None:
                     try:
                         tracking_keyframe_reset()
                     except Exception as exc:
-                        log_error(None, "GoTo: failed to reset tracking keyframe", exc)
+                        log_error(None, "GoTo: no se pudo reiniciar el cuadro de referencia del tracking", exc)
 
     def _exec_steps(self, move_steps: MoveStepsFn, axis: Axis, signed_steps: float, *, delay_us: int) -> None:
         s = int(round(float(signed_steps)))
@@ -4521,7 +4521,7 @@ class GoToController:
             try:
                 stop()
             except Exception as exc:
-                log_error(None, "GoTo: stop failed before parallel move", exc)
+                log_error(None, "GoTo: falló la parada antes del movimiento en paralelo", exc)
 
         if s_az != 0:
             dir_az = +1 if s_az >= 0 else -1
@@ -4638,12 +4638,12 @@ class GoToController:
 
         az_rate = _clamp(float(s_az) / duration_s, -max_rate_az, +max_rate_az)
         alt_rate = _clamp(float(s_alt) / duration_s, -max_rate_alt, +max_rate_alt)
-        log_info(
+        log_debug(
             None,
-            "GoTo: rate move "
+            "GoTo: movimiento por velocidad "
             f"dsteps=[{s_az:+d},{s_alt:+d}] "
-            f"rates=[{az_rate:+.2f},{alt_rate:+.2f}] steps/s "
-            f"dur={duration_s:.3f}s",
+            f"velocidades=[{az_rate:+.2f},{alt_rate:+.2f}] pasos/s "
+            f"duración={duration_s:.3f}s",
             throttle_s=0.02,
             throttle_key="goto_rate_move",
         )
@@ -4652,7 +4652,7 @@ class GoToController:
             try:
                 stop()
             except Exception as exc:
-                log_error(None, "GoTo: stop failed before rate move", exc)
+                log_error(None, "GoTo: falló la parada antes del movimiento por velocidad", exc)
 
         t0 = time.perf_counter()
         try:
@@ -4667,12 +4667,12 @@ class GoToController:
             try:
                 rate_mount(0.0, 0.0)
             except Exception as exc:
-                log_error(None, "GoTo: failed to stop rate move", exc)
+                log_error(None, "GoTo: no se pudo parar el movimiento por velocidad", exc)
             if stop is not None:
                 try:
                     stop()
                 except Exception as exc:
-                    log_error(None, "GoTo: stop failed after rate move", exc)
+                    log_error(None, "GoTo: falló la parada tras el movimiento por velocidad", exc)
 
     # -------------------------
     # Calibration (blocking)
@@ -4920,17 +4920,17 @@ class GoToWorker(BaseWorker):
             star_count = max(star_count, int(platesolving_cfg.max_det) + 1)
             log_info(
                 self._out_log,
-                "GoTo: AutoCal crowded detection frame "
-                f"active_pixels={100.0 * active_fraction:.1f}% -> reducing exposure/gain",
+                "GoTo: autocal, cuadro saturado de detecciones "
+                f"píxeles_activos={100.0 * active_fraction:.1f}%; se baja exposición o ganancia",
                 throttle_s=2.0,
                 throttle_key="goto_autocal_crowded_detection",
             )
         elif np.isfinite(active_fraction) and active_fraction > crowded_limit:
             log_info(
                 self._out_log,
-                "GoTo: AutoCal quantized/noisy background "
-                f"active_pixels={100.0 * active_fraction:.1f}% "
-                f"sources={star_count}/{max_sources}; preserving exposure/gain",
+                "GoTo: autocal, fondo cuantizado o ruidoso "
+                f"píxeles_activos={100.0 * active_fraction:.1f}% "
+                f"fuentes={star_count}/{max_sources}; se conservan exposición y ganancia",
                 throttle_s=2.0,
                 throttle_key="goto_autocal_quantized_background",
             )
@@ -5002,7 +5002,7 @@ class GoToWorker(BaseWorker):
                 except Exception as exc:
                     log_error(
                         self._out_log,
-                        "GoTo: failed to maintain autocal axis rate",
+                        "GoTo: no se pudo mantener la velocidad de eje del autocal",
                         exc,
                         throttle_s=2.0,
                         throttle_key="goto_autocal_rate_hold",
@@ -5030,7 +5030,7 @@ class GoToWorker(BaseWorker):
             except Exception as exc:
                 log_error(
                     self._out_log,
-                    "GoTo: AutoCal frame detection failed; waiting for a new frame",
+                    "GoTo: autocal, falló la detección en el cuadro; esperando uno nuevo",
                     exc,
                     throttle_s=2.0,
                     throttle_key="goto_autocal_frame_detection",
@@ -5168,7 +5168,7 @@ class GoToWorker(BaseWorker):
         if n <= int(window):
             log_error(
                 self._out_log,
-                f"GoTo: AutoCal drift stack needs > window frames (n={n} window={int(window)})",
+                f"GoTo: autocal, la deriva por apilado necesita más cuadros que la ventana (n={n}, ventana={int(window)})",
             )
             return None
 
@@ -5185,13 +5185,13 @@ class GoToWorker(BaseWorker):
             if not np.isfinite(dt_med) or dt_med <= 0.0:
                 dt_med = None
         if dt_med is None:
-            log_error(self._out_log, "GoTo: AutoCal drift stack missing valid frame capture timestamps")
+            log_error(self._out_log, "GoTo: autocal, a la deriva por apilado le faltan marcas de tiempo de captura válidas")
             return None
 
         try:
             stack = np.stack([fr.raw16 for fr in frames], axis=0)
         except Exception as exc:
-            log_error(self._out_log, "GoTo: AutoCal drift stack build failed", exc)
+            log_error(self._out_log, "GoTo: autocal, no se pudo construir el apilado para la deriva", exc)
             return None
 
         try:
@@ -5209,21 +5209,21 @@ class GoToWorker(BaseWorker):
                 return_per_window=False,
             )
         except Exception as exc:
-            log_error(self._out_log, "GoTo: AutoCal drift stack failed", exc)
+            log_error(self._out_log, "GoTo: autocal, falló la deriva por apilado", exc)
             return None
 
         vx = float(out.get("vx_mean", 0.0))
         vy = float(out.get("vy_mean", 0.0))
         if not np.isfinite(vx) or not np.isfinite(vy):
-            log_error(self._out_log, "GoTo: AutoCal drift stack produced non-finite velocity")
+            log_error(self._out_log, "GoTo: autocal, la deriva por apilado dio una velocidad no finita")
             return None
 
         # estimator uses +y down; autocal uses +y up
         v = np.array([vx, -vy], dtype=np.float64)
 
-        log_info(
+        log_debug(
             self._out_log,
-            "GoTo: AutoCal drift stack "
+            "GoTo: autocal, deriva por apilado "
             f"v=[{float(v[0]):.3f},{float(v[1]):.3f}] "
             f"dt_med={float(dt_med or 0.0):.3f}s dt_span={float(t[-1] - t[0]):.3f}s "
             f"window={int(window)} n={n} "
@@ -5257,7 +5257,7 @@ class GoToWorker(BaseWorker):
         if len(frames) < int(min_frames):
             log_error(
                 self._out_log,
-                f"GoTo: AutoCal drift line sweep needs >= {int(min_frames)} frames, got {len(frames)}",
+                f"GoTo: autocal, el barrido de línea de deriva necesita {int(min_frames)} cuadros; hay {len(frames)}",
             )
             return None
 
@@ -5277,14 +5277,14 @@ class GoToWorker(BaseWorker):
         if len(per_frame) < int(min_frames):
             log_error(
                 self._out_log,
-                f"GoTo: AutoCal drift line sweep insufficient usable frames "
-                f"usable={len(per_frame)} min={int(min_frames)}",
+                f"GoTo: autocal, cuadros utilizables insuficientes para el barrido de línea "
+                f"utilizables={len(per_frame)} mínimo={int(min_frames)}",
             )
             return None
 
         t = np.asarray(t_list, dtype=np.float64)
         if t.size < 2:
-            log_error(self._out_log, "GoTo: AutoCal drift line sweep needs >=2 timestamps")
+            log_error(self._out_log, "GoTo: autocal, el barrido de línea de deriva necesita al menos 2 marcas de tiempo")
             return None
         order = np.argsort(t)
         t = t[order]
@@ -5302,8 +5302,8 @@ class GoToWorker(BaseWorker):
         if not np.isfinite(duration_s) or duration_s < float(min_duration_s):
             log_error(
                 self._out_log,
-                "GoTo: AutoCal drift line sweep duration too short "
-                f"dt={duration_s:.3f}s min={float(min_duration_s):.3f}s",
+                "GoTo: autocal, barrido de línea de deriva demasiado corto "
+                f"dt={duration_s:.3f}s mínimo={float(min_duration_s):.3f}s",
             )
             return None
 
@@ -5320,14 +5320,14 @@ class GoToWorker(BaseWorker):
         except Exception as exc:
             log_error(
                 self._out_log,
-                "GoTo: AutoCal drift line sweep failed",
+                "GoTo: autocal, falló el barrido de línea de deriva",
                 exc,
             )
             return None
 
         u = best.get("u", None)
         if u is None:
-            log_error(self._out_log, "GoTo: AutoCal drift line sweep missing direction vector")
+            log_error(self._out_log, "GoTo: autocal, el barrido de línea de deriva no tiene vector de dirección")
             return None
         u = np.asarray(u, dtype=np.float64).reshape(2,)
 
@@ -5368,11 +5368,11 @@ class GoToWorker(BaseWorker):
             if np.all(np.isfinite(v)):
                 log_info(
                     self._out_log,
-                    "GoTo: AutoCal drift line sweep "
-                    f"deg={float(best.get('deg', 0.0)):.2f} score={float(best.get('score', 0.0)):.3f} "
+                    "GoTo: autocal, barrido de línea de deriva "
+                    f"ángulo={float(best.get('deg', 0.0)):.2f}° score={float(best.get('score', 0.0)):.3f} "
                     f"v=[{float(v[0]):.3f},{float(v[1]):.3f}] "
-                    f"dt_med={float(dt_med or 0.0):.3f}s pairs={len(vels)}/{total_pairs} "
-                    f"frames={len(per_frame)} pts={xy_all.shape[0]}",
+                    f"dt_med={float(dt_med or 0.0):.3f}s pares={len(vels)}/{total_pairs} "
+                    f"cuadros={len(per_frame)} puntos={xy_all.shape[0]}",
                 )
                 self._diagnostics_record(
                     "drift_estimate_line_sweep",
@@ -5389,7 +5389,7 @@ class GoToWorker(BaseWorker):
         t_rel = t - t[0]
         t_f = np.array([np.median(p @ u) for p in per_frame], dtype=np.float64)
         if not np.all(np.isfinite(t_f)):
-            log_error(self._out_log, "GoTo: AutoCal drift line sweep invalid projection values")
+            log_error(self._out_log, "GoTo: autocal, proyección inválida en el barrido de línea de deriva")
             return None
 
         if bool(use_theil_sen):
@@ -5401,15 +5401,15 @@ class GoToWorker(BaseWorker):
         v_img = float(slope) * u
         v = np.array([float(v_img[0]), -float(v_img[1])], dtype=np.float64)  # to +y up
         if not np.all(np.isfinite(v)):
-            log_error(self._out_log, "GoTo: AutoCal drift line sweep produced non-finite velocity")
+            log_error(self._out_log, "GoTo: autocal, el barrido de línea de deriva dio una velocidad no finita")
             return None
 
-        log_info(
+        log_debug(
             self._out_log,
-            "GoTo: AutoCal drift line sweep (proj) "
-            f"deg={float(best.get('deg', 0.0)):.2f} score={float(best.get('score', 0.0)):.3f} "
-            f"slope={float(slope):.6f} v=[{float(v[0]):.3f},{float(v[1]):.3f}] "
-            f"frames={len(per_frame)} pts={xy_all.shape[0]}",
+            "GoTo: autocal, barrido de línea de deriva (proyección) "
+            f"ángulo={float(best.get('deg', 0.0)):.2f}° score={float(best.get('score', 0.0)):.3f} "
+            f"pendiente={float(slope):.6f} v=[{float(v[0]):.3f},{float(v[1]):.3f}] "
+            f"cuadros={len(per_frame)} puntos={xy_all.shape[0]}",
         )
         self._diagnostics_record(
             "drift_estimate_line_sweep",
@@ -5432,21 +5432,21 @@ class GoToWorker(BaseWorker):
         st = self._get_state()
         if not bool(st.camera.connected):
             out["status"] = "ERR_NO_CAMERA"
-            log_error(self._out_log, "GoTo: Roll estimate failed (no camera)")
+            log_error(self._out_log, "GoTo: estimación de giro fallida: no hay cámara")
             return out
         if not bool(st.mount.connected):
             out["status"] = "ERR_NO_MOUNT"
-            log_error(self._out_log, "GoTo: Roll estimate failed (no mount)")
+            log_error(self._out_log, "GoTo: estimación de giro fallida: no hay montura")
             return out
         if self._rate_mount is None:
             out["status"] = "ERR_NO_RATE"
-            log_error(self._out_log, "GoTo: Roll estimate failed (rate unavailable)")
+            log_error(self._out_log, "GoTo: estimación de giro fallida: no hay control de velocidad")
             return out
 
         try:
             self._command_mount_rate(0.0, 0.0)
         except Exception as exc:
-            log_error(self._out_log, "GoTo: Roll estimate failed to stop mount", exc)
+            log_error(self._out_log, "GoTo: estimación de giro: no se pudo parar la montura", exc)
 
         mount_cfg = self._get_mount_cfg()
 
@@ -5497,7 +5497,7 @@ class GoToWorker(BaseWorker):
                 roll_stack_profile_q = None
         if roll_rate_steps_s <= 0.0:
             out["status"] = "ERR_BAD_RATE"
-            log_error(self._out_log, "GoTo: Roll estimate failed (rate <= 0)")
+            log_error(self._out_log, "GoTo: estimación de giro fallida: velocidad <= 0")
             return out
         if np.isfinite(roll_rate_max_steps_s) and roll_rate_max_steps_s > 0.0:
             roll_rate_steps_s = min(float(roll_rate_steps_s), float(roll_rate_max_steps_s))
@@ -5513,13 +5513,13 @@ class GoToWorker(BaseWorker):
             roll_timeout_slow_scale_max = 1.0
         if not np.isfinite(roll_max_speed_px_s) or roll_max_speed_px_s <= 0.0:
             out["status"] = "ERR_BAD_SPEED_LIMIT"
-            log_error(self._out_log, "GoTo: Roll estimate failed (invalid roll_max_speed_px_s)")
+            log_error(self._out_log, "GoTo: estimación de giro fallida: roll_max_speed_px_s inválido")
             return out
         if (not np.isfinite(roll_max_axis_jump_deg)) or roll_max_axis_jump_deg <= 0.0:
             roll_guard_prev_axis = False
         if (not roll_use_stack) and (not roll_use_line):
             out["status"] = "ERR_ROLL_METHOD"
-            log_error(self._out_log, "GoTo: Roll estimate failed (all methods disabled)")
+            log_error(self._out_log, "GoTo: estimación de giro fallida: todos los métodos desactivados")
             return out
 
         def _capture_timeout_for_rate(rate_steps_s: float) -> float:
@@ -5566,20 +5566,20 @@ class GoToWorker(BaseWorker):
                     speed = float(np.hypot(v[0], v[1]))
                     rel_std = float(max(vx_std, vy_std) / max(speed, 1e-6))
                     if not np.all(np.isfinite(v)):
-                        log_error(self._out_log, f"GoTo: Roll {label} stack drift non-finite")
+                        log_error(self._out_log, f"GoTo: giro, deriva por apilado {label} no finita")
                         v = None
                     elif rel_std > float(roll_max_rel_std):
-                        log_error(
+                        log_debug(
                             self._out_log,
-                            "GoTo: Roll stack drift unstable "
-                            f"label={label} rel_std={rel_std:.3f} "
-                            f"vx_std={vx_std:.3f} vy_std={vy_std:.3f} speed={speed:.3f}",
+                            "GoTo: giro, deriva por apilado inestable "
+                            f"etiqueta={label} rel_std={rel_std:.3f} "
+                            f"vx_std={vx_std:.3f} vy_std={vy_std:.3f} velocidad={speed:.3f}",
                         )
                         v = None
                     else:
                         source = "stack"
                 except Exception as exc:
-                    log_error(self._out_log, f"GoTo: Roll {label} stack drift failed", exc)
+                    log_error(self._out_log, f"GoTo: giro, falló la deriva por apilado {label}", exc)
                     v = None
             if v is None and roll_use_line:
                 v = self._autocal_estimate_drift_line_sweep(
@@ -5600,18 +5600,18 @@ class GoToWorker(BaseWorker):
             if v is not None:
                 speed = float(np.hypot(float(v[0]), float(v[1])))
                 if speed > float(roll_max_speed_px_s):
-                    log_error(
+                    log_debug(
                         self._out_log,
-                        "GoTo: Roll drift speed too high "
-                        f"label={label} source={source} speed={speed:.3f} "
-                        f"limit={float(roll_max_speed_px_s):.3f}",
+                        "GoTo: deriva de giro demasiado rápida "
+                        f"etiqueta={label} fuente={source} velocidad={speed:.3f} "
+                        f"límite={float(roll_max_speed_px_s):.3f}",
                     )
                     v = None
             return v
 
-        log_info(
+        log_debug(
             self._out_log,
-            "GoTo: Roll estimate config "
+            "GoTo: configuración de la estimación de giro "
             f"frames={roll_frames} window={roll_window} "
             f"rate_steps_s={roll_rate_steps_s:.1f} ramp_s={roll_ramp_s:.2f} "
             f"use_stack={int(roll_use_stack)} use_line={int(roll_use_line)} "
@@ -5631,23 +5631,23 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_DRIFT0_FRAMES"
             log_error(
                 self._out_log,
-                f"GoTo: Roll estimate insufficient baseline frames ({len(frames0)}/{roll_frames})",
+                f"GoTo: estimación de giro con cuadros de referencia insuficientes ({len(frames0)}/{roll_frames})",
             )
             return out
 
         v0 = _estimate_drift(frames0, "baseline")
         if v0 is None:
             out["status"] = "ERR_DRIFT0"
-            log_error(self._out_log, "GoTo: Roll estimate failed (baseline drift)")
+            log_error(self._out_log, "GoTo: estimación de giro fallida: deriva de referencia")
             return out
 
         slew_sign = 1.0
         if roll_follow_vx and abs(float(v0[0])) > 1e-6:
             slew_sign = 1.0 if float(v0[0]) >= 0.0 else -1.0
-        log_info(
+        log_debug(
             self._out_log,
-            "GoTo: Roll slew direction "
-            f"v0x={float(v0[0]):+.3f} sign={int(slew_sign):+d}",
+            "GoTo: sentido del barrido para el giro "
+            f"v0x={float(v0[0]):+.3f} signo={int(slew_sign):+d}",
         )
 
         v1: Optional[np.ndarray] = None
@@ -5658,11 +5658,11 @@ class GoToWorker(BaseWorker):
         for attempt_idx in range(int(roll_rate_attempts)):
             rate_signed = float(slew_sign * rate_try)
             attempt_timeout_s = _capture_timeout_for_rate(rate_try)
-            log_info(
+            log_debug(
                 self._out_log,
-                "GoTo: Roll slew attempt "
-                f"{attempt_idx + 1}/{int(roll_rate_attempts)} rate_steps_s={rate_signed:+.2f} "
-                f"capture_timeout_s={attempt_timeout_s:.2f}",
+                "GoTo: intento de barrido para el giro "
+                f"{attempt_idx + 1}/{int(roll_rate_attempts)} velocidad={rate_signed:+.2f} pasos/s "
+                f"timeout_captura={attempt_timeout_s:.2f}s",
             )
 
             frames_try: List[_AutocalFrame] = []
@@ -5702,9 +5702,9 @@ class GoToWorker(BaseWorker):
                     moved_steps = self._finish_rate_step_capture()
                     self._apply_rate_steps_to_model(moved_steps)
                     if np.any(np.abs(moved_steps) >= 0.5):
-                        log_info(
+                        log_debug(
                             self._out_log,
-                            "GoTo: Roll slew accounted model steps "
+                            "GoTo: barrido para el giro, pasos registrados en el modelo "
                             f"az={int(round(float(moved_steps[0]))):+d} "
                             f"alt={int(round(float(moved_steps[1]))):+d}",
                         )
@@ -5713,8 +5713,8 @@ class GoToWorker(BaseWorker):
             if len(frames_try) < max(2, int(roll_frames)):
                 log_error(
                     self._out_log,
-                    "GoTo: Roll slew attempt insufficient frames "
-                    f"attempt={attempt_idx + 1} frames={len(frames_try)}/{roll_frames}",
+                    "GoTo: intento de barrido para el giro con cuadros insuficientes "
+                    f"intento={attempt_idx + 1} cuadros={len(frames_try)}/{roll_frames}",
                 )
             else:
                 v_try = _estimate_drift(frames_try, f"slew#{attempt_idx + 1}")
@@ -5730,14 +5730,14 @@ class GoToWorker(BaseWorker):
                     if rate_try <= float(roll_rate_min_steps_s) + 1e-9:
                         log_error(
                             self._out_log,
-                            "GoTo: Roll slew retry aborted (already at min rate) "
-                            f"rate={rate_try:.2f} min={float(roll_rate_min_steps_s):.2f}",
+                            "GoTo: barrido para el giro, reintento abortado (ya en la velocidad mínima) "
+                            f"velocidad={rate_try:.2f} mínimo={float(roll_rate_min_steps_s):.2f}",
                         )
                         break
                     next_rate = float(roll_rate_min_steps_s)
                 log_info(
                     self._out_log,
-                    "GoTo: Roll slew retry with lower rate "
+                    "GoTo: barrido para el giro, reintento a menor velocidad "
                     f"{rate_try:.2f} -> {next_rate:.2f}",
                 )
                 rate_try = next_rate
@@ -5749,15 +5749,15 @@ class GoToWorker(BaseWorker):
                 out["status"] = "ERR_DRIFT1"
             log_error(
                 self._out_log,
-                "GoTo: Roll estimate failed (slew drift) "
-                f"attempts={int(roll_rate_attempts)}",
+                "GoTo: estimación de giro fallida: deriva durante el barrido "
+                f"intentos={int(roll_rate_attempts)}",
             )
             return out
 
         dv = np.array([float(v1[0]) - float(v0[0]), float(v1[1]) - float(v0[1])], dtype=np.float64)
         if not np.all(np.isfinite(dv)):
             out["status"] = "ERR_DRIFT_DELTA"
-            log_error(self._out_log, "GoTo: Roll estimate failed (non-finite delta)")
+            log_error(self._out_log, "GoTo: estimación de giro fallida: delta no finito")
             return out
 
         dv_mag = float(np.hypot(dv[0], dv[1]))
@@ -5766,7 +5766,7 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_DRIFT_DELTA_SMALL"
             log_error(
                 self._out_log,
-                f"GoTo: Roll estimate failed (delta too small: {dv_mag:.3f} < {min_dv:.3f})",
+                f"GoTo: estimación de giro fallida: delta demasiado pequeño ({dv_mag:.3f} < {min_dv:.3f})",
             )
             return out
 
@@ -5796,9 +5796,9 @@ class GoToWorker(BaseWorker):
                 out["roll_axis_jump_deg"] = axis_jump_deg
                 log_error(
                     self._out_log,
-                    "GoTo: Roll estimate rejected (axis jump too large) "
-                    f"jump={axis_jump_deg:.3f}deg max={float(roll_max_axis_jump_deg):.3f}deg "
-                    f"prev_ref={prev_roll_ref_deg:+.3f}deg roll_axis={roll_axis_deg:+.3f}deg",
+                    "GoTo: estimación de giro rechazada: salto de eje demasiado grande "
+                    f"salto={axis_jump_deg:.3f}° máximo={float(roll_max_axis_jump_deg):.3f}° "
+                    f"referencia_previa={prev_roll_ref_deg:+.3f}° eje={roll_axis_deg:+.3f}°",
                 )
                 return out
         out["ok"] = True
@@ -5822,12 +5822,12 @@ class GoToWorker(BaseWorker):
         )
         log_info(
             self._out_log,
-            "GoTo: Roll estimate OK "
+            "GoTo: giro estimado "
             f"slew_rate_cmd={used_slew_rate:+.2f} slew_rate_eff={slew_rate_for_roll:+.2f} invert_az={int(invert_az)} "
-            f"roll_raw={roll_raw_deg:+.3f}deg roll_branch={roll_branch_deg:+.3f}deg "
-            f"roll_prev={prev_roll_deg:+.3f}deg roll_ref={prev_roll_ref_deg:+.3f}deg "
-            f"roll={roll_deg:+.3f}deg roll_axis={roll_axis_deg:+.3f}deg "
-            f"axis_jump={axis_jump_deg:+.3f}deg guard={int(roll_guard_prev_axis)} "
+            f"roll_raw={roll_raw_deg:+.3f}° roll_branch={roll_branch_deg:+.3f}° "
+            f"roll_prev={prev_roll_deg:+.3f}° roll_ref={prev_roll_ref_deg:+.3f}° "
+            f"roll={roll_deg:+.3f}° roll_axis={roll_axis_deg:+.3f}° "
+            f"axis_jump={axis_jump_deg:+.3f}° guard={int(roll_guard_prev_axis)} "
             f"v0=[{float(v0[0]):.3f},{float(v0[1]):.3f}] "
             f"v1=[{float(v1[0]):.3f},{float(v1[1]):.3f}] "
             f"dv=[{float(dv[0]):.3f},{float(dv[1]):.3f}]",
@@ -5941,14 +5941,14 @@ class GoToWorker(BaseWorker):
             )
             log_info(
                 self._out_log,
-                "Platesolving: OK "
-                f"status={ps_reason} inliers={int(getattr(result, 'n_inliers', 0))} "
-                f"valid={int(metrics.get('validation_inliers', 0) or 0)} "
-                f"rms_px={float(getattr(result, 'rms_px', float('nan'))):.3f} "
-                f"scale={float(getattr(result, 'scale_arcsec_per_px', 0.0)):.4f}arcsec/px "
-                f"target_offset={float(metrics.get('target_offset_deg', float('nan'))):.4f}deg "
-                f"match_az={float(az_match):.4f}deg "
-                f"match_alt={float(alt_match):.4f}deg",
+                "Platesolving: resuelto "
+                f"estado={ps_reason} inliers={int(getattr(result, 'n_inliers', 0))} "
+                f"de_validación={int(metrics.get('validation_inliers', 0) or 0)} "
+                f"rms={float(getattr(result, 'rms_px', float('nan'))):.3f}px "
+                f"escala={float(getattr(result, 'scale_arcsec_per_px', 0.0)):.4f}arcsec/px "
+                f"distancia_al_objetivo={float(metrics.get('target_offset_deg', float('nan'))):.4f}° "
+                f"az={float(az_match):.4f}° "
+                f"alt={float(alt_match):.4f}°",
             )
             self._publish_state(
                 {
@@ -5962,11 +5962,11 @@ class GoToWorker(BaseWorker):
             metrics = dict(getattr(result, "metrics", {}) or {})
             log_info(
                 self._out_log,
-                f"Platesolving: ERR status={ps_reason} "
+                f"Platesolving: sin solución estado={ps_reason} "
                 f"inliers={int(getattr(result, 'n_inliers', 0))} "
-                f"valid={int(metrics.get('validation_inliers', 0) or 0)} "
-                f"rms_px={float(getattr(result, 'rms_px', float('nan'))):.3f} "
-                f"target_offset={float(metrics.get('target_offset_deg', float('nan'))):.4f}deg",
+                f"de_validación={int(metrics.get('validation_inliers', 0) or 0)} "
+                f"rms={float(getattr(result, 'rms_px', float('nan'))):.3f}px "
+                f"distancia_al_objetivo={float(metrics.get('target_offset_deg', float('nan'))):.4f}°",
             )
         return result
 
@@ -6088,20 +6088,20 @@ class GoToWorker(BaseWorker):
             cols.append(dp / steps)
 
         if not cols:
-            log_info(
+            log_debug(
                 self._out_log,
-                "GoTo: AutoCal J axis scan "
-                f"axis={axis.name} rate={float(rate_steps_s):.2f} "
-                f"frames={len(frames)} resp_low={resp_low} ok=0",
+                "GoTo: autocal, barrido de eje para J "
+                f"eje={axis.name.lower()} velocidad={float(rate_steps_s):.2f} "
+                f"cuadros={len(frames)} resp_low={resp_low} ok=0",
             )
             return _AutocalJResult(col=None, ok_count=0, resp_low=resp_low, missing_frames=0)
 
         col = np.median(np.stack(cols, axis=0), axis=0)
-        log_info(
+        log_debug(
             self._out_log,
-            "GoTo: AutoCal J axis scan "
-            f"axis={axis.name} rate={float(rate_steps_s):.2f} "
-            f"frames={len(frames)} resp_low={resp_low} ok={len(cols)}",
+            "GoTo: autocal, barrido de eje para J "
+            f"eje={axis.name.lower()} velocidad={float(rate_steps_s):.2f} "
+            f"cuadros={len(frames)} resp_low={resp_low} ok={len(cols)}",
         )
         return _AutocalJResult(col=col, ok_count=len(cols), resp_low=resp_low, missing_frames=0)
 
@@ -6140,7 +6140,7 @@ class GoToWorker(BaseWorker):
             except Exception as exc:
                 log_error(
                     self._out_log,
-                    f"GoTo: invalid autocal platesolving overrides ({ps_overrides})",
+                    f"GoTo: parámetros de plate solve del autocal inválidos ({ps_overrides})",
                     exc,
                 )
 
@@ -6260,9 +6260,9 @@ class GoToWorker(BaseWorker):
             except (TypeError, ValueError):
                 drift_stack_profile_q = None
 
-        log_info(
+        log_debug(
             self._out_log,
-            "GoTo: AutoCal config "
+            "GoTo: configuración del autocal "
             f"stars=[{target_star_min},{target_star_max}] sat_max={target_sat_max:.3f} "
             f"exp_ms=[{exp_min_ms:.1f},{exp_max_ms:.1f}] gain=[{gain_min},{gain_max}] "
             f"drift_frames={drift_frames} drift_dt_min={drift_dt_min:.2f} "
@@ -6289,8 +6289,8 @@ class GoToWorker(BaseWorker):
         if drift_stack_enable and drift_frames <= drift_stack_window:
             log_info(
                 self._out_log,
-                "GoTo: AutoCal drift stack will be skipped "
-                f"(drift_frames={drift_frames} window={drift_stack_window})",
+                "GoTo: autocal, se omite la deriva por apilado "
+                f"(drift_frames={drift_frames}, ventana={drift_stack_window})",
             )
 
         plate_scale_rad = float(platesolving_cfg.pixel_size_m) / float(platesolving_cfg.focal_m)
@@ -6341,17 +6341,17 @@ class GoToWorker(BaseWorker):
                     )
             if not tuned:
                 out["status"] = "ERR_EXPOSURE_TUNE"
-                log_info(self._out_log, "GoTo: AutoCal exposure tune failed")
+                log_info(self._out_log, "GoTo: autocal, falló el ajuste de exposición")
                 return out
         else:
             log_info(
                 self._out_log,
-                "GoTo: manual plate solve preserving operator exposure/gain",
+                "GoTo: plate solve manual, se conservan la exposición y la ganancia del operador",
             )
         cam_cfg = self._get_camera_cfg()
         log_info(
             self._out_log,
-            f"GoTo: AutoCal exposure {'tuned' if tune_exposure else 'preserved'} "
+            f"GoTo: autocal, exposición {'ajustada' if tune_exposure else 'conservada'} "
             f"exp_ms={float(getattr(cam_cfg, 'exp_ms', 0.0)):.2f} "
             f"gain={int(getattr(cam_cfg, 'gain', 0))}",
         )
@@ -6405,7 +6405,7 @@ class GoToWorker(BaseWorker):
                 out["status"] = "ERR_AUTOCAL_PS_TARGET"
                 log_error(
                     self._out_log,
-                    f"GoTo: AutoCal invalid target for mode={autocal_ps_mode}",
+                    f"GoTo: autocal, objetivo inválido para el modo {autocal_ps_mode}",
                 )
                 return out
 
@@ -6470,12 +6470,12 @@ class GoToWorker(BaseWorker):
                 if attempts == 0:
                     log_info(
                         self._out_log,
-                        "GoTo: AutoCal platesolve first target "
-                        f"mode={autocal_ps_mode} "
-                        f"az={float(target['az_deg']):.3f}deg "
-                        f"alt={float(target['alt_deg']):.3f}deg "
-                        f"radius={1.0:.3f}deg "
-                        f"jitter=({float(jitter[0]):.3f},{float(jitter[1]):.3f})",
+                        "GoTo: autocal, primer objetivo del plate solve "
+                        f"modo={autocal_ps_mode} "
+                        f"az={float(target['az_deg']):.3f}° "
+                        f"alt={float(target['alt_deg']):.3f}° "
+                        f"radio={1.0:.3f}° "
+                        f"perturbación=({float(jitter[0]):.3f},{float(jitter[1]):.3f})",
                     )
                 platesolving_result = self._autocal_run_platesolve(
                     fr.raw16,
@@ -6558,27 +6558,27 @@ class GoToWorker(BaseWorker):
             out["status"] = "ERR_DRIFT_FRAMES"
             log_info(
                 self._out_log,
-                f"GoTo: AutoCal drift capture insufficient frames ({len(drift_frames_list)})",
+                f"GoTo: autocal, cuadros de deriva insuficientes ({len(drift_frames_list)})",
             )
             return out
         star_counts = [fr.star_count for fr in drift_frames_list]
         sat_fracs = [fr.saturation_frac for fr in drift_frames_list]
         log_info(
             self._out_log,
-            "GoTo: AutoCal drift frames "
-            f"count={len(drift_frames_list)} "
-            f"stars=[{min(star_counts)},{int(np.median(star_counts))},{max(star_counts)}] "
-            f"sat=[{min(sat_fracs):.3f},{float(np.median(sat_fracs)):.3f},{max(sat_fracs):.3f}]",
+            "GoTo: autocal, cuadros de deriva "
+            f"n={len(drift_frames_list)} "
+            f"estrellas=[{min(star_counts)},{int(np.median(star_counts))},{max(star_counts)}] "
+            f"saturación=[{min(sat_fracs):.3f},{float(np.median(sat_fracs)):.3f},{max(sat_fracs):.3f}]",
         )
         if len(drift_frames_list) > 1:
             ref_t = self._autocal_frame_time_s(drift_frames_list[0])
             for idx, fr in enumerate(drift_frames_list):
                 fr_t = self._autocal_frame_time_s(fr)
                 dt = float(fr_t - ref_t)
-                log_info(
+                log_debug(
                     self._out_log,
-                    "GoTo: AutoCal drift frame sources "
-                    f"idx={idx} dt={dt:.3f}s stars={fr.star_count} "
+                    "GoTo: autocal, fuentes en el cuadro de deriva "
+                    f"idx={idx} dt={dt:.3f}s estrellas={fr.star_count} "
                     f"top3={self._format_autocal_sources(fr.top_sources)}",
                 )
         best_drift_frame = self._autocal_pick_best_frame(drift_frames_list)
@@ -6619,7 +6619,7 @@ class GoToWorker(BaseWorker):
             )
         if drift_pix is None:
             out["status"] = "ERR_DRIFT"
-            log_error(self._out_log, "GoTo: AutoCal drift estimate failed")
+            log_error(self._out_log, "GoTo: autocal, falló la estimación de la deriva")
             return out
         drift_pix_raw = np.asarray(drift_pix, dtype=np.float64)
         roll_deg = 0.0
@@ -6644,10 +6644,10 @@ class GoToWorker(BaseWorker):
 
         log_info(
             self._out_log,
-            "GoTo: AutoCal drift vectors "
-            f"raw=[{float(drift_pix_raw[0]):.3f},{float(drift_pix_raw[1]):.3f}] "
-            f"corr=[{float(drift_pix_corr[0]):.3f},{float(drift_pix_corr[1]):.3f}] "
-            f"roll_deg={float(roll_deg):+.3f} use_roll={int(use_roll_corr)}",
+            "GoTo: autocal, vectores de deriva "
+            f"crudo=[{float(drift_pix_raw[0]):.3f},{float(drift_pix_raw[1]):.3f}] "
+            f"corregido=[{float(drift_pix_corr[0]):.3f},{float(drift_pix_corr[1]):.3f}] "
+            f"giro={float(roll_deg):+.3f}° usa_giro={int(use_roll_corr)}",
         )
         self._diagnostics_record(
             "autocal_drift_vectors",
@@ -6733,7 +6733,7 @@ class GoToWorker(BaseWorker):
                 if trial_label == "raw" and use_roll_corr:
                     log_error(
                         self._out_log,
-                        "GoTo: AutoCal drift az/alt candidates none/failed with roll-corrected drift; retrying raw drift",
+                        "GoTo: autocal, sin candidatos az/alt con la deriva corregida por giro; se reintenta con la deriva cruda",
                     )
 
                 conv_label, trial_vec_eff, sols = _solve_drift_to_azalt_with_fallback(trial_vec)
@@ -6741,20 +6741,20 @@ class GoToWorker(BaseWorker):
                 if conv_label != "direct":
                     log_info(
                         self._out_log,
-                        "GoTo: AutoCal drift az/alt fallback convention "
-                        f"mode={mode_label} vec=[{float(trial_vec_eff[0]):.3f},{float(trial_vec_eff[1]):.3f}]",
+                        "GoTo: autocal, convención alternativa para deriva a az/alt "
+                        f"modo={mode_label} vec=[{float(trial_vec_eff[0]):.3f},{float(trial_vec_eff[1]):.3f}]",
                     )
                 if not sols:
                     log_error(
                         self._out_log,
-                        f"GoTo: AutoCal drift az/alt candidates: none (mode={mode_label})",
+                        f"GoTo: autocal, ningún candidato az/alt por deriva (modo {mode_label})",
                     )
                     continue
 
                 sol_txt = ", ".join(f"az={az_deg:.3f} alt={alt_deg:.3f}" for az_deg, alt_deg in sols)
                 log_info(
                     self._out_log,
-                    f"GoTo: AutoCal drift az/alt candidates (mode={mode_label}): {sol_txt}",
+                    f"GoTo: autocal, candidatos az/alt por deriva (modo {mode_label}): {sol_txt}",
                 )
 
                 candidates: List[Tuple[Tuple[float, float], Tuple[float, float]]] = []
@@ -6768,12 +6768,12 @@ class GoToWorker(BaseWorker):
                         target = (float(coord.ra.deg), float(coord.dec.deg))
                         candidates.append(((float(az_deg), float(alt_deg)), target))
                     except Exception as exc:
-                        log_info(self._out_log, f"GoTo: AutoCal drift target parse failed: {exc}")
+                        log_info(self._out_log, f"GoTo: autocal, falló la lectura del objetivo por deriva: {exc}")
 
                 if not candidates:
                     log_error(
                         self._out_log,
-                        f"GoTo: AutoCal drift target parse produced no candidates (mode={mode_label})",
+                        f"GoTo: autocal, el objetivo por deriva no dio candidatos (modo {mode_label})",
                     )
                     continue
 
@@ -6803,8 +6803,8 @@ class GoToWorker(BaseWorker):
                         return out
                     log_info(
                         self._out_log,
-                        "GoTo: AutoCal platesolve (drift) "
-                        f"mode={mode_label} cand={idx} az={azalt[0]:.3f} alt={azalt[1]:.3f}",
+                        "GoTo: autocal, plate solve por deriva "
+                        f"modo={mode_label} candidato={idx} az={azalt[0]:.3f}° alt={azalt[1]:.3f}°",
                     )
                     platesolving_result = self._autocal_run_platesolve(
                         best_drift_frame.raw16,
@@ -6835,7 +6835,7 @@ class GoToWorker(BaseWorker):
             if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
                 out["status"] = "ERR_PLATESOLVING"
                 out["platesolving_result"] = platesolving_result
-                log_info(self._out_log, "GoTo: AutoCal platesolving failed (horizontal drift)")
+                log_info(self._out_log, "GoTo: autocal, falló el plate solve (deriva horizontal)")
                 return out
 
         if not use_horizontal:
@@ -6988,9 +6988,9 @@ class GoToWorker(BaseWorker):
                 out["status"] = "ERR_POINTING_SOLVE"
                 log_error(
                     self._out_log,
-                    "GoTo: AutoCal JCal pointing solve rejected "
-                    f"status={pointing_report.get('status')} "
-                    f"resid={pointing_report.get('residual_rad_s')}",
+                    "GoTo: autocal, solución de apuntado JCal rechazada "
+                    f"estado={pointing_report.get('status')} "
+                    f"residuo={pointing_report.get('residual_rad_s')}",
                 )
                 return out
             coeff_pix_s = np.asarray(pointing_report["coeff_pix_s"], dtype=np.float64)
@@ -7000,14 +7000,14 @@ class GoToWorker(BaseWorker):
             v_obs = np.asarray(
                 pointing_report["coordinate_rate_rad_s"], dtype=np.float64
             )
-            log_info(
+            log_debug(
                 self._out_log,
-                "GoTo: AutoCal drift basis solve "
-                f"coeff_az={float(coeff_pix_s[0]):.3f}px/s "
-                f"coeff_alt={float(coeff_pix_s[1]):.3f}px/s "
-                f"e_az_hat=[{float(e_az_hat[0]):.3f},{float(e_az_hat[1]):.3f}] "
-                f"e_alt_hat=[{float(e_alt_hat[0]):.3f},{float(e_alt_hat[1]):.3f}] "
-                f"tangent_rad_s=[{float(tangent_obs[0]):.6e},{float(tangent_obs[1]):.6e}]",
+                "GoTo: autocal, solución de la base de deriva "
+                f"coef_az={float(coeff_pix_s[0]):.3f}px/s "
+                f"coef_alt={float(coeff_pix_s[1]):.3f}px/s "
+                f"e_az=[{float(e_az_hat[0]):.3f},{float(e_az_hat[1]):.3f}] "
+                f"e_alt=[{float(e_alt_hat[0]):.3f},{float(e_alt_hat[1]):.3f}] "
+                f"tangente_rad_s=[{float(tangent_obs[0]):.6e},{float(tangent_obs[1]):.6e}]",
             )
 
         if platesolving_result is None or not bool(getattr(platesolving_result, "success", False)):
@@ -7022,9 +7022,9 @@ class GoToWorker(BaseWorker):
 
             log_info(
                 self._out_log,
-                "GoTo: AutoCal pointing estimate "
-                f"az={float(az_hat):.3f}deg alt={float(alt_hat):.3f}deg "
-                f"resid={float(best_res):.3e} v_obs_rad_s=[{float(v_obs[0]):.6e},{float(v_obs[1]):.6e}]",
+                "GoTo: autocal, apuntado estimado "
+                f"az={float(az_hat):.3f}° alt={float(alt_hat):.3f}° "
+                f"residuo={float(best_res):.3e} v_obs_rad_s=[{float(v_obs[0]):.6e},{float(v_obs[1]):.6e}]",
             )
             out["pointing_estimate"] = {"az_deg": az_hat, "alt_deg": alt_hat, "radius_deg": 1.0}
             self._publish_state(
@@ -7088,11 +7088,11 @@ class GoToWorker(BaseWorker):
                 if attempts == 0:
                     log_info(
                         self._out_log,
-                        "GoTo: AutoCal platesolve first target "
-                        f"az={float(target['az_deg']):.3f}deg "
-                        f"alt={float(target['alt_deg']):.3f}deg "
-                        f"radius={1.0:.3f}deg "
-                        f"jitter=({float(jitter[0]):.3f},{float(jitter[1]):.3f}) "
+                        "GoTo: autocal, primer objetivo del plate solve "
+                        f"az={float(target['az_deg']):.3f}° "
+                        f"alt={float(target['alt_deg']):.3f}° "
+                        f"radio={1.0:.3f}° "
+                        f"perturbación=({float(jitter[0]):.3f},{float(jitter[1]):.3f}) "
                         f"dt={dt_s:.3f}s",
                     )
                 platesolving_result = self._autocal_run_platesolve(
@@ -7195,14 +7195,14 @@ class GoToWorker(BaseWorker):
         if not bool(report.get("ok", False)):
             log_error(
                 self._out_log,
-                "GoTo: rejected implausible plate-solve sample "
-                f"context={context} "
+                "GoTo: muestra de plate solve rechazada por inverosímil "
+                f"contexto={context} "
                 f"dsteps=[{float(report.get('dsteps_az', 0.0)):+.0f},"
                 f"{float(report.get('dsteps_alt', 0.0)):+.0f}] "
-                f"motion={float(report.get('observed_motion_deg', float('nan'))):.4f}deg "
-                f"limit={float(report.get('motion_limit_deg', float('nan'))):.4f}deg "
-                f"roll_jump={float(report.get('roll_jump_deg', float('nan'))):.3f}deg "
-                f"roll_limit={float(report.get('roll_tolerance_deg', float('nan'))):.3f}deg",
+                f"movimiento={float(report.get('observed_motion_deg', float('nan'))):.4f}° "
+                f"límite={float(report.get('motion_limit_deg', float('nan'))):.4f}° "
+                f"salto_de_giro={float(report.get('roll_jump_deg', float('nan'))):.3f}° "
+                f"límite_de_giro={float(report.get('roll_tolerance_deg', float('nan'))):.3f}°",
             )
         return report
 
@@ -7235,7 +7235,7 @@ class GoToWorker(BaseWorker):
         model = self._goto.model
         J = getattr(model, "J_deg_per_step", None)
         if J is None or getattr(J, "shape", None) != (2, 2):
-            log_error(self._out_log, "GoTo: J matrix unavailable or invalid", ValueError("invalid J matrix"))
+            log_error(self._out_log, "GoTo: matriz J no disponible o inválida", ValueError("invalid J matrix"))
             return
         fit_report = model.model_fit_report()
         self._publish_state(
@@ -7280,16 +7280,16 @@ class GoToWorker(BaseWorker):
         log_info(
             self._out_log,
             f"{prefix} "
-            f"samples={int(rep['model_fit_samples'])} "
+            f"muestras={int(rep['model_fit_samples'])} "
             f"J=[[{float(J[0, 0]):+.6e},{float(J[0, 1]):+.6e}],"
             f"[{float(J[1, 0]):+.6e},{float(J[1, 1]):+.6e}]] "
             f"dJ=[[{float(rep['J00_err']):.3e},{float(rep['J01_err']):.3e}],"
             f"[{float(rep['J10_err']):.3e},{float(rep['J11_err']):.3e}]] "
-            f"nonorth={float(rep['model_non_orthogonality_deg']):+.4f}±{float(rep['model_non_orthogonality_err_deg']):.4f}deg "
-            f"roll={float(rep['model_roll_deg']):+.3f}±{float(rep['model_roll_err_deg']):.3f}deg "
-            f"rms=[az={float(rep['model_fit_rms_az_deg']):.4f}deg "
-            f"alt={float(rep['model_fit_rms_alt_deg']):.4f}deg "
-            f"tot={float(rep['model_fit_rms_arcsec']):.2f}arcsec]",
+            f"no_ortogonalidad={float(rep['model_non_orthogonality_deg']):+.4f}±{float(rep['model_non_orthogonality_err_deg']):.4f}° "
+            f"giro={float(rep['model_roll_deg']):+.3f}±{float(rep['model_roll_err_deg']):.3f}° "
+            f"rms=[az={float(rep['model_fit_rms_az_deg']):.4f}° "
+            f"alt={float(rep['model_fit_rms_alt_deg']):.4f}° "
+            f"total={float(rep['model_fit_rms_arcsec']):.2f}arcsec]",
         )
 
     def _pointing_snapshot_from_model(self) -> Optional[Dict[str, float]]:
@@ -7440,12 +7440,12 @@ class GoToWorker(BaseWorker):
                 if status.ok:
                     log_info(
                         self._out_log,
-                        f"GoTo: OK status={status.status} iters={status.iters} err_arcsec={err_norm:.2f}",
+                        f"GoTo: llegó estado={status.status} iteraciones={status.iters} error={err_norm:.2f}arcsec",
                     )
                 else:
                     log_info(
                         self._out_log,
-                        f"GoTo: ERR status={status.status} iters={status.iters} err_arcsec={err_norm:.2f}",
+                        f"GoTo: no llegó estado={status.status} iteraciones={status.iters} error={err_norm:.2f}arcsec",
                     )
 
             elif kind == "autocal":
@@ -7476,7 +7476,7 @@ class GoToWorker(BaseWorker):
                 )
                 log_info(
                     self._out_log,
-                    f"GoTo: AUTOCAL status={autocal_out.get('status')} ok={autocal_ok}",
+                    f"GoTo: autocal terminado estado={autocal_out.get('status')} ok={autocal_ok}",
                 )
 
             elif kind == "roll":
@@ -7499,7 +7499,7 @@ class GoToWorker(BaseWorker):
                 )
                 log_info(
                     self._out_log,
-                    f"GoTo: ROLL_ESTIMATE status={roll_status} ok={roll_ok}",
+                    f"GoTo: estimación de giro terminada estado={roll_status} ok={roll_ok}",
                 )
 
             elif kind == "fit_model":
@@ -7530,7 +7530,7 @@ class GoToWorker(BaseWorker):
                         self._out_log,
                         "GoTo fit: recorrido insuficiente para medir la escala media "
                         f"(az={cov.get('az', 0.0):.2f} ciclos, alt={cov.get('alt', 0.0):.2f} ciclos). "
-                        "El error de transmisión ciclodial domina en movimientos cortos; "
+                        "El error de transmisión cicloidal domina en movimientos cortos; "
                         f"usa desplazamientos de al menos un ciclo completo "
                         f"({period_az} pasos en az, {period_alt} en alt).",
                     )
@@ -7556,13 +7556,13 @@ class GoToWorker(BaseWorker):
                 )
                 log_info(
                     self._out_log,
-                    f"GoTo: FIT_MODEL ok={ok} min_samples={min_samples} "
-                    f"manual_samples={n_manual} "
-                    f"synced={bool(getattr(self._goto.model, 'synced', False))} "
-                    f"synced_from_manual={synced_from_manual}",
+                    f"GoTo: ajuste del modelo terminado ok={ok} min_samples={min_samples} "
+                    f"muestras={n_manual} "
+                    f"sincronizada={bool(getattr(self._goto.model, 'synced', False))} "
+                    f"sincronizada_desde_muestra={synced_from_manual}",
                 )
                 if ok:
-                    self._log_model_fit_state(prefix="GoTo: FIT_MODEL report")
+                    self._log_model_fit_state(prefix="GoTo: estado del modelo tras el ajuste")
 
             elif kind == "list_samples":
                 report = self._goto.model.manual_samples_deviation_report(sort_by_deviation=True)
@@ -7579,12 +7579,12 @@ class GoToWorker(BaseWorker):
                             }
                         }
                     )
-                    log_info(self._out_log, "GoTo: LIST_SAMPLES no manual samples")
+                    log_info(self._out_log, "GoTo: no hay muestras manuales")
                 else:
                     thr_arcsec = float(report[0].get("threshold_arcsec", float("nan")))
                     log_info(
                         self._out_log,
-                        f"GoTo: LIST_SAMPLES n={n_manual} threshold={thr_arcsec:.2f}arcsec (sorted by deviation)",
+                        f"GoTo: {n_manual} muestras, umbral={thr_arcsec:.2f}arcsec (ordenadas por desviación)",
                     )
                     for row in report:
                         idx = int(row.get("sample_idx", -1))
@@ -7596,11 +7596,11 @@ class GoToWorker(BaseWorker):
                         ref_tag = " ref" if bool(row.get("is_ref_idx", False)) else ""
                         log_info(
                             self._out_log,
-                            "GoTo: SAMPLE "
-                            f"idx={idx} rank={rank} {out_tag}{ref_tag} "
-                            f"dev={dev_arcsec:.2f}arcsec "
+                            "GoTo: muestra "
+                            f"idx={idx} puesto={rank} {out_tag}{ref_tag} "
+                            f"desviación={dev_arcsec:.2f}arcsec "
                             f"(az={dev_az_arcsec:+.2f}, alt={dev_alt_arcsec:+.2f}) "
-                            f"steps=[{float(row.get('steps_az', 0.0)):.0f},{float(row.get('steps_alt', 0.0)):.0f}] "
+                            f"pasos=[{float(row.get('steps_az', 0.0)):.0f},{float(row.get('steps_alt', 0.0)):.0f}] "
                             f"altaz=[{float(row.get('az_deg', 0.0)):.4f},{float(row.get('alt_deg', 0.0)):.4f}]",
                         )
                     self._publish_state(
@@ -7638,17 +7638,17 @@ class GoToWorker(BaseWorker):
                 )
                 log_info(
                     self._out_log,
-                    "GoTo: PRUNE_OUTLIERS "
-                    f"status={prune_status} ok={prune_ok} "
-                    f"removed={removed} indices={removed_indices} "
-                    f"n_before={int(out.get('n_before', 0))} n_after={n_after} "
-                    f"threshold={float(out.get('threshold_arcsec', float('nan'))):.2f}arcsec "
-                    f"fit_before_ok={bool(out.get('fit_before_ok', False))} "
-                    f"fit_after_ok={bool(out.get('fit_after_ok', False))} "
-                    f"synced_from_manual={synced_from_manual}",
+                    "GoTo: descarte de atípicas "
+                    f"estado={prune_status} ok={prune_ok} "
+                    f"descartadas={removed} índices={removed_indices} "
+                    f"antes={int(out.get('n_before', 0))} después={n_after} "
+                    f"umbral={float(out.get('threshold_arcsec', float('nan'))):.2f}arcsec "
+                    f"ajuste_antes_ok={bool(out.get('fit_before_ok', False))} "
+                    f"ajuste_después_ok={bool(out.get('fit_after_ok', False))} "
+                    f"sincronizada_desde_muestra={synced_from_manual}",
                 )
                 if prune_ok:
-                    self._log_model_fit_state(prefix="GoTo: PRUNE_OUTLIERS report")
+                    self._log_model_fit_state(prefix="GoTo: estado del modelo tras descartar atípicas")
                 self._diagnostics_record(
                     "prune_outliers_result",
                     result=out,
@@ -7667,14 +7667,14 @@ class GoToWorker(BaseWorker):
                     try:
                         self._apply_camera_param("roll_deg", float(camera_roll))
                     except Exception as exc:
-                        log_error(self._out_log, "GoTo: failed to apply restored camera roll", exc)
+                        log_error(self._out_log, "GoTo: no se pudo aplicar el giro de cámara restaurado", exc)
                         self._publish_state({"camera": {"roll_deg": float(camera_roll)}})
 
                 pointing = None
                 try:
                     pointing = self._pointing_snapshot_from_model()
                 except Exception as exc:
-                    log_error(self._out_log, "GoTo: failed to compute restored pointing", exc)
+                    log_error(self._out_log, "GoTo: no se pudo calcular el apuntado restaurado", exc)
 
                 goto_patch: Dict[str, Any] = {
                     "manual_samples": int(n_manual),
@@ -7701,16 +7701,16 @@ class GoToWorker(BaseWorker):
                 )
                 log_info(
                     self._out_log,
-                    "GoTo: RESTORE_LAST_LOG "
-                    f"status={status} ok={ok} "
-                    f"manual_samples={n_manual} "
-                    f"synced={bool(getattr(model, 'synced', False))} "
-                    f"camera_roll={camera_roll:+.3f}deg "
-                    f"loaded_manual={bool(out.get('loaded_manual', False))} "
-                    f"loaded_fit={bool(out.get('loaded_fit', False))}",
+                    "GoTo: restauración del último modelo "
+                    f"estado={status} ok={ok} "
+                    f"muestras={n_manual} "
+                    f"sincronizada={bool(getattr(model, 'synced', False))} "
+                    f"giro_cámara={camera_roll:+.3f}° "
+                    f"muestras_cargadas={bool(out.get('loaded_manual', False))} "
+                    f"ajuste_cargado={bool(out.get('loaded_fit', False))}",
                 )
                 if ok:
-                    self._log_model_fit_state(prefix="GoTo: RESTORE_LAST_LOG report")
+                    self._log_model_fit_state(prefix="GoTo: estado del modelo restaurado")
 
             elif kind == "reset":
                 model = self._goto.model
@@ -7741,7 +7741,7 @@ class GoToWorker(BaseWorker):
                 )
                 log_info(
                     self._out_log,
-                    f"GoTo: RESET ok=True manual_samples={n_manual_prev}->0 synced={was_synced}->False",
+                    f"GoTo: modelo borrado; muestras {n_manual_prev} -> 0, sincronizada {was_synced} -> False",
                 )
 
             else:
@@ -7754,7 +7754,7 @@ class GoToWorker(BaseWorker):
 
         except (RuntimeError, ValueError, TypeError) as exc:
             diagnostic_status = "EXCEPTION"
-            log_error(self._out_log, f"GoTo worker failed ({kind})", exc)
+            log_error(self._out_log, f"GoTo: falló el trabajador ({kind})", exc)
             self._diagnostics_record("operation_exception", error=repr(exc))
             self._publish_state({"goto": {"status": GotoStatus.FAIL, "reason": "EXCEPTION"}})
 

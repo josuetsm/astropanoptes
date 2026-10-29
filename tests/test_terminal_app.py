@@ -134,21 +134,22 @@ class TerminalAppTests(unittest.TestCase):
     def test_wait_uses_nested_state_paths(self) -> None:
         self.runner.state.camera.connected = True
         self.terminal.execute_line("wait camera.connected true 0.1")
-        self.assertIn("OK camera.connected=True", self.stdout.getvalue())
+        self.assertTrue(self.stdout.getvalue().startswith("ok  camera.connected = true"))
         self.assertFalse(self.terminal.had_error)
 
     def test_get_reads_one_state_field_for_compact_diagnostics(self) -> None:
         self.runner.state.tracking.error_px = 3.25
         self.terminal.execute_line("get tracking.error_px")
-        self.assertEqual(self.stdout.getvalue().strip(), "3.25")
+        self.assertEqual(self.stdout.getvalue().strip(), "ok  3.25")
         self.assertFalse(self.terminal.had_error)
 
     def test_await_waits_for_the_operation_queued_by_this_console(self) -> None:
         self.terminal.execute_line("goto altaz 180 45")
         self.terminal.execute_line("await goto 0.1")
 
-        output = self.stdout.getvalue()
-        self.assertIn('"operation": "goto"', output)
+        lines = self.stdout.getvalue().splitlines()
+        self.assertTrue(lines[0].startswith("ok  en cola: goto a az 180°, alt 45°"), lines)
+        self.assertTrue(any(line.startswith("ok  goto terminó") for line in lines), lines)
         self.assertFalse(self.terminal.had_error)
 
     def test_await_supports_manual_moves_and_raw_recordings(self) -> None:
@@ -158,8 +159,10 @@ class TerminalAppTests(unittest.TestCase):
         self.terminal.execute_line("await record 0.1")
 
         output = self.stdout.getvalue()
-        self.assertIn('"operation": "mount_move"', output)
-        self.assertIn('"operation": "camera_record"', output)
+        self.assertIn("ok  movimiento terminó", output)
+        self.assertIn("ok  grabación terminó", output)
+        # el movimiento dice cuantos grados son esos pasos, no solo los pasos
+        self.assertIn("mover az +25 pasos (0.016°)", output)
         self.assertFalse(self.terminal.had_error)
 
     def test_manual_move_accepts_smooth_and_direct_profiles(self) -> None:
@@ -185,10 +188,15 @@ class TerminalAppTests(unittest.TestCase):
         self.runner.state.goto.status = GotoStatus.OK
         self.runner.state.goto.reason = "AUTOCAL"
 
-        self.terminal.execute_line("health")
+        self.terminal.execute_line("health --json")
 
         payload = json.loads(self.stdout.getvalue())
-        self.assertIsNone(payload["errors"]["goto"])
+        self.assertNotIn("goto", payload["errors"])
+
+        self.stdout.seek(0)
+        self.stdout.truncate(0)
+        self.terminal.execute_line("health")
+        self.assertTrue(self.stdout.getvalue().startswith("ok  sin errores"))
 
     def test_demo_seed_is_available_for_reproducible_debugging(self) -> None:
         args = build_parser().parse_args(["--demo", "--seed", "42"])
@@ -198,7 +206,9 @@ class TerminalAppTests(unittest.TestCase):
     def test_image_is_saved_inside_images_folder_with_state_metadata(self) -> None:
         self.terminal.execute_line("image live ../outside 0")
 
-        image_path = Path(self.stdout.getvalue().strip())
+        first = self.stdout.getvalue().splitlines()[0]
+        self.assertTrue(first.startswith("ok  "), first)
+        image_path = Path(first.removeprefix("ok  ").strip())
         self.assertEqual(image_path.parent, (Path(self.tmp.name) / "images").resolve())
         self.assertEqual(image_path.name, "outside.jpg")
         self.assertEqual(image_path.read_bytes(), self.runner.preview)
@@ -209,14 +219,13 @@ class TerminalAppTests(unittest.TestCase):
         self.assertIn("camera", metadata["state"])
 
     def test_live_view_serves_preview_and_mirrors_latest_image(self) -> None:
-        self.terminal.execute_line("view start 0 20 no-open")
+        self.terminal.execute_line("view start 0 20 no-open --json")
         payload = json.loads(self.stdout.getvalue().strip())
         latest_path = Path(payload["latest_image"])
         deadline = time.monotonic() + 1.0
         while not latest_path.exists() and time.monotonic() < deadline:
             time.sleep(0.01)
 
-        self.assertTrue(payload["ok"])
         self.assertFalse(payload["browser_opened"])
         self.assertEqual(latest_path.read_bytes(), self.runner.preview)
         with urllib.request.urlopen(payload["url"] + "latest.jpg", timeout=1.0) as response:
@@ -228,15 +237,15 @@ class TerminalAppTests(unittest.TestCase):
         self.assertEqual(console["entries"][-2]["kind"], "command")
         self.assertEqual(console["entries"][-2]["text"], "camera connect 2")
         self.assertEqual(console["entries"][-1]["kind"], "output")
-        self.assertEqual(console["entries"][-1]["text"], "OK")
+        self.assertEqual(console["entries"][-1]["text"], "ok  en cola: conectar cámara 2")
 
         self.stdout.seek(0)
         self.stdout.truncate(0)
         self.terminal.execute_line("view stop")
-        self.assertEqual(self.stdout.getvalue().strip(), "OK")
+        self.assertEqual(self.stdout.getvalue().strip(), "ok  visor detenido")
 
     def test_live_view_opens_browser_by_default(self) -> None:
-        self.terminal.execute_line("view start 0 2")
+        self.terminal.execute_line("view start 0 2 --json")
         payload = json.loads(self.stdout.getvalue().strip())
         self.assertTrue(payload["browser_opened"])
         self.assertEqual(self.opened_urls, [payload["url"]])
@@ -295,6 +304,8 @@ def test_tracking_why_names_the_gate_that_is_blocking() -> None:
         terminal.close()
         runner.stop()
 
-    assert "camara conectada" in text
-    assert "Falta conectar la camara" in text
+    lines = text.splitlines()
+    # el veredicto va primero, que es lo que se busca
+    assert lines[0] == "ok  falta conectar la cámara", lines[0]
+    assert any(line.strip().startswith("cámara conectada") and line.rstrip().endswith("no") for line in lines)
     assert not terminal.had_error

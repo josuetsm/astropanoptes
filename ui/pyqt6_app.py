@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import re
+
 import math
 import sys
 import time
@@ -40,6 +42,7 @@ from ap_types import Axis, CameraStatus, MountStatus
 from app_runner import AppRunner
 from config import AppConfig
 from control_server import DEFAULT_SOCKET_PATH, ControlServer, ControlServerError
+from console_format import event_line
 from logging_utils import set_global_log_sink
 from ui.console_panel import ConsolePanel
 from ui.settings_store import (
@@ -319,7 +322,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._frame_timer.timeout.connect(self._render_frame)
         self._frame_timer.start()
 
-        self._log("PyQt6 UI ready. Consola activa: escriba 'help' para ver los comandos.")
+        self._log("ui: interfaz lista; consola activa, escribe help para ver los comandos")
 
         if enable_control_server:
             self._start_control_server(control_socket_path)
@@ -329,10 +332,10 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         try:
             server.start()
         except (ControlServerError, OSError) as exc:
-            self._log(f"Control CLI no disponible: {exc}")
+            self._log(f"ui: control por consola no disponible: {exc}")
             return
         self._control_server = server
-        self._log(f"Control CLI activo: python app.py attach --socket {server.socket_path}")
+        self._log(f"ui: control por consola activo: python app.py attach --socket {server.socket_path}")
 
     def closeEvent(self, event) -> None:  # noqa: N802
         self._save_settings()
@@ -711,44 +714,44 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             {"exp_ms": exp_ms, "gain": gain, "offset": offset, "gamma": gamma}
         )
         self._log(
-            f"[camera] apply exposure={exp_ms:.1f} ms gain={gain} offset={offset} gamma={gamma:.2f}"
+            f"[camera] ajustes: exposición={exp_ms:.1f}ms ganancia={gain} offset={offset} gamma={gamma:.2f}"
         )
 
     def _camera_record_raw(self) -> None:
         if not bool(self.runner.get_state().camera.connected):
-            self._log("[camera] Record RAW skipped (camera not connected)")
+            self._log("[camera] grabación RAW omitida (cámara no conectada)")
             return
         ts = time.strftime("%Y%m%d_%H%M%S")
         basename = f"raw_{ts}"
         self.runner.request_camera_record_raw(duration_s=None, out_dir="raw_output", basename=basename)
-        self._log(f"[camera] Recording RAW started -> raw_output/{basename}.npy")
+        self._log(f"[camera] grabación RAW arrancada -> raw_output/{basename}.npy")
 
     def _camera_stop_record_raw(self) -> None:
         self.runner.request_camera_stop_record_raw()
-        self._log("[camera] Recording RAW stop requested")
+        self._log("[camera] parada de la grabación RAW solicitada")
 
     def _simulation_toggled(self, enabled: bool) -> None:
         enabled_b = bool(enabled)
         self.cfg.simulation.enabled = enabled_b
         self.runner.set_simulation_enabled(enabled_b)
         suffix = "ON" if enabled_b else "OFF"
-        self._log(f"[top] Demo mode {suffix}; reconnect camera/mount to apply")
+        self._log(f"[top] modo demo {suffix}; reconecta cámara y montura para aplicarlo")
 
     def _connect_camera(self) -> None:
         self.runner.request_camera_connect(self.cfg.camera.camera_index)
-        self._log("[top] Connect camera")
+        self._log("[camera] conectar")
 
     def _disconnect_camera(self) -> None:
         self.runner.request_camera_disconnect()
-        self._log("[top] Disconnect camera")
+        self._log("[camera] desconectar")
 
     def _connect_mount(self) -> None:
         self.runner.request_mount_connect(self.cfg.mount.port, self.cfg.mount.baudrate)
-        self._log("[top] Connect mount")
+        self._log("[mount] conectar")
 
     def _disconnect_mount(self) -> None:
         self.runner.request_mount_disconnect()
-        self._log("[top] Disconnect mount")
+        self._log("[mount] desconectar")
 
     def _toggle_camera_connection(self) -> None:
         connected = bool(self.runner.get_state().camera.connected)
@@ -774,15 +777,15 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
 
     def _tracking_start(self) -> None:
         self.runner.request_tracking_start()
-        self._log("[tracking] Start")
+        self._log("[tracking] arrancar")
 
     def _tracking_stop(self) -> None:
         self.runner.request_tracking_stop()
-        self._log("[tracking] Stop")
+        self._log("[tracking] detener")
 
     def _tracking_reset(self) -> None:
         self.runner.enqueue(tracking_keyframe_reset())
-        self._log("[tracking] Reset")
+        self._log("[tracking] reiniciar")
 
     def _tracking_apply(self) -> None:
         params = {
@@ -803,26 +806,26 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.cfg.tracking.sidereal_ff_hold_s = float(params["sidereal_ff_hold_s"])
         self.cfg.tracking.sidereal_ff_slew_per_s = float(params["sidereal_ff_slew_per_s"])
         self._log(
-            "[tracking] Apply "
-            f"resp_min={params['resp_min']:.3f} ff={int(params['sidereal_ff_enabled'])} "
-            f"gain={params['sidereal_ff_gain']:.3f}"
+            "[tracking] aplicar "
+            f"resp_min={params['resp_min']:.3f} feed_forward={int(params['sidereal_ff_enabled'])} "
+            f"ganancia={params['sidereal_ff_gain']:.3f}"
         )
 
     def _stacking_start(self) -> None:
         self.runner.request_stacking_start()
-        self._log("[stacking] Start")
+        self._log("[stacking] arrancar")
 
     def _stacking_stop(self) -> None:
         self.runner.request_stacking_stop()
-        self._log("[stacking] Stop")
+        self._log("[stacking] detener")
 
     def _stacking_reset(self) -> None:
         self.runner.request_stacking_reset()
-        self._log("[stacking] Reset")
+        self._log("[stacking] vaciar")
 
     def _stacking_save(self) -> None:
         self.runner.request_stacking_save(out_dir="stack_output", basename="stack", fmt="png")
-        self._log("[stacking] Save Stack -> stack_output/stack_YYYYMMDD_HHMMSS_az123p45_altp67p89.{raw.npy,png}")
+        self._log("[stacking] guardar en stack_output/ (raw, pesos y metadatos)")
 
     def _stacking_color_toggled(self, checked: bool) -> None:
         color_mode = "rgb" if bool(checked) else "mono"
@@ -830,7 +833,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.runner.request_stacking_params(color_mode=color_mode, bayer_pattern=bayer_pattern)
         self.cfg.stacking.color_mode = color_mode
         self.cfg.stacking.bayer_pattern = bayer_pattern
-        self._log(f"[stacking] color_mode={color_mode} bayer={bayer_pattern} (alignment mono)")
+        self._log(f"[stacking] modo_color={color_mode} bayer={bayer_pattern} (alineación en mono)")
 
     def _stacking_drizzle_changed(self, _: int) -> None:
         data = self.dd_st_drizzle.currentData()
@@ -842,7 +845,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             drizzle_scale = 1.0
         self.runner.request_stacking_params(drizzle_scale=drizzle_scale)
         self.cfg.stacking.drizzle_scale = drizzle_scale
-        self._log(f"[stacking] drizzle=x{int(drizzle_scale)}")
+        self._log(f"[stacking] drizzle x{int(drizzle_scale)}")
 
     def _stacking_apply(self) -> None:
         drizzle_scale = float(self.dd_st_drizzle.currentData() or 1.0)
@@ -882,22 +885,22 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self.cfg.stacking.preview_hz = float(params["preview_hz"])
         self.cfg.stacking.preview_log_vmin = float(params["preview_log_vmin"])
         self._log(
-            "[stacking] Apply "
-            f"mode={color_mode} drizzle=x{int(drizzle_scale)} batch={params['batch_size']} "
-            f"median={align_median_k} smooth={params['smooth_k']} max_shift={params['max_shift_px']}"
+            "[stacking] aplicar "
+            f"modo={color_mode} drizzle=x{int(drizzle_scale)} lote={params['batch_size']} "
+            f"mediana={align_median_k} suavizado={params['smooth_k']} desplazamiento_max={params['max_shift_px']}px"
         )
 
     def _goto_start(self) -> None:
         target = self._build_goto_target()
         if target is None:
-            self._log("[goto] missing target; ignored")
+            self._log("[goto] falta el objetivo; se ignora")
             return
         self.runner.request_mount_goto(target)
-        self._log(f"[goto] GoTo target={target} (modelo, sin plate solving)")
+        self._log(f"[goto] goto a {target} (por modelo, sin plate solving)")
 
     def _goto_cancel(self) -> None:
         self.runner.request_goto_cancel()
-        self._log("[goto] Cancel")
+        self._log("[goto] cancelar")
 
     def _apply_platesolving_source_and_verification(self) -> None:
         """Push the image source and verification settings to the solver."""
@@ -931,37 +934,37 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             else ""
         )
         self._log(
-            "[goto] Plate Solving "
-            f"mode={ps_mode}{target_txt} "
-            f"radius={self.ds_goto_ps_radius.value():.2f}deg "
+            "[goto] plate solving "
+            f"modo={ps_mode}{target_txt} "
+            f"radio={self.ds_goto_ps_radius.value():.2f}° "
             f"fuente={self.dd_ps_source.currentData()} "
-            f"validacion={int(self.sb_ps_min_validation.value())}; "
-            "exposición/ganancia preservadas"
+            f"validación={int(self.sb_ps_min_validation.value())}; "
+            "exposición y ganancia conservadas"
         )
 
     def _goto_estimate_roll(self) -> None:
         self.runner.request_goto_estimate_roll()
-        self._log("[goto] Estimar Roll")
+        self._log("[goto] estimar el giro de la cámara")
 
     def _goto_fit_model(self) -> None:
         self.runner.request_goto_fit_model()
-        self._log("[goto] Fit GoTo Model")
+        self._log("[goto] ajustar el modelo de apuntado")
 
     def _goto_list_samples(self) -> None:
         self.runner.request_goto_list_samples()
-        self._log("[goto] Listar muestras manuales")
+        self._log("[goto] listar las muestras manuales")
 
     def _goto_prune_outliers(self) -> None:
         self.runner.request_goto_prune_outliers()
-        self._log("[goto] Eliminar muestras outliers")
+        self._log("[goto] descartar muestras atípicas")
 
     def _goto_restore_last_log(self) -> None:
         self.runner.request_goto_restore_last_log()
-        self._log("[goto] Cargar ultimo registro desde CSV (backup)")
+        self._log("[goto] cargar el último modelo guardado (CSV)")
 
     def _goto_reset(self) -> None:
         self.runner.request_goto_reset()
-        self._log("[goto] Reset manual samples + sync")
+        self._log("[goto] borrar muestras y sincronización")
 
     def _home(self) -> None:
         target = {
@@ -969,7 +972,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             "alt_deg": float(self.cfg.goto.alt_min_deg),
         }
         self.runner.request_mount_goto(target)
-        self._log("[goto] Home -> alt/az safe default")
+        self._log("[goto] home: posición segura por defecto")
 
     def _manual_move(self, axis: Axis, direction: int) -> None:
         steps = int(self.sb_steps.value())
@@ -987,13 +990,13 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
             profile=profile,
         )
         self._log(
-            f"[manual] move axis={axis.value} direction={direction} "
-            f"steps={steps} delay_us={delay_us} profile={profile}"
+            f"[manual] mover eje={axis.value} dirección={direction} "
+            f"pasos={steps} retardo={delay_us}µs perfil={profile}"
         )
 
     def _manual_stop(self) -> None:
         self.runner.request_mount_stop()
-        self._log("[manual] STOP")
+        self._log("[manual] parada")
 
     # -------------------------
     # Enfocador
@@ -1034,7 +1037,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
 
     def _focus_cancel(self) -> None:
         self.runner.request_focuser_cancel()
-        self._log("[focus] cancelar / parar enfocador")
+        self._log("[focus] cancelar y parar el enfocador")
 
     def _focus_zero(self) -> None:
         self.runner.request_focuser_zero()
@@ -1052,7 +1055,7 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
 
     def _focus_save_preset(self, name: str) -> None:
         self.runner.request_focuser_save_preset(name)
-        self._log(f"[focus] guardar posición actual como {name}")
+        self._log(f"[focus] guardar la posición actual como {name}")
 
     def _update_focuser_from_state(self, state) -> None:
         focuser = getattr(state, "focuser", None)
@@ -1507,10 +1510,24 @@ class AstroPanoptesWindow(ModulesTabsMixin, QMainWindow):
         self._camera_apply()
         self._tracking_apply()
         self._stacking_apply()
-        self._log(f"[settings] restaurados desde {self._settings_path}")
+        self._log(f"[settings] ajustes restaurados desde {self._settings_path}")
 
     def _log(self, msg: str) -> None:
-        self.console.append_log(msg)
+        """Un evento originado en la interfaz, con el mismo formato que los demás.
+
+        Los mensajes de los botones llevaban su propio formato ("[camera] ...");
+        se pasan al de los eventos para que el panel se lea de una sola manera.
+        """
+        text = str(msg)
+        # Lo que llega por el sink global ya es un evento formateado; volver a
+        # formatearlo duplicaba hora, nivel y subsistema en cada linea.
+        if re.match(r"^\d\d:\d\d:\d\d\.\d{3}  ", text):
+            self.console.append_log(text)
+            return
+        match = re.match(r"^\[(\w+)\]\s*(.*)$", text, re.S)
+        if match:
+            text = f"{match.group(1)}: {match.group(2)}"
+        self.console.append_log(event_line("info", text))
 
 
 @dataclass

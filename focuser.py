@@ -72,6 +72,16 @@ def focus_metric(image: np.ndarray) -> float:
     import cv2
     import sep
 
+    from sep_utils import repair_bad_pixels, repair_isolated_pixels
+
+    # Un pixel caliente es la fuente mas nitida posible y no cambia con el
+    # foco. En un campo pobre dominaba la suma: el 2026-10-28 uno solo, a 31856
+    # ADU, dejo las curvas planas (+-1 %) y el "mejor foco" caia en cualquier
+    # posicion. Se repara antes de medir, igual que antes de apilar.
+    raw = np.asarray(image)
+    if raw.ndim == 2 and raw.dtype == np.uint16:
+        image = repair_isolated_pixels(repair_bad_pixels(raw))
+
     plane = np.ascontiguousarray(cfa_plane(image))
     if plane.size < 4096:
         return 0.0
@@ -386,7 +396,7 @@ class FocuserWorker(BaseWorker):
         except Exception as exc:  # pragma: no cover - frontera defensiva
             log_error(
                 self._out_log,
-                "Focuser: state publish failed",
+                "Focuser: no se pudo publicar el estado",
                 exc,
                 throttle_s=5.0,
                 throttle_key="focuser_publish",
@@ -422,7 +432,7 @@ class FocuserWorker(BaseWorker):
                     "last_error": str(exc),
                 }
             )
-            log_error(self._out_log, f"Focuser: {kind} failed", exc)
+            log_error(self._out_log, f"Focuser: falló {kind}", exc)
         finally:
             if self._operation_finished is not None:
                 self._operation_finished()
@@ -556,7 +566,7 @@ class FocuserWorker(BaseWorker):
         self._publish({"autofocus_stage": "homing", "last_error": None})
         log_info(
             self._out_log,
-            f"Focuser: homing, {total} pasos de retraccion "
+            f"Focuser: homing, {total} pasos de retracción "
             f"({travel} de recorrido + {overshoot} de patinaje)",
         )
         # allow_beyond_limit: el homing es justo la operacion que tiene que
@@ -578,7 +588,7 @@ class FocuserWorker(BaseWorker):
                 "best_metric": 0.0,
             }
         )
-        log_info(self._out_log, "Focuser: homing terminado, posicion 0 = retraido")
+        log_info(self._out_log, "Focuser: homing terminado, posición 0 = retraído")
 
     def _do_preset(self, name: str) -> None:
         entry = self._presets.get(name)
@@ -697,7 +707,7 @@ class FocuserWorker(BaseWorker):
             )
             log_info(
                 self._out_log,
-                f"Focuser: {stage} {index + 1}/{int(points)} pos={self.position:+d} "
+                f"Focuser: {stage} {index + 1}/{int(points)} posición={self.position:+d} "
                 f"nitidez={value:.3f}",
             )
 
@@ -871,7 +881,7 @@ class FocuserWorker(BaseWorker):
             log_info(
                 self._out_log,
                 f"Focuser: autofoco dirigido por {preset_name!r}, centro "
-                f"{prior_center:+d} +-{prior_half} ({points}x{step})",
+                f"{prior_center:+d} ±{prior_half} ({points}x{step})",
             )
             coarse = self._sweep_until_bracketed(
                 mount,
@@ -890,8 +900,8 @@ class FocuserWorker(BaseWorker):
                 # mejor punto de una ventana que no contenia el maximo.
                 log_info(
                     self._out_log,
-                    f"Focuser: el prior de {preset_name!r} no encerro el maximo; "
-                    "pasando a busqueda general",
+                    f"Focuser: el prior de {preset_name!r} no encerró el máximo; "
+                    "se pasa a búsqueda general",
                 )
                 coarse = {}
 
@@ -913,6 +923,20 @@ class FocuserWorker(BaseWorker):
         if max(coarse.values()) <= 0.0:
             raise RuntimeError(
                 "ninguna posicion dio senal medible; revisa exposicion y ganancia"
+            )
+        # Una curva de foco real es una V marcada. Si la nitidez apenas cambia
+        # a lo largo del barrido, lo que se mide no depende del foco (pocas
+        # estrellas, solo ruido) o el foco no se esta moviendo (motor sin
+        # corriente): elegir su "maximo" es elegir al azar.
+        top, bottom = max(coarse.values()), min(coarse.values())
+        contrast = (top - bottom) / top
+        min_contrast = float(params.get("min_contrast", getattr(cfg, "autofocus_min_contrast", 0.15)))
+        if contrast < min_contrast:
+            self._move_relative(mount, origin - self.position)
+            raise RuntimeError(
+                f"la curva de foco salió plana (la nitidez varía {contrast:.0%} entre "
+                f"posiciones; hace falta {min_contrast:.0%}): pocas estrellas en el campo "
+                f"o el enfocador no mueve el foco. Volví a {origin:+d}"
             )
         # Centrar el fino en el vertice interpolado del grueso y no en su punto
         # medido mas alto: con pasos gruesos el maximo real cae casi siempre

@@ -50,7 +50,9 @@ def _send_command(rfile, sock: socket.socket, line: str, *, output: IO[str]) -> 
         text = raw.decode("utf-8", errors="replace").rstrip("\n")
         if text == RESPONSE_TERMINATOR:
             break
-        if text.startswith("CLI ERROR:"):
+        # Una linea de resultado empieza en la columna 0; el detalle va
+        # indentado, asi que un "error" dentro del detalle no se confunde.
+        if text == "error" or text.startswith("error  "):
             had_error = True
         print(text, file=output)
     return not had_error
@@ -60,13 +62,18 @@ def run_commands(sock: socket.socket, commands: Iterable[str], *, output: IO[str
     rfile = sock.makefile("rb")
     ok = True
     for command in commands:
+        if not command.strip() or command.strip().startswith("#"):
+            continue
+        # El eco lo pone el cliente: el servidor no sabe si quien escribe es una
+        # persona en un terminal (que ya ve lo que tecleo) o un script.
+        print(f"› {command.strip()}", file=output)
         ok = _send_command(rfile, sock, command, output=output) and ok
     return ok
 
 
 def run_interactive(sock: socket.socket, *, output: IO[str] = sys.stdout) -> bool:
     rfile = sock.makefile("rb")
-    print("Astropanoptes attach. Conectado a la app abierta. Escriba 'help' o 'quit'.", file=output)
+    print("ok  conectado a la app abierta; escribe help para ver los comandos, quit para salir", file=output)
     ok = True
     while True:
         try:
@@ -108,7 +115,7 @@ def main(argv: Optional[list[str]] = None) -> int:
     try:
         sock = connect(socket_path)
     except AttachError as exc:
-        print(f"ATTACH ERROR: {exc}", file=sys.stderr)
+        print(f"error  no hay una app abierta a la que conectarse: {exc}", file=sys.stderr)
         return 2
 
     ok = True
@@ -123,7 +130,7 @@ def main(argv: Optional[list[str]] = None) -> int:
         if should_interact:
             ok = run_interactive(sock) and ok
     except AttachError as exc:
-        print(f"ATTACH ERROR: {exc}", file=sys.stderr)
+        print(f"error  se perdió la conexión con la app: {exc}", file=sys.stderr)
         ok = False
     finally:
         sock.close()

@@ -180,7 +180,7 @@ def _safe_lower(s: str) -> str:
     try:
         return (s or "").lower()
     except Exception as exc:
-        log_error(None, "Mount: failed to normalize string", exc, throttle_s=10.0, throttle_key="mount_safe_lower")
+        log_error(None, "Mount: no se pudo normalizar el texto", exc, throttle_s=10.0, throttle_key="mount_safe_lower")
         return ""
 
 
@@ -371,7 +371,7 @@ class ArduinoController:
             if err:
                 log_info(
                     None,
-                    f"Mount: BT device lookup hint ({err})",
+                    f"Mount: aviso al buscar el dispositivo Bluetooth ({err})",
                     throttle_s=2.0,
                     throttle_key="mount_blueutil_lookup_hint",
                 )
@@ -382,7 +382,7 @@ class ArduinoController:
         except Exception as exc:
             log_error(
                 None,
-                "Mount: failed to parse blueutil device JSON",
+                "Mount: no se pudo leer el JSON de dispositivos de blueutil",
                 exc,
                 throttle_s=10.0,
                 throttle_key="mount_blueutil_json",
@@ -464,13 +464,13 @@ class ArduinoController:
 
         rc_disc, _o_disc, e_disc = self._blueutil_run("--disconnect", device_id, timeout_s=4.0)
         if rc_disc != 0 and e_disc:
-            log_info(None, f"Mount: BT disconnect hint ({e_disc})", throttle_s=2.0, throttle_key="mount_bt_disconnect_hint")
+            log_info(None, f"Mount: aviso de desconexión Bluetooth ({e_disc})", throttle_s=2.0, throttle_key="mount_bt_disconnect_hint")
         else:
             self._blueutil_run("--wait-disconnect", device_id, "5", timeout_s=6.0)
 
         rc_unpair, _o_unpair, e_unpair = self._blueutil_run("--unpair", device_id, timeout_s=8.0)
         if rc_unpair != 0 and e_unpair:
-            log_info(None, f"Mount: BT unpair hint ({e_unpair})", throttle_s=2.0, throttle_key="mount_bt_unpair_hint")
+            log_info(None, f"Mount: aviso de desemparejado Bluetooth ({e_unpair})", throttle_s=2.0, throttle_key="mount_bt_unpair_hint")
 
         if float(self.cfg.bt_forget_retry_s) > 0.0:
             time.sleep(float(self.cfg.bt_forget_retry_s))
@@ -479,13 +479,13 @@ class ArduinoController:
             rc_pair, _o_pair, e_pair = self._blueutil_run("--pair", device_id, timeout_s=30.0)
             if rc_pair != 0:
                 message = e_pair or "pair failed"
-                log_info(None, f"Mount: BT pair hint ({message})", throttle_s=2.0, throttle_key="mount_bt_pair_hint")
+                log_info(None, f"Mount: aviso de emparejado Bluetooth ({message})", throttle_s=2.0, throttle_key="mount_bt_pair_hint")
                 return (False, f"no se pudo emparejar la montura: {message}")
 
         rc_conn, _o_conn, e_conn = self._blueutil_run("--connect", device_id, timeout_s=20.0)
         if rc_conn != 0:
             message = e_conn or "connect failed"
-            log_info(None, f"Mount: BT connect hint ({message})", throttle_s=2.0, throttle_key="mount_bt_connect_hint")
+            log_info(None, f"Mount: aviso de conexión Bluetooth ({message})", throttle_s=2.0, throttle_key="mount_bt_connect_hint")
             return (False, f"no se pudo conectar la montura por Bluetooth: {message}")
 
         rc_wait, _o_wait, e_wait = self._blueutil_run("--wait-connect", device_id, "15", timeout_s=16.0)
@@ -553,7 +553,7 @@ class ArduinoController:
                     if self._ser is not None:
                         self._ser.close()
                 except Exception as exc:
-                    log_error(None, "Mount: failed to close existing serial connection", exc, throttle_s=5.0, throttle_key="mount_close_existing")
+                    log_error(None, "Mount: no se pudo cerrar la conexión serie anterior", exc, throttle_s=5.0, throttle_key="mount_close_existing")
                 self._ser = None
 
                 try:
@@ -571,7 +571,7 @@ class ArduinoController:
                         ser.reset_input_buffer()
                         ser.reset_output_buffer()
                     except Exception as exc:
-                        log_error(None, "Mount: failed to reset serial buffers", exc, throttle_s=5.0, throttle_key="mount_reset_buffers")
+                        log_error(None, "Mount: no se pudieron vaciar los búferes del puerto serie", exc, throttle_s=5.0, throttle_key="mount_reset_buffers")
 
                     self._ser = ser
                     self._move_profiles_supported = None
@@ -580,7 +580,7 @@ class ArduinoController:
                     self.cfg.port = target_port
                 except Exception as e:
                     self._ser = None
-                    log_error(None, "Mount: failed to connect", e, throttle_s=5.0, throttle_key="mount_connect")
+                    log_error(None, "Mount: no se pudo conectar", e, throttle_s=5.0, throttle_key="mount_connect")
                     last_error = f"Mount error al conectar ({e})"
                     continue
 
@@ -629,7 +629,7 @@ class ArduinoController:
         except Exception as exc:
             log_error(
                 None,
-                "Mount: failed to close serial connection",
+                "Mount: no se pudo cerrar la conexión serie",
                 exc,
                 throttle_s=5.0,
                 throttle_key="mount_close_locked",
@@ -678,7 +678,7 @@ class ArduinoController:
                     try:
                         b = ser.readline()
                     except Exception as exc:
-                        log_error(None, "Mount: failed to read serial line", exc, throttle_s=5.0, throttle_key="mount_readline")
+                        log_error(None, "Mount: no se pudo leer una línea del puerto serie", exc, throttle_s=5.0, throttle_key="mount_readline")
                         break
                     if not b:
                         break
@@ -690,7 +690,7 @@ class ArduinoController:
                     if old_timeout is not None:
                         ser.timeout = old_timeout
                 except Exception as exc:
-                    log_error(None, "Mount: failed to restore serial timeout", exc, throttle_s=5.0, throttle_key="mount_timeout_restore")
+                    log_error(None, "Mount: no se pudo restaurar el timeout del puerto serie", exc, throttle_s=5.0, throttle_key="mount_timeout_restore")
 
         return lines
 
@@ -739,7 +739,7 @@ class ArduinoController:
                     try:
                         ser.reset_input_buffer()
                     except Exception as exc:
-                        log_error(None, "Mount: failed to reset input buffer", exc, throttle_s=5.0, throttle_key="mount_reset_input")
+                        log_error(None, "Mount: no se pudo vaciar el búfer de entrada", exc, throttle_s=5.0, throttle_key="mount_reset_input")
                         self._close_serial_locked(ser)
                         raise serial.SerialException("input buffer reset failed") from exc
 
@@ -748,21 +748,21 @@ class ArduinoController:
                     try:
                         ser.flush()
                     except Exception as exc:
-                        log_error(None, "Mount: failed to flush serial buffer", exc, throttle_s=5.0, throttle_key="mount_flush")
+                        log_error(None, "Mount: no se pudo vaciar el búfer del puerto serie", exc, throttle_s=5.0, throttle_key="mount_flush")
 
                 t0 = time.time()
                 while True:
                     try:
                         line = ser.readline().decode(errors="ignore").strip()
                     except Exception as exc:
-                        log_error(None, "Mount: failed to read serial response", exc, throttle_s=5.0, throttle_key="mount_read_response")
+                        log_error(None, "Mount: no se pudo leer la respuesta del puerto serie", exc, throttle_s=5.0, throttle_key="mount_read_response")
                         line = ""
                     if line and self._response_matches_command(cmd, line):
                         return line
                     if (time.time() - t0) > float(timeout_s):
                         return ""
             except Exception as exc:
-                log_error(None, "Mount: send failed", exc, throttle_s=5.0, throttle_key="mount_send")
+                log_error(None, "Mount: falló el envío", exc, throttle_s=5.0, throttle_key="mount_send")
                 self._close_serial_locked(ser)
                 raise
 
@@ -927,9 +927,9 @@ class ArduinoMount:
         self.cfg.baud = int(baud)
         msg = self.ctrl.connect()
         if "error" in _safe_lower(msg):
-            log_error(None, f"Mount: connect failed ({msg})", throttle_s=5.0, throttle_key="mount_connect_result")
+            log_error(None, f"Mount: no se pudo conectar ({msg})", throttle_s=5.0, throttle_key="mount_connect_result")
         else:
-            log_info(None, f"Mount: connect result ({msg})", throttle_s=2.0, throttle_key="mount_connect_result_ok")
+            log_info(None, f"Mount: resultado de la conexión ({msg})", throttle_s=2.0, throttle_key="mount_connect_result_ok")
         return msg
 
     def disconnect(self) -> None:
@@ -937,7 +937,7 @@ class ArduinoMount:
             if self.ctrl.is_connected:
                 self.stop()
         except Exception as exc:
-            log_error(None, "Mount: stop failed during disconnect", exc, throttle_s=2.0, throttle_key="mount_stop_on_disconnect")
+            log_error(None, "Mount: falló la parada al desconectar", exc, throttle_s=2.0, throttle_key="mount_stop_on_disconnect")
         finally:
             self.ctrl.close()
 
@@ -1017,7 +1017,7 @@ class ArduinoMount:
             except Exception as exc:
                 log_error(
                     None,
-                    "Mount: failed to stop before move",
+                    "Mount: no se pudo parar antes de mover",
                     exc,
                     throttle_s=5.0,
                     throttle_key="mount_stop_before_move",
@@ -1221,7 +1221,7 @@ class MountMoveWorker(BaseWorker):
                     "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE},
                 }
             )
-            log_error(self._out_log, "Mount: MOVE steps failed", exc)
+            log_error(self._out_log, "Mount: falló el MOVE", exc)
         finally:
             if self._operation_finished is not None:
                 self._operation_finished()

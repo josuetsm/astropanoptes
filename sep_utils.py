@@ -185,6 +185,47 @@ def repair_bad_pixels(raw16: np.ndarray, mask: Optional[np.ndarray] = None) -> n
     return out
 
 
+def repair_isolated_pixels(raw16: np.ndarray, *, sigma: float = 8.0, contrast: float = 4.0) -> np.ndarray:
+    """Replace hot pixels the map does not know about, frame by frame.
+
+    The map only covers the defects it was built from, and it can be missing
+    altogether (it lives outside git and was lost once). On 2026-10-28 one
+    unmapped pixel at 31856 ADU, on a sky of 80, was the brightest thing in a
+    sparse field: the stacker's max-projection signature followed it instead
+    of the stars, measured ~0 motion while the sky drifted 14 px/s, and the
+    mosaic smeared.
+
+    A hot pixel stands alone; a star never does. Even an undersampled star
+    lights its immediate neighbours to a sizeable fraction of its peak (~0.3 of
+    it across a Bayer colour step), while a defect leaves them at the sky. So a
+    pixel is repaired only when it is ``sigma`` noise above the local
+    background *and* ``contrast`` times further above it than its brightest
+    neighbour. Both tests are local, so a gradient or a bright star does not
+    trigger them.
+    """
+    import cv2
+
+    raw = np.asarray(raw16)
+    if raw.ndim != 2 or raw.dtype != np.uint16 or raw.size < 25:
+        return raw16
+    bg = cv2.medianBlur(raw, 5).astype(np.int32)
+    ring = np.ones((3, 3), np.uint8)
+    ring[1, 1] = 0
+    neighbour_max = cv2.dilate(raw, ring).astype(np.int32)
+    excess = raw.astype(np.int32) - bg
+    # Noise from a sparse sample: the full-frame MAD would cost as much as
+    # the repair itself and the sky statistics do not need 2M samples.
+    sample = excess[::7, ::7]
+    noise = 1.4826 * float(np.median(np.abs(sample - np.median(sample))))
+    threshold = max(1.0, float(sigma) * noise)
+    hot = (excess > threshold) & (excess > float(contrast) * np.maximum(neighbour_max - bg, threshold / float(contrast)))
+    if not hot.any():
+        return raw16
+    out = raw.copy()
+    out[hot] = bg[hot].astype(np.uint16)
+    return out
+
+
 def sep_detect_from_raw16(
     raw16: np.ndarray,
     *,

@@ -13,7 +13,7 @@ from logging_utils import log_error, log_info
 try:
     import pyPOACamera  # user-provided SDK wrapper
 except Exception as exc:
-    log_error(None, "Camera: failed to import pyPOACamera", exc)
+    log_error(None, "Camera: no se pudo importar pyPOACamera", exc)
     pyPOACamera = None
     POA_UNAVAILABLE_REASON = str(exc)
 else:
@@ -68,7 +68,7 @@ def _bayerpattern_to_str(bp: Any) -> str:
             return str(bp.name)
         return str(bp)
     except Exception as exc:
-        log_error(None, "Camera: failed to decode bayer pattern", exc, throttle_s=10.0, throttle_key="camera_bayerpattern")
+        log_error(None, "Camera: no se pudo decodificar el patrón Bayer", exc, throttle_s=10.0, throttle_key="camera_bayerpattern")
         return "UNKNOWN"
 
 
@@ -190,11 +190,11 @@ class POACameraDevice:
         try:
             self.stop()
         except Exception as exc:
-            log_error(None, "Camera: stop failed during close", exc, throttle_s=5.0, throttle_key="camera_stop_close")
+            log_error(None, "Camera: falló la parada al cerrar", exc, throttle_s=5.0, throttle_key="camera_stop_close")
         try:
             err = pyPOACamera.CloseCamera(self.cam_id)
             if err != pyPOACamera.POAErrors.POA_OK:
-                log_error(None, f"Camera: CloseCamera failed (err={err})", throttle_s=5.0, throttle_key="camera_close")
+                log_error(None, f"Camera: falló CloseCamera (err={err})", throttle_s=5.0, throttle_key="camera_close")
         finally:
             self._opened = False
             self._cam_id = None
@@ -264,16 +264,16 @@ class POACameraDevice:
                     if applied_gain != requested_gain:
                         log_info(
                             None,
-                            "Camera: gain fuera del rango del sensor; "
-                            f"requested={requested_gain} applied={applied_gain} "
-                            f"range=[{gain_min},{gain_max}]",
+                            "Camera: ganancia fuera del rango del sensor; "
+                            f"pedida={requested_gain} aplicada={applied_gain} "
+                            f"rango=[{gain_min},{gain_max}]",
                         )
         except Exception as exc:
             # Older SDKs may not expose config attributes. SetGain still
             # validates the value below and its return code is never ignored.
             log_error(
                 None,
-                "Camera: no se pudo consultar el rango de gain",
+                "Camera: no se pudo consultar el rango de ganancia",
                 exc,
                 throttle_s=10.0,
                 throttle_key="camera_gain_range",
@@ -299,8 +299,8 @@ class POACameraDevice:
                         log_info(
                             None,
                             "Camera: offset fuera del rango del sensor; "
-                            f"requested={requested_offset} applied={applied_offset} "
-                            f"range=[{offset_min},{offset_max}]",
+                            f"pedido={requested_offset} aplicado={applied_offset} "
+                            f"rango=[{offset_min},{offset_max}]",
                         )
         except Exception as exc:
             log_error(
@@ -341,7 +341,7 @@ class POACameraDevice:
         except Exception as exc:
             log_error(
                 None,
-                "Camera: no se pudo verificar exposición/gain/offset aplicados",
+                "Camera: no se pudo verificar exposición, ganancia y offset aplicados",
                 exc,
                 throttle_s=10.0,
                 throttle_key="camera_config_readback",
@@ -352,9 +352,9 @@ class POACameraDevice:
         cfg.auto_gain = bool(actual_auto_gain)
         log_info(
             None,
-            "Camera: settings verified "
-            f"exposure={cfg.exp_ms:.3f}ms gain={cfg.gain} offset={cfg.offset} "
-            f"auto_gain={int(cfg.auto_gain)}",
+            "Camera: ajustes verificados "
+            f"exposición={cfg.exp_ms:.3f}ms ganancia={cfg.gain} offset={cfg.offset} "
+            f"ganancia_auto={int(cfg.auto_gain)}",
         )
 
         # Gamma / Debayer: depende de SDK; se controlará desde otro módulo si procede.
@@ -489,7 +489,7 @@ class CameraStream:
             try:
                 self._dev.stop()
             except Exception as exc:
-                log_error(None, "CameraStream: device stop failed", exc, throttle_s=5.0, throttle_key="camera_stream_stop")
+                log_error(None, "CameraStream: falló la parada del dispositivo", exc, throttle_s=5.0, throttle_key="camera_stream_stop")
 
         self._dev = None
         self._cfg = None
@@ -514,7 +514,7 @@ class CameraStream:
         try:
             return self._dev.info
         except Exception as exc:
-            log_error(None, "CameraStream: failed to read camera info", exc, throttle_s=10.0, throttle_key="camera_info")
+            log_error(None, "CameraStream: no se pudo leer la información de la cámara", exc, throttle_s=10.0, throttle_key="camera_info")
             return None
 
     def _run(self) -> None:
@@ -562,7 +562,7 @@ class CameraStream:
                     timeout_s=ready_timeout_s,
                 )
             except Exception as exc:
-                log_error(None, "CameraStream: wait_ready failed", exc, throttle_s=5.0, throttle_key="camera_wait_ready")
+                log_error(None, "CameraStream: falló la espera de imagen lista", exc, throttle_s=5.0, throttle_key="camera_wait_ready")
                 self._dropped += 1
                 if self._stop.is_set():
                     break
@@ -575,7 +575,7 @@ class CameraStream:
                 self._dropped += 1
                 log_error(
                     None,
-                    "CameraStream: image ready timeout",
+                    "CameraStream: se agotó la espera de imagen lista",
                     TimeoutError(f"ImageReady timed out after {ready_timeout_s:.2f}s"),
                     throttle_s=5.0,
                     throttle_key="camera_ready_timeout",
@@ -589,7 +589,7 @@ class CameraStream:
                 dev.read_into(buf, timeout_ms=1000)
             except Exception as exc:
                 # si falla, contamos como drop y seguimos
-                log_error(None, "CameraStream: read failed", exc, throttle_s=5.0, throttle_key="camera_read")
+                log_error(None, "CameraStream: falló la lectura", exc, throttle_s=5.0, throttle_key="camera_read")
                 self._dropped += 1
                 continue
 
@@ -600,7 +600,7 @@ class CameraStream:
             if fmt != pyPOACamera.POAImgFormat.POA_RAW16:
                 log_error(
                     None,
-                    "CameraStream: unexpected format",
+                    "CameraStream: formato inesperado",
                     RuntimeError(f"unexpected format {fmt} (RAW16 required)"),
                     throttle_s=5.0,
                     throttle_key="camera_unexpected_format",

@@ -74,7 +74,7 @@ class BaseWorker:
             except Exception as exc:
                 log_error(
                     None,
-                    f"{self._name}: unhandled worker error",
+                    f"Runner: error no controlado en el trabajador {self._name}",
                     exc,
                     throttle_s=2.0,
                     throttle_key=f"worker_unhandled_{self._name}",
@@ -140,7 +140,7 @@ class SaveWorker:
             except Exception as exc:
                 log_error(
                     None,
-                    "SaveWorker: unhandled save error",
+                    "Stacking: error no controlado al guardar",
                     exc,
                     throttle_s=2.0,
                     throttle_key="save_worker_unhandled",

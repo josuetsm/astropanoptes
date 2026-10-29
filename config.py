@@ -117,6 +117,9 @@ class FocuserConfig:
     autofocus_fine_points: int = 7
     autofocus_settle_s: float = 0.8
     autofocus_frames: int = 3
+    # Variacion minima de la nitidez en el barrido grueso, (max-min)/max. Por
+    # debajo, la curva no depende del foco y el autofoco se rinde.
+    autofocus_min_contrast: float = 0.15
 
     # --- Busqueda guiada por presets ---
     # Con una posicion conocida no hace falta barrer todo el recorrido: basta
@@ -189,6 +192,12 @@ class StackingConfig:
     smooth_k: int = 30
     max_shift_px: int = 50
     use_subpixel: bool = True
+    # Motion model: a registration more than this far from the predicted drift
+    # is a false peak and the frame is skipped (0 disables, e.g. for dither).
+    motion_gate_px: float = 6.0
+    # After this long without an accepted frame the model is dropped and the
+    # search restarts around zero instead of insisting on a stale prediction.
+    lost_after_s: float = 3.0
 
     # drizzle / mosaic
     drizzle_scale: float = 1.0     # UI presets: 1.0 (off), 2.0, 3.0
@@ -202,7 +211,10 @@ class StackingConfig:
 
     # preview
     preview_hz: float = 1.0
-    preview_log_vmin: float = 5.0
+    # Piso opcional del negro en log1p(ADU). En 0 el estirado lo fijan solo
+    # los percentiles del stack; un piso fijo por encima del cielo real (con
+    # offset bajo el fondo ronda 60 ADU, bajo e^5) dejaba la preview en 0/255.
+    preview_log_vmin: float = 0.0
 
     # backend
     backend: Literal["cpu"] = "cpu"
@@ -348,8 +360,15 @@ class PlatesolvingConfig:
     # varias estrellas de sobra: los solves buenos de campo real dieron 7-9
     # inliers. Un campo demasiado pobre para llegar aqui no es un campo que
     # convenga creerse.
-    min_inliers: int = 5
-    min_validation_inliers: int = 2
+    #
+    # Calibrado el 2026-10-28 resolviendo los 35 stacks guardados dos veces:
+    # en su apuntado y corridos 20 grados en Az, donde el campo no puede estar.
+    # Las soluciones falsas llegaron a 4 inliers / 1 de validacion; esa noche,
+    # probando 49 posiciones alrededor de Rigel, hasta 6 / 3 (una "solucion"
+    # junto a M42 sin rastro de la nebulosa). Ninguna verdadera cayo entre 5 y
+    # 6: todas dieron 7 / 4 o mas. El umbral va en ese hueco.
+    min_inliers: int = 7
+    min_validation_inliers: int = 4
     max_rms_px: float = 2.5
     # The search radius is also the declared pointing uncertainty. A fitted
     # optical center outside that cone is not a valid answer for the request.

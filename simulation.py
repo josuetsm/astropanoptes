@@ -62,9 +62,9 @@ def _configure_iers_for_demo(out_log: Any = None) -> None:
             iers.conf.auto_download = False
             iers.conf.auto_max_age = None
             _IERS_OFFLINE_CONFIGURED = True
-            log_info(out_log, "Simulation: Astropy IERS configured for offline demo mode")
+            log_info(out_log, "Simulation: IERS de Astropy configurado sin red para el modo demo")
         except Exception as exc:
-            log_error(out_log, "Simulation: failed to configure offline IERS mode", exc)
+            log_error(out_log, "Simulation: no se pudo configurar IERS sin red", exc)
 
 
 def restore_iers_after_demo(out_log: Any = None) -> None:
@@ -80,9 +80,9 @@ def restore_iers_after_demo(out_log: Any = None) -> None:
             iers.conf.auto_max_age = _IERS_PREVIOUS_CONFIG[1]
             _IERS_OFFLINE_CONFIGURED = False
             _IERS_PREVIOUS_CONFIG = None
-            log_info(out_log, "Simulation: Astropy IERS settings restored")
+            log_info(out_log, "Simulation: ajustes IERS de Astropy restaurados")
         except Exception as exc:
-            log_error(out_log, "Simulation: failed to restore Astropy IERS settings", exc)
+            log_error(out_log, "Simulation: no se pudieron restaurar los ajustes IERS de Astropy", exc)
 
 
 class SimulationState:
@@ -181,13 +181,13 @@ class SimulationState:
         log_info(
             out_log,
             (
-                "Simulation: seeded demo mode "
-                f"seed={self.seed} mount_tilt=({self.mount_tilt_az_deg:+.3f},"
-                f"{self.mount_tilt_alt_deg:+.3f}) deg "
-                f"camera_roll_error={self.camera_roll_error_deg:+.3f} deg "
-                f"transmission_error=({self.transmission_amp_deg[0]:.3f},"
-                f"{self.transmission_amp_deg[1]:.3f}) deg "
-                f"backlash=({int(self.backlash_steps[0])},{int(self.backlash_steps[1])}) steps "
+                "Simulation: modo demo con semilla "
+                f"{self.seed}: inclinación=({self.mount_tilt_az_deg:+.3f},"
+                f"{self.mount_tilt_alt_deg:+.3f})° "
+                f"error_de_giro={self.camera_roll_error_deg:+.3f}° "
+                f"rizado=({self.transmission_amp_deg[0]:.3f},"
+                f"{self.transmission_amp_deg[1]:.3f})° "
+                f"juego=({int(self.backlash_steps[0])},{int(self.backlash_steps[1])}) pasos "
                 f"foco_real={int(self.focus_best_steps):+d} pasos"
             ),
         )
@@ -484,7 +484,7 @@ class SimulatedCameraStream:
         if thr is not None:
             thr.join(timeout=2.0)
             if thr.is_alive():
-                log_error(self._out_log, "Simulation camera: thread did not stop within timeout")
+                log_error(self._out_log, "Simulation camera: el hilo no se detuvo a tiempo")
         self._thr = None
         with self._lock:
             self._latest = None
@@ -537,7 +537,7 @@ class SimulatedCameraStream:
             except Exception as exc:
                 log_error(
                     self._out_log,
-                    "Simulation camera: frame render failed",
+                    "Simulation camera: falló el render del cuadro",
                     exc,
                     throttle_s=2.0,
                     throttle_key="simulation_render_failed",
@@ -617,14 +617,14 @@ class SimulatedCameraStream:
                 last_error = "Gaia cache returned 0 stars for the current demo field"
                 log_info(
                     self._out_log,
-                    f"Simulation camera: Gaia catalog is empty radius={radius_deg:.2f} deg",
+                    f"Simulation camera: el catálogo de Gaia está vacío en radio={radius_deg:.2f}°",
                     throttle_s=10.0,
                     throttle_key="simulation_gaia_empty",
                 )
             else:
                 log_info(
                     self._out_log,
-                    f"Simulation camera: Gaia catalog loaded rows={len(df)} radius={radius_deg:.2f} deg",
+                    f"Simulation camera: catálogo de Gaia cargado filas={len(df)} radio={radius_deg:.2f}°",
                     throttle_s=10.0,
                     throttle_key="simulation_gaia_loaded",
                 )
@@ -634,8 +634,8 @@ class SimulatedCameraStream:
                 log_info(
                     self._out_log,
                     (
-                        "Simulation camera: Gaia cache missing for current field; "
-                        "using opt-in synthetic fallback"
+                        "Simulation camera: faltan teselas de Gaia para el campo actual; "
+                        "se usa el respaldo sintético activado"
                     ),
                     throttle_s=10.0,
                     throttle_key="simulation_gaia_cache_miss_synthetic",
@@ -647,8 +647,8 @@ class SimulatedCameraStream:
                 log_info(
                     self._out_log,
                     (
-                        "Simulation camera: Gaia cache missing for current field; "
-                        "rendering no stars until those Gaia tiles exist"
+                        "Simulation camera: faltan teselas de Gaia para el campo actual; "
+                        "no se pintan estrellas hasta que existan"
                     ),
                     throttle_s=10.0,
                     throttle_key="simulation_gaia_cache_miss",
@@ -659,7 +659,7 @@ class SimulatedCameraStream:
         except Exception as exc:
             log_error(
                 self._out_log,
-                "Simulation camera: Gaia catalog load failed",
+                "Simulation camera: falló la carga del catálogo de Gaia",
                 exc,
                 throttle_s=10.0,
                 throttle_key="simulation_gaia_load_failed",

@@ -34,6 +34,7 @@ from ap_types import (
     TrackingMode,
     TrackingStatus,
 )
+from astro_setup import configure_astropy
 from config import AppConfig, FocuserConfig, PlatesolvingConfig, SepConfig
 from actions import (
     Action,
@@ -242,7 +243,7 @@ def _append_tracking_csv_log_row(row: Dict[str, Any]) -> None:
     except Exception as exc:
         log_error(
             None,
-            "Tracking: failed to append CSV log (tracking_samples.csv)",
+            "Tracking: no se pudo añadir la muestra al log CSV (tracking_samples.csv)",
             exc,
             throttle_s=5.0,
             throttle_key="tracking_csv_log",
@@ -311,6 +312,9 @@ class AppRunner:
     """
 
     def __init__(self, cfg: AppConfig, out_log=None) -> None:
+        # Antes de cualquier conversion de coordenadas: sin esto, el primer plate
+        # solve de la sesion esperaba hasta 43 s a que astropy descargara IERS.
+        configure_astropy(out_log)
         self.default_cfg = cfg
         self.cfg = replace(cfg)
         self.cfg.camera = replace(cfg.camera)
@@ -721,9 +725,9 @@ class AppRunner:
         self.cfg.simulation.enabled = enabled_b
         self._release_simulation_if_idle()
         if self._cam_stream is not None or self._mount is not None:
-            log_info(self.out_log, "Simulation: mode changed; reconnect camera/mount to apply it")
+            log_info(self.out_log, "Simulation: modo cambiado; reconecta cámara y montura para aplicarlo")
         else:
-            log_info(self.out_log, f"Simulation: {'enabled' if enabled_b else 'disabled'}")
+            log_info(self.out_log, f"Simulation: modo demo {'activado' if enabled_b else 'desactivado'}")
 
     def _simulation_enabled(self) -> bool:
         return bool(getattr(self.cfg.simulation, "enabled", False))
@@ -972,7 +976,7 @@ class AppRunner:
         except Exception as exc:
             log_error(
                 self.out_log,
-                "Tracking: failed to build nominal calibration",
+                "Tracking: no se pudo construir la calibración nominal",
                 exc,
                 throttle_s=5.0,
                 throttle_key="tracking_nominal_calib",
@@ -1051,14 +1055,14 @@ class AppRunner:
             log_info(
                 self.out_log,
                 (
-                    "Tracking: geometry calibration seeded "
+                    "Tracking: calibración sembrada desde la geometría "
                     f"A=[[{A[0,0]:+.4f},{A[0,1]:+.4f}],"
                     f"[{A[1,0]:+.4f},{A[1,1]:+.4f}]]"
                 ),
             )
             return True
         except Exception as exc:
-            log_error(self.out_log, "Tracking: failed to seed geometry calibration", exc, throttle_s=5.0, throttle_key="tracking_seed_calib")
+            log_error(self.out_log, "Tracking: no se pudo sembrar la calibración desde la geometría", exc, throttle_s=5.0, throttle_key="tracking_seed_calib")
             return False
 
     def _get_fps_capture(self) -> float:
@@ -1074,7 +1078,7 @@ class AppRunner:
                 return stacked
             log_info(
                 self.out_log,
-                "Platesolving: stack source empty, falling back to live frame",
+                "Platesolving: el mosaico apilado está vacío; se usa el cuadro en vivo",
             )
         if self._cam_stream is None:
             return None
@@ -1086,7 +1090,7 @@ class AppRunner:
         except Exception as exc:
             log_error(
                 self.out_log,
-                "Platesolving: live frame copy failed",
+                "Platesolving: no se pudo copiar el cuadro en vivo",
                 exc,
                 throttle_s=2.0,
                 throttle_key="platesolving_frame_copy",
@@ -1109,7 +1113,7 @@ class AppRunner:
         except Exception as exc:
             log_error(
                 self.out_log,
-                "Platesolving: stack snapshot failed",
+                "Platesolving: no se pudo leer el mosaico apilado",
                 exc,
                 throttle_s=5.0,
                 throttle_key="platesolving_stack_snapshot",
@@ -1123,8 +1127,8 @@ class AppRunner:
         self._platesolving_stack_info = info
         log_info(
             self.out_log,
-            f"Platesolving: using live stack ({int(info['frames'])} frames, "
-            f"canvas {info['canvas'][1]}x{info['canvas'][0]})",
+            f"Platesolving: resolviendo sobre el mosaico apilado ({int(info['frames'])} cuadros, "
+            f"lienzo {info['canvas'][1]}x{info['canvas'][0]} px)",
         )
         return np.ascontiguousarray(img)
 
@@ -1202,7 +1206,7 @@ class AppRunner:
         except Exception as exc:
             log_error(
                 self.out_log,
-                "GoTo: live pointing update failed",
+                "GoTo: no se pudo actualizar el apuntado en vivo",
                 exc,
                 throttle_s=2.0,
                 throttle_key="goto_pointing_update",
@@ -1248,8 +1252,8 @@ class AppRunner:
         self._thr.start()
         if self._stacking_enabled:
             self._stacking.start()
-            log_info(self.out_log, "Stacking: worker started")
-        log_info(self.out_log, "Runner: started")
+            log_info(self.out_log, "Stacking: trabajador arrancado")
+        log_info(self.out_log, "Runner: arrancado")
 
     def stop(self) -> None:
         self._stop.set()
@@ -1263,7 +1267,7 @@ class AppRunner:
             if gaia_thr.is_alive():
                 log_error(
                     self.out_log,
-                    "Gaia download: thread did not stop within timeout",
+                    "Gaia download: el hilo no se detuvo a tiempo",
                     RuntimeError("gaia download still running"),
                 )
 
@@ -1274,7 +1278,7 @@ class AppRunner:
             if coverage_thr.is_alive():
                 log_error(
                     self.out_log,
-                    "Gaia coverage: worker did not stop within timeout",
+                    "Gaia coverage: el trabajador no se detuvo a tiempo",
                     RuntimeError("Gaia coverage still running"),
                 )
 
@@ -1306,7 +1310,7 @@ class AppRunner:
         if raw_thr is not None and raw_thr.is_alive():
             raw_thr.join(timeout=2.0)
             if raw_thr.is_alive():
-                log_error(self.out_log, "Raw record: thread did not stop within timeout", RuntimeError("raw recording still running"))
+                log_error(self.out_log, "Raw record: el hilo no se detuvo a tiempo", RuntimeError("raw recording still running"))
 
         self._shutdown_camera()
         self._shutdown_mount()
@@ -1315,13 +1319,13 @@ class AppRunner:
         try:
             self._stacking.stop()
         except Exception as exc:
-            log_error(self.out_log, "Stacking: stop failed", exc)
+            log_error(self.out_log, "Stacking: no se pudo detener", exc)
         try:
             self._stacking.shutdown()
         except Exception as exc:
-            log_error(self.out_log, "Stacking: shutdown failed", exc)
+            log_error(self.out_log, "Stacking: no se pudo cerrar", exc)
 
-        log_info(self.out_log, "Runner: stopped")
+        log_info(self.out_log, "Runner: detenido")
 
     # -------------------------
     # UI entrypoints
@@ -1399,7 +1403,7 @@ class AppRunner:
                 coverage = self.get_gaia_coverage()
             except Exception as exc:
                 error = f"{type(exc).__name__}: {exc}"
-                log_error(self.out_log, "Gaia coverage: refresh failed", exc)
+                log_error(self.out_log, "Gaia coverage: falló la actualización", exc)
             finally:
                 with self._gaia_coverage_lock:
                     if coverage is not None:
@@ -1457,7 +1461,7 @@ class AppRunner:
             )
             log_info(
                 self.out_log,
-                f"Runner: slow loop total={total_ms:.1f}ms ({breakdown})",
+                f"Runner: ciclo lento total={total_ms:.1f}ms ({breakdown})",
             )
 
     def get_performance_metrics(self) -> Dict[str, object]:
@@ -1975,7 +1979,7 @@ class AppRunner:
                 reset_tracker(self._tracking_state, now_t=float(_perf()), mode="STABILIZE")
             self._invalidate_tracking_pipeline()
         except Exception as exc:
-            log_error(self.out_log, "Tracking: failed to reset keyframe", exc)
+            log_error(self.out_log, "Tracking: no se pudo reiniciar el cuadro de referencia", exc)
 
     def _reset_tracking_feedforward_cache(self) -> None:
         self._tracking_ff_hold_az = 0.0
@@ -2063,6 +2067,37 @@ class AppRunner:
             # garantiza la reserva de linea por eje, no este recorte.
             room = 1
         return int(max(-room, min(room, n)))
+
+    def _bounded_rate_debt(self, acc: float, rate_steps_s: float) -> float:
+        window_s = self._rate_emul_period_s
+        if window_s is None:
+            return float(acc)
+        limit = max(1.0, abs(float(rate_steps_s)) * float(window_s))
+        return float(max(-limit, min(limit, float(acc))))
+
+    def _emission_delay_us(self, steps: int, rate_steps_s: float, *, axis: Axis) -> int:
+        """Retardo entre pasos para que el lote termine dentro de la ventana.
+
+        Sacar el retardo solo de la velocidad (1/velocidad) hacia que cada
+        paso ocupara la linea mas que un tick del lazo: la reserva de linea
+        dejaba pasar a lo sumo un paso cada varios ticks y sobre ~15 pasos/s
+        la montura entregaba menos de lo pedido. Lo que no salia quedaba en el
+        acumulador y, al invertir el sentido la correccion, la montura seguia
+        gastando ese saldo hacia el lado viejo. La cadencia ya la marca el
+        acumulador; el retardo solo tiene que hacer que el lote quepa.
+        """
+        delay = self._rate_to_delay_us(abs(float(rate_steps_s)), axis=axis)
+        window_s = self._rate_emul_period_s
+        n = abs(int(steps))
+        if window_s is None or n == 0:
+            return delay
+        budget_us = float(window_s) * 1.0e6 * _RATE_EMUL_WINDOW_FRAC
+        fit = int(budget_us // n - _RATE_EMUL_PULSE_US)
+        if fit >= delay:
+            return delay
+        # Piso: el mismo retardo que ya usan los slews en este eje.
+        floor_us = int(self.cfg.mount.slew_delay_us_az if axis == Axis.AZ else self.cfg.mount.slew_delay_us_alt)
+        return max(1, floor_us, fit)
 
     def _is_manual_move_active(self) -> bool:
         if self._mount_move_worker.is_busy():
@@ -2155,7 +2190,7 @@ class AppRunner:
                             },
                         }
                     )
-                    log_error(self.out_log, "Mount: STOP failed (rate emulation)", exc, throttle_s=2.0, throttle_key="mount_stop_rate_emul")
+                    log_error(self.out_log, "Mount: falló la parada (emulación de velocidad)", exc, throttle_s=2.0, throttle_key="mount_stop_rate_emul")
                 return 0, 0
 
             if self._is_manual_move_active():
@@ -2171,8 +2206,8 @@ class AppRunner:
             step_az = int(max(-400, min(400, step_az)))
             step_alt = int(max(-400, min(400, step_alt)))
 
-            delay_az = self._rate_to_delay_us(abs(az_cmd), axis=Axis.AZ)
-            delay_alt = self._rate_to_delay_us(abs(alt_cmd), axis=Axis.ALT)
+            delay_az = self._emission_delay_us(step_az, az_cmd, axis=Axis.AZ)
+            delay_alt = self._emission_delay_us(step_alt, alt_cmd, axis=Axis.ALT)
 
             # El firmware ASIGNA el plan pendiente (g_moveRem[ax] = steps), no lo
             # acumula: un MOVE nuevo descarta los pasos que el anterior todavia
@@ -2207,6 +2242,13 @@ class AppRunner:
 
             self._rate_emul_acc_az -= float(step_az)
             self._rate_emul_acc_alt -= float(step_alt)
+            # Lo que no salio se difiere como mucho un ciclo. Un saldo mayor es
+            # deuda que la montura ya no puede pagar a tiempo: ejecutarlo tarde
+            # mueve la montura cuando la correccion ya cambio, incluso hacia el
+            # lado contrario. El lazo de imagen corrige lo que se descarte, y el
+            # contador de pasos no se entera porque nunca se emitio.
+            self._rate_emul_acc_az = self._bounded_rate_debt(self._rate_emul_acc_az, az_cmd)
+            self._rate_emul_acc_alt = self._bounded_rate_debt(self._rate_emul_acc_alt, alt_cmd)
             self._rate_emul_active = True
 
             if step_az == 0 and step_alt == 0:
@@ -2230,7 +2272,7 @@ class AppRunner:
                     },
                 }
             )
-            log_error(self.out_log, "Mount: MOVE rate-emulation failed", exc, throttle_s=2.0, throttle_key="mount_move_rate_emul")
+            log_error(self.out_log, "Mount: falló la emulación de velocidad por MOVE", exc, throttle_s=2.0, throttle_key="mount_move_rate_emul")
             return 0, 0
 
     def _ensure_transmission_collector(self) -> Optional[TransmissionErrorCollector]:
@@ -2251,7 +2293,7 @@ class AppRunner:
         except Exception as exc:
             log_error(
                 self.out_log,
-                "Transmission: collector init failed",
+                "Transmission: no se pudo iniciar el colector",
                 exc,
                 throttle_s=30.0,
                 throttle_key="transmission_collector_init",
@@ -2297,7 +2339,7 @@ class AppRunner:
         except Exception as exc:
             log_error(
                 self.out_log,
-                "Transmission: observe failed",
+                "Transmission: no se pudo registrar la observación",
                 exc,
                 throttle_s=30.0,
                 throttle_key="transmission_observe",
@@ -2336,13 +2378,13 @@ class AppRunner:
             self._goto.model.periodic_coeff_deg = self._goto.model.safe_periodic_coeff_for_prediction(coeff)
             self._goto.model.periodic_model_samples = int(collector.samples)
         except Exception as exc:
-            log_error(self.out_log, "Transmission: apply failed", exc)
+            log_error(self.out_log, "Transmission: no se pudo aplicar el rizado aprendido", exc)
             return False
         log_info(
             self.out_log,
-            "Transmission: modelo periódico actualizado desde tracking "
+            "Transmission: rizado actualizado desde el tracking "
             f"({int(collector.samples)} muestras, "
-            f"cobertura az={detail.get('az_coverage', 0.0):.2f} alt={detail.get('alt_coverage', 0.0):.2f})",
+            f"cobertura de fase az={detail.get('az_coverage', 0.0):.2f} alt={detail.get('alt_coverage', 0.0):.2f})",
         )
         return True
 
@@ -2415,7 +2457,7 @@ class AppRunner:
             try:
                 self._cam_stream.stop()
             except Exception as exc:
-                log_error(self.out_log, "Camera: stream stop failed", exc)
+                log_error(self.out_log, "Camera: no se pudo detener el flujo", exc)
             self._cam_stream = None
             self._invalidate_tracking_pipeline()
             self._tracking_last_cmd_az = 0.0
@@ -2431,7 +2473,7 @@ class AppRunner:
             try:
                 self._cam_dev.close()
             except Exception as exc:
-                log_error(self.out_log, "Camera: device close failed", exc)
+                log_error(self.out_log, "Camera: no se pudo cerrar el dispositivo", exc)
             self._cam_dev = None
 
         self._update_state(
@@ -2476,9 +2518,9 @@ class AppRunner:
                 log_info(
                     self.out_log,
                     (
-                        "Camera: connected in DEMO mode "
-                        f"frame={int(self.cfg.simulation.frame_w)}x{int(self.cfg.simulation.frame_h)} "
-                        f"roll_error={float(snap['camera_roll_error_deg']):+.3f} deg"
+                        "Camera: conectada en modo demo "
+                        f"cuadro={int(self.cfg.simulation.frame_w)}x{int(self.cfg.simulation.frame_h)} "
+                        f"error_de_giro={float(snap['camera_roll_error_deg']):+.3f}°"
                     ),
                 )
                 return
@@ -2495,7 +2537,7 @@ class AppRunner:
             self._update_state({"camera": {"connected": True, "status": CameraStatus.OK, "last_error": None}})
             log_info(
                 self.out_log,
-                f"Camera: connected id={info.camera_id} model={info.model} sensor={info.sensor} "
+                f"Camera: conectada id={info.camera_id} modelo={info.model} sensor={info.sensor} "
                 f"usb3={info.is_usb3} bayer={info.bayer_pattern} max={info.max_w}x{info.max_h}",
             )
         except Exception as exc:
@@ -2509,7 +2551,7 @@ class AppRunner:
                     }
                 }
             )
-            log_error(self.out_log, "Camera: connect failed (is it open in another app?)", exc)
+            log_error(self.out_log, "Camera: no se pudo conectar (¿está abierta en otra aplicación?)", exc)
 
     def _set_camera_param_value(self, name: str, value: Any) -> Optional[bool]:
         """Apply one runtime value and report whether capture must restart."""
@@ -2555,14 +2597,14 @@ class AppRunner:
         elif n in ("roll_deg", "camera_roll_deg"):
             roll = float(value)
             if not np.isfinite(roll):
-                log_info(self.out_log, f"Camera: roll inválido ignorado: {value}")
+                log_info(self.out_log, f"Camera: giro inválido ignorado: {value}")
                 return None
             self.cfg.camera.roll_deg = float(roll)
             self.cfg.platesolving.rotation_prior_roll_offset_deg = float(roll)
             self._update_state({"camera": {"roll_deg": float(roll)}})
             return False
         else:
-            log_info(self.out_log, f"Camera: param ignorado (no soportado aún): {n}={value}")
+            log_info(self.out_log, f"Camera: parámetro ignorado (todavía no soportado): {n}={value}")
             return None
 
         return True
@@ -2584,7 +2626,7 @@ class AppRunner:
             )
         if applied_names:
             self._invalidate_preview_pipeline()
-            log_info(self.out_log, f"Camera: SET_PARAMS {', '.join(applied_names)}")
+            log_info(self.out_log, f"Camera: parámetros aplicados: {', '.join(applied_names)}")
 
     def _apply_camera_param(self, name: str, value: Any) -> None:
         self._apply_camera_params({str(name): value})
@@ -2594,11 +2636,11 @@ class AppRunner:
             return
         try:
             cam_index = int(self.cfg.camera.camera_index)
-            log_info(self.out_log, f"Camera: reconfigure (restart stream) due to {reason}")
+            log_info(self.out_log, f"Camera: reconfigurando (reinicio del flujo) por {reason}")
             self._connect_camera(cam_index)
         except Exception as exc:
             self._update_state({"camera": {"status": CameraStatus.ERROR, "last_error": "reconfigure failed"}})
-            log_error(self.out_log, "Camera: failed to apply config (restart)", exc)
+            log_error(self.out_log, "Camera: no se pudo aplicar la configuración (reinicio)", exc)
 
     def _reset_camera_defaults(self) -> None:
         self.cfg.camera = replace(self.default_cfg.camera)
@@ -2740,7 +2782,7 @@ class AppRunner:
             self._preview_last_frame_token = float(token)
             self._t_last_preview = now
         except Exception as exc:
-            log_error(self.out_log, "Preview: enqueue failed", exc)
+            log_error(self.out_log, "Preview: no se pudo encolar la vista previa", exc)
 
     def _render_preview_request(self, request: Dict[str, Any]) -> None:
         try:
@@ -2750,14 +2792,13 @@ class AppRunner:
                 if generation != int(self._preview_generation):
                     return
 
-            state_snapshot = self.get_state()
-            platesolving_overlay = list(
-                getattr(state_snapshot.platesolving, "overlay", None) or []
-            )
+            # Las detecciones y semillas de un plate solve no se dibujan aqui:
+            # son coordenadas de un cuadro ya pasado, y sin tracking el cielo
+            # se mueve debajo de ellas. Quedaban pegadas sobre la vista hasta el
+            # siguiente solve. Siguen en el estado y en los diagnosticos.
             overlay_enabled = bool(
                 self._live_sep_overlay_enabled
                 or self._expected_stars_overlay_enabled
-                or platesolving_overlay
             )
 
             if overlay_enabled:
@@ -2771,11 +2812,6 @@ class AppRunner:
                 )
                 if self._live_sep_overlay_enabled:
                     u8_preview = self._apply_live_sep_overlay(raw16_work, u8_preview)
-                if platesolving_overlay:
-                    u8_preview = self._apply_platesolving_overlay(
-                        u8_preview,
-                        platesolving_overlay,
-                    )
                 if self._expected_stars_overlay_enabled:
                     wall_t = request.get("wall_t")
                     obstime = (
@@ -2817,7 +2853,7 @@ class AppRunner:
                 self._n_view = 0
                 self._update_state({"camera": {"fps_view": float(fps_view)}})
         except Exception as exc:
-            log_error(self.out_log, "Preview: failed", exc)
+            log_error(self.out_log, "Preview: falló la vista previa", exc)
 
     def _invalidate_preview_pipeline(self) -> None:
         with self._preview_config_lock:
@@ -2873,61 +2909,8 @@ class AppRunner:
 
             return img
         except Exception as exc:
-            log_error(self.out_log, "Live SEP: overlay failed", exc, throttle_s=2.0, throttle_key="live_sep_overlay")
+            log_error(self.out_log, "Live SEP: falló el overlay de detecciones", exc, throttle_s=2.0, throttle_key="live_sep_overlay")
             return u8_preview
-
-    def _apply_platesolving_overlay(
-        self,
-        u8_preview: np.ndarray,
-        overlay: Sequence[Any],
-    ) -> np.ndarray:
-        """Draw persistent detections and the exact plate-solving seeds."""
-        if u8_preview.ndim == 2:
-            img = cv2.cvtColor(u8_preview, cv2.COLOR_GRAY2BGR)
-        else:
-            img = u8_preview.copy()
-        h, w = img.shape[:2]
-        colors = {
-            "det": (255, 0, 0),
-            "det_persistent": (255, 255, 0),
-            "seed": (255, 0, 255),
-            "match": (0, 255, 0),
-            "guide": (0, 0, 255),
-        }
-        for item in overlay:
-            if isinstance(item, dict):
-                x_raw = item.get("x", 0.0)
-                y_raw = item.get("y", 0.0)
-                kind = str(item.get("kind", "det"))
-                label = item.get("label", None)
-            else:
-                x_raw = getattr(item, "x", 0.0)
-                y_raw = getattr(item, "y", 0.0)
-                kind = str(getattr(item, "kind", "det"))
-                label = getattr(item, "label", None)
-            x = int(round(float(x_raw)))
-            y = int(round(float(y_raw)))
-            if x < 0 or y < 0 or x >= w or y >= h:
-                continue
-            color = colors.get(kind, (255, 255, 0))
-            radius = 12 if kind == "seed" else 9 if kind in {"match", "guide"} else 7
-            thickness = 2 if kind == "seed" else 1
-            cv2.circle(img, (x, y), radius, color, thickness, lineType=cv2.LINE_AA)
-            if kind == "seed":
-                cv2.line(img, (x - 5, y), (x + 5, y), color, 1, lineType=cv2.LINE_AA)
-                cv2.line(img, (x, y - 5), (x, y + 5), color, 1, lineType=cv2.LINE_AA)
-            if kind in {"seed", "guide"} and label:
-                cv2.putText(
-                    img,
-                    str(label),
-                    (x + radius + 2, max(12, y - radius)),
-                    cv2.FONT_HERSHEY_SIMPLEX,
-                    0.45,
-                    color,
-                    1,
-                    lineType=cv2.LINE_AA,
-                )
-        return img
 
     def _invalidate_expected_stars_catalog(self) -> None:
         self._expected_stars_catalog = None
@@ -3165,7 +3148,7 @@ class AppRunner:
         except Exception as exc:
             log_error(
                 self.out_log,
-                "Expected stars overlay failed",
+                "Expected stars overlay: falló el overlay de estrellas esperadas",
                 exc,
                 throttle_s=2.0,
                 throttle_key="expected_stars_overlay",
@@ -3183,7 +3166,7 @@ class AppRunner:
             try:
                 self._mount.disconnect()
             except Exception as exc:
-                log_error(self.out_log, "Mount: disconnect failed", exc)
+                log_error(self.out_log, "Mount: no se pudo desconectar", exc)
         self._mount = None
         self._focuser_worker.cancel()
         self._update_state({"mount": {"connected": False, "status": MountStatus.DISCONNECTED}})
@@ -3207,8 +3190,8 @@ class AppRunner:
                 log_info(
                     self.out_log,
                     (
-                        f"Mount: connected in DEMO mode ({msg}); "
-                        f"truth Az/Alt={float(snap['az_deg']):.3f}/{float(snap['alt_deg']):.3f} deg"
+                        f"Mount: conectada en modo demo ({msg}); "
+                        f"apuntado real az={float(snap['az_deg']):.3f}° alt={float(snap['alt_deg']):.3f}°"
                     ),
                 )
                 return
@@ -3218,18 +3201,18 @@ class AppRunner:
             if "error" in str(msg).lower():
                 self._shutdown_mount()
                 self._update_state({"mount": {"connected": False, "status": MountStatus.ERROR, "last_error": str(msg)}})
-                log_error(self.out_log, f"Mount: connect failed ({msg})")
+                log_error(self.out_log, f"Mount: no se pudo conectar ({msg})")
                 return
             self._mount = m
             # Ensure microstep settings are applied on every connect so manual speed is consistent.
             self._mount_set_microsteps(self.cfg.mount.ms_az, self.cfg.mount.ms_alt)
             self._update_state({"mount": {"connected": True, "status": MountStatus.OK, "last_error": None}})
             self._publish_focuser_support()
-            log_info(self.out_log, f"Mount: connected ({msg})")
+            log_info(self.out_log, f"Mount: conectada ({msg})")
         except Exception as exc:
             self._shutdown_mount()
             self._update_state({"mount": {"connected": False, "status": MountStatus.ERROR, "last_error": "connect failed"}})
-            log_error(self.out_log, "Mount: connect failed", exc)
+            log_error(self.out_log, "Mount: no se pudo conectar", exc)
 
     def _mount_stop(self) -> None:
         self._reset_rate_emulation()
@@ -3245,7 +3228,7 @@ class AppRunner:
                     "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE},
                 }
             )
-            log_error(self.out_log, "Mount: STOP failed", exc)
+            log_error(self.out_log, "Mount: falló la parada", exc)
 
     def _mount_set_microsteps(self, az_div: int, alt_div: int) -> None:
         if self._mount is None or not self._mount.is_connected():
@@ -3253,7 +3236,7 @@ class AppRunner:
         if int(az_div) != 64 or int(alt_div) != 64:
             log_error(
                 self.out_log,
-                "Mount: ignored microstep change; hardware is fixed at 1/64",
+                "Mount: cambio de microstepping ignorado; el hardware está fijo en 1/64",
                 ValueError(
                     f"requested AZ=1/{int(az_div)} ALT=1/{int(alt_div)}"
                 ),
@@ -3268,7 +3251,7 @@ class AppRunner:
             self._goto.model.set_microsteps(int(common_ms), int(common_ms))
             self.cfg.mount.ms_az = int(common_ms)
             self.cfg.mount.ms_alt = int(common_ms)
-            log_info(self.out_log, "Mount: fixed microstepping confirmed (1/64)")
+            log_info(self.out_log, "Mount: microstepping fijo confirmado (1/64)")
         except Exception as exc:
             self._update_state(
                 {
@@ -3276,7 +3259,7 @@ class AppRunner:
                     "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE},
                 }
             )
-            log_error(self.out_log, "Mount: MS failed", exc)
+            log_error(self.out_log, "Mount: falló la consulta de microstepping", exc)
 
     def _mount_move_steps(
         self,
@@ -3377,11 +3360,11 @@ class AppRunner:
         with self._gaia_download_lock:
             current = self._gaia_download_thread
             if current is not None and current.is_alive():
-                log_info(self.out_log, "Gaia download: already running")
+                log_info(self.out_log, "Gaia download: ya hay una descarga en curso")
                 return
 
         if self._platesolving_worker.is_busy():
-            log_info(self.out_log, "Gaia download: skipped because plate solving is busy")
+            log_info(self.out_log, "Gaia download: omitida porque hay un plate solve en curso")
             return
 
         try:
@@ -3400,7 +3383,7 @@ class AppRunner:
                     }
                 }
             )
-            log_error(self.out_log, "Gaia download: failed to resolve current field", exc)
+            log_error(self.out_log, "Gaia download: no se pudo determinar el campo actual", exc)
             return
 
         def _worker() -> None:
@@ -3454,9 +3437,9 @@ class AppRunner:
                 log_info(
                     self.out_log,
                     (
-                        "Gaia download: OK "
-                        f"source={source} center=({center_icrs.ra.deg:.5f},{center_icrs.dec.deg:.5f}) "
-                        f"radius={radius:.3f}deg rows={rows} elapsed={elapsed_s:.1f}s"
+                        "Gaia download: completada "
+                        f"fuente={source} centro=({center_icrs.ra.deg:.5f},{center_icrs.dec.deg:.5f}) "
+                        f"radio={radius:.3f}° filas={rows} duración={elapsed_s:.1f}s"
                     ),
                 )
             except Exception as exc:
@@ -3472,7 +3455,7 @@ class AppRunner:
                         }
                     }
                 )
-                log_error(self.out_log, "Gaia download: failed", exc)
+                log_error(self.out_log, "Gaia download: falló", exc)
             finally:
                 with self._gaia_download_lock:
                     if self._gaia_download_thread is current_thread:
@@ -3515,7 +3498,7 @@ class AppRunner:
         except Exception as exc:
             log_error(
                 self.out_log,
-                "Stacking: failed to read current pointing for output name",
+                "Stacking: no se pudo leer el apuntado para nombrar el fichero",
                 exc,
                 throttle_s=10.0,
                 throttle_key="stacking_capture_pointing",
@@ -3529,7 +3512,7 @@ class AppRunner:
             except Exception as exc:
                 log_error(
                     self.out_log,
-                    "Stacking: invalid current pointing for output name",
+                    "Stacking: apuntado inválido para nombrar el fichero",
                     exc,
                     throttle_s=10.0,
                     throttle_key="stacking_capture_pointing_invalid",
@@ -3560,7 +3543,7 @@ class AppRunner:
                 except (OSError, OverflowError, ValueError) as exc:
                     log_error(
                         self.out_log,
-                        "Stacking: invalid frame wall timestamp; using current time",
+                        "Stacking: marca de tiempo del cuadro inválida; se usa la hora actual",
                         exc,
                         throttle_s=5.0,
                         throttle_key="stacking_capture_timestamp",
@@ -3605,7 +3588,7 @@ class AppRunner:
         try:
             raw, wgt = eng.get_stack_snapshot(mean_dtype=np.float32, wgt_dtype=np.float32)
             if raw is None:
-                log_info(self.out_log, "Stacking: save skipped (no data)")
+                log_info(self.out_log, "Stacking: guardado omitido (no hay datos)")
                 return
 
             # Create output directory
@@ -3613,7 +3596,7 @@ class AppRunner:
                 Path(out_dir).mkdir(parents=True, exist_ok=True)
             except Exception as exc:
                 self._update_state({"stacking": {"status": StackingStatus.ERROR, "last_error": "save failed"}})
-                log_error(self.out_log, f"Stacking: failed to create output directory {out_dir}", exc)
+                log_error(self.out_log, f"Stacking: no se pudo crear la carpeta {out_dir}", exc)
                 return
 
             final_basename = self._stacking_capture_basename(basename)
@@ -3664,10 +3647,10 @@ class AppRunner:
             if not ok_png:
                 raise RuntimeError(f"cv2.imwrite failed for {png_path}")
 
-            log_info(self.out_log, f"Stacking: saved raw to {raw_path} and png to {png_path}")
+            log_info(self.out_log, f"Stacking: guardado raw en {raw_path} y png en {png_path}")
         except Exception as exc:
             self._update_state({"stacking": {"status": StackingStatus.ERROR, "last_error": "save failed"}})
-            log_error(self.out_log, "Stacking: save failed", exc)
+            log_error(self.out_log, "Stacking: falló el guardado", exc)
 
     def _handle_save_request(self, request: Dict[str, Any]) -> None:
         self._save_stacking(
@@ -3687,12 +3670,12 @@ class AppRunner:
         basename: Optional[str] = None,
     ) -> None:
         if self._cam_stream is None:
-            log_info(self.out_log, "Raw record: skipped (camera not connected)")
+            log_info(self.out_log, "Raw record: omitida (cámara no conectada)")
             return
 
         with self._raw_record_lock:
             if self._raw_record_active:
-                log_info(self.out_log, "Raw record: already running")
+                log_info(self.out_log, "Raw record: ya hay una grabación en curso")
                 return
             self._raw_record_active = True
             self._raw_record_stop.clear()
@@ -3708,16 +3691,16 @@ class AppRunner:
             try:
                 stream = self._cam_stream
                 if stream is None:
-                    log_info(self.out_log, "Raw record: aborted (camera disconnected)")
+                    log_info(self.out_log, "Raw record: abortada (cámara desconectada)")
                     return
 
                 t0 = _perf()
                 last_token: Optional[float] = None
 
                 if duration_s is None:
-                    log_info(self.out_log, "Raw record: started; waiting for Stop")
+                    log_info(self.out_log, "Raw record: arrancada; esperando la orden de parar")
                 else:
-                    log_info(self.out_log, f"Raw record: start duration={duration_s:.1f}s")
+                    log_info(self.out_log, f"Raw record: arrancada por {duration_s:.1f}s")
                 while (
                     not self._raw_record_stop.is_set()
                     and not self._stop.is_set()
@@ -3738,7 +3721,7 @@ class AppRunner:
                     except Exception as exc:
                         log_error(
                             self.out_log,
-                            "Raw record: frame is not RAW16 Bayer; saving numpy view fallback",
+                            "Raw record: el cuadro no es RAW16 Bayer; se guarda la vista numpy",
                             exc,
                             throttle_s=5.0,
                             throttle_key="raw_record_frame_format",
@@ -3755,13 +3738,13 @@ class AppRunner:
                     )
 
                 if not frames:
-                    log_info(self.out_log, "Raw record: no frames captured")
+                    log_info(self.out_log, "Raw record: no se capturó ningún cuadro")
                     return
 
                 try:
                     Path(out_dir).mkdir(parents=True, exist_ok=True)
                 except Exception as exc:
-                    log_error(self.out_log, f"Raw record: failed to create output directory {out_dir}", exc)
+                    log_error(self.out_log, f"Raw record: no se pudo crear la carpeta {out_dir}", exc)
                     return
                 out_path = os.path.join(out_dir, f"{basename}.npy")
                 stack = np.stack(frames, axis=0)
@@ -3789,12 +3772,12 @@ class AppRunner:
                     )
                 log_info(
                     self.out_log,
-                    f"Raw record: saved {stack.shape[0]} frames to {out_path} "
-                    f"with timing metadata {metadata_path} "
-                    f"(shape={stack.shape}, dtype={stack.dtype})",
+                    f"Raw record: {stack.shape[0]} cuadros guardados en {out_path} "
+                    f"con metadatos de tiempo en {metadata_path} "
+                    f"(forma={stack.shape}, tipo={stack.dtype})",
                 )
             except Exception as exc:
-                log_error(self.out_log, "Raw record: failed", exc)
+                log_error(self.out_log, "Raw record: falló", exc)
             finally:
                 with self._raw_record_lock:
                     self._raw_record_active = False
@@ -3809,7 +3792,7 @@ class AppRunner:
             active = bool(self._raw_record_active)
         if active:
             self._raw_record_stop.set()
-            log_info(self.out_log, "Raw record: stop requested")
+            log_info(self.out_log, "Raw record: parada solicitada")
 
 
     # -------------------------
@@ -3934,7 +3917,7 @@ class AppRunner:
                         except Exception as stop_exc:
                             log_error(
                                 self.out_log,
-                                "Tracking: failed to stop mount after tracking error",
+                                "Tracking: no se pudo parar la montura tras un error de tracking",
                                 stop_exc,
                                 throttle_s=2.0,
                                 throttle_key="tracking_stop_after_error",
@@ -3942,8 +3925,8 @@ class AppRunner:
                         log_error(
                             self.out_log,
                             (
-                                f"Tracking: step failed {failures}/{limit}"
-                                + ("; giving up" if give_up else "; retrying")
+                                f"Tracking: falló el paso {failures}/{limit}"
+                                + ("; se abandona" if give_up else "; se reintenta")
                             ),
                             tracking_error,
                             throttle_s=2.0,
@@ -4005,7 +3988,7 @@ class AppRunner:
                                 "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE, "last_error": "mount MOVE failed", "n_det": int(out.n_det)},
                             }
                         )
-                        log_error(self.out_log, "Tracking: mount MOVE failed", exc, throttle_s=2.0, throttle_key="tracking_mount_move")
+                        log_error(self.out_log, "Tracking: falló el MOVE de la montura", exc, throttle_s=2.0, throttle_key="tracking_mount_move")
 
                     self._maybe_log_tracking_sample(
                         out,
@@ -4062,7 +4045,7 @@ class AppRunner:
                     self._update_state({"stacking": {"last_error": "enqueue failed"}})
                     log_error(
                         self.out_log,
-                        "Stacking: enqueue failed",
+                        "Stacking: no se pudo encolar el cuadro",
                         exc,
                         throttle_s=2.0,
                         throttle_key="stacking_enqueue",
@@ -4233,7 +4216,7 @@ class AppRunner:
                             }
                         )
 
-                log_error(self.out_log, f"Action failed: {act.type}", exc)
+                log_error(self.out_log, f"Runner: falló la acción {act.type}", exc)
 
     def _handle_action(self, act: Action) -> None:
         t = act.type
@@ -4248,7 +4231,7 @@ class AppRunner:
 
         if t == ActionType.CAMERA_DISCONNECT:
             self._shutdown_camera()
-            log_info(self.out_log, "Camera: disconnected")
+            log_info(self.out_log, "Camera: desconectada")
             return
 
         if t == ActionType.CAMERA_SET_PARAM:
@@ -4276,12 +4259,12 @@ class AppRunner:
 
         if t == ActionType.RESET_CAMERA_DEFAULTS:
             self._reset_camera_defaults()
-            log_info(self.out_log, "Camera: RESET_DEFAULTS")
+            log_info(self.out_log, "Camera: valores por defecto restaurados")
             return
 
         if t == ActionType.RESET_PREVIEW_DEFAULTS:
             self._reset_preview_defaults()
-            log_info(self.out_log, "Preview: RESET_DEFAULTS")
+            log_info(self.out_log, "Preview: valores por defecto restaurados")
             return
 
         # ---- Mount ----
@@ -4293,7 +4276,7 @@ class AppRunner:
 
         if t == ActionType.MOUNT_DISCONNECT:
             self._shutdown_mount()
-            log_info(self.out_log, "Mount: disconnected")
+            log_info(self.out_log, "Mount: desconectada")
             return
 
         if t == ActionType.MOUNT_STOP:
@@ -4357,7 +4340,7 @@ class AppRunner:
 
         if t == ActionType.RESET_MOUNT_DEFAULTS:
             self._reset_mount_defaults()
-            log_info(self.out_log, "Mount: RESET_DEFAULTS")
+            log_info(self.out_log, "Mount: valores por defecto restaurados")
             return
 
         if self._handle_focuser_action(t, p):
@@ -4372,7 +4355,7 @@ class AppRunner:
             return
 
         # ---- Otros ----
-        log_info(self.out_log, f"Unknown or unhandled action type: {t}")
+        log_info(self.out_log, f"Runner: acción desconocida o sin manejador: {t}")
 
     def _handle_focuser_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
         if t == ActionType.FOCUSER_MOVE:
@@ -4395,7 +4378,7 @@ class AppRunner:
 
         if t == ActionType.FOCUSER_ZERO:
             self._focuser_worker.zero()
-            log_info(self.out_log, "Focuser: posicion puesta a cero")
+            log_info(self.out_log, "Focuser: posición puesta a cero")
             return True
 
         if t == ActionType.FOCUSER_HOME:
@@ -4434,7 +4417,7 @@ class AppRunner:
             log_info(
                 self.out_log,
                 f"Focuser: preset {name!r} guardado en {position:+d} "
-                + ("(con homing)" if homed else "(SIN homing: solo vale en esta sesion)"),
+                + ("(con homing)" if homed else "(sin homing: solo vale en esta sesión)"),
             )
             return True
 
@@ -4447,7 +4430,7 @@ class AppRunner:
                 return True
             log_info(
                 self.out_log,
-                f"Focuser: preset {name!r} " + ("borrado" if removed else "no existia"),
+                f"Focuser: preset {name!r} " + ("borrado" if removed else "no existía"),
             )
             return True
 
@@ -4458,7 +4441,7 @@ class AppRunner:
                 self._update_state(
                     {"focuser": {"autofocus": "failed", "last_error": "camera not connected"}}
                 )
-                log_info(self.out_log, "Focuser: autofoco necesita la camara conectada")
+                log_info(self.out_log, "Focuser: el autofoco necesita la cámara conectada")
                 return True
             self._start_operation("focuser")
             self._focuser_worker.request(kind="autofocus", params=dict(p.get("params") or {}))
@@ -4472,7 +4455,7 @@ class AppRunner:
                     # el slew o el tracking que esten corriendo en paralelo.
                     self._mount.stop_axis(FOCUS_AXIS_FW)
                 except Exception as exc:
-                    log_error(self.out_log, "Focuser: stop failed", exc)
+                    log_error(self.out_log, "Focuser: no se pudo detener", exc)
             return True
 
         if t == ActionType.FOCUSER_SET_PARAMS:
@@ -4482,7 +4465,7 @@ class AppRunner:
         if t == ActionType.RESET_FOCUSER_DEFAULTS:
             self.cfg.focuser = FocuserConfig()
             self._publish_focuser_config()
-            log_info(self.out_log, "Focuser: RESET_DEFAULTS")
+            log_info(self.out_log, "Focuser: valores por defecto restaurados")
             return True
 
         return False
@@ -4499,7 +4482,7 @@ class AppRunner:
             try:
                 supported = bool(self._mount.supports_focuser())
             except Exception as exc:
-                log_error(self.out_log, "Focuser: capability probe failed", exc)
+                log_error(self.out_log, "Focuser: falló la consulta de capacidades", exc)
         self._update_state({"focuser": {"supported": supported}})
         if not supported:
             log_info(
@@ -4514,7 +4497,7 @@ class AppRunner:
             )
             log_info(
                 self.out_log,
-                "Focuser: la montura no esta conectada",
+                "Focuser: la montura no está conectada",
                 throttle_s=5.0,
                 throttle_key="focuser_no_mount",
             )
@@ -4524,19 +4507,19 @@ class AppRunner:
     def _apply_focuser_params(self, params: Dict[str, Any]) -> None:
         for name, value in params.items():
             if not hasattr(self.cfg.focuser, name):
-                log_info(self.out_log, f"Focuser: parametro desconocido {name!r}")
+                log_info(self.out_log, f"Focuser: parámetro desconocido {name!r}")
                 continue
             current = getattr(self.cfg.focuser, name)
             try:
                 setattr(self.cfg.focuser, name, type(current)(value))
             except (TypeError, ValueError):
-                log_info(self.out_log, f"Focuser: valor invalido para {name!r}: {value!r}")
+                log_info(self.out_log, f"Focuser: valor inválido para {name!r}: {value!r}")
         self._publish_focuser_config()
 
     def _publish_focuser_config(self) -> None:
         log_info(
             self.out_log,
-            "Focuser: SET_PARAMS " + _format_params(asdict(self.cfg.focuser)),
+            "Focuser: parámetros " + _format_params(asdict(self.cfg.focuser)),
         )
 
     def _handle_tracking_action(self, t: ActionType, p: Dict[str, Any]) -> bool:
@@ -4560,7 +4543,7 @@ class AppRunner:
                         seeded = True
                         log_info(
                             self.out_log,
-                            "Tracking: calibracion nominal desde la mecanica "
+                            "Tracking: calibración nominal desde la mecánica "
                             f"A=[[{theta_nom[0,0]:+.4f},{theta_nom[0,1]:+.4f}],"
                             f"[{theta_nom[1,0]:+.4f},{theta_nom[1,1]:+.4f}]]",
                         )
@@ -4591,7 +4574,7 @@ class AppRunner:
             self._reset_rate_emulation()
             self._mount_rate_safe(0.0, 0.0)
             self._tracking_keyframe_reset()
-            log_info(self.out_log, "Tracking: START")
+            log_info(self.out_log, "Tracking: arrancado")
             return True
 
         if t == ActionType.TRACKING_STOP:
@@ -4620,12 +4603,12 @@ class AppRunner:
             )
             self._reset_rate_emulation()
             self._mount_rate_safe(0.0, 0.0)
-            log_info(self.out_log, "Tracking: STOP")
+            log_info(self.out_log, "Tracking: detenido")
             return True
 
         if t == ActionType.TRACKING_KEYFRAME_RESET:
             self._tracking_keyframe_reset()
-            log_info(self.out_log, "Tracking: KEYFRAME_RESET")
+            log_info(self.out_log, "Tracking: cuadro de referencia reiniciado")
             return True
 
         if t == ActionType.TRACKING_SET_PARAMS:
@@ -4712,26 +4695,26 @@ class AppRunner:
                         }
                     }
                 )
-                log_info(self.out_log, f"Tracking: SET_PARAMS {_format_params(updates)}")
+                log_info(self.out_log, f"Tracking: parámetros {_format_params(updates)}")
             return True
 
         if t == ActionType.RESET_TRACKING_DEFAULTS:
             self._reset_tracking_defaults()
-            log_info(self.out_log, "Tracking: RESET_DEFAULTS")
+            log_info(self.out_log, "Tracking: valores por defecto restaurados")
             return True
 
         if t == ActionType.TRACKING_CALIB_RESET:
             with self._tracking_state_lock:
                 auto_reset(self._tracking_state, src="auto")
             self._tracking_keyframe_reset()
-            log_info(self.out_log, "Tracking: CALIB_RESET (autocal only)")
+            log_info(self.out_log, "Tracking: calibración borrada (queda solo la autocalibración)")
             return True
 
         if t == ActionType.TRACKING_AUTO_RESET:
             with self._tracking_state_lock:
                 auto_reset(self._tracking_state, src="auto")
             self._tracking_keyframe_reset()
-            log_info(self.out_log, "Tracking: AUTO_RESET")
+            log_info(self.out_log, "Tracking: autocalibración reiniciada")
             return True
 
         if t == ActionType.TRACKING_SET_CALIB:
@@ -4743,7 +4726,7 @@ class AppRunner:
             try:
                 theta = np.asarray(p.get("theta"), dtype=np.float64).reshape(2, 3)
             except (TypeError, ValueError) as exc:
-                log_error(self.out_log, "Tracking: matriz de calibracion invalida", exc)
+                log_error(self.out_log, "Tracking: matriz de calibración inválida", exc)
                 return True
             with self._tracking_state_lock:
                 auto_reset(self._tracking_state, src="manual", theta=theta)
@@ -4754,22 +4737,22 @@ class AppRunner:
                                              "calib_det": det}})
             log_info(
                 self.out_log,
-                f"Tracking: calibracion manual instalada ok={ok} det={det:.4f} "
+                f"Tracking: calibración manual instalada ok={ok} det={det:.4f} "
                 f"cond={cond:.1f} A=[[{theta[0,0]:+.3f},{theta[0,1]:+.3f}],"
                 f"[{theta[1,0]:+.3f},{theta[1,1]:+.3f}]]",
             )
             return True
 
         if t == ActionType.TRACKING_CALIB_AZ:
-            log_info(self.out_log, "Tracking: CALIB_AZ ignored (autocalibration only)")
+            log_info(self.out_log, "Tracking: calibración por eje az ignorada (solo hay autocalibración)")
             return True
 
         if t == ActionType.TRACKING_CALIB_ALT:
-            log_info(self.out_log, "Tracking: CALIB_ALT ignored (autocalibration only)")
+            log_info(self.out_log, "Tracking: calibración por eje alt ignorada (solo hay autocalibración)")
             return True
 
         if t == ActionType.TRACKING_BOOTSTRAP:
-            log_info(self.out_log, "Tracking: BOOTSTRAP ignored (autocalibration only)")
+            log_info(self.out_log, "Tracking: arranque en frío ignorado (solo hay autocalibración)")
             return True
 
         return False
@@ -4780,7 +4763,7 @@ class AppRunner:
             self._stacking_enabled = True
             self._stacking.start()
             self._update_state({"stacking": {"enabled": True, "status": StackingStatus.RUNNING, "last_error": None}})
-            log_info(self.out_log, "Stacking: START")
+            log_info(self.out_log, "Stacking: arrancado")
             return True
 
         if t == ActionType.STACKING_STOP:
@@ -4788,14 +4771,14 @@ class AppRunner:
             self._stacking_enabled = False
             self._stacking.stop()
             self._update_state({"stacking": {"enabled": False, "status": StackingStatus.OFF, "last_error": None}})
-            log_info(self.out_log, "Stacking: STOP")
+            log_info(self.out_log, "Stacking: detenido")
             return True
 
         if t == ActionType.STACKING_RESET:
             self._stacking_last_frame_token = None
             self._stacking.reset()
             self._update_state({"stacking": {"last_error": None}})
-            log_info(self.out_log, "Stacking: RESET")
+            log_info(self.out_log, "Stacking: vaciado")
             return True
 
         if t == ActionType.STACKING_SET_PARAMS:
@@ -4813,12 +4796,12 @@ class AppRunner:
                 if align_updates:
                     with self._tracking_state_lock:
                         tracking_set_params(self._tracking_state, **align_updates)
-                log_info(self.out_log, f"Stacking: SET_PARAMS {list(p.keys())}")
+                log_info(self.out_log, f"Stacking: parámetros {', '.join(p.keys())}")
             return True
 
         if t == ActionType.RESET_STACKING_DEFAULTS:
             self._reset_stacking_defaults()
-            log_info(self.out_log, "Stacking: RESET_DEFAULTS")
+            log_info(self.out_log, "Stacking: valores por defecto restaurados")
             return True
 
         if t == ActionType.STACKING_SAVE:
@@ -4837,7 +4820,7 @@ class AppRunner:
                     basename="stack",
                     fmt="png",
                 )
-            log_info(self.out_log, "Stacking: save queued")
+            log_info(self.out_log, "Stacking: guardado en cola")
             return True
 
         return False
@@ -4851,7 +4834,7 @@ class AppRunner:
                 if "source" in payload:
                     source = str(payload.pop("source") or "live").strip().lower()
                     if source not in {"live", "stack"}:
-                        log_info(self.out_log, f"Platesolving: fuente inválida {source!r} (use live|stack)")
+                        log_info(self.out_log, f"Platesolving: fuente inválida {source!r} (usa live o stack)")
                     else:
                         self._platesolving_source = source
                         log_info(self.out_log, f"Platesolving: fuente = {source}")
@@ -4905,16 +4888,16 @@ class AppRunner:
                             self._platesolving_observer = ObserverConfig(**obs)
                             self._goto.cfg.observer = self._platesolving_observer
                         except Exception as exc:
-                            log_error(self.out_log, "Platesolving: observer params rejected", exc)
+                            log_error(self.out_log, "Platesolving: parámetros del observador rechazados", exc)
                 if payload:
-                    log_info(self.out_log, "Platesolving: params updated")
+                    log_info(self.out_log, "Platesolving: parámetros actualizados")
                 if observer_payload:
-                    log_info(self.out_log, "Platesolving: observer updated")
+                    log_info(self.out_log, "Platesolving: observador actualizado")
             return True
 
         if t == ActionType.RESET_PLATESOLVING_DEFAULTS:
             self._reset_platesolving_defaults()
-            log_info(self.out_log, "Platesolving: RESET_DEFAULTS")
+            log_info(self.out_log, "Platesolving: valores por defecto restaurados")
             return True
 
         if t == ActionType.PLATESOLVING_DOWNLOAD_CURRENT_FIELD:
@@ -4942,7 +4925,7 @@ class AppRunner:
                     self._live_sep_params["max_det"] = int(p.get("max_det"))
                 self._goto.cfg.sep = self.cfg.sep
                 self._invalidate_preview_pipeline()
-                log_info(self.out_log, "Live SEP: params updated")
+                log_info(self.out_log, "Live SEP: parámetros actualizados")
             return True
 
         if t == ActionType.EXPECTED_STARS_SET_PARAMS:
@@ -4974,7 +4957,7 @@ class AppRunner:
                 log_info(
                     self.out_log,
                     "Expected stars overlay: "
-                    f"{'ON' if enabled else 'OFF'} "
+                    f"{'activado' if enabled else 'desactivado'} "
                     f"mag<={mag_limit:.1f} max={max_stars}",
                 )
             return True
@@ -4985,7 +4968,7 @@ class AppRunner:
             pw = str(p.get("gaia_password", "")).strip()
             if user and pw:
                 save_gaia_auth(user, pw)
-                log_info(self.out_log, "Platesolving: Gaia credentials saved")
+                log_info(self.out_log, "Platesolving: credenciales de Gaia guardadas")
             self._last_platesolving_result = None
             self._update_state(
                 {
@@ -4996,7 +4979,7 @@ class AppRunner:
                 }
             )
             self._platesolving_request(target=target)
-            log_info(self.out_log, "Platesolving: RUN source=live")
+            log_info(self.out_log, "Platesolving: resolviendo sobre el cuadro en vivo")
             return True
 
         return False
@@ -5015,7 +4998,7 @@ class AppRunner:
                         }
                     }
                 )
-                log_info(self.out_log, "GoTo: automatic sample validation rejected (no valid solution)")
+                log_info(self.out_log, "GoTo: muestra rechazada en la validación automática (no hay solución válida)")
                 return True
             try:
                 ps_cfg = self._get_platesolving_cfg_snapshot()
@@ -5091,13 +5074,13 @@ class AppRunner:
                     )
                     log_info(
                         self.out_log,
-                        "GoTo: sample automatically rejected "
-                        f"reason={quality_reason} inliers={n_inliers}/{min_inliers} "
+                        "GoTo: muestra rechazada "
+                        f"motivo={quality_reason} inliers={n_inliers}/{min_inliers} "
                         f"rms={rms_px:.3f}/{max_rms_px:.3f}px "
-                        f"motion={float(continuity.get('observed_motion_deg', float('nan'))):.4f}deg "
-                        f"limit={float(continuity.get('motion_limit_deg', float('nan'))):.4f}deg "
-                        f"roll_jump={float(continuity.get('roll_jump_deg', float('nan'))):.3f}deg "
-                        f"roll_est_error={roll_axis_error:.3f}deg",
+                        f"movimiento={float(continuity.get('observed_motion_deg', float('nan'))):.4f}° "
+                        f"limite={float(continuity.get('motion_limit_deg', float('nan'))):.4f}° "
+                        f"salto_de_giro={float(continuity.get('roll_jump_deg', float('nan'))):.3f}° "
+                        f"error_de_giro={roll_axis_error:.3f}°",
                     )
                     return True
                 debug_info = dict(self.get_state().platesolving.debug_info or {})
@@ -5133,9 +5116,9 @@ class AppRunner:
                 )
                 log_info(
                     self.out_log,
-                    "GoTo: sample automatically accepted "
+                    "GoTo: muestra aceptada "
                     f"n={n_samples} inliers={n_inliers} rms={rms_px:.3f}px "
-                    f"az={float(az_alt[0]):.6f} alt={float(az_alt[1]):.6f} roll={float(roll):+.3f}",
+                    f"az={float(az_alt[0]):.6f}° alt={float(az_alt[1]):.6f}° giro={float(roll):+.3f}°",
                 )
             except Exception as exc:
                 self._update_state(
@@ -5148,7 +5131,7 @@ class AppRunner:
                         }
                     }
                 )
-                log_error(self.out_log, "GoTo: automatic sample validation failed", exc)
+                log_error(self.out_log, "GoTo: falló la validación automática de la muestra", exc)
             return True
 
         if t == ActionType.MOUNT_SYNC:
@@ -5173,14 +5156,14 @@ class AppRunner:
                 )
                 log_info(
                     self.out_log,
-                    "GoTo: explicit AltAz sync "
-                    f"{'OK' if ok else 'ERR'} az={float(az_alt[0]):.6f} "
-                    f"alt={float(az_alt[1]):.6f}",
+                    "GoTo: sincronización explícita por AltAz "
+                    f"{'hecha' if ok else 'fallida'} az={float(az_alt[0]):.6f}° "
+                    f"alt={float(az_alt[1]):.6f}°",
                 )
                 return True
             sol = getattr(self, "_last_platesolving_result", None)
             if sol is None or not bool(getattr(sol, "success", False)):
-                log_info(self.out_log, "GoTo: sync failed (no successful platesolving cached)")
+                log_info(self.out_log, "GoTo: no se pudo sincronizar (no hay un plate solve correcto en memoria)")
                 self._update_state(
                     {
                         "goto": {
@@ -5195,7 +5178,7 @@ class AppRunner:
             try:
                 ok = bool(self._goto.sync_from_platesolving(sol))
             except Exception as exc:
-                log_error(self.out_log, "GoTo: sync exception", exc)
+                log_error(self.out_log, "GoTo: excepción al sincronizar", exc)
             self._update_state(
                 {
                     "goto": {
@@ -5205,7 +5188,7 @@ class AppRunner:
                     }
                 }
             )
-            log_info(self.out_log, f"GoTo: sync {'OK' if ok else 'ERR'}")
+            log_info(self.out_log, f"GoTo: sincronización {'hecha' if ok else 'fallida'}")
             return True
 
         if t == ActionType.MOUNT_GOTO:

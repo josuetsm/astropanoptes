@@ -10,3 +10,4 @@ astropy-healpix
 scikit-learn
 pyarrow
 pytest
+matplotlib

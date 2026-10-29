@@ -306,7 +306,7 @@ class UiRegressionTests(unittest.TestCase):
 
         self.assertIn("> status", console.view.toPlainText())
         ran = self._wait_for_console(
-            lambda: "camera" in console.view.toPlainText().lower()
+            lambda: "camara" in console.view.toPlainText().lower()
         )
         self.assertTrue(ran, console.view.toPlainText())
 
@@ -314,7 +314,7 @@ class UiRegressionTests(unittest.TestCase):
         console = self.window.console
         console.run_command("comando-que-no-existe")
         failed = self._wait_for_console(
-            lambda: "CLI ERROR" in console.view.toPlainText()
+            lambda: "error  comando desconocido" in console.view.toPlainText()
         )
         self.assertTrue(failed, console.view.toPlainText())
 

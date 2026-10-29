@@ -206,3 +206,54 @@ class TestSiderealRateActuallyReachesTheMount:
             r._mount_rate_safe(-10.0, 6.0)
         axes = {axis for axis, _, _, _ in mount.moves}
         assert axes == {"az", "alt"}, f"algun eje se quedo sin emitir: {axes}"
+
+
+class TestDeliveredRateMatchesCommand:
+    """Lo que llega a la montura tiene que ser lo que pide el lazo.
+
+    Con el retardo sacado de 1/velocidad cada paso ocupaba la linea mas que
+    un tick del lazo de 120 Hz, y la reserva de linea solo dejaba salir un
+    paso cada varios ticks: a 30 pasos/s llegaban ~27, a 100 llegaban ~60.
+    El saldo crecia sin limite y, al invertir la correccion, la montura
+    seguia gastandolo hacia el lado viejo.
+    """
+
+    @staticmethod
+    def _run(monkeypatch, rate_fn, secs: float) -> tuple[_FakeMount, float, AppRunner]:
+        import random
+
+        clock = [0.0]
+        r, mount = _emitting_runner(monkeypatch, clock)
+        times: list[float] = []
+        original = mount.move_steps
+
+        def move_steps(**kw):
+            times.append(clock[0])
+            original(**kw)
+
+        mount.move_steps = move_steps  # type: ignore[method-assign]
+        rnd = random.Random(1)
+        for _ in range(int(secs * 120)):
+            clock[0] += (1.0 / 120.0) * rnd.uniform(0.85, 1.15)
+            r._mount_rate_safe(0.0, rate_fn(clock[0]))
+        mount.times = times  # type: ignore[attr-defined]
+        return mount, clock[0], r
+
+    @pytest.mark.parametrize("rate", [30.0, 80.0, 150.0])
+    def test_mid_rates_are_delivered_in_full(self, monkeypatch, rate: float) -> None:
+        mount, elapsed, r = self._run(monkeypatch, lambda t: rate, secs=10.0)
+        delivered = sum(steps for _, _, steps, _ in mount.moves) / elapsed
+        assert delivered == pytest.approx(rate, rel=0.03)
+        assert abs(r._rate_emul_acc_alt) < 2.0, "el saldo no entregado crece"
+
+    def test_a_reversal_is_obeyed_at_once(self, monkeypatch) -> None:
+        def square(t: float) -> float:
+            return 50.0 if int(t) % 2 == 0 else -50.0
+
+        mount, _, _ = self._run(monkeypatch, square, secs=10.0)
+        wrong = sum(
+            steps
+            for t, (_, direction, steps, _) in zip(mount.times, mount.moves)
+            if direction * (1 if int(t) % 2 == 0 else -1) < 0
+        )
+        assert wrong == 0, f"{wrong} pasos salieron en el sentido ya revertido"

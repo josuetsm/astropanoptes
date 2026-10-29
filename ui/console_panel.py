@@ -12,6 +12,7 @@ bloquean por segundos y congelarían la ventana.
 from __future__ import annotations
 
 import html as _html
+import re
 from pathlib import Path
 from typing import Optional
 
@@ -247,15 +248,20 @@ class ConsolePanel(QWidget):
 
     def _append(self, message: str, color: Optional[str]) -> None:
         # Siempre se inserta como HTML: `append` solo interpreta marcado cuando
-        # el texto empieza por una etiqueta, así que el span va siempre. La
-        # sangría se preserva con espacios duros (importa para el JSON de
-        # `config`/`status`), pero los espacios interiores se dejan tal cual
-        # para que las líneas largas sigan haciendo wrap.
-        raw = str(message)
-        body = raw.lstrip(" ")
-        indent = "&nbsp;" * (len(raw) - len(body))
-        style = f"color:{color};" if color else ""
-        self.view.append(f'<span style="{style}">{indent}{_html.escape(body)}</span>')
+        # el texto empieza por una etiqueta, así que el span va siempre.
+        #
+        # El HTML colapsa los espacios, y la consola los usa para alinear
+        # columnas (claves y valores, hora/nivel/subsistema de los eventos). Cada
+        # tramo de varios espacios se convierte en espacios duros salvo el
+        # último, que queda partible: así se conserva el ancho y las líneas
+        # largas siguen haciendo wrap. La sangría inicial va entera en duros.
+        for raw in str(message).split("\n"):
+            body = raw.lstrip(" ")
+            indent = "&nbsp;" * (len(raw) - len(body))
+            escaped = _html.escape(body)
+            escaped = re.sub(r" {2,}", lambda m: "&nbsp;" * (len(m.group(0)) - 1) + " ", escaped)
+            style = f"color:{color};" if color else ""
+            self.view.append(f'<span style="{style}">{indent}{escaped}</span>')
 
     @pyqtSlot(str, str)
     def _append_worker_output(self, message: str, kind: str) -> None:

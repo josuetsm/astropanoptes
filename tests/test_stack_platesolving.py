@@ -70,6 +70,29 @@ def test_preview_keeps_light_polluted_background_dark() -> None:
     assert int(prev.max()) > 200
 
 
+def test_preview_dark_sky_is_not_thresholded_to_two_colours() -> None:
+    """Regression: with a low camera offset the sky sits near 64 ADU.
+
+    A log floor of 5.0 (~148 ADU) then sat above the 99.7th percentile, the
+    stretch collapsed to ``hi = lo + 1e-3`` and the preview came out as a
+    pure 0/255 threshold. The floor must yield when it leaves no range.
+    """
+    rng = np.random.default_rng(0)
+    st = _stacker(preview_log_vmin=5.0)
+    for i in range(8):
+        # Frame grande: las estrellas deben quedar bajo el 0.3% de los pixeles,
+        # como en el cielo real, para que el p99.7 caiga en el fondo.
+        frame = _frame(h=200, w=240, bg=64).astype(np.float32)
+        frame += rng.normal(0.0, 6.0, frame.shape)
+        st.add_frame(np.clip(frame, 0, 65535).astype(np.uint16), t_unix=1000.0 + i)
+    prev = st.get_preview_u8()
+
+    assert prev is not None
+    levels = np.unique(prev)
+    assert levels.size > 32, f"preview posterizada: {levels.size} niveles"
+    assert int(prev.max()) > 200
+
+
 def test_preview_ignores_empty_canvas_border() -> None:
     """The growing mosaic canvas must not drag the stretch statistics."""
     st = _stacker()

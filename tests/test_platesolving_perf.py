@@ -196,3 +196,109 @@ def test_gaia_size_guard_counts_the_detections_the_solver_uses() -> None:
 
     assert result.status != "GAIA_TOO_SMALL"
     assert result.success
+
+
+# ---------------------------------------------------------------------------
+# Busqueda de triangulos por indice de pares
+# ---------------------------------------------------------------------------
+
+
+def _field(n=900, seed=7, center=(246.5, -27.7), radius_deg=1.5):
+    """Catalogo sintetico en un casquete, como el que carga un solve."""
+    rng = np.random.default_rng(seed)
+    r = radius_deg * np.sqrt(rng.uniform(0.0, 1.0, n))
+    phi = rng.uniform(0.0, 2.0 * np.pi, n)
+    dec = center[1] + r * np.sin(phi)
+    ra = center[0] + r * np.cos(phi) / np.cos(np.deg2rad(center[1]))
+    c = SkyCoord(ra=ra * u.deg, dec=dec * u.deg)
+    V = np.column_stack([
+        np.cos(np.deg2rad(dec)) * np.cos(np.deg2rad(ra)),
+        np.cos(np.deg2rad(dec)) * np.sin(np.deg2rad(ra)),
+        np.sin(np.deg2rad(dec)),
+    ])
+    return c, np.ascontiguousarray(V)
+
+
+def _annulus_reference(V, img_triplets, tol, sigma):
+    """La busqueda por anillos de antes, sin tope de vertices: la referencia exacta."""
+    from platesolving import chord_radius, triplet_score
+
+    tree = KDTree(V, leaf_size=40)
+    found = set()
+    for a, b, c, sides in img_triplets:
+        d1, d2, d3 = sides
+        for i in range(V.shape[0]):
+            for j in annulus_candidates(tree, V, i, d3, tol):
+                if j <= i:
+                    continue
+                ann = lambda idx, d: set(annulus_candidates(tree, V, int(idx), d, tol).tolist())
+                ks = (ann(i, d1) & ann(j, d2)) | (ann(i, d2) & ann(j, d1))
+                for k in ks:
+                    if k in (i, j):
+                        continue
+                    cat = sorted_sides_arcsec_from_vectors(V, i, int(j), int(k))
+                    _, err = triplet_score(sides, cat, sigma)
+                    if err <= tol:
+                        found.add(((a, b, c), tuple(sorted((int(i), int(j), int(k))))))
+    return found
+
+
+def test_pair_index_finds_exactly_the_triangles_the_annuli_found() -> None:
+    """La busqueda nueva no puede perder ni inventar candidatos: los mismos, mas rapido.
+
+    Medido sobre stacks reales paso de 10 s a 0.13 s con los mismos 395
+    candidatos y la misma solucion.
+    """
+    from platesolving import build_pair_index, pair_index_triplet_candidates
+
+    _coords, V = _field()
+    rng = np.random.default_rng(3)
+    img_triplets = []
+    for t in range(6):
+        i, j, k = rng.choice(V.shape[0], size=3, replace=False)
+        sides = sorted_sides_arcsec_from_vectors(V, int(i), int(j), int(k))
+        if sides[2] > 4000.0:
+            continue
+        img_triplets.append((t, t + 1, t + 2, sides + rng.normal(0.0, 0.5, 3)))
+    assert img_triplets
+    tol, sigma = 3.0, 0.6
+
+    max_side = max(float(t[3][2]) for t in img_triplets)
+    pairs, sep = build_pair_index(V, max_side + tol)
+    new = pair_index_triplet_candidates(
+        V, img_triplets, pairs=pairs, sep=sep, tol_arcsec=tol, sigma_arcsec=sigma,
+        source_ids=np.arange(V.shape[0]),
+    )
+    got = {(c["img_triplet"], tuple(sorted(c["gaia_idx"]))) for c in new}
+
+    assert got == _annulus_reference(V, img_triplets, tol, sigma)
+    assert len(got) >= len(img_triplets), "cada triangulo de la imagen debe encontrarse a si mismo"
+
+
+def test_pair_index_is_sorted_by_separation_and_bounded() -> None:
+    from platesolving import build_pair_index
+
+    _coords, V = _field(n=300)
+    pairs, sep = build_pair_index(V, 1800.0)
+
+    assert pairs.shape == (sep.size, 2)
+    assert np.all(np.diff(sep) >= 0.0)
+    assert sep.max() <= 1800.0 + 1e-6
+    assert np.all(pairs[:, 0] != pairs[:, 1])
+
+
+def test_numpy_sky_offsets_match_astropy_to_the_microarcsecond() -> None:
+    """La validacion proyectaba el catalogo con astropy una vez por candidato."""
+    from platesolving import offsets_arcsec_from_vectors
+
+    for center in ((246.49, -27.72), (346.7, -30.4), (10.0, 85.0), (180.0, -89.0)):
+        coords, V = _field(n=500, center=center, radius_deg=1.0)
+        c = SkyCoord(ra=center[0] * u.deg, dec=center[1] * u.deg)
+        dl, db = c.spherical_offsets_to(coords)
+        ref = np.column_stack([dl.to_value(u.arcsec), db.to_value(u.arcsec)])
+        cv = np.array([
+            np.cos(np.deg2rad(center[1])) * np.cos(np.deg2rad(center[0])),
+            np.cos(np.deg2rad(center[1])) * np.sin(np.deg2rad(center[0])),
+            np.sin(np.deg2rad(center[1])),
+        ])
+        np.testing.assert_allclose(offsets_arcsec_from_vectors(cv, V), ref, atol=1e-6)
