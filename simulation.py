@@ -62,9 +62,9 @@ def _configure_iers_for_demo(out_log: Any = None) -> None:
             iers.conf.auto_download = False
             iers.conf.auto_max_age = None
             _IERS_OFFLINE_CONFIGURED = True
-            log_info(out_log, "Simulation: Astropy IERS configured for offline demo mode")
+            log_info(out_log, "Simulation: IERS de Astropy configurado sin red para el modo demo")
         except Exception as exc:
-            log_error(out_log, "Simulation: failed to configure offline IERS mode", exc)
+            log_error(out_log, "Simulation: no se pudo configurar IERS sin red", exc)
 
 
 def restore_iers_after_demo(out_log: Any = None) -> None:
@@ -80,9 +80,9 @@ def restore_iers_after_demo(out_log: Any = None) -> None:
             iers.conf.auto_max_age = _IERS_PREVIOUS_CONFIG[1]
             _IERS_OFFLINE_CONFIGURED = False
             _IERS_PREVIOUS_CONFIG = None
-            log_info(out_log, "Simulation: Astropy IERS settings restored")
+            log_info(out_log, "Simulation: ajustes IERS de Astropy restaurados")
         except Exception as exc:
-            log_error(out_log, "Simulation: failed to restore Astropy IERS settings", exc)
+            log_error(out_log, "Simulation: no se pudieron restaurar los ajustes IERS de Astropy", exc)
 
 
 class SimulationState:
@@ -129,12 +129,20 @@ class SimulationState:
         # A*sin(2*pi*s/P + phase), so the locally measured scale swings by
         # A*2*pi/P around nominal: a move much shorter than one lobe measures
         # that local slope instead of the mean scale.
-        amp_lo = abs(_finite_float(getattr(cfg, "transmission_error_deg_min", 0.08), 0.08))
-        amp_hi = abs(_finite_float(getattr(cfg, "transmission_error_deg_max", 0.25), 0.25))
-        if amp_hi < amp_lo:
-            amp_lo, amp_hi = amp_hi, amp_lo
+        # Por eje: el cicloidal impreso de azimut riza mucho, el planetario
+        # comprado de altitud casi nada. Un rango comun para los dos describia
+        # una montura que no es esta.
+        def _amp(axis_suffix: str, lo_default: float, hi_default: float) -> float:
+            lo = abs(_finite_float(
+                getattr(cfg, f"transmission_error_deg_min_{axis_suffix}", lo_default), lo_default))
+            hi = abs(_finite_float(
+                getattr(cfg, f"transmission_error_deg_max_{axis_suffix}", hi_default), hi_default))
+            if hi < lo:
+                lo, hi = hi, lo
+            return float(self._rng.uniform(lo, hi))
+
         self.transmission_amp_deg = np.array(
-            [self._rng.uniform(amp_lo, amp_hi), self._rng.uniform(amp_lo, amp_hi)],
+            [_amp("az", 0.08, 0.25), _amp("alt", 0.002, 0.02)],
             dtype=np.float64,
         )
         self.transmission_phase_rad = np.array(
@@ -145,14 +153,27 @@ class SimulationState:
         # --- Backlash ---
         # Slack taken up when an axis reverses: the motor turns but the sky
         # does not move until the pending amount is consumed.
-        bl_lo = int(max(0, getattr(cfg, "backlash_steps_min", 5)))
-        bl_hi = int(max(bl_lo, getattr(cfg, "backlash_steps_max", 40)))
+        # Tambien por eje, y al reves que el rizado: el planetario de altitud es
+        # el que trae el juego, del orden de 15-60 arcmin en la salida.
+        def _slack(axis_suffix: str, lo_default: int, hi_default: int) -> float:
+            lo = int(max(0, getattr(cfg, f"backlash_steps_min_{axis_suffix}", lo_default)))
+            hi = int(max(lo, getattr(cfg, f"backlash_steps_max_{axis_suffix}", hi_default)))
+            return float(self._rng.integers(lo, hi + 1))
+
         self.backlash_steps = np.array(
-            [self._rng.integers(bl_lo, bl_hi + 1), self._rng.integers(bl_lo, bl_hi + 1)],
+            [_slack("az", 0, 40), _slack("alt", 800, 3200)],
             dtype=np.float64,
         )
         self._last_direction = np.zeros(2, dtype=np.float64)
         self._backlash_pending = np.zeros(2, dtype=np.float64)
+
+        # --- Foco ---
+        # El enfocador arranca en cero y el foco real esta en otro lado: eso es
+        # lo que la busqueda tiene que encontrar. El desenfoque ensancha la PSF
+        # igual que en el telescopio, asi que la metrica de nitidez ve una V.
+        focus_span = abs(int(getattr(cfg, "focus_best_offset_steps", 1200)))
+        self.focus_best_steps = float(self._rng.integers(-focus_span, focus_span + 1)) if focus_span > 0 else 0.0
+        self._focus_steps = 0.0
 
         self._az_deg = (float(cfg.initial_az_deg) + self.mount_tilt_az_deg) % 360.0
         self._alt_deg = float(np.clip(float(cfg.initial_alt_deg) + self.mount_tilt_alt_deg, 1.0, 89.0))
@@ -160,13 +181,14 @@ class SimulationState:
         log_info(
             out_log,
             (
-                "Simulation: seeded demo mode "
-                f"seed={self.seed} mount_tilt=({self.mount_tilt_az_deg:+.3f},"
-                f"{self.mount_tilt_alt_deg:+.3f}) deg "
-                f"camera_roll_error={self.camera_roll_error_deg:+.3f} deg "
-                f"transmission_error=({self.transmission_amp_deg[0]:.3f},"
-                f"{self.transmission_amp_deg[1]:.3f}) deg "
-                f"backlash=({int(self.backlash_steps[0])},{int(self.backlash_steps[1])}) steps"
+                "Simulation: modo demo con semilla "
+                f"{self.seed}: inclinación=({self.mount_tilt_az_deg:+.3f},"
+                f"{self.mount_tilt_alt_deg:+.3f})° "
+                f"error_de_giro={self.camera_roll_error_deg:+.3f}° "
+                f"rizado=({self.transmission_amp_deg[0]:.3f},"
+                f"{self.transmission_amp_deg[1]:.3f})° "
+                f"juego=({int(self.backlash_steps[0])},{int(self.backlash_steps[1])}) pasos "
+                f"foco_real={int(self.focus_best_steps):+d} pasos"
             ),
         )
 
@@ -266,6 +288,27 @@ class SimulationState:
             self._alt_deg = float(np.clip(self._alt_deg + float(d_altaz[1]), 1.0, 89.0))
             return float(self._az_deg), float(self._alt_deg)
 
+    def apply_focus_move(self, direction: int, steps: int) -> float:
+        with self._lock:
+            self._focus_steps += float(int(direction) * int(steps))
+            return float(self._focus_steps)
+
+    def focus_steps_position(self) -> float:
+        with self._lock:
+            return float(self._focus_steps)
+
+    def defocus_sigma_px(self) -> float:
+        """Ensanchamiento de la PSF por desenfoque, en pixeles.
+
+        Lineal con la distancia al foco, como el circulo de confusion de un
+        sistema optico: al doble de recorrido, el doble de borroso.
+        """
+        with self._lock:
+            offset = abs(float(self._focus_steps) - float(self.focus_best_steps))
+        blur = abs(_finite_float(getattr(self.cfg, "focus_blur_px_per_step", 0.010), 0.010))
+        cap = abs(_finite_float(getattr(self.cfg, "focus_max_defocus_sigma_px", 12.0), 12.0))
+        return float(min(offset * blur, cap))
+
     def snapshot_altaz(self) -> Tuple[float, float]:
         with self._lock:
             return float(self._az_deg), float(self._alt_deg)
@@ -317,9 +360,53 @@ class SimulatedMount:
     def stop(self) -> str:
         return "OK SIM STOP"
 
+    def stop_axis(self, axis_fw: str) -> str:
+        return f"OK SIM STOP {str(axis_fw).upper()}"
+
+    def supports_focuser(self) -> bool:
+        return True
+
+    def supports_test_mode(self) -> bool:
+        return True
+
     def set_microsteps(self, az_div: int, alt_div: int) -> str:
         self._state.set_microsteps(int(az_div), int(alt_div))
         return "OK SIM MS"
+
+    def focus_steps(
+        self,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        *,
+        profile: str = "smooth",
+        blocking: bool = True,
+    ) -> str:
+        if not self.is_connected():
+            raise RuntimeError("simulated mount not connected")
+        if int(steps) <= 0:
+            return "OK SIM FOCUS skipped"
+        self._state.apply_focus_move(int(direction), int(steps))
+        if bool(blocking):
+            wait_s = self._estimate_move_duration_s(
+                int(steps), int(delay_us), profile=profile
+            )
+            if wait_s > 0.0:
+                time.sleep(min(wait_s + 0.02, 0.25))
+        return "OK SIM FOCUS"
+
+    def test_steps(
+        self,
+        axis_fw: str,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        *,
+        profile: str = "smooth",
+        blocking: bool = True,
+    ) -> str:
+        _ = (axis_fw, direction, steps, delay_us, profile, blocking)
+        return "OK SIM TEST"
 
     @staticmethod
     def _estimate_move_duration_s(
@@ -397,7 +484,7 @@ class SimulatedCameraStream:
         if thr is not None:
             thr.join(timeout=2.0)
             if thr.is_alive():
-                log_error(self._out_log, "Simulation camera: thread did not stop within timeout")
+                log_error(self._out_log, "Simulation camera: el hilo no se detuvo a tiempo")
         self._thr = None
         with self._lock:
             self._latest = None
@@ -450,7 +537,7 @@ class SimulatedCameraStream:
             except Exception as exc:
                 log_error(
                     self._out_log,
-                    "Simulation camera: frame render failed",
+                    "Simulation camera: falló el render del cuadro",
                     exc,
                     throttle_s=2.0,
                     throttle_key="simulation_render_failed",
@@ -530,14 +617,14 @@ class SimulatedCameraStream:
                 last_error = "Gaia cache returned 0 stars for the current demo field"
                 log_info(
                     self._out_log,
-                    f"Simulation camera: Gaia catalog is empty radius={radius_deg:.2f} deg",
+                    f"Simulation camera: el catálogo de Gaia está vacío en radio={radius_deg:.2f}°",
                     throttle_s=10.0,
                     throttle_key="simulation_gaia_empty",
                 )
             else:
                 log_info(
                     self._out_log,
-                    f"Simulation camera: Gaia catalog loaded rows={len(df)} radius={radius_deg:.2f} deg",
+                    f"Simulation camera: catálogo de Gaia cargado filas={len(df)} radio={radius_deg:.2f}°",
                     throttle_s=10.0,
                     throttle_key="simulation_gaia_loaded",
                 )
@@ -547,8 +634,8 @@ class SimulatedCameraStream:
                 log_info(
                     self._out_log,
                     (
-                        "Simulation camera: Gaia cache missing for current field; "
-                        "using opt-in synthetic fallback"
+                        "Simulation camera: faltan teselas de Gaia para el campo actual; "
+                        "se usa el respaldo sintético activado"
                     ),
                     throttle_s=10.0,
                     throttle_key="simulation_gaia_cache_miss_synthetic",
@@ -560,8 +647,8 @@ class SimulatedCameraStream:
                 log_info(
                     self._out_log,
                     (
-                        "Simulation camera: Gaia cache missing for current field; "
-                        "rendering no stars until those Gaia tiles exist"
+                        "Simulation camera: faltan teselas de Gaia para el campo actual; "
+                        "no se pintan estrellas hasta que existan"
                     ),
                     throttle_s=10.0,
                     throttle_key="simulation_gaia_cache_miss",
@@ -572,7 +659,7 @@ class SimulatedCameraStream:
         except Exception as exc:
             log_error(
                 self._out_log,
-                "Simulation camera: Gaia catalog load failed",
+                "Simulation camera: falló la carga del catálogo de Gaia",
                 exc,
                 throttle_s=10.0,
                 throttle_key="simulation_gaia_load_failed",
@@ -771,6 +858,7 @@ class SimulatedCameraStream:
         if jitter > 0.0:
             base_sigma = float(base_sigma * (1.0 + self._rng.normal(0.0, jitter * 0.5)))
             base_sigma = float(np.clip(base_sigma, 0.45, 12.0))
+        defocus_sigma = float(self._state.defocus_sigma_px())
         base_flux = _finite_float(getattr(self._cfg.simulation, "star_flux_adu", 18000.0), 18000.0)
         exp_scale = max(0.05, _finite_float(getattr(self._cfg.camera, "exp_ms", 100.0), 100.0) / 100.0)
         gain_scale = max(0.2, _finite_float(getattr(self._cfg.camera, "gain", 360.0), 360.0) / 360.0)
@@ -785,6 +873,17 @@ class SimulatedCameraStream:
             # Real PSF size is mostly optical, but bright stars look wider in
             # raw frames because their wings and saturation stay above noise.
             core_sigma = float(np.clip(base_sigma * (0.82 + 0.62 * bright - 0.14 * faint), 0.42, 3.2))
+            defocus_dim = 1.0
+            if defocus_sigma > 0.0:
+                # En cuadratura: el desenfoque es una convolucion independiente
+                # del seeing, no un reemplazo suyo.
+                focused_sigma = core_sigma
+                core_sigma = float(np.hypot(core_sigma, defocus_sigma))
+                # El desenfoque reparte el mismo flujo en mas area, no anade
+                # luz: el pico cae como sigma^2. Sin esta correccion una
+                # estrella desenfocada seria mas brillante que enfocada y la
+                # curva de foco saldria al reves.
+                defocus_dim = float((focused_sigma / core_sigma) ** 2)
             halo_sigma = float(np.clip(core_sigma * (2.2 + 2.4 * bright), core_sigma + 0.4, 14.0))
             halo_frac = float(0.018 + 0.11 * bright)
             # Must reach out to where halo_sigma (clipped up to 14.0 above)
@@ -799,7 +898,7 @@ class SimulatedCameraStream:
             if xi < -radius or yi < -radius or xi >= w + radius or yi >= h + radius:
                 continue
 
-            amp = float(base_flux * exp_scale * np.sqrt(gain_scale) * mag_scale)
+            amp = float(base_flux * exp_scale * np.sqrt(gain_scale) * mag_scale * defocus_dim)
             # No floor: a faint star's patch is allowed to sit at an amplitude
             # the sky noise will bury. Only the saturation ceiling is real.
             amp = float(np.clip(amp, 0.0, 62000.0))

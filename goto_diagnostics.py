@@ -13,7 +13,7 @@ from typing import Any, Dict, Optional, Sequence
 
 import numpy as np
 
-from logging_utils import log_error, log_info
+from logging_utils import log_debug, log_error, log_info
 
 
 def _json_safe(value: Any) -> Any:
@@ -149,10 +149,10 @@ class DiagnosticSession:
                 },
             )
             self.record("session_started", context=dict(context or {}))
-            log_info(self.out_log, f"Diagnostics: session={self.path}")
+            log_debug(self.out_log, f"Diagnostics: sesión en {self.path}")
         except Exception as exc:
             self.enabled = False
-            log_error(self.out_log, "Diagnostics: failed to create session", exc)
+            log_error(self.out_log, "Diagnostics: no se pudo crear la sesión", exc)
 
     def _write_json(self, path: Path, payload: Dict[str, Any]) -> None:
         path.write_text(
@@ -185,7 +185,7 @@ class DiagnosticSession:
         except Exception as exc:
             log_error(
                 self.out_log,
-                f"Diagnostics: failed to record stage={stage}",
+                f"Diagnostics: no se pudo registrar la etapa {stage}",
                 exc,
                 throttle_s=2.0,
                 throttle_key="diagnostics_record",
@@ -220,7 +220,7 @@ class DiagnosticSession:
             self.record("raw_saved", artifact=artifact)
             return str(path.resolve())
         except Exception as exc:
-            log_error(self.out_log, f"Diagnostics: failed to save raw stage={stage}", exc)
+            log_error(self.out_log, f"Diagnostics: no se pudo guardar el raw de la etapa {stage}", exc)
             return None
 
     def save_raw_stack(
@@ -259,7 +259,7 @@ class DiagnosticSession:
             self.record("raw_stack_saved", artifact=artifact)
             return str(path.resolve())
         except Exception as exc:
-            log_error(self.out_log, f"Diagnostics: failed to save raw stack stage={stage}", exc)
+            log_error(self.out_log, f"Diagnostics: no se pudo guardar el apilado raw de la etapa {stage}", exc)
             return None
 
     def close(self, status: str, **summary: Any) -> None:
@@ -281,9 +281,9 @@ class DiagnosticSession:
                 "events": self._events,
             }
             self._write_json(self.path / "manifest.json", manifest)
-            log_info(self.out_log, f"Diagnostics: saved session={self.path}")
+            log_info(self.out_log, f"Diagnostics: sesión guardada en {self.path}")
         except Exception as exc:
-            log_error(self.out_log, "Diagnostics: failed to finalize session", exc)
+            log_error(self.out_log, "Diagnostics: no se pudo cerrar la sesión", exc)
 
 
 __all__ = ["DiagnosticSession", "raw16_statistics"]

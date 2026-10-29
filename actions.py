@@ -3,7 +3,7 @@ from __future__ import annotations
 
 from dataclasses import dataclass
 from enum import Enum
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 import time
 
 from ap_types import Axis
@@ -28,6 +28,19 @@ class ActionType(str, Enum):
     MOUNT_STOP = "MOUNT_STOP"
     RESET_MOUNT_DEFAULTS = "RESET_MOUNT_DEFAULTS"
 
+    # focuser (tercer motor)
+    FOCUSER_MOVE = "FOCUSER_MOVE"
+    FOCUSER_GOTO = "FOCUSER_GOTO"
+    FOCUSER_ZERO = "FOCUSER_ZERO"
+    FOCUSER_HOME = "FOCUSER_HOME"
+    FOCUSER_PRESET = "FOCUSER_PRESET"
+    FOCUSER_SAVE_PRESET = "FOCUSER_SAVE_PRESET"
+    FOCUSER_DELETE_PRESET = "FOCUSER_DELETE_PRESET"
+    FOCUSER_AUTOFOCUS = "FOCUSER_AUTOFOCUS"
+    FOCUSER_CANCEL = "FOCUSER_CANCEL"
+    FOCUSER_SET_PARAMS = "FOCUSER_SET_PARAMS"
+    RESET_FOCUSER_DEFAULTS = "RESET_FOCUSER_DEFAULTS"
+
     # tracking
     TRACKING_START = "TRACKING_START"
     TRACKING_STOP = "TRACKING_STOP"
@@ -38,6 +51,7 @@ class ActionType(str, Enum):
     TRACKING_CALIB_AZ = "TRACKING_CALIB_AZ"
     TRACKING_CALIB_ALT = "TRACKING_CALIB_ALT"
     TRACKING_CALIB_RESET = "TRACKING_CALIB_RESET"
+    TRACKING_SET_CALIB = "TRACKING_SET_CALIB"
 
     TRACKING_AUTO_RESET = "TRACKING_AUTO_RESET"
     TRACKING_BOOTSTRAP = "TRACKING_BOOTSTRAP"
@@ -171,8 +185,82 @@ def mount_move_steps(
     )
 
 
+def tracking_set_calib(a00: float, a01: float, a10: float, a11: float,
+                       b0: float = 0.0, b1: float = 0.0) -> Action:
+    """Instala una calibracion pixel<->paso medida fuera de la app."""
+    return Action(
+        ActionType.TRACKING_SET_CALIB,
+        {"theta": [[float(a00), float(a01), float(b0)],
+                   [float(a10), float(a11), float(b1)]]},
+        _now(),
+    )
+
+
 def mount_stop() -> Action:
     return Action(ActionType.MOUNT_STOP, {}, _now())
+
+
+def focuser_move(direction: int, steps: int) -> Action:
+    if direction not in (-1, +1):
+        raise ValueError("direction must be -1 or +1")
+    if int(steps) <= 0:
+        raise ValueError("steps must be positive")
+    return Action(
+        ActionType.FOCUSER_MOVE,
+        {"direction": int(direction), "steps": int(steps)},
+        _now(),
+    )
+
+
+def focuser_goto(position: int) -> Action:
+    return Action(ActionType.FOCUSER_GOTO, {"position": int(position)}, _now())
+
+
+def focuser_zero() -> Action:
+    return Action(ActionType.FOCUSER_ZERO, {}, _now())
+
+
+def focuser_home() -> Action:
+    return Action(ActionType.FOCUSER_HOME, {}, _now())
+
+
+def focuser_preset(name: str) -> Action:
+    if not str(name).strip():
+        raise ValueError("preset name must not be empty")
+    return Action(ActionType.FOCUSER_PRESET, {"name": str(name).strip()}, _now())
+
+
+def focuser_save_preset(name: str, position: Optional[int] = None) -> Action:
+    if not str(name).strip():
+        raise ValueError("preset name must not be empty")
+    return Action(
+        ActionType.FOCUSER_SAVE_PRESET,
+        {
+            "name": str(name).strip(),
+            "position": None if position is None else int(position),
+        },
+        _now(),
+    )
+
+
+def focuser_delete_preset(name: str) -> Action:
+    return Action(ActionType.FOCUSER_DELETE_PRESET, {"name": str(name).strip()}, _now())
+
+
+def focuser_autofocus(params: Dict[str, Any] | None = None) -> Action:
+    return Action(ActionType.FOCUSER_AUTOFOCUS, {"params": dict(params or {})}, _now())
+
+
+def focuser_cancel() -> Action:
+    return Action(ActionType.FOCUSER_CANCEL, {}, _now())
+
+
+def focuser_set_params(**kwargs: Any) -> Action:
+    return Action(ActionType.FOCUSER_SET_PARAMS, dict(kwargs), _now())
+
+
+def focuser_reset_defaults() -> Action:
+    return Action(ActionType.RESET_FOCUSER_DEFAULTS, {}, _now())
 
 
 def mount_reset_defaults() -> Action:

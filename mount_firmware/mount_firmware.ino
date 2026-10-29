@@ -1,27 +1,44 @@
 // ============================================================
-// Dual-stepper controller for ESP32 (TMC2209 STEP/DIR)
+// Triple-stepper controller for ESP32 (TMC2209 STEP/DIR)
 // + Fixed 1/64 microstepping (configured by hardware wiring)
 // + Bluetooth Classic SPP via BluetoothSerial
+//
+// Axes:
+//   A = AZ    (mount azimuth)
+//   B = ALT   (mount altitude)
+//   C = FOCUS (focuser, drives the telescope focus knob)
 //
 // Commands (newline-terminated; CR/LF/CRLF accepted):
 //   PING
 //   ENABLE 0|1
 //   MS 64                            (legacy compatibility; no-op)
 //   MS AZ|ALT 64                     (legacy compatibility; no-op)
-//   STOP
-//   MOVE A|B FWD|REV steps delay_us [SMOOTH|DIRECT]
-//   STATUS                              (reports MS=64 MSFIXED=1)
+//   STOP                             (all axes)
+//   STOP A|B|C                       (single axis)
+//   MOVE A|B|C FWD|REV steps delay_us [SMOOTH|DIRECT]
+//   TEST A|B|C FWD|REV steps delay_us [SMOOTH|DIRECT]
+//   STATUS                              (reports MS=64 MSFIXED=1 AXES=3)
 //   DEBUG 0|1                       (toggle ALIVE heartbeat)
+//
+// MOVE vs TEST
+//   MOVE is the observing command and stays clamped to MOVE_MAX_RATE_STEPS_S,
+//   which protects the telescope's 45:1 drive from being commanded past what it
+//   can actually follow. TEST runs the identical scheduler with that clamp
+//   lifted, for bench-testing other motors whose reduction allows much higher
+//   step rates. Both accept SMOOTH (S-curve accel/brake) and DIRECT (constant
+//   rate). Never use TEST on the telescope drive.
 //
 // YOUR PCB pinout (ESP32 30-pin):
 //   EN  (common): GPIO21  (LOW=enabled)
-//   AZ:  STEP=GPIO33  DIR=GPIO25
-//   ALT: STEP=GPIO26  DIR=GPIO27
+//   AZ:    STEP=GPIO33  DIR=GPIO25
+//   ALT:   STEP=GPIO26  DIR=GPIO27
+//   FOCUS: STEP=GPIO14  DIR=GPIO13     <-- ADJUST to your CNC-shield wiring
 //
-// Notes (Mac terminal cleanliness):
-// - Responses are forced to CRLF ("\r\n") regardless of terminal.
-// - READY is sent ONLY when SPP channel is actually opened.
-// - ALIVE is optional (DEBUG 1) and is suppressed while you are typing.
+// If you change the focuser pins, avoid GPIO 34/35/36/39 (input-only, they
+// cannot drive STEP or DIR at all) and the strapping pins 0/2/4/5/12/15. GPIO12
+// in particular selects the flash voltage at reset: a driver input holding it
+// high stops the board from booting, and that failure looks like a dead ESP32
+// rather than a wiring mistake.
 // ============================================================
 
 #include <Arduino.h>
@@ -31,13 +48,16 @@
 
 BluetoothSerial SerialBT;
 
-// --- Pins ---
-static const uint8_t STEP_A = 33;  // AZ STEP
-static const uint8_t DIR_A  = 25;  // AZ DIR
-static const uint8_t STEP_B = 26;  // ALT STEP
-static const uint8_t DIR_B  = 27;  // ALT DIR
+// --- Axis indices ---
+enum AxisId { AX_A = 0, AX_B = 1, AX_C = 2, AX_COUNT = 3 };
 
-static const uint8_t EN_PIN  = 21; // LOW=enabled (common)
+// --- Pins (index by AxisId) ---
+// The focuser is the third driver socket on the CNC shield. Change STEP/DIR
+// below to match how that socket is wired to the ESP32.
+static const uint8_t STEP_PIN[AX_COUNT] = { 33, 26, 14 };
+static const uint8_t DIR_PIN [AX_COUNT] = { 25, 27, 13 };
+
+static const uint8_t EN_PIN  = 21; // LOW=enabled (common to all drivers)
 
 static const uint16_t STEP_PULSE_US = 3;
 
@@ -51,21 +71,22 @@ static const float MOVE_SMOOTH_START_RATE_STEPS_S = 400.0f;
 static const float MOVE_SMOOTH_MAX_ACCEL_STEPS_S2 = 4000.0f;
 static const float SMOOTHERSTEP_MAX_DERIVATIVE = 1.875f;
 
+// Absolute ceiling for TEST. Not a drive-safety limit but a physical one: the
+// scheduler cannot emit pulses faster than the loop can service them, and the
+// STEP pulse itself takes STEP_PULSE_US.
+static const float TEST_MAX_RATE_STEPS_S = 200000.0f;
+
 static bool g_enabled = false;
 
-// MOVE scheduler (non-blocking)
-static volatile long g_moveRemA = 0;
-static volatile long g_moveRemB = 0;
-static long g_moveTotalA = 0;
-static long g_moveTotalB = 0;
-static uint32_t moveTargetPerA_us = 0;
-static uint32_t moveTargetPerB_us = 0;
-static uint32_t movePerA_us  = 0;
-static uint32_t movePerB_us  = 0;
-static uint32_t moveNextA_us = 0;
-static uint32_t moveNextB_us = 0;
-static bool moveSmoothA = true;
-static bool moveSmoothB = true;
+// MOVE scheduler (non-blocking), per axis
+static volatile long g_moveRem[AX_COUNT]   = { 0, 0, 0 };
+static long g_moveTotal[AX_COUNT]          = { 0, 0, 0 };
+static uint32_t moveTargetPer_us[AX_COUNT] = { 0, 0, 0 };
+static uint32_t movePer_us[AX_COUNT]       = { 0, 0, 0 };
+static uint32_t moveNext_us[AX_COUNT]      = { 0, 0, 0 };
+static bool moveSmooth[AX_COUNT]           = { true, true, true };
+// Set by TEST: run this axis with the observing speed clamp lifted.
+static bool moveUnlimited[AX_COUNT]        = { false, false, false };
 
 static const uint16_t FIXED_MICROSTEPS = 64;
 
@@ -75,7 +96,6 @@ static bool g_debugAlive = false;     // default OFF (clean terminal)
 static uint32_t g_lastRxMs = 0;       // last received byte time (ms)
 
 static inline void setHighDrive(uint8_t pin) {
-  // Increase output drive strength for long traces / noisy loads.
   gpio_set_drive_capability((gpio_num_t)pin, GPIO_DRIVE_CAP_3);
 }
 
@@ -90,26 +110,35 @@ static inline void setEnable(bool on) {
   digitalWrite(EN_PIN, on ? LOW : HIGH);
 }
 
+static inline bool axisFromChar(char c, int *out) {
+  if (c == 'A') { *out = AX_A; return true; }
+  if (c == 'B') { *out = AX_B; return true; }
+  if (c == 'C') { *out = AX_C; return true; }
+  return false;
+}
+
+static void clearMovePlan(int ax) {
+  g_moveRem[ax] = 0;
+  g_moveTotal[ax] = 0;
+  moveTargetPer_us[ax] = 0;
+  movePer_us[ax] = 0;
+  moveNext_us[ax] = 0;
+  moveUnlimited[ax] = false;
+}
+
 static inline void clearMovePlans() {
-  g_moveRemA = 0;
-  g_moveRemB = 0;
-  g_moveTotalA = 0;
-  g_moveTotalB = 0;
-  moveTargetPerA_us = 0;
-  moveTargetPerB_us = 0;
-  movePerA_us = 0;
-  movePerB_us = 0;
-  moveNextA_us = 0;
-  moveNextB_us = 0;
+  for (int ax = 0; ax < AX_COUNT; ++ax) clearMovePlan(ax);
 }
 
 static uint32_t profiledMovePeriodUs(
   uint32_t requestedPer_us,
   long total,
   long remaining,
-  bool smoothProfile
+  bool smoothProfile,
+  bool unlimited
 ) {
-  const uint32_t safeMinPeriod_us = (uint32_t)ceilf(1000000.0f / MOVE_MAX_RATE_STEPS_S);
+  const float maxRate = unlimited ? TEST_MAX_RATE_STEPS_S : MOVE_MAX_RATE_STEPS_S;
+  const uint32_t safeMinPeriod_us = (uint32_t)ceilf(1000000.0f / maxRate);
   const uint32_t targetPer_us = max(requestedPer_us, safeMinPeriod_us);
   if (targetPer_us == 0 || total <= 0 || remaining <= 0) return targetPer_us;
   if (!smoothProfile) return targetPer_us;
@@ -151,35 +180,28 @@ static uint32_t profiledMovePeriodUs(
 }
 
 static void startMoveNonBlocking(
-  char axis,
+  int ax,
   bool fwd,
   long steps,
   long delay_us,
-  bool smoothProfile
+  bool smoothProfile,
+  bool unlimited
 ) {
   if (steps <= 0) return;
   if (delay_us < 0) delay_us = 0;
+  if (ax < 0 || ax >= AX_COUNT) return;
 
   uint32_t per_us = (uint32_t)(max(1L, delay_us + (long)STEP_PULSE_US));
   uint32_t now = micros();
 
-  if (axis == 'A') {
-    digitalWrite(DIR_A, fwd ? HIGH : LOW);
-    g_moveRemA = steps;
-    g_moveTotalA = steps;
-    moveSmoothA = smoothProfile;
-    moveTargetPerA_us = per_us;
-    movePerA_us = profiledMovePeriodUs(per_us, steps, steps, moveSmoothA);
-    moveNextA_us = now;
-  } else { // 'B'
-    digitalWrite(DIR_B, fwd ? HIGH : LOW);
-    g_moveRemB = steps;
-    g_moveTotalB = steps;
-    moveSmoothB = smoothProfile;
-    moveTargetPerB_us = per_us;
-    movePerB_us = profiledMovePeriodUs(per_us, steps, steps, moveSmoothB);
-    moveNextB_us = now;
-  }
+  digitalWrite(DIR_PIN[ax], fwd ? HIGH : LOW);
+  g_moveRem[ax] = steps;
+  g_moveTotal[ax] = steps;
+  moveSmooth[ax] = smoothProfile;
+  moveUnlimited[ax] = unlimited;
+  moveTargetPer_us[ax] = per_us;
+  movePer_us[ax] = profiledMovePeriodUs(per_us, steps, steps, smoothProfile, unlimited);
+  moveNext_us[ax] = now;
 }
 
 // ---- BT output helpers (force CRLF) ----
@@ -229,29 +251,55 @@ void btCallback(esp_spp_cb_event_t event, esp_spp_cb_param_t *param) {
 }
 
 void setup() {
-  pinMode(STEP_A, OUTPUT);
-  pinMode(DIR_A, OUTPUT);
-  pinMode(STEP_B, OUTPUT);
-  pinMode(DIR_B, OUTPUT);
+  for (int ax = 0; ax < AX_COUNT; ++ax) {
+    pinMode(STEP_PIN[ax], OUTPUT);
+    pinMode(DIR_PIN[ax], OUTPUT);
+    // Increase output drive strength for long traces / noisy loads.
+    setHighDrive(STEP_PIN[ax]);
+    setHighDrive(DIR_PIN[ax]);
+    digitalWrite(STEP_PIN[ax], LOW);
+    digitalWrite(DIR_PIN[ax], LOW);
+  }
 
   pinMode(EN_PIN, OUTPUT);
-
-  setHighDrive(STEP_A);
-  setHighDrive(DIR_A);
-  setHighDrive(STEP_B);
-  setHighDrive(DIR_B);
   setHighDrive(EN_PIN);
-
-  digitalWrite(STEP_A, LOW);
-  digitalWrite(STEP_B, LOW);
-  digitalWrite(DIR_A, LOW);
-  digitalWrite(DIR_B, LOW);
 
   setEnable(false);
   delay(2);
 
   SerialBT.register_callback(btCallback);
   SerialBT.begin("AstroPanoptes-ESP32");
+}
+
+// Shared by MOVE and TEST: they differ only in whether the observing speed
+// clamp applies.
+static void handleMoveCommand(bool unlimited) {
+  char *ax = strtok(NULL, " ");
+  char *dr = strtok(NULL, " ");
+  char *st = strtok(NULL, " ");
+  char *du = strtok(NULL, " ");
+  char *pf = strtok(NULL, " ");
+
+  if (!ax || !dr || !st || !du) { btPrintCRLF("ERR"); return; }
+  int axis = -1;
+  if (!axisFromChar(ax[0], &axis)) { btPrintCRLF("ERR"); return; }
+
+  bool fwd = (!strcmp(dr, "FWD"));
+  if (!(fwd || !strcmp(dr, "REV"))) { btPrintCRLF("ERR"); return; }
+
+  long steps = atol(st);
+  long delay_us = atol(du);
+  if (delay_us < 0) delay_us = 0;
+  bool smoothProfile = true;
+  if (pf && !strcmp(pf, "DIRECT")) {
+    smoothProfile = false;
+  } else if (pf && strcmp(pf, "SMOOTH")) {
+    btPrintCRLF("ERR PROFILE");
+    return;
+  }
+
+  startMoveNonBlocking(axis, fwd, steps, delay_us, smoothProfile, unlimited);
+  btPrintCRLF("OK");
 }
 
 void loop() {
@@ -266,36 +314,28 @@ void loop() {
     }
   }
 
-  // --- move scheduler ---
+  // --- move scheduler (all axes) ---
   if (g_enabled) {
     uint32_t now = micros();
-
-    if (g_moveRemA > 0 && movePerA_us > 0 && (int32_t)(now - moveNextA_us) >= 0) {
-      const uint32_t stepStarted_us = micros();
-      pulseStep(STEP_A);
-      g_moveRemA -= 1;
-      if (g_moveRemA <= 0) {
-        g_moveRemA = 0;
-        movePerA_us = 0;
-      } else {
-        movePerA_us = profiledMovePeriodUs(moveTargetPerA_us, g_moveTotalA, g_moveRemA, moveSmoothA);
-        // Schedule from the pulse start so movePerA_us is the true
-        // step-to-step period. Using micros() after the pulse silently added
-        // STEP_PULSE_US a second time and made host duration estimates drift.
-        moveNextA_us = stepStarted_us + movePerA_us;
-      }
-    }
-
-    if (g_moveRemB > 0 && movePerB_us > 0 && (int32_t)(now - moveNextB_us) >= 0) {
-      const uint32_t stepStarted_us = micros();
-      pulseStep(STEP_B);
-      g_moveRemB -= 1;
-      if (g_moveRemB <= 0) {
-        g_moveRemB = 0;
-        movePerB_us = 0;
-      } else {
-        movePerB_us = profiledMovePeriodUs(moveTargetPerB_us, g_moveTotalB, g_moveRemB, moveSmoothB);
-        moveNextB_us = stepStarted_us + movePerB_us;
+    for (int ax = 0; ax < AX_COUNT; ++ax) {
+      if (g_moveRem[ax] > 0 && movePer_us[ax] > 0 && (int32_t)(now - moveNext_us[ax]) >= 0) {
+        const uint32_t stepStarted_us = micros();
+        pulseStep(STEP_PIN[ax]);
+        g_moveRem[ax] -= 1;
+        if (g_moveRem[ax] <= 0) {
+          g_moveRem[ax] = 0;
+          movePer_us[ax] = 0;
+          moveUnlimited[ax] = false;
+        } else {
+          movePer_us[ax] = profiledMovePeriodUs(
+            moveTargetPer_us[ax], g_moveTotal[ax], g_moveRem[ax],
+            moveSmooth[ax], moveUnlimited[ax]
+          );
+          // Schedule from the pulse start so movePer_us is the true
+          // step-to-step period. Using micros() after the pulse silently added
+          // STEP_PULSE_US a second time and made host duration estimates drift.
+          moveNext_us[ax] = stepStarted_us + movePer_us[ax];
+        }
       }
     }
   }
@@ -342,7 +382,16 @@ void loop() {
   }
 
   if (!strcmp(tok, "STOP")) {
-    clearMovePlans();
+    // STOP alone halts everything; STOP <axis> halts just that one, so the
+    // focuser can be interrupted without aborting a slew (and vice versa).
+    char *a = strtok(NULL, " ");
+    if (a) {
+      int axis = -1;
+      if (!axisFromChar(a[0], &axis)) { btPrintCRLF("ERR"); return; }
+      clearMovePlan(axis);
+    } else {
+      clearMovePlans();
+    }
     btPrintCRLF("OK");
     return;
   }
@@ -352,7 +401,7 @@ void loop() {
     if (!a1) { btPrintCRLF("ERR"); return; }
 
     uint16_t ms = 0;
-    if (!strcmp(a1, "AZ") || !strcmp(a1, "ALT")) {
+    if (!strcmp(a1, "AZ") || !strcmp(a1, "ALT") || !strcmp(a1, "FOCUS")) {
       char *a2 = strtok(NULL, " ");
       ms = a2 ? (uint16_t)atoi(a2) : 0;
     } else {
@@ -368,45 +417,37 @@ void loop() {
   }
 
   if (!strcmp(tok, "MOVE")) {
-    char *ax = strtok(NULL, " ");
-    char *dr = strtok(NULL, " ");
-    char *st = strtok(NULL, " ");
-    char *du = strtok(NULL, " ");
-    char *pf = strtok(NULL, " ");
+    handleMoveCommand(false);
+    return;
+  }
 
-    if (!ax || !dr || !st || !du) { btPrintCRLF("ERR"); return; }
-    char axis = ax[0];
-    if (!(axis == 'A' || axis == 'B')) { btPrintCRLF("ERR"); return; }
-
-    bool fwd = (!strcmp(dr, "FWD"));
-    if (!(fwd || !strcmp(dr, "REV"))) { btPrintCRLF("ERR"); return; }
-
-    long steps = atol(st);
-    long delay_us = atol(du);
-    if (delay_us < 0) delay_us = 0;
-    bool smoothProfile = true;
-    if (pf && !strcmp(pf, "DIRECT")) {
-      smoothProfile = false;
-    } else if (pf && strcmp(pf, "SMOOTH")) {
-      btPrintCRLF("ERR PROFILE");
-      return;
-    }
-
-    startMoveNonBlocking(axis, fwd, steps, delay_us, smoothProfile);
-    btPrintCRLF("OK");
+  if (!strcmp(tok, "TEST")) {
+    // Bench testing for motors with a different reduction: same scheduler,
+    // same profiles, but without the telescope's speed clamp.
+    handleMoveCommand(true);
     return;
   }
 
   if (!strcmp(tok, "STATUS")) {
     String s;
-    s.reserve(110);
+    s.reserve(180);
     s += "EN=";    s += (g_enabled ? "1" : "0");
     s += " MS=";   s += String((uint16_t)FIXED_MICROSTEPS);
     s += " MSFIXED=1";
     s += " MOVEPROFILES=1";
-    s += " MOVE="; s += String((long)g_moveRemA); s += ","; s += String((long)g_moveRemB);
-    s += " PROFILE="; s += (moveSmoothA ? "SMOOTH" : "DIRECT");
-    s += ","; s += (moveSmoothB ? "SMOOTH" : "DIRECT");
+    s += " AXES=3";
+    s += " FOCUS=1";
+    s += " TESTMODE=1";
+    s += " MOVE=";
+    for (int ax = 0; ax < AX_COUNT; ++ax) {
+      if (ax) s += ",";
+      s += String((long)g_moveRem[ax]);
+    }
+    s += " PROFILE=";
+    for (int ax = 0; ax < AX_COUNT; ++ax) {
+      if (ax) s += ",";
+      s += (moveSmooth[ax] ? "SMOOTH" : "DIRECT");
+    }
     s += " BT=";   s += (g_btConnected ? "1" : "0");
     s += " DBG=";  s += (g_debugAlive ? "1" : "0");
     replyBT(s);

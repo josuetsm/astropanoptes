@@ -114,6 +114,28 @@ class MountState:
 
 
 @dataclass
+class FocuserState:
+    """Estado del enfocador (tercer motor).
+
+    ``position`` es relativa: el enfocador no tiene encoder ni final de carrera,
+    asi que se cuenta desde donde estaba al arrancar la app (o desde el ultimo
+    ``focus zero``). Sirve para volver a un foco conocido dentro de la sesion,
+    no entre sesiones.
+    """
+    supported: bool = False
+    moving: bool = False
+    position: int = 0
+    homed: bool = False
+    autofocus: str = "idle"          # idle | running | done | failed | cancelled
+    autofocus_stage: str = ""
+    best_position: Optional[int] = None
+    best_metric: float = 0.0
+    last_metric: float = 0.0
+    samples: int = 0
+    last_error: Optional[str] = None
+
+
+@dataclass
 class TrackingState:
     enabled: bool = False
     status: TrackingStatus = TrackingStatus.OFF
@@ -147,6 +169,9 @@ class TrackingState:
     fail_count: int = 0
     calib_ms_az: int = 0
     calib_ms_alt: int = 0
+    anchor_px: float = 0.0
+    anchor_chained: bool = False
+    anchor_lost: bool = False
     bootstrap_active: bool = False
     bootstrap_phase: TrackingMode | str = TrackingMode.IDLE
     last_error: Optional[str] = None
@@ -263,6 +288,7 @@ class GotoState:
 class AppState:
     camera: CameraState = field(default_factory=CameraState)
     mount: MountState = field(default_factory=MountState)
+    focuser: FocuserState = field(default_factory=FocuserState)
     tracking: TrackingState = field(default_factory=TrackingState)
     stacking: StackingState = field(default_factory=StackingState)
     platesolving: PlatesolvingState = field(default_factory=PlatesolvingState)
@@ -284,6 +310,7 @@ class AppState:
         return AppState(
             camera=replace(self.camera),
             mount=replace(self.mount),
+            focuser=replace(self.focuser),
             tracking=replace(self.tracking),
             stacking=replace(self.stacking),
             platesolving=replace(self.platesolving),

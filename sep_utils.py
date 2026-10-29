@@ -10,11 +10,24 @@ from imaging import ensure_raw16_bayer, median_prefilter_raw16
 
 _SEP_EXTRACT_LOCK = threading.Lock()
 _SEP_PIXSTACK = 300_000
+_SEP_SUB_OBJECTS = 1024          # SEP's own default
 
 
 def _is_pixstack_error(exc: BaseException) -> bool:
     text = str(exc).strip().lower()
     return "pixel buffer full" in text or "pixstack" in text
+
+
+def _is_deblend_error(exc: BaseException) -> bool:
+    """SEP's *other* capacity limit, separate from the pixel stack.
+
+    A frame full of hot pixels or a mosaic with a ragged border can push the
+    deblender past its sub-object limit. Unlike the pixstack error this one used
+    to escape uncaught, and since detection is the first step of a solve, it
+    failed the whole plate solve rather than degrading.
+    """
+    text = str(exc).strip().lower()
+    return "deblend" in text and ("overflow" in text or "sub-object" in text or "limit" in text)
 
 
 def _extract_with_crowding_recovery(
@@ -31,7 +44,7 @@ def _extract_with_crowding_recovery(
     that is insufficient, grow the global stack to the image size and make one
     final bounded attempt.
     """
-    global _SEP_PIXSTACK
+    global _SEP_PIXSTACK, _SEP_SUB_OBJECTS
     last_error: Optional[BaseException] = None
     threshold_factors = (1.0, 1.5, 2.25, 3.5)
     with _SEP_EXTRACT_LOCK:
@@ -43,6 +56,25 @@ def _extract_with_crowding_recovery(
                     minarea=int(minarea),
                 )
             except Exception as exc:
+                if _is_deblend_error(exc):
+                    # Raise the deblender's ceiling once and retry the same
+                    # threshold: the frame is legitimately crowded, not wrong.
+                    if _SEP_SUB_OBJECTS < 8192:
+                        _SEP_SUB_OBJECTS = 8192
+                        sep.set_sub_object_limit(_SEP_SUB_OBJECTS)
+                        try:
+                            return sep.extract(
+                                img_det,
+                                float(threshold) * float(factor),
+                                minarea=int(minarea),
+                            )
+                        except Exception as exc2:
+                            if not (_is_pixstack_error(exc2) or _is_deblend_error(exc2)):
+                                raise
+                            last_error = exc2
+                            continue
+                    last_error = exc
+                    continue
                 if not _is_pixstack_error(exc):
                     raise
                 last_error = exc
@@ -62,13 +94,136 @@ def _extract_with_crowding_recovery(
                 minarea=int(minarea),
             )
         except Exception as exc:
-            if not _is_pixstack_error(exc):
+            if not (_is_pixstack_error(exc) or _is_deblend_error(exc)):
                 raise
             last_error = exc
+
+        # Last resort: pick the threshold from the pixel distribution instead of
+        # from the background RMS.
+        #
+        # Scaling the RMS assumes the frame is mostly sky. When it is not — a
+        # daylight or badly-lit frame where a third of the pixels sit above the
+        # background and the RMS collapses to a fraction of an ADU — every
+        # multiple of it still selects most of the image, and the deblender
+        # drowns no matter how high the ceiling is raised. A high percentile is
+        # bounded by construction: it keeps a known small fraction of pixels.
+        for pct in (99.9, 99.99):
+            try:
+                return sep.extract(
+                    img_det,
+                    float(np.percentile(img_det, pct)),
+                    minarea=int(minarea),
+                )
+            except Exception as exc:
+                if not (_is_pixstack_error(exc) or _is_deblend_error(exc)):
+                    raise
+                last_error = exc
 
     if last_error is not None:
         raise last_error
     raise RuntimeError("SEP extraction failed without an error")
+
+
+_BAD_PIXEL_MAP: Optional[np.ndarray] = None
+_BAD_PIXEL_MAP_TRIED = False
+_BAD_PIXEL_PATH = "calibration_frames/bad_pixel_map.npy"
+
+
+def load_bad_pixel_map(path: Optional[str] = None) -> Optional[np.ndarray]:
+    """Boolean map of known-defective sensor pixels, or None if unavailable.
+
+    Built by ``scripts/pixel_diagnostics.py`` from dark frames and repeated
+    sky detections. Cached after the first read; the file rarely changes and
+    detection runs on every frame.
+    """
+    global _BAD_PIXEL_MAP, _BAD_PIXEL_MAP_TRIED
+    if path is not None:
+        try:
+            return np.asarray(np.load(path)).astype(bool)
+        except Exception:
+            return None
+    if _BAD_PIXEL_MAP_TRIED:
+        return _BAD_PIXEL_MAP
+    _BAD_PIXEL_MAP_TRIED = True
+    try:
+        _BAD_PIXEL_MAP = np.asarray(np.load(_BAD_PIXEL_PATH)).astype(bool)
+    except Exception:
+        _BAD_PIXEL_MAP = None
+    return _BAD_PIXEL_MAP
+
+
+def set_bad_pixel_map(mask: Optional[np.ndarray]) -> None:
+    """Override the cached map (None disables masking)."""
+    global _BAD_PIXEL_MAP, _BAD_PIXEL_MAP_TRIED
+    _BAD_PIXEL_MAP = None if mask is None else np.asarray(mask).astype(bool)
+    _BAD_PIXEL_MAP_TRIED = True
+
+
+def repair_bad_pixels(raw16: np.ndarray, mask: Optional[np.ndarray] = None) -> np.ndarray:
+    """Replace defective pixels with a local median of their neighbours.
+
+    A hot pixel is a single bright sample sitting on the sky, which is exactly
+    what a faint star looks like to a detector. Left alone they enter the
+    brightest-N list the plate solver works from and waste triplet trials on
+    geometry that no catalogue can match. Substituting the local median keeps
+    the frame's statistics intact, and because the map only covers ~0.03% of
+    the sensor no real signal is at risk.
+
+    Only same-shape masks are applied, so a ROI or binning change simply skips
+    the repair instead of corrupting the frame.
+    """
+    if mask is None:
+        mask = load_bad_pixel_map()
+    if mask is None or mask.shape != raw16.shape or not mask.any():
+        return raw16
+    import cv2
+
+    out = raw16.copy()
+    # 5x5 median: wide enough that adjacent defects do not feed each other.
+    med = cv2.medianBlur(raw16, 5)
+    out[mask] = med[mask]
+    return out
+
+
+def repair_isolated_pixels(raw16: np.ndarray, *, sigma: float = 8.0, contrast: float = 4.0) -> np.ndarray:
+    """Replace hot pixels the map does not know about, frame by frame.
+
+    The map only covers the defects it was built from, and it can be missing
+    altogether (it lives outside git and was lost once). On 2026-10-28 one
+    unmapped pixel at 31856 ADU, on a sky of 80, was the brightest thing in a
+    sparse field: the stacker's max-projection signature followed it instead
+    of the stars, measured ~0 motion while the sky drifted 14 px/s, and the
+    mosaic smeared.
+
+    A hot pixel stands alone; a star never does. Even an undersampled star
+    lights its immediate neighbours to a sizeable fraction of its peak (~0.3 of
+    it across a Bayer colour step), while a defect leaves them at the sky. So a
+    pixel is repaired only when it is ``sigma`` noise above the local
+    background *and* ``contrast`` times further above it than its brightest
+    neighbour. Both tests are local, so a gradient or a bright star does not
+    trigger them.
+    """
+    import cv2
+
+    raw = np.asarray(raw16)
+    if raw.ndim != 2 or raw.dtype != np.uint16 or raw.size < 25:
+        return raw16
+    bg = cv2.medianBlur(raw, 5).astype(np.int32)
+    ring = np.ones((3, 3), np.uint8)
+    ring[1, 1] = 0
+    neighbour_max = cv2.dilate(raw, ring).astype(np.int32)
+    excess = raw.astype(np.int32) - bg
+    # Noise from a sparse sample: the full-frame MAD would cost as much as
+    # the repair itself and the sky statistics do not need 2M samples.
+    sample = excess[::7, ::7]
+    noise = 1.4826 * float(np.median(np.abs(sample - np.median(sample))))
+    threshold = max(1.0, float(sigma) * noise)
+    hot = (excess > threshold) & (excess > float(contrast) * np.maximum(neighbour_max - bg, threshold / float(contrast)))
+    if not hot.any():
+        return raw16
+    out = raw.copy()
+    out[hot] = bg[hot].astype(np.uint16)
+    return out
 
 
 def sep_detect_from_raw16(
@@ -79,6 +234,7 @@ def sep_detect_from_raw16(
     sep_thresh_sigma: float,
     sep_minarea: int,
     max_sources: Optional[int] = None,
+    repair_defects: bool = True,
 ) -> Tuple[np.ndarray, sep.Background, np.ndarray, np.ndarray]:
     """
     Detect sources from a RAW16 Bayer frame using SEP.
@@ -98,6 +254,8 @@ def sep_detect_from_raw16(
         obj_xy: (N,2) float64 array of x,y positions.
     """
     raw = ensure_raw16_bayer(raw16)
+    if repair_defects:
+        raw = repair_bad_pixels(raw)
     img_med = median_prefilter_raw16(raw, ksize=3)
 
     bkg = sep.Background(img_med, bw=int(sep_bw), bh=int(sep_bh))

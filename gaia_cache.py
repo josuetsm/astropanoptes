@@ -40,8 +40,31 @@ from typing import Optional, Sequence, Tuple, Union, List, Dict
 import numpy as np
 from erfa import ErfaWarning
 from logging_utils import log_error, log_info
-from astroquery.gaia import Gaia
-from astroquery.utils.tap import TapPlus
+# astroquery.gaia no se importa al cargar el modulo. Al importarse instancia el
+# cliente del archivo de Gaia y hace una peticion de red: medido, 3.3 s con buena
+# conexion, y colgado durante minutos cuando la red iba mal -- lo que bloqueaba el
+# arranque de la app entera, incluso para resolver con la cache local, que no
+# necesita la red para nada. Ademas imprimia un aviso de version por stdout, en
+# medio de la conversacion de la consola. Ahora se importa la primera vez que de
+# verdad se va a descargar o consultar el archivo.
+import contextlib as _contextlib
+import io as _io
+import threading as _threading
+
+_ASTROQUERY_LOCK = _threading.Lock()
+_ASTROQUERY: dict = {}
+
+
+def _astroquery():
+    """(Gaia, TapPlus), importados la primera vez que hacen falta."""
+    with _ASTROQUERY_LOCK:
+        if not _ASTROQUERY:
+            with _contextlib.redirect_stdout(_io.StringIO()):
+                from astroquery.gaia import Gaia as _Gaia
+                from astroquery.utils.tap import TapPlus as _TapPlus
+            _ASTROQUERY["gaia"] = _Gaia
+            _ASTROQUERY["tap"] = _TapPlus
+        return _ASTROQUERY["gaia"], _ASTROQUERY["tap"]
 from astropy.coordinates import SkyCoord, Angle, ICRS
 import astropy.units as u
 from astropy.table import Table, vstack
@@ -53,7 +76,7 @@ try:
     import pyarrow  # type: ignore  # noqa: F401
     _HAS_PARQUET = True
 except Exception as exc:
-    log_error(None, "Gaia cache: failed to import pyarrow; parquet disabled", exc)
+    log_error(None, "Gaia cache: no se pudo importar pyarrow; parquet desactivado", exc)
     _HAS_PARQUET = False
 
 class GaiaCacheMissError(RuntimeError):
@@ -185,7 +208,7 @@ def save_gaia_auth(
     try:
         os.chmod(path, 0o600)
     except OSError as exc:
-        log_error(None, "Gaia cache: failed to chmod auth file", exc)
+        log_error(None, "Gaia cache: no se pudieron fijar los permisos del fichero de credenciales", exc)
 
     rel_path = _repo_relpath(path)
     if rel_path is not None:
@@ -202,7 +225,7 @@ def resolve_name_to_icrs(name: str) -> SkyCoord:
     if match:
         source_id = int(match.group(1))
         query = f"SELECT ra, dec FROM gaiadr2.gaia_source WHERE source_id = {source_id}"
-        job = Gaia.launch_job_async(query, background=False, dump_to_file=False, verbose=False)
+        job = _astroquery()[0].launch_job_async(query, background=False, dump_to_file=False, verbose=False)
         results = job.get_results()
         if len(results) < 1:
             raise ValueError(f"Gaia DR2 source not found: {source_id}")
@@ -607,7 +630,7 @@ def gaia_healpix_coverage(
             except OSError as exc:
                 log_error(
                     None,
-                    f"Gaia coverage: failed to inspect cache tile {catalog_path}",
+                    f"Gaia coverage: no se pudo inspeccionar la tesela {catalog_path}",
                     exc,
                     throttle_s=10.0,
                     throttle_key=f"gaia_coverage_stat_{catalog_kind}_{pix_i}",
@@ -706,12 +729,12 @@ def _tap_login_only(user: str, password: str) -> None:
 
     Using Gaia.login() can hang while trying the separate Gaia data server.
     """
-    TapPlus.login(Gaia, user=user, password=password, verbose=False)
+    _astroquery()[1].login(_astroquery()[0], user=user, password=password, verbose=False)
 
 
 def _tap_logout_only() -> None:
     """Logout only from Gaia TAP endpoint."""
-    TapPlus.logout(Gaia, verbose=False)
+    _astroquery()[1].logout(_astroquery()[0], verbose=False)
 
 
 # -------------------------
@@ -746,7 +769,7 @@ def gaia_cone_with_mag(
     path = _path_for(hexkey, prefer_parquet)
     if path.exists():
         if verbose:
-            log_info(None, f"[gaia_cache] HIT {path}")
+            log_info(None, f"Gaia cache: en caché {path}")
         return add_bright_star_supplement(
             _load_table(path),
             center_icrs=center,
@@ -754,7 +777,7 @@ def gaia_cone_with_mag(
             gmax=gmax,
         )
 
-    Gaia.ROW_LIMIT = row_limit
+    _astroquery()[0].ROW_LIMIT = row_limit
     cols_sql = ", ".join(columns)
     query = f"""
     SELECT {cols_sql}
@@ -770,31 +793,31 @@ def gaia_cone_with_mag(
     try:
         if auth:
             if verbose:
-                log_info(None, "[gaia_cache] Login TAP-only al Gaia Archive...")
+                log_info(None, "Gaia cache: iniciando sesión en el archivo de Gaia (solo TAP)")
             _tap_login_only(auth[0], auth[1])
             did_login = True
 
         for attempt in range(1, retries + 1):
             try:
-                job = Gaia.launch_job_async(query, background=False, dump_to_file=False, verbose=verbose)
+                job = _astroquery()[0].launch_job_async(query, background=False, dump_to_file=False, verbose=verbose)
                 tab = job.get_results()
                 break
             except Exception as e:
                 if attempt == retries:
                     raise
                 if verbose:
-                    log_info(None, f"[gaia_cache] retry {attempt}: {type(e).__name__} -> {e}")
-                log_error(None, f"Gaia cache: query retry {attempt} failed", e)
+                    log_info(None, f"Gaia cache: reintento {attempt}: {type(e).__name__}: {e}")
+                log_error(None, f"Gaia cache: falló el reintento {attempt} de la consulta", e)
                 time.sleep(backoff_s * attempt)
 
     finally:
         if did_login:
             if verbose:
-                log_info(None, "[gaia_cache] Logout TAP-only del Gaia Archive.")
+                log_info(None, "Gaia cache: sesión cerrada en el archivo de Gaia")
             try:
                 _tap_logout_only()
             except Exception as exc:
-                log_error(None, "Gaia cache: logout failed", exc)
+                log_error(None, "Gaia cache: falló el cierre de sesión", exc)
 
     # dedup por source_id
     if "source_id" in tab.colnames:
@@ -802,7 +825,7 @@ def gaia_cone_with_mag(
             import pandas as pd
             tab = Table.from_pandas(tab.to_pandas().drop_duplicates(subset=["source_id"]))
         except Exception as exc:
-            log_error(None, "Gaia cache: pandas dedup failed; falling back to python", exc)
+            log_error(None, "Gaia cache: falló la deduplicación con pandas; se hace en python", exc)
             seen = set()
             keep = []
             for i, sid in enumerate(tab["source_id"]):
@@ -814,7 +837,7 @@ def gaia_cone_with_mag(
 
     _save_table(tab, path)
     if verbose:
-        log_info(None, f"[gaia_cache] MISS -> saved {len(tab)} rows to {path}")
+        log_info(None, f"Gaia cache: no estaba en caché; {len(tab)} filas guardadas en {path}")
     return add_bright_star_supplement(
         tab,
         center_icrs=center,
@@ -862,18 +885,18 @@ def _query_healpix_tile_async(
     WHERE phot_g_mean_mag <= {gmax}
       AND 1=CONTAINS(POINT('ICRS', ra, dec), {poly_adql})
     """
-    Gaia.ROW_LIMIT = row_limit
+    _astroquery()[0].ROW_LIMIT = row_limit
 
     for attempt in range(1, retries + 1):
         try:
-            job = Gaia.launch_job_async(query, background=False, dump_to_file=False, verbose=verbose)
+            job = _astroquery()[0].launch_job_async(query, background=False, dump_to_file=False, verbose=verbose)
             return job.get_results()
         except Exception as e:
             if attempt == retries:
                 raise
             if verbose:
-                log_info(None, f"[gaia_healpix] retry {attempt}: {type(e).__name__} -> {e}")
-            log_error(None, f"Gaia healpix: query retry {attempt} failed", e)
+                log_info(None, f"Gaia healpix: reintento {attempt}: {type(e).__name__}: {e}")
+            log_error(None, f"Gaia healpix: falló el reintento {attempt} de la consulta", e)
             time.sleep(backoff_s * attempt)
 
 
@@ -886,17 +909,17 @@ def _launch_catalog_query(
     verbose: bool,
     label: str,
 ) -> Table:
-    Gaia.ROW_LIMIT = row_limit
+    _astroquery()[0].ROW_LIMIT = row_limit
     for attempt in range(1, retries + 1):
         try:
-            job = Gaia.launch_job_async(query, background=False, dump_to_file=False, verbose=verbose)
+            job = _astroquery()[0].launch_job_async(query, background=False, dump_to_file=False, verbose=verbose)
             return job.get_results()
         except Exception as exc:
             if attempt == retries:
                 raise
             if verbose:
-                log_info(None, f"[{label}] retry {attempt}: {type(exc).__name__} -> {exc}")
-            log_error(None, f"{label}: query retry {attempt} failed", exc)
+                log_info(None, f"Gaia download: {label}, reintento {attempt}: {type(exc).__name__}: {exc}")
+            log_error(None, f"Gaia download: {label}, falló el reintento {attempt} de la consulta", exc)
             time.sleep(backoff_s * attempt)
     raise RuntimeError(f"{label}: query did not return")
 
@@ -1148,8 +1171,8 @@ def gaia_healpix_cone_with_mag(
     if verbose and need_download:
         log_info(
             None,
-            f"[gaia_healpix] nside={nside}, Gaia tiles={len(pix_indices)}, "
-            f"bright tiles={len(bright_pix_indices)}",
+            f"Gaia healpix: nside={nside}, teselas de Gaia={len(pix_indices)}, "
+            f"teselas brillantes={len(bright_pix_indices)}",
         )
         if progress_cb:
             progress_cb("gaia:healpix:start", {
@@ -1164,12 +1187,12 @@ def gaia_healpix_cone_with_mag(
             if verbose:
                 log_info(
                     None,
-                    "[gaia_healpix] Login TAP-only único al Gaia Archive... "
-                    f"(missing tiles={len(missing) + len(bright_missing)})",
+                    "Gaia healpix: iniciando sesión única en el archivo de Gaia "
+                    f"(teselas que faltan={len(missing) + len(bright_missing)})",
                 )
             _tap_login_only(auth[0], auth[1])
             did_login = True
-        elif need_download and auth is None and getattr(Gaia, "login", None) is not None:
+        elif need_download and auth is None and getattr(_astroquery()[0], "login", None) is not None:
             # allow anonymous downloads; only error out if caller explicitly wants auth
             pass
 
@@ -1182,12 +1205,12 @@ def gaia_healpix_cone_with_mag(
             if path.exists():
                 # Si hay descargas, puede ser útil indicar el directorio base una vez
                 if verbose and need_download and i == 1:
-                    log_info(None, f"[gaia_healpix] HIT first tile -> {path.parent}")
+                    log_info(None, f"Gaia healpix: primera tesela en caché en {path.parent}")
                 tab = _load_table(path)
             else:
                 if verbose:
                     # Ojo: este bloque solo corre si need_download=True (por definición)
-                    log_info(None, f"[gaia_healpix] Query tile {i}/{len(pix_indices)} (pix={pix_i})")
+                    log_info(None, f"Gaia healpix: consultando tesela {i}/{len(pix_indices)} (pix={pix_i})")
                 if progress_cb:
                     progress_cb("gaia:healpix:tile", {"tile": float(i), "tiles": float(len(pix_indices)), "pix": float(pix_i)})
                 poly = hp.boundaries_skycoord(pix, step=1)
@@ -1214,7 +1237,7 @@ def gaia_healpix_cone_with_mag(
                 if verbose:
                     log_info(
                         None,
-                        f"[gaia_healpix] Query bright tile {i}/{len(bright_pix_indices)} "
+                        f"Gaia healpix: consultando tesela brillante {i}/{len(bright_pix_indices)} "
                         f"(pix={pix_i})",
                     )
                 poly = hp.boundaries_skycoord(pix, step=1)
@@ -1232,11 +1255,11 @@ def gaia_healpix_cone_with_mag(
     finally:
         if did_login:
             if verbose:
-                log_info(None, "[gaia_healpix] Logout TAP-only del Gaia Archive.")
+                log_info(None, "Gaia healpix: sesión cerrada en el archivo de Gaia")
             try:
                 _tap_logout_only()
             except Exception as exc:
-                log_error(None, "Gaia healpix: logout failed", exc)
+                log_error(None, "Gaia healpix: falló el cierre de sesión", exc)
 
     if parts:
         full = vstack(parts, join_type="outer", metadata_conflicts="silent")
@@ -1252,7 +1275,7 @@ def gaia_healpix_cone_with_mag(
             import pandas as pd
             full = Table.from_pandas(full.to_pandas().drop_duplicates(subset=["source_id"]))
         except Exception as exc:
-            log_error(None, "Gaia healpix: pandas dedup failed; falling back to python", exc)
+            log_error(None, "Gaia healpix: falló la deduplicación con pandas; se hace en python", exc)
             seen = set()
             keep = []
             for j, sid in enumerate(full["source_id"]):
@@ -1292,6 +1315,6 @@ def gaia_healpix_cone_with_mag(
     )
 
     if verbose and need_download:
-        log_info(None, f"[gaia_healpix] Final combined rows (limit={gmax}): {len(full)}")
+        log_info(None, f"Gaia healpix: filas combinadas finales (límite G={gmax}): {len(full)}")
 
     return full

@@ -9,6 +9,8 @@ from dataclasses import dataclass, replace
 from typing import Any, Callable, Dict, List, Optional, Tuple, Union
 
 import numpy as np
+from scipy import sparse
+from scipy.spatial import cKDTree
 import pandas as pd
 import cv2
 
@@ -19,7 +21,8 @@ from astropy.time import Time
 from sklearn.neighbors import KDTree
 from itertools import combinations, permutations
 
-from logging_utils import log_error, log_info
+from astro_setup import configure_astropy
+from logging_utils import log_debug, log_error, log_info
 from ap_types import PlatesolvingStatus
 from protocols import StatePublisherProtocol
 from workers import BaseWorker
@@ -293,7 +296,7 @@ _ICRS_FRAME = ICRS()
 
 def _ensure_icrs(coord: SkyCoord, *, label: str) -> SkyCoord:
     if not coord.frame.is_equivalent_frame(_ICRS_FRAME):
-        log_info(None, f"Platesolving: normalizing {label} from frame {coord.frame} to ICRS")
+        log_info(None, f"Platesolving: normalizando {label} del marco {coord.frame} a ICRS")
     return coord.icrs
 
 
@@ -758,6 +761,9 @@ def chord_radius(theta_rad: float) -> float:
     return float(2.0 * np.sin(float(theta_rad) / 2.0))
 
 
+_ARCSEC_TO_RAD = float(np.pi / (180.0 * 3600.0))
+
+
 def annulus_candidates(
     tree: KDTree,
     V: np.ndarray,
@@ -765,9 +771,11 @@ def annulus_candidates(
     theta_arcsec: float,
     tol_arcsec: float,
 ) -> np.ndarray:
-    theta_min = ((float(theta_arcsec) - float(tol_arcsec)) * u.arcsec).to(u.rad).value
-    theta_max = ((float(theta_arcsec) + float(tol_arcsec)) * u.arcsec).to(u.rad).value
-    theta_min = max(float(theta_min), 0.0)
+    # Plain float arithmetic instead of astropy Quantity conversions: this runs
+    # inside the triplet search's innermost loops, where the unit machinery
+    # costs far more than the geometry it wraps.
+    theta_min = max((float(theta_arcsec) - float(tol_arcsec)) * _ARCSEC_TO_RAD, 0.0)
+    theta_max = (float(theta_arcsec) + float(tol_arcsec)) * _ARCSEC_TO_RAD
 
     r_max = chord_radius(theta_max)
     r_min = chord_radius(theta_min)
@@ -779,6 +787,140 @@ def annulus_candidates(
     dots = V[idxs] @ V[center_idx]
     chord2 = 2.0 - 2.0 * dots
     return idxs[chord2 >= (r_min * r_min)]
+
+
+def annulus_candidates_batch(
+    tree: KDTree,
+    V: np.ndarray,
+    center_idxs: np.ndarray,
+    theta_arcsec: float,
+    tol_arcsec: float,
+) -> List[np.ndarray]:
+    """Annuli for many centres in a single KDTree query.
+
+    Same result as calling :func:`annulus_candidates` per index, but one query
+    instead of N. scikit-learn validates its input array on every call, so with
+    thousands of centres that per-call overhead dwarfs the search itself.
+    """
+    theta_min = max((float(theta_arcsec) - float(tol_arcsec)) * _ARCSEC_TO_RAD, 0.0)
+    theta_max = (float(theta_arcsec) + float(tol_arcsec)) * _ARCSEC_TO_RAD
+    r_max = chord_radius(theta_max)
+    r_min_sq = chord_radius(theta_min) ** 2
+
+    raw = tree.query_radius(V[center_idxs], r=r_max, return_distance=False)
+    out: List[np.ndarray] = []
+    for pos, idxs in enumerate(raw):
+        if idxs.size == 0:
+            out.append(idxs)
+            continue
+        dots = V[idxs] @ V[int(center_idxs[pos])]
+        out.append(idxs[(2.0 - 2.0 * dots) >= r_min_sq])
+    return out
+
+
+def build_pair_index(V: np.ndarray, max_sep_arcsec: float) -> Tuple[np.ndarray, np.ndarray]:
+    """Todos los pares del catalogo a menos de ``max_sep_arcsec``, ordenados por separacion.
+
+    Es la estructura que hace barata la busqueda de triangulos: con los pares
+    ordenados, "todos los pares a d ± tol" es una busqueda binaria y un corte del
+    array, no una consulta al arbol por cada estrella.
+    """
+    V = np.asarray(V, dtype=np.float64)
+    if V.shape[0] < 2 or not np.isfinite(max_sep_arcsec) or max_sep_arcsec <= 0.0:
+        return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float64)
+    chord = 2.0 * np.sin(float(max_sep_arcsec) * _ARCSEC_TO_RAD / 2.0)
+    pairs = cKDTree(V).query_pairs(chord, output_type="ndarray")
+    if pairs.size == 0:
+        return np.zeros((0, 2), dtype=np.int64), np.zeros(0, dtype=np.float64)
+    dots = np.einsum("ij,ij->i", V[pairs[:, 0]], V[pairs[:, 1]])
+    sep = np.arccos(np.clip(dots, -1.0, 1.0)) * _RAD_TO_ARCSEC
+    order = np.argsort(sep, kind="stable")
+    return pairs[order].astype(np.int64), sep[order]
+
+
+def _pair_band(
+    pairs: np.ndarray, sep: np.ndarray, lo: float, hi: float, n: int
+) -> Tuple["sparse.csr_matrix", np.ndarray]:
+    """Los pares con separacion en [lo, hi], como adyacencia simetrica y como lista."""
+    a, b = np.searchsorted(sep, [lo, hi])
+    band = pairs[a:b]
+    rows = np.concatenate([band[:, 0], band[:, 1]])
+    cols = np.concatenate([band[:, 1], band[:, 0]])
+    adjacency = sparse.csr_matrix(
+        (np.ones(rows.size, dtype=np.int32), (rows, cols)), shape=(n, n)
+    )
+    return adjacency, band
+
+
+def pair_index_triplet_candidates(
+    V: np.ndarray,
+    img_triplets: Sequence[Tuple[int, int, int, np.ndarray]],
+    *,
+    pairs: np.ndarray,
+    sep: np.ndarray,
+    tol_arcsec: float,
+    sigma_arcsec: float,
+    source_ids: np.ndarray,
+    progress_cb: Optional[ProgressCB] = None,
+) -> List[Dict[str, Any]]:
+    """Triangulos del catalogo que casan con los de la imagen, sin bucles por estrella.
+
+    Para un triangulo de la imagen con lados a <= b <= c, un candidato es un par
+    (i, j) a distancia c y una tercera estrella k a distancia a de un vertice y
+    b del otro. Con A y B las adyacencias de los pares a distancia a y b, el
+    numero de esos k para cada (i, j) es (A·B)[i, j]: un producto de dos matrices
+    dispersas finisimas, porque cada estrella tiene pocos vecinos a una
+    distancia exacta mas o menos la tolerancia. Solo se recorren a mano los pares
+    que tienen algun k, que son unos pocos por triangulo.
+
+    Da los mismos candidatos que la busqueda por anillos -- todos los triangulos
+    del catalogo dentro de la tolerancia -- pero sin tope de vertices: aquella
+    solo miraba las ``max_i_scan`` estrellas mas brillantes como vertice.
+    """
+    n = int(V.shape[0])
+    tol = float(tol_arcsec)
+    sigma = float(sigma_arcsec)
+    out: List[Dict[str, Any]] = []
+    for t_idx, (a, b, c, img_sides) in enumerate(img_triplets):
+        if progress_cb:
+            progress_cb("platesolving:checkpoint", {"phase": "triplets", "triplet": int(t_idx)})
+        d1, d2, d3 = (float(x) for x in img_sides)
+        A, _ = _pair_band(pairs, sep, d1 - tol, d1 + tol, n)
+        B, _ = _pair_band(pairs, sep, d2 - tol, d2 + tol, n)
+        lo, hi = np.searchsorted(sep, [d3 - tol, d3 + tol])
+        long_side = pairs[lo:hi]
+        if long_side.shape[0] == 0 or A.nnz == 0 or B.nnz == 0:
+            continue
+        pi, pj = long_side[:, 0], long_side[:, 1]
+        closes = (np.asarray((A @ B)[pi, pj]).ravel() > 0) | (np.asarray((B @ A)[pi, pj]).ravel() > 0)
+        seen: set = set()
+        for i, j in long_side[closes]:
+            i, j = int(i), int(j)
+            a_i = A.indices[A.indptr[i]:A.indptr[i + 1]]
+            b_i = B.indices[B.indptr[i]:B.indptr[i + 1]]
+            a_j = A.indices[A.indptr[j]:A.indptr[j + 1]]
+            b_j = B.indices[B.indptr[j]:B.indptr[j + 1]]
+            for k in np.union1d(np.intersect1d(a_i, b_j), np.intersect1d(b_i, a_j)):
+                k = int(k)
+                if k == i or k == j:
+                    continue
+                key = (min(i, j, k), i + j + k - min(i, j, k) - max(i, j, k), max(i, j, k))
+                if key in seen:
+                    continue
+                seen.add(key)
+                cat_sides = sorted_sides_arcsec_from_vectors(V, i, j, k)
+                score, err_max = triplet_score(img_sides, cat_sides, sigma_arcsec=sigma)
+                if err_max <= tol:
+                    out.append({
+                        "score": float(score),
+                        "err_max": float(err_max),
+                        "img_triplet": (int(a), int(b), int(c)),
+                        "gaia_idx": (i, j, k),
+                        "gaia_source_id": (
+                            int(source_ids[i]), int(source_ids[j]), int(source_ids[k]),
+                        ),
+                    })
+    return out
 
 
 def sorted_sides_arcsec_from_pixels(xy3: np.ndarray, arcsec_per_pixel: float) -> np.ndarray:
@@ -796,11 +938,66 @@ def sorted_sides_arcsec_from_coords(coords: SkyCoord, i: int, j: int, k: int) ->
     return np.sort(np.array([s1, s2, s3], dtype=np.float64))
 
 
+_RAD_TO_ARCSEC = float(180.0 * 3600.0 / np.pi)
+
+
+def sorted_sides_arcsec_from_vectors(V: np.ndarray, i: int, j: int, k: int) -> np.ndarray:
+    """Triangle sides from unit vectors, without astropy.
+
+    Identical geometry to ``sorted_sides_arcsec_from_coords`` but evaluated on
+    the unit-vector array the triplet search already builds. Indexing a
+    ``SkyCoord`` and calling ``separation`` allocates new frame objects on every
+    call, which is ruinous in the innermost candidate loop.
+    """
+    vi = V[i]
+    vj = V[j]
+    vk = V[k]
+    d = np.array(
+        [float(vi @ vj), float(vj @ vk), float(vk @ vi)],
+        dtype=np.float64,
+    )
+    np.clip(d, -1.0, 1.0, out=d)
+    return np.sort(np.arccos(d) * _RAD_TO_ARCSEC)
+
+
 def triplet_score(img_sides: np.ndarray, cat_sides: np.ndarray, sigma_arcsec: float) -> Tuple[float, float]:
     errs = cat_sides - img_sides
     score = float(np.sum((errs / float(sigma_arcsec)) ** 2))
     err_max = float(np.max(np.abs(errs)))
     return score, err_max
+
+
+def offsets_arcsec_from_vectors(center_v: np.ndarray, V: np.ndarray) -> np.ndarray:
+    """Offsets (lon, lat) en arcsec de V en el marco centrado en ``center_v``.
+
+    La misma geometria que ``SkyCoord.spherical_offsets_to`` -- eje x hacia el
+    centro, y hacia el este, z hacia el norte -- calculada sobre los vectores
+    unitarios que la busqueda ya tiene. Coincide con astropy a 1e-10 arcsec,
+    tambien junto a los polos, y es unas quince veces mas rapida: la validacion
+    la llama una vez por candidato sobre el catalogo entero, y la maquinaria de
+    marcos de astropy era la mayor parte de su coste.
+    """
+    c = np.asarray(center_v, dtype=np.float64)
+    c = c / float(np.linalg.norm(c))
+    ra0 = float(np.arctan2(c[1], c[0]))
+    dec0 = float(np.arcsin(np.clip(c[2], -1.0, 1.0)))
+    east = np.array([-np.sin(ra0), np.cos(ra0), 0.0])
+    north = np.array([-np.sin(dec0) * np.cos(ra0), -np.sin(dec0) * np.sin(ra0), np.cos(dec0)])
+    V = np.asarray(V, dtype=np.float64)
+    x, y, z = V @ c, V @ east, V @ north
+    lon = np.arctan2(y, x)
+    lat = np.arcsin(np.clip(z, -1.0, 1.0))
+    return np.column_stack([lon * _RAD_TO_ARCSEC, lat * _RAD_TO_ARCSEC])
+
+
+def _vector_to_skycoord(v: np.ndarray) -> SkyCoord:
+    v = np.asarray(v, dtype=np.float64)
+    v = v / float(np.linalg.norm(v))
+    return SkyCoord(
+        ra=float(np.arctan2(v[1], v[0]) % (2.0 * np.pi)) * u.rad,
+        dec=float(np.arcsin(np.clip(v[2], -1.0, 1.0))) * u.rad,
+        frame="icrs",
+    )
 
 
 def sph_centroid(skycoords: SkyCoord) -> SkyCoord:
@@ -1009,7 +1206,7 @@ def build_guides_from_solution(
             try:
                 name = str(gc.resolve_coord_name(SkyCoord(ra=ra * u.deg, dec=dec * u.deg, frame="icrs"), cfg=cfg))
             except (RuntimeError, ValueError, TypeError) as exc:
-                log_error(None, "Platesolving: failed to resolve Gaia coord name", exc)
+                log_error(None, "Platesolving: no se pudo resolver el nombre de la coordenada en Gaia", exc)
                 name = "GAIA"
 
         guides.append(GuideStar(name=name, ra_deg=ra, dec_deg=dec, gmag=gmag, x=x_ds, y=y_ds))
@@ -1080,6 +1277,43 @@ def _gaia_load_df(
     want = [c for c in ["source_id", "ra", "dec", "phot_g_mean_mag"] if c in df.columns]
     df = df.loc[:, want].dropna(subset=["ra", "dec"]).reset_index(drop=True)
     return df
+
+
+def _limit_catalog_depth(
+    df: pd.DataFrame,
+    *,
+    cfg: PlatesolvingConfig,
+    arcsec_per_px: float,
+    width: int,
+    height: int,
+    radius_deg: float,
+) -> pd.DataFrame:
+    """Keep the brightest stars, at about the density the image itself reaches.
+
+    The matcher only ever uses the ``N_det`` brightest detections, so catalog
+    stars far fainter than those cannot match anything. They are not free: the
+    triplet search is roughly quadratic in catalog size, and every extra star
+    multiplies the spurious triplets that crowd out the true one before
+    ``triplet_max_trials`` validations run out.
+
+    Measured on a real 0.47 x 0.50 deg field with the default 3 deg cone: the
+    full G<=15 catalog (34084 stars) solved in 94 s, capped to 4000 in 7 s, and
+    both landed on the same centre and rotation. Below ~1000 stars the field
+    stops being covered, so the cap keeps a floor.
+    """
+    factor = float(getattr(cfg, "catalog_density_factor", 1.5))
+    n_det = int(getattr(cfg, "N_det", 30))
+    if factor <= 0.0 or n_det <= 0 or "phot_g_mean_mag" not in df.columns:
+        return df
+    field_deg2 = (float(width) * arcsec_per_px / 3600.0) * (float(height) * arcsec_per_px / 3600.0)
+    cone_deg2 = float(np.pi * float(radius_deg) ** 2)
+    if field_deg2 <= 0.0 or cone_deg2 <= field_deg2:
+        return df
+    keep = int(np.ceil(factor * n_det * cone_deg2 / field_deg2))
+    keep = max(keep, int(max(8, 3 * n_det)))
+    if keep >= len(df):
+        return df
+    return df.nsmallest(keep, "phot_g_mean_mag").reset_index(drop=True)
 
 
 def _configured_plate_scale_arcsec_per_px(cfg: PlatesolvingConfig) -> float:
@@ -1244,11 +1478,10 @@ def verify_plate_from_prior(
         )
 
     # This used to be hardcoded to max(6, ...), silently ignoring a lower
-    # cfg.min_inliers. That defeats the whole point of the multi-frame
-    # consensus check (initial_consensus_count) as a substitute safety net in
-    # genuinely star-poor fields (heavy light pollution, narrow FoV): with a
-    # low per-frame floor here, a real single-star or two-star field could
-    # never be confirmed at all, no matter how many frames agreed.
+    # cfg.min_inliers. The floor here is about how many detections the fast
+    # verification needs, not about trusting the solution: what guards against
+    # a coincidental match is min_validation_inliers, i.e. stars that confirm
+    # the hypothesis beyond the three that defined it.
     min_inliers = max(1, int(getattr(cfg, "min_inliers", 6)))
     if img_xy.shape[0] < min_inliers:
         return _failure("FAST_PRIOR_NOT_ENOUGH_DETECTIONS", {"n_det": float(img_xy.shape[0])})
@@ -1288,7 +1521,7 @@ def verify_plate_from_prior(
     except gc.GaiaCacheMissError as exc:
         return _failure("GAIA_CACHE_MISS", {"missing": float(len(getattr(exc, "missing_paths", [])))})
     except (RuntimeError, ValueError, OSError, TypeError) as exc:
-        log_error(None, "Platesolving: fast-prior Gaia load failed", exc)
+        log_error(None, "Platesolving: falló la carga de Gaia para la verificación rápida", exc)
         return _failure("GAIA_LOAD_ERROR", {"err": 1.0})
 
     if len(gaia_df) < min_inliers:
@@ -1630,6 +1863,9 @@ def solve_plate(
     progress_cb: Optional[ProgressCB] = None,
     temporal_detections: Optional[TemporalDetections] = None,
 ) -> PlatesolvingResult:
+    # Sin esto, un solve lanzado fuera de AppRunner (scripts, tests) espera la
+    # descarga de IERS antes de la primera conversion: 12 s medidos.
+    configure_astropy()
     if obstime is None:
         obstime = Time.now()
 
@@ -1637,7 +1873,7 @@ def solve_plate(
     try:
         center_icrs = parse_target_to_icrs(target, observer=observer, obstime=obstime)
     except (TargetParseError, ValueError, TypeError) as exc:
-        log_error(None, "Platesolving: target parse failed", exc)
+        log_error(None, "Platesolving: no se pudo leer el objetivo", exc)
         return PlatesolvingResult(
             success=False,
             status="TARGET_PARSE_ERROR",
@@ -1858,7 +2094,7 @@ def solve_plate(
         )
 
     except (RuntimeError, ValueError, OSError, TypeError) as exc:
-        log_error(None, "Platesolving: Gaia load failed", exc)
+        log_error(None, "Platesolving: falló la carga de Gaia", exc)
         return PlatesolvingResult(
             success=False,
             status="GAIA_LOAD_ERROR",
@@ -1879,7 +2115,21 @@ def solve_plate(
             metrics={"err": 1.0},
         )
 
-    if len(gaia_df) < int(max(8, 3 * img_xy_all.shape[0])):
+    gaia_df = _limit_catalog_depth(
+        gaia_df,
+        cfg=cfg,
+        arcsec_per_px=arcsec_per_px,
+        width=w,
+        height=h,
+        radius_deg=radius_deg,
+    )
+
+    # The guard belongs against the detections the solver will actually use
+    # (N_det of them, truncated below), not against every source SEP returned:
+    # max_det is 250 by default, which demanded 750 catalog stars for a search
+    # that never looks at more than the brightest 30 detections.
+    n_det_used = int(min(int(getattr(cfg, "N_det", 30)), img_xy_all.shape[0]))
+    if len(gaia_df) < int(max(8, 3 * n_det_used)):
         return PlatesolvingResult(
             success=False,
             status="GAIA_TOO_SMALL",
@@ -1956,90 +2206,151 @@ def solve_plate(
     max_trials = int(getattr(cfg, "max_trials", getattr(cfg, "triplet_max_trials", 500)))
 
     candidates: List[Dict[str, Any]] = []
+    # Pull source ids out of the DataFrame once: pandas .iloc in the innermost
+    # candidate loop costs more than the geometry being computed there.
+    if "source_id" in gaia_df.columns:
+        source_ids = np.asarray(gaia_df["source_id"], dtype=np.int64)
+    else:
+        source_ids = np.arange(len(gaia_df), dtype=np.int64)
     if progress_cb:
         progress_cb("platesolving:triplets:start", {"n_triplets": int(len(img_triplets))})
 
-    # Performance safeguard: cap how many Gaia "i" centers we scan per triplet
-    # (otherwise O(N^2) can explode at high gmax/radius)
-    max_i_scan = int(getattr(cfg, "max_i_scan", 2000))
-    i_scan = np.arange(V.shape[0])
-    if V.shape[0] > max_i_scan:
-        # bias towards bright Gaia if available
-        if "phot_g_mean_mag" in gaia_df.columns:
-            mags = np.asarray(gaia_df["phot_g_mean_mag"], dtype=np.float64)
-            i_scan = np.argsort(mags)[:max_i_scan]
-        else:
-            i_scan = i_scan[:max_i_scan]
+    triplet_search = str(getattr(cfg, "triplet_search", "pairs")).strip().lower()
+    if triplet_search == "pairs":
+        # Indice de pares una vez por solve y busqueda vectorizada por triangulo.
+        # Ver pair_index_triplet_candidates: mismos candidatos que los anillos,
+        # dos ordenes de magnitud menos tiempo.
+        max_side = max((float(t[3][2]) for t in img_triplets), default=0.0)
+        pairs, pair_sep = build_pair_index(V, max_side + tol_arcsec_pairs)
+        candidates = pair_index_triplet_candidates(
+            V,
+            img_triplets,
+            pairs=pairs,
+            sep=pair_sep,
+            tol_arcsec=tol_arcsec_pairs,
+            sigma_arcsec=sigma_arcsec,
+            source_ids=source_ids,
+            progress_cb=progress_cb,
+        )
+    else:
+        # Performance safeguard: cap how many Gaia "i" centers we scan per triplet
+        # (otherwise O(N^2) can explode at high gmax/radius)
+        max_i_scan = int(getattr(cfg, "max_i_scan", 2000))
+        i_scan = np.arange(V.shape[0])
+        if V.shape[0] > max_i_scan:
+            # bias towards bright Gaia if available
+            if "phot_g_mean_mag" in gaia_df.columns:
+                mags = np.asarray(gaia_df["phot_g_mean_mag"], dtype=np.float64)
+                i_scan = np.argsort(mags)[:max_i_scan]
+            else:
+                i_scan = i_scan[:max_i_scan]
 
-    for triplet_idx, (a, b, c, img_sides) in enumerate(img_triplets):
-        if progress_cb and triplet_idx % 8 == 0:
-            progress_cb(
-                "platesolving:checkpoint",
-                {"phase": "triplets", "triplet": int(triplet_idx)},
-            )
-        d1, d2, d3 = float(img_sides[0]), float(img_sides[1]), float(img_sides[2])
-
-        theta_min = ((d3 - tol_arcsec_pairs) * u.arcsec).to(u.rad).value
-        theta_max = ((d3 + tol_arcsec_pairs) * u.arcsec).to(u.rad).value
-        theta_min = max(float(theta_min), 0.0)
-
-        r_max = chord_radius(theta_max)
-        r_min = chord_radius(theta_min)
-
-        for i_position, i in enumerate(i_scan):
-            if progress_cb and i_position % 64 == 0:
+        for triplet_idx, (a, b, c, img_sides) in enumerate(img_triplets):
+            if progress_cb and triplet_idx % 8 == 0:
                 progress_cb(
                     "platesolving:checkpoint",
-                    {
-                        "phase": "catalog_scan",
-                        "triplet": int(triplet_idx),
-                        "catalog_index": int(i_position),
-                    },
+                    {"phase": "triplets", "triplet": int(triplet_idx)},
                 )
-            nbrs = tree3.query_radius(V[i:i + 1], r=r_max, return_distance=False)[0]
-            nbrs = nbrs[nbrs > i]  # avoid duplicate pairs
-            if nbrs.size == 0:
-                continue
+            d1, d2, d3 = float(img_sides[0]), float(img_sides[1]), float(img_sides[2])
+            # Annuli depend on the triplet's side lengths, so the memo is per triplet.
+            annulus_cache: Dict[Tuple[int, int], np.ndarray] = {}
 
-            dots = V[nbrs] @ V[i]
-            chord2 = 2.0 - 2.0 * dots
-            nbrs = nbrs[chord2 >= (r_min * r_min)]
-            if nbrs.size == 0:
-                continue
+            theta_min = max((d3 - tol_arcsec_pairs) * _ARCSEC_TO_RAD, 0.0)
+            theta_max = (d3 + tol_arcsec_pairs) * _ARCSEC_TO_RAD
 
-            for j in nbrs:
-                candA = np.intersect1d(
-                    annulus_candidates(tree3, V, int(i), d1, tol_arcsec_pairs),
-                    annulus_candidates(tree3, V, int(j), d2, tol_arcsec_pairs),
-                    assume_unique=False
-                )
-                candB = np.intersect1d(
-                    annulus_candidates(tree3, V, int(i), d2, tol_arcsec_pairs),
-                    annulus_candidates(tree3, V, int(j), d1, tol_arcsec_pairs),
-                    assume_unique=False
-                )
-                ks = np.union1d(candA, candB)
-                if ks.size == 0:
+            r_max = chord_radius(theta_max)
+            r_min = chord_radius(theta_min)
+
+            # One batched neighbour query per triplet instead of one per scanned
+            # catalog star. scikit-learn re-validates its input on every call, and
+            # that validation dominated the whole solve when issued tens of
+            # thousands of times.
+            nbrs_batch = tree3.query_radius(V[i_scan], r=r_max, return_distance=False)
+
+            # Resolve which centres survive the pair filter first, then compute
+            # their annuli in one query. Batching over every scanned star instead
+            # would spend most of the work on centres that get discarded here.
+            r_min_sq_pair = r_min * r_min
+            pair_nbrs: Dict[int, np.ndarray] = {}
+            for i_position, i in enumerate(i_scan):
+                cand = nbrs_batch[i_position]
+                cand = cand[cand > i]
+                if cand.size == 0:
                     continue
-                ks = ks[(ks != i) & (ks != j)]
-                if ks.size == 0:
+                cand = cand[(2.0 - 2.0 * (V[cand] @ V[i])) >= r_min_sq_pair]
+                if cand.size:
+                    pair_nbrs[i_position] = cand
+
+            if not pair_nbrs:
+                continue
+            active_positions = np.fromiter(pair_nbrs.keys(), dtype=np.int64)
+            active_idx = np.asarray(i_scan)[active_positions]
+            ann_d1 = annulus_candidates_batch(tree3, V, active_idx, d1, tol_arcsec_pairs)
+            ann_d2 = annulus_candidates_batch(tree3, V, active_idx, d2, tol_arcsec_pairs)
+            ann_i_d1_by_pos = {int(p): ann_d1[n] for n, p in enumerate(active_positions)}
+            ann_i_d2_by_pos = {int(p): ann_d2[n] for n, p in enumerate(active_positions)}
+
+            for i_position, i in enumerate(i_scan):
+                if progress_cb and i_position % 64 == 0:
+                    progress_cb(
+                        "platesolving:checkpoint",
+                        {
+                            "phase": "catalog_scan",
+                            "triplet": int(triplet_idx),
+                            "catalog_index": int(i_position),
+                        },
+                    )
+                nbrs = pair_nbrs.get(i_position)
+                if nbrs is None:
                     continue
 
-                for k in ks:
-                    cat_sides = sorted_sides_arcsec_from_coords(coords, int(i), int(j), int(k))
-                    score, err_max = triplet_score(img_sides, cat_sides, sigma_arcsec=sigma_arcsec)
-                    if err_max <= tol_arcsec_pairs:
-                        candidates.append({
-                            "score": float(score),
-                            "err_max": float(err_max),
-                            "img_triplet": (int(a), int(b), int(c)),
-                            "gaia_idx": (int(i), int(j), int(k)),
-                            "gaia_source_id": (
-                                int(gaia_df["source_id"].iloc[int(i)]) if "source_id" in gaia_df.columns else int(i),
-                                int(gaia_df["source_id"].iloc[int(j)]) if "source_id" in gaia_df.columns else int(j),
-                                int(gaia_df["source_id"].iloc[int(k)]) if "source_id" in gaia_df.columns else int(k),
-                            ),
-                        })
+                # The annuli around i do not depend on j, so they are resolved once
+                # per (triplet, i) instead of once per pair. Recomputing them inside
+                # the pair loop was the single dominant cost of the whole solve.
+                ann_i_d1 = ann_i_d1_by_pos[i_position]
+                ann_i_d2 = ann_i_d2_by_pos[i_position]
+                if ann_i_d1.size == 0 and ann_i_d2.size == 0:
+                    continue
+
+                for j in nbrs:
+                    # Annuli around j are reused across the triplets that share the
+                    # same side lengths, so memoise them per (index, side).
+                    jj = int(j)
+                    key_d2 = (jj, 1)
+                    ann_j_d2 = annulus_cache.get(key_d2)
+                    if ann_j_d2 is None:
+                        ann_j_d2 = annulus_candidates(tree3, V, jj, d2, tol_arcsec_pairs)
+                        annulus_cache[key_d2] = ann_j_d2
+                    key_d1 = (jj, 0)
+                    ann_j_d1 = annulus_cache.get(key_d1)
+                    if ann_j_d1 is None:
+                        ann_j_d1 = annulus_candidates(tree3, V, jj, d1, tol_arcsec_pairs)
+                        annulus_cache[key_d1] = ann_j_d1
+
+                    candA = np.intersect1d(ann_i_d1, ann_j_d2, assume_unique=False)
+                    candB = np.intersect1d(ann_i_d2, ann_j_d1, assume_unique=False)
+                    ks = np.union1d(candA, candB)
+                    if ks.size == 0:
+                        continue
+                    ks = ks[(ks != i) & (ks != j)]
+                    if ks.size == 0:
+                        continue
+
+                    for k in ks:
+                        cat_sides = sorted_sides_arcsec_from_vectors(V, int(i), int(j), int(k))
+                        score, err_max = triplet_score(img_sides, cat_sides, sigma_arcsec=sigma_arcsec)
+                        if err_max <= tol_arcsec_pairs:
+                            candidates.append({
+                                "score": float(score),
+                                "err_max": float(err_max),
+                                "img_triplet": (int(a), int(b), int(c)),
+                                "gaia_idx": (int(i), int(j), int(k)),
+                                "gaia_source_id": (
+                                    int(source_ids[int(i)]),
+                                    int(source_ids[int(j)]),
+                                    int(source_ids[int(k)]),
+                                ),
+                            })
 
     candidates.sort(key=lambda d: d["score"])
 
@@ -2084,18 +2395,19 @@ def solve_plate(
         i, j, k = cand["gaia_idx"]
 
         img_tri = img_xy_seed[[a, b, c]]
-        tri_coords = coords[[i, j, k]]
-        center0 = sph_centroid(tri_coords)
+        # Centroide esferico del triangulo y offsets en su marco, sobre los
+        # vectores unitarios: misma geometria que sph_centroid +
+        # spherical_offsets_to, sin crear objetos de astropy por candidato.
+        tri_v = V[[i, j, k]]
+        center_v = tri_v.mean(axis=0)
+        if float(np.linalg.norm(center_v)) <= 0.0:
+            center_v = tri_v[0]
+        center0 = _vector_to_skycoord(center_v)
 
-        # Gaia triplet in TAN plane (arcsec)
-        d_lon, d_lat = center0.spherical_offsets_to(tri_coords)
-        cat_tri = np.column_stack([d_lon.to_value(u.arcsec), d_lat.to_value(u.arcsec)])
-
+        cat_tri = offsets_arcsec_from_vectors(center_v, tri_v)
         fit = best_assignment_similarity(img_tri, cat_tri)
 
-        # ALL Gaia into TAN plane
-        d_lon_all, d_lat_all = center0.spherical_offsets_to(coords)
-        cat_all = np.column_stack([d_lon_all.to_value(u.arcsec), d_lat_all.to_value(u.arcsec)])
+        cat_all = offsets_arcsec_from_vectors(center_v, V)
 
         # ALL detections -> TAN via similarity
         pred_all = apply_similarity(img_xy_all, fit["s"], fit["R"], fit["t"])
@@ -2192,6 +2504,22 @@ def solve_plate(
     if progress_cb:
         progress_cb("platesolving:validate:start", {"n_eval": int(len(to_eval))})
 
+    # Parada temprana. Un triangulo falso casa sus tres vertices y, con suerte,
+    # alguna estrella mas; el verdadero casa la mayoria de las detecciones. En un
+    # cuadro en vivo con 12 detecciones la solucion casaba las 12 y se seguian
+    # evaluando 1499 candidatos mas, ~6 s, solo para confirmar lo obvio. Al
+    # alcanzar la mitad de las detecciones (y al menos min_inliers + 2, con tres
+    # confirmaciones fuera del triangulo semilla) ya no hay competencia posible:
+    # una alineacion casual con esa tolerancia no llega ahi.
+    n_used = int(img_xy_all.shape[0])
+    decisive_inliers = int(max(int(getattr(cfg, "min_inliers", 5)) + 2, int(np.ceil(0.5 * n_used))))
+    # Ademas el candidato tiene que pasar ya los criterios de exito del paso 14;
+    # si no, cortar aqui podria dejar fuera uno peor puntuado que si los pasa.
+    decisive_validation = max(3, int(getattr(cfg, "min_validation_inliers", 0)))
+    decisive_rms_arcsec = float(getattr(cfg, "max_rms_px", 0.0)) * float(arcsec_per_px)
+    early_stop = bool(getattr(cfg, "validation_early_stop", True))
+    stopped_early_at: Optional[int] = None
+
     for candidate_idx, cand in enumerate(to_eval):
         if progress_cb and candidate_idx % 16 == 0:
             progress_cb(
@@ -2218,11 +2546,19 @@ def solve_plate(
                 continue
         if best is None:
             best = ev
-            continue
-        cur = (ev["num_inliers"], -ev["rms_inliers"], -ev["candidate"]["score"])
-        bst = (best["num_inliers"], -best["rms_inliers"], -best["candidate"]["score"])
-        if cur > bst:
-            best = ev
+        else:
+            cur = (ev["num_inliers"], -ev["rms_inliers"], -ev["candidate"]["score"])
+            bst = (best["num_inliers"], -best["rms_inliers"], -best["candidate"]["score"])
+            if cur > bst:
+                best = ev
+        if (
+            early_stop
+            and int(best["num_inliers"]) >= decisive_inliers
+            and int(best.get("validation_inliers", 0)) >= decisive_validation
+            and (decisive_rms_arcsec <= 0.0 or float(best["rms_inliers"]) <= decisive_rms_arcsec)
+        ):
+            stopped_early_at = int(candidate_idx) + 1
+            break
 
     if best is None:
         if scale_tol_frac > 0.0 and scale_rejected > 0:
@@ -2424,6 +2760,8 @@ def solve_plate(
         "triplet_score": float(best["candidate"]["score"]),
         "triplet_err_max": float(best["candidate"]["err_max"]),
         "max_trials": float(len(to_eval)),
+        "n_evaluated": float(stopped_early_at if stopped_early_at is not None else len(to_eval)),
+        "stopped_early": float(stopped_early_at is not None),
         "n_inliers": float(best["num_inliers"]),
         "validation_inliers": float(best.get("validation_inliers", 0)),
         "min_validation_inliers": float(min_validation_inliers),
@@ -2527,7 +2865,7 @@ def _render_platesolving_debug_jpeg(
     try:
         ok, buf = cv2.imencode(".jpg", img, [cv2.IMWRITE_JPEG_QUALITY, 80])
     except cv2.error as exc:
-        log_error(None, "Platesolving: failed to encode debug JPEG", exc)
+        log_error(None, "Platesolving: no se pudo codificar el JPEG de depuración", exc)
         return None
     if not ok:
         return None
@@ -2560,9 +2898,7 @@ def _build_platesolving_debug_info(result: Any) -> Dict[str, Any]:
         "match_tol_arcsec": metrics.get("match_tol_arcsec"),
         "fast_prior": metrics.get("fast_prior"),
         "continuous_prior": metrics.get("continuous_prior"),
-        "consensus_count": metrics.get("consensus_count"),
-        "consensus_requested": metrics.get("consensus_requested"),
-        "consensus_pointing_arcsec": metrics.get("consensus_pointing_arcsec"),
+        "verify_pointing_arcsec": metrics.get("verify_pointing_arcsec"),
     }
     return info
 
@@ -2654,21 +2990,21 @@ class PlatesolvingWorker(BaseWorker):
         if not enabled:
             return
         a = np.asarray(arr)
-        log_info(self._out_log, f"[{name}] shape={a.shape} dtype={a.dtype} C={a.flags['C_CONTIGUOUS']}")
+        log_debug(self._out_log, f"Platesolving: entrada [{name}] forma={a.shape} tipo={a.dtype} contigua={a.flags['C_CONTIGUOUS']}")
         if a.size == 0:
-            log_info(self._out_log, "  EMPTY")
+            log_debug(self._out_log, "Platesolving:   vacío")
             return
         if a.ndim == 1:
-            log_info(self._out_log, f"  1D buffer: min={a.min()} max={a.max()} mean={a.mean():.3g}")
+            log_debug(self._out_log, f"Platesolving:   búfer 1D: min={a.min()} max={a.max()} media={a.mean():.3g}")
             return
         flat = a.reshape(-1)
         p = np.percentile(flat, [0, 1, 5, 50, 95, 99, 100])
-        log_info(self._out_log, f"  min/p1/p5/p50/p95/p99/max = {p}")
-        log_info(self._out_log, f"  mean={flat.mean():.3g} std={flat.std():.3g}")
+        log_debug(self._out_log, f"Platesolving:   min/p1/p5/p50/p95/p99/max = {p}")
+        log_debug(self._out_log, f"Platesolving:   media={flat.mean():.3g} desviación={flat.std():.3g}")
         if a.dtype == np.uint16:
-            log_info(self._out_log, f"  sat65535={np.mean(flat == 65535):.4f}")
+            log_debug(self._out_log, f"Platesolving:   saturados_65535={np.mean(flat == 65535):.4f}")
         if a.dtype == np.uint8:
-            log_info(self._out_log, f"  sat255={np.mean(flat == 255):.4f}")
+            log_debug(self._out_log, f"Platesolving:   saturados_255={np.mean(flat == 255):.4f}")
 
     def _wait_for_distinct_frame(
         self,
@@ -2795,168 +3131,13 @@ class PlatesolvingWorker(BaseWorker):
         )
         log_info(
             self._out_log,
-            "Platesolving: temporal detection "
-            f"frames={detections.frame_count}/{window} "
-            f"required_hits={detections.required_hits} "
-            f"confirmed={detections.xy.shape[0]} seeds={seed_count} "
-            f"drift_failures={detections.drift_failures}",
+            "Platesolving: confirmación temporal "
+            f"cuadros={detections.frame_count}/{window} "
+            f"apariciones_requeridas={detections.required_hits} "
+            f"confirmadas={detections.xy.shape[0]} semillas={seed_count} "
+            f"fallos_de_deriva={detections.drift_failures}",
         )
         return detections, detections.reference_frame, latest_time
-
-    def _confirm_initial_solution(
-        self,
-        first: PlatesolvingResult,
-        first_frame: np.ndarray,
-        *,
-        target: Any,
-        cfg: PlatesolvingConfig,
-        sep_cfg: SepConfig,
-        observer: ObserverConfig,
-        diagnostics: Optional[DiagnosticSession] = None,
-    ) -> Tuple[PlatesolvingResult, np.ndarray]:
-        requested = max(1, int(getattr(cfg, "initial_consensus_count", 3)))
-        if requested <= 1 or not bool(first.success):
-            return first, first_frame
-        timeout_s = max(0.2, float(getattr(cfg, "initial_consensus_timeout_s", 8.0)))
-        per_frame_timeout = timeout_s / float(max(1, requested - 1))
-        accepted: List[PlatesolvingResult] = [first]
-        previous_frame = first_frame
-        prior = first
-        max_pointing = 0.0
-        max_scale = 0.0
-        max_roll = 0.0
-
-        for confirmation_idx in range(2, requested + 1):
-            self._raise_if_aborted()
-            fresh = self._wait_for_distinct_frame(previous_frame, timeout_s=per_frame_timeout)
-            if fresh is None:
-                metrics = dict(getattr(prior, "metrics", {}) or {})
-                metrics.update(
-                    {
-                        "consensus_count": float(len(accepted)),
-                        "consensus_requested": float(requested),
-                    }
-                )
-                return (
-                    replace(
-                        prior,
-                        success=False,
-                        status="INITIAL_CONSENSUS_NO_NEW_FRAME",
-                        metrics=metrics,
-                    ),
-                    previous_frame,
-                )
-            current_frame, current_time = fresh
-            confirmation_temporal: Optional[TemporalDetections] = None
-            if bool(getattr(cfg, "temporal_detection_enabled", True)):
-                (
-                    confirmation_temporal,
-                    current_frame,
-                    current_time,
-                ) = self._collect_temporal_detections(
-                    current_frame,
-                    cfg=cfg,
-                    sep_cfg=sep_cfg,
-                    diagnostics=diagnostics,
-                )
-            if diagnostics is not None:
-                diagnostics.save_raw(
-                    f"consensus_{confirmation_idx}",
-                    current_frame,
-                    metadata={
-                        "obstime_unix": float(current_time.unix),
-                        "temporal_frames": (
-                            int(confirmation_temporal.frame_count)
-                            if confirmation_temporal is not None
-                            else 1
-                        ),
-                        "temporal_confirmed": (
-                            int(confirmation_temporal.xy.shape[0])
-                            if confirmation_temporal is not None
-                            else None
-                        ),
-                    },
-                )
-            verified = verify_plate_from_prior(
-                current_frame,
-                prior=prior,
-                target=target,
-                cfg=cfg,
-                sep_cfg=sep_cfg,
-                observer=observer,
-                obstime=current_time,
-                progress_cb=None,
-                temporal_detections=confirmation_temporal,
-            )
-            self._raise_if_aborted()
-            consistency = platesolving_solutions_consistent(
-                first,
-                verified,
-                observer=observer,
-                pointing_tol_arcsec=float(getattr(cfg, "consensus_pointing_tol_arcsec", 30.0)),
-                scale_tol_frac=float(getattr(cfg, "consensus_scale_tol_frac", 0.02)),
-                roll_tol_deg=float(getattr(cfg, "consensus_roll_tol_deg", 3.0)),
-            )
-            if diagnostics is not None:
-                diagnostics.record(
-                    "platesolving_consensus",
-                    confirmation_index=int(confirmation_idx),
-                    result=verified,
-                    consistency=consistency,
-                )
-            if not bool(verified.success) or not bool(consistency.get("ok", False)):
-                metrics = dict(getattr(verified, "metrics", {}) or {})
-                metrics.update(
-                    {
-                        "consensus_count": float(len(accepted)),
-                        "consensus_requested": float(requested),
-                        "consensus_pointing_arcsec": float(consistency.get("pointing_arcsec", float("inf"))),
-                        "consensus_scale_frac": float(consistency.get("scale_frac", float("inf"))),
-                        "consensus_roll_deg": float(consistency.get("roll_deg", float("inf"))),
-                    }
-                )
-                return (
-                    replace(
-                        verified,
-                        success=False,
-                        status="INITIAL_CONSENSUS_MISMATCH",
-                        metrics=metrics,
-                    ),
-                    current_frame,
-                )
-            max_pointing = max(max_pointing, float(consistency["pointing_arcsec"]))
-            max_scale = max(max_scale, float(consistency["scale_frac"]))
-            max_roll = max(max_roll, float(consistency["roll_deg"]))
-            accepted.append(verified)
-            prior = verified
-            previous_frame = current_frame
-            log_info(
-                self._out_log,
-                "Platesolving: fast independent confirmation "
-                f"{confirmation_idx}/{requested} inliers={verified.n_inliers} "
-                f"rms_px={verified.rms_px:.3f} mount_delta={float(consistency['pointing_arcsec']):.2f}arcsec",
-            )
-
-        metrics = dict(getattr(prior, "metrics", {}) or {})
-        metrics.update(
-            {
-                "consensus_count": float(len(accepted)),
-                "consensus_requested": float(requested),
-                "consensus_pointing_arcsec": float(max_pointing),
-                "consensus_scale_frac": float(max_scale),
-                "consensus_roll_deg": float(max_roll),
-            }
-        )
-        return (
-            replace(
-                prior,
-                status="OK_CONSENSUS",
-                overlay=list(first.overlay),
-                guides=list(first.guides),
-                metrics=metrics,
-            ),
-            first_frame,
-        )
 
     def _solve_or_verify(
         self,
@@ -2986,7 +3167,7 @@ class PlatesolvingWorker(BaseWorker):
             ):
                 fresh = self._wait_for_distinct_frame(
                     raw16,
-                    timeout_s=float(getattr(cfg, "initial_consensus_timeout_s", 8.0)),
+                    timeout_s=float(getattr(cfg, "fresh_frame_timeout_s", 8.0)),
                 )
                 if fresh is not None:
                     raw16, obstime = fresh
@@ -3011,9 +3192,9 @@ class PlatesolvingWorker(BaseWorker):
                 prior,
                 fast,
                 observer=observer,
-                pointing_tol_arcsec=float(getattr(cfg, "consensus_pointing_tol_arcsec", 30.0)),
-                scale_tol_frac=float(getattr(cfg, "consensus_scale_tol_frac", 0.02)),
-                roll_tol_deg=float(getattr(cfg, "consensus_roll_tol_deg", 3.0)),
+                pointing_tol_arcsec=float(getattr(cfg, "verify_pointing_tol_arcsec", 30.0)),
+                scale_tol_frac=float(getattr(cfg, "verify_scale_tol_frac", 0.02)),
+                roll_tol_deg=float(getattr(cfg, "verify_roll_tol_deg", 3.0)),
             )
             if diagnostics is not None:
                 diagnostics.record(
@@ -3026,16 +3207,13 @@ class PlatesolvingWorker(BaseWorker):
                 metrics.update(
                     {
                         "continuous_prior": 1.0,
-                        "consensus_count": float(
-                            max(3, int((getattr(prior, "metrics", {}) or {}).get("consensus_count", 3)))
-                        ),
-                        "consensus_pointing_arcsec": float(consistency["pointing_arcsec"]),
+                        "verify_pointing_arcsec": float(consistency["pointing_arcsec"]),
                     }
                 )
                 return replace(fast, status="OK_FAST_CONTINUOUS", metrics=metrics), raw16
             log_info(
                 self._out_log,
-                "Platesolving: previous field no longer continuous; running full solve and new consensus",
+                "Platesolving: el campo anterior ya no es continuo; se hace un solve completo",
             )
 
         full = solve_plate(
@@ -3050,15 +3228,7 @@ class PlatesolvingWorker(BaseWorker):
         )
         if diagnostics is not None:
             diagnostics.record("platesolving_full_solve", result=full)
-        return self._confirm_initial_solution(
-            full,
-            raw16,
-            target=target,
-            cfg=cfg,
-            sep_cfg=sep_cfg,
-            observer=observer,
-            diagnostics=diagnostics,
-        )
+        return full, raw16
 
     def _handle_request(self, request: Dict[str, Any]) -> None:
         diagnostics: Optional[DiagnosticSession] = None
@@ -3089,7 +3259,7 @@ class PlatesolvingWorker(BaseWorker):
                     }
                 }
             )
-            log_error(self._out_log, "Platesolving: ERR_NO_TARGET")
+            log_error(self._out_log, "Platesolving: no hay objetivo")
             return
 
         cfg = self._get_cfg()
@@ -3113,9 +3283,9 @@ class PlatesolvingWorker(BaseWorker):
                 }
             )
             if abort_status is not None:
-                log_info(self._out_log, f"Platesolving: {abort_status}")
+                log_info(self._out_log, f"Platesolving: abortado ({abort_status})")
             else:
-                log_error(self._out_log, "Platesolving: ERR_NO_FRAME")
+                log_error(self._out_log, "Platesolving: no hay cuadro")
             return
 
         try:
@@ -3176,8 +3346,8 @@ class PlatesolvingWorker(BaseWorker):
                 )
                 log_info(
                     self._out_log,
-                    "Platesolving: temporal confirmation empty; "
-                    "falling back to the original RAW16 frame",
+                    "Platesolving: la confirmación temporal no dejó fuentes; "
+                    "se vuelve al cuadro RAW16 original",
                 )
                 temporal_detections = None
                 raw16 = initial_raw16
@@ -3206,7 +3376,7 @@ class PlatesolvingWorker(BaseWorker):
             )
             if diagnostics is not None:
                 diagnostics.close(exc.status)
-            log_info(self._out_log, f"Platesolving: {exc.status}")
+            log_info(self._out_log, f"Platesolving: fallo ({exc.status})")
             return
         except Exception as exc:
             self._publish_state(
@@ -3221,7 +3391,7 @@ class PlatesolvingWorker(BaseWorker):
                     }
                 }
             )
-            log_error(self._out_log, "Platesolving: frame/config preparation failed", exc)
+            log_error(self._out_log, "Platesolving: falló la preparación del cuadro o la configuración", exc)
             if diagnostics is not None:
                 diagnostics.close("FRAME_OR_CONFIG_ERROR", error=repr(exc))
             return
@@ -3250,7 +3420,7 @@ class PlatesolvingWorker(BaseWorker):
             )
             if diagnostics is not None:
                 diagnostics.close(exc.status)
-            log_info(self._out_log, f"Platesolving: {exc.status}")
+            log_info(self._out_log, f"Platesolving: fallo ({exc.status})")
             return
         except Exception as exc:
             self._publish_state(
@@ -3263,7 +3433,7 @@ class PlatesolvingWorker(BaseWorker):
                     }
                 }
             )
-            log_error(self._out_log, "Platesolving: failed", exc)
+            log_error(self._out_log, "Platesolving: falló", exc)
             if diagnostics is not None:
                 diagnostics.close("EXCEPTION", error=repr(exc))
             return
@@ -3289,7 +3459,7 @@ class PlatesolvingWorker(BaseWorker):
         except Exception as exc:
             debug_jpeg = None
             debug_info = {"status": result_status, "debug_error": type(exc).__name__}
-            log_error(self._out_log, "Platesolving: debug output failed", exc)
+            log_error(self._out_log, "Platesolving: falló la salida de depuración", exc)
 
         self._publish_state(
             {
@@ -3345,22 +3515,22 @@ class PlatesolvingWorker(BaseWorker):
             )
             log_info(
                 self._out_log,
-                "Platesolving: OK "
-                f"status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g} "
-                f"valid={int(metrics.get('validation_inliers', 0) or 0)} "
-                f"scale={float(getattr(result, 'scale_arcsec_per_px', 0.0)):.4f}arcsec/px "
-                f"target_offset={float(metrics.get('target_offset_deg', float('nan'))):.4f}deg "
-                f"match_az={az_match:.4f}deg match_alt={alt_match:.4f}deg",
+                "Platesolving: resuelto "
+                f"estado={status} respuesta={resp:.3g} inliers={n_inliers} rms={rms_px:.3g}px "
+                f"de_validación={int(metrics.get('validation_inliers', 0) or 0)} "
+                f"escala={float(getattr(result, 'scale_arcsec_per_px', 0.0)):.4f}arcsec/px "
+                f"distancia_al_objetivo={float(metrics.get('target_offset_deg', float('nan'))):.4f}° "
+                f"az={az_match:.4f}° alt={alt_match:.4f}°",
             )
         else:
             if public_reason != status:
                 log_error(
                     self._out_log,
-                    f"Platesolving: ERR reason={public_reason} status={status} "
-                    f"resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+                    f"Platesolving: sin solución motivo={public_reason} estado={status} "
+                    f"respuesta={resp:.3g} inliers={n_inliers} rms={rms_px:.3g}px",
                 )
             else:
                 log_error(
                     self._out_log,
-                    f"Platesolving: ERR status={status} resp={resp:.3g} inliers={n_inliers} rms_px={rms_px:.3g}",
+                    f"Platesolving: sin solución estado={status} respuesta={resp:.3g} inliers={n_inliers} rms={rms_px:.3g}px",
                 )

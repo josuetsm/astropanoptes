@@ -249,9 +249,14 @@ def test_second_incompatible_axis_sample_cannot_rewrite_nominal_scale() -> None:
 
     assert not runner.get_state().goto.sample_last_ok
     assert runner.get_state().goto.sample_last_reason == "SAMPLE_MOTION_MISMATCH"
-    assert runner._goto.model.kin.gear_reduction_alt == pytest.approx(45.0)
+    assert runner._goto.model.kin.gear_reduction_alt == pytest.approx(90.5)
     assert runner._goto.model.kin.microsteps_alt == 64
-    assert runner._goto.model.J_deg_per_step[1, 1] == pytest.approx(0.000625)
+    # La escala nominal de altitud sigue intacta: una muestra incompatible no
+    # puede reescribirla. Se compara contra la cinematica configurada, no
+    # contra un 0.000625 fijo, que era el nominal de cuando altitud iba a 45:1.
+    assert runner._goto.model.J_deg_per_step[1, 1] == pytest.approx(
+        abs(float(runner._goto.model.kin.deg_per_step(Axis.ALT)))
+    )
 
 
 def test_runner_initial_state_publishes_configured_backlash() -> None:

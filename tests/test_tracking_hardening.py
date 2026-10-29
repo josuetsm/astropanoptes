@@ -266,3 +266,179 @@ def test_tracking_rate_accounts_exact_emitted_steps_with_fractional_accumulator(
     assert second == (3, 0)
     assert sum(steps for axis, steps in fake_mount.moves if axis == Axis.AZ) == 5
     np.testing.assert_allclose(runner._goto.model.steps_est, [5.0, 0.0])
+
+
+def test_tracking_stays_enabled_while_the_camera_is_missing() -> None:
+    """Activar tracking sin camara no debe deshacerse solo.
+
+    El bucle de control publicaba aqui el mismo apagado que TRACKING_STOP, asi
+    que la peticion del usuario se revertia en la primera vuelta: el boton
+    parecia no hacer nada y el estado quedaba en "off", indistinguible de no
+    haberlo pulsado nunca.
+    """
+    import time
+
+    from app_runner import AppRunner
+    from ap_types import TrackingStatus
+    from config import AppConfig
+    from terminal_app import TerminalApp
+
+    cfg = AppConfig()
+    cfg.simulation.enabled = True
+    cfg.simulation.seed = 3
+
+    runner = AppRunner(cfg)
+    terminal = TerminalApp(runner)
+    runner.start()
+    try:
+        terminal.execute_line("mount connect")
+        terminal.execute_line("wait mount.connected true 10")
+        assert not runner.get_state().camera.connected
+
+        terminal.execute_line("tracking start")
+        time.sleep(1.0)
+        paused = runner.get_state().tracking
+        assert paused.enabled is True
+        assert paused.status == TrackingStatus.PAUSED
+        assert paused.measurement_reason == "no_camera"
+
+        # y al aparecer la camara arranca solo, sin volver a pulsar nada
+        terminal.execute_line("camera connect")
+        terminal.execute_line("wait camera.connected true 15")
+        deadline = time.monotonic() + 15.0
+        while time.monotonic() < deadline:
+            running = runner.get_state().tracking
+            if running.status == TrackingStatus.RUNNING and running.measurement_valid:
+                break
+            time.sleep(0.1)
+        running = runner.get_state().tracking
+    finally:
+        terminal.close()
+        runner.stop()
+
+    assert running.enabled is True
+    assert running.status == TrackingStatus.RUNNING, running.measurement_reason
+    assert running.n_det > 0
+
+
+def _runner_with_flaky_tracking(fail_from: int, fail_until: int):
+    """Runner en demo cuyo tracking_step revienta en un rango de llamadas."""
+    import app_runner as app_runner_module
+    from app_runner import AppRunner
+    from config import AppConfig
+
+    real_step = app_runner_module.tracking_step
+    calls = {"n": 0}
+
+    def flaky(*args, **kwargs):
+        calls["n"] += 1
+        if fail_from <= calls["n"] <= fail_until:
+            raise RuntimeError("alineacion fallida (simulada)")
+        return real_step(*args, **kwargs)
+
+    cfg = AppConfig()
+    cfg.simulation.enabled = True
+    cfg.simulation.seed = 3
+    return app_runner_module, real_step, flaky, AppRunner(cfg), calls
+
+
+def test_one_failed_step_does_not_end_the_session() -> None:
+    """Una alineacion que revienta no puede matar la noche entera.
+
+    Al apagar el tracking, el bucle deja de enviar frames, y sin frames no hay
+    forma de que se recupere solo: el estado quedaba ademas en "off" -- pisado
+    sobre el ERROR en la vuelta siguiente -- indistinguible de no haber pulsado
+    nunca el boton.
+    """
+    import time
+
+    from ap_types import TrackingStatus
+    from terminal_app import TerminalApp
+
+    module, real_step, flaky, runner, calls = _runner_with_flaky_tracking(6, 6)
+    terminal = TerminalApp(runner)
+    module.tracking_step = flaky
+    runner.start()
+    try:
+        terminal.execute_line("camera connect")
+        terminal.execute_line("mount connect")
+        terminal.execute_line("wait camera.connected true 15")
+        terminal.execute_line("tracking start")
+
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline and calls["n"] < 20:
+            time.sleep(0.1)
+        state = runner.get_state().tracking
+    finally:
+        module.tracking_step = real_step
+        terminal.close()
+        runner.stop()
+
+    assert calls["n"] >= 20, "el tracking dejo de pedir frames tras el fallo"
+    assert state.enabled is True
+    assert state.status == TrackingStatus.RUNNING, state.last_error
+
+
+def test_repeated_step_failures_stop_tracking_and_keep_the_reason() -> None:
+    """Reintentar no puede ser para siempre, y el motivo tiene que sobrevivir."""
+    import time
+
+    from ap_types import TrackingStatus
+    from terminal_app import TerminalApp
+
+    module, real_step, flaky, runner, calls = _runner_with_flaky_tracking(6, 10_000)
+    terminal = TerminalApp(runner)
+    module.tracking_step = flaky
+    limit = int(runner.cfg.tracking.max_consecutive_step_failures)
+    runner.start()
+    try:
+        terminal.execute_line("camera connect")
+        terminal.execute_line("mount connect")
+        terminal.execute_line("wait camera.connected true 15")
+        terminal.execute_line("tracking start")
+
+        deadline = time.monotonic() + 20.0
+        while time.monotonic() < deadline:
+            if runner.get_state().tracking.status == TrackingStatus.ERROR:
+                break
+            time.sleep(0.1)
+        state = runner.get_state().tracking
+        # y el motivo no se pisa con "off" en las vueltas siguientes
+        time.sleep(1.0)
+        later = runner.get_state().tracking
+    finally:
+        module.tracking_step = real_step
+        terminal.close()
+        runner.stop()
+
+    assert state.status == TrackingStatus.ERROR
+    assert state.enabled is False
+    assert str(limit) in str(state.last_error), state.last_error
+    assert later.status == TrackingStatus.ERROR
+    assert later.last_error == state.last_error
+
+
+def test_rate_cadence_never_outlasts_the_next_command() -> None:
+    """Un lote pausado se queda a medias: el MOVE siguiente lo sobrescribe.
+
+    El firmware descarta el plan pendiente al recibir una orden nueva sobre el
+    mismo eje, pero el acumulador ya descontó esos pasos como ejecutados. El
+    control se queda corto sin enterarse y la realimentación sube pidiendo cada
+    vez más, hasta que cada corrección es un tirón visible en la imagen.
+    """
+    from app_runner import AppRunner
+    from ap_types import Axis
+    from config import AppConfig
+
+    runner = AppRunner(AppConfig())
+    try:
+        cap = runner.cfg.mount.rate_emul_max_delay_us
+        # El tope acota cuánto puede durar un solo paso del lote. Con el bucle
+        # de control emitiendo a decenas de Hz, un lote corto termina antes de
+        # que llegue la orden siguiente; uno de cientos de ms no.
+        assert cap <= 50_000, "un retardo largo deja lotes a medias"
+        for rate in (0.5, 5.0, 100.0):
+            delay = runner._rate_to_delay_us(rate, axis=Axis.AZ)
+            assert 1 <= delay <= cap
+    finally:
+        runner.stop()

@@ -18,9 +18,12 @@ from typing import Any, Callable, Iterable, Optional, TextIO
 import numpy as np
 
 from actions import Action, ActionType
-from ap_types import Axis
+from ap_types import Axis, TrackingStatus
 from app_runner import AppRunner
 from config import AppConfig
+from console_format import code, explain, reason as reason_text, render_value, result_lines, state_word
+from logging_utils import log_info, set_log_file
+from pointing.kinematics import MountKinematics
 
 
 DEFAULT_IMAGES_DIR = Path("terminal_output") / "images"
@@ -31,6 +34,51 @@ LIVE_VIEW_CONSOLE_LIMIT = 200
 
 class CommandError(ValueError):
     """Error de uso recuperable dentro de la consola."""
+
+
+def _wrap(text: str, *, indent: int = 2, width: int = 78) -> list[str]:
+    """Prosa en lineas de ancho fijo, indentada como el detalle de una respuesta."""
+    import textwrap
+
+    pad = " " * indent
+    return textwrap.wrap(text, width=width, initial_indent=pad, subsequent_indent=pad)
+
+
+def _count(n: int, one: str, many: str) -> str:
+    return f"{n} {one if n == 1 else many}"
+
+
+def _int_arg(text: str, name: str) -> int:
+    """Un argumento entero, con un error que dice cual y por que.
+
+    Sin esto, `mount move az 1 abc` respondia con el texto interno de Python
+    ("invalid literal for int() with base 10"), que no dice que argumento fallo.
+    """
+    try:
+        return int(str(text).strip())
+    except ValueError:
+        raise CommandError(f"se esperaba un número entero para {name}; recibí {text!r}") from None
+
+
+def _float_arg(text: str, name: str) -> float:
+    try:
+        return float(str(text).strip())
+    except ValueError:
+        raise CommandError(f"se esperaba un número para {name}; recibí {text!r}") from None
+
+
+def _axis_arg(text: str) -> Axis:
+    try:
+        return Axis(str(text).strip().lower())
+    except ValueError:
+        raise CommandError(f"el eje debe ser az o alt; recibí {text!r}") from None
+
+
+def _direction_arg(text: str) -> int:
+    value = _int_arg(text, "la dirección")
+    if value not in (-1, 1):
+        raise CommandError(f"la dirección debe ser 1 o -1; recibí {text!r}")
+    return value
 
 
 class _LiveViewHTTPServer(http.server.ThreadingHTTPServer):
@@ -324,19 +372,36 @@ def _parse_assignments(tokens: Iterable[str]) -> dict[str, Any]:
     return params
 
 
+def _children(node: Any) -> list[str]:
+    if dataclasses.is_dataclass(node):
+        return [f.name for f in dataclasses.fields(node)]
+    if isinstance(node, dict):
+        return [str(k) for k in node]
+    return []
+
+
 def _nested_value(root: Any, path: str) -> Any:
+    """Un campo del estado por su ruta con puntos.
+
+    Si la ruta no existe, el error dice que campos hay en ese nivel: sin eso,
+    `get stacking.frames` obligaba a pedir el estado entero para descubrir que
+    el campo se llama `frames_used`.
+    """
     current = root
+    walked: list[str] = []
     for part in path.split("."):
         if not part:
-            raise CommandError(f"ruta de estado inválida: {path!r}")
-        if dataclasses.is_dataclass(current) or hasattr(current, part):
-            if not hasattr(current, part):
-                raise CommandError(f"no existe el estado {path!r}")
+            raise CommandError(f"ruta de estado mal formada: {path!r}")
+        if dataclasses.is_dataclass(current) and hasattr(current, part):
             current = getattr(current, part)
         elif isinstance(current, dict) and part in current:
             current = current[part]
         else:
-            raise CommandError(f"no existe el estado {path!r}")
+            here = ".".join(walked) or "el estado"
+            options = _children(current)
+            hint = f"; en {here} hay: {', '.join(options)}" if options else ""
+            raise CommandError(f"no existe {path}{hint}")
+        walked.append(part)
     if isinstance(current, enum.Enum):
         return current.value
     return current
@@ -373,49 +438,70 @@ def _compare(actual: Any, operator: str, expected: Any) -> bool:
     raise CommandError(f"operador no soportado: {operator!r}")
 
 
-HELP_TEXT = """Comandos principales:
-  status [--json]                  Estado resumido o JSON completo
-  get RUTA                         Lee un campo puntual (ej: get tracking.error_px)
-  config [sección]                 Configuración efectiva en JSON
-  health                           Errores y operaciones activas
-  wait RUTA [OP] VALOR [SEG]       Espera un estado (ej: wait camera.connected true 5)
-  await platesolving|goto|mount|record [SEG]
-                                    Espera la operación encolada, sin carrera de inicio
-  sleep SEG                        Pausa útil en scripts de diagnóstico
-  stop                             Parada de emergencia: cancela workers, tracking y montura
+HELP_TEXT = """Estado y espera
+  status [--json]                    resumen de cada subsistema
+  get RUTA                           un campo del estado (get tracking.rate_az)
+  config [SECCION]                   configuración efectiva
+  health                             errores, operaciones en curso y latencias
+  wait RUTA [OP] VALOR [SEG]         espera a que el estado cumpla algo
+                                       (wait camera.connected true 5)
+  await solve|goto|mount|record|focus [SEG]
+                                     espera la última operación que lanzaste
+  sleep SEG                          pausa
+  stop                               parada de emergencia: montura, goto y tracking
 
+Cámara y montura
+  camera connect [INDICE] | disconnect | set NOMBRE VALOR
+  camera record [SEG] [DIR] [NOMBRE] | stop
+  mount connect [PUERTO] [BAUDIOS] | disconnect | stop | sync
+  mount move az|alt 1|-1 PASOS [RETARDO_US] [smooth|direct]
+                                     un ciclo de transmisión son 12800 pasos:
+                                     8° en azimut, 4° en altura
   demo on|off
-  camera connect [ÍNDICE] | disconnect | set NOMBRE VALOR
-  camera record [SEG] [CARPETA] [NOMBRE] | stop
-  mount connect [PUERTO] [BAUD] | disconnect | stop | sync
-  mount move az|alt DIRECCIÓN PASOS [DELAY_US] [smooth|direct]
-  tracking start|stop | set nombre=valor ...
-  stacking start|stop|reset | set nombre=valor ...
-  stacking save [CARPETA] [NOMBRE] [FORMATO]
-  solve OBJETIVO                   Plate solve por nombre o coordenadas
-  solve altaz AZ ALT
-  platesolving set nombre=valor ... | download [RADIO_DEG]
-  platesolving source live|stack   Resuelve el frame vivo o el mosaico apilado
-  goto OBJETIVO | goto altaz AZ ALT | goto cancel|fit|samples|prune|restore|reset
-  goto autocalibrate [nombre=valor ...] | goto roll
-  overlay sep|expected on|off [nombre=valor ...]
-  transmission status|apply       Error de transmisión aprendido desde el tracking
 
+Foco
+  focus in|out [PASOS] | goto POS|PRESET | home | zero | cancel
+  focus auto [PRESET] [nombre=valor ...]
+  focus save NOMBRE [POS] | presets | forget NOMBRE | status | set nombre=valor ...
+
+Tracking y apilado
+  tracking start | stop | why | set nombre=valor ...
+  stacking start | stop | reset | set nombre=valor ... | save [DIR] [NOMBRE] [FMT]
+  transmission status | apply        rizado del reductor aprendido del tracking
+
+Plate solving y goto
+  solve OBJETIVO | solve altaz AZ ALT
+  platesolving source live|stack | set nombre=valor ... | download [RADIO_DEG]
+  goto OBJETIVO | goto altaz AZ ALT | goto cancel
+  goto autocalibrate [nombre=valor ...]   sitúa la montura por deriva y resuelve;
+                                          después hace falta mount sync
+  goto roll | fit | samples | prune | restore | reset
+  overlay sep|expected on|off [nombre=valor ...]
+
+Imágenes y visor
   image live|stack|platesolve [NOMBRE] [ESPERA_SEG]
-                                    Guarda JPEG + JSON en la carpeta de imágenes
-  view start [PUERTO] [FPS] [no-open]
-  view status|open|stop             Visor local en vivo; actualiza live-latest.jpg
-  action TIPO [JSON]               Inyecta una Action avanzada para depuración
+  view start [PUERTO] [FPS] [no-open] | status | open | stop
+
+Otros
+  action TIPO [JSON]                 inyecta una acción en bruto, para depurar
   help | quit
 
-Los comandos `set` aceptan booleanos, números, null y JSON. Los logs del runtime
-van a stderr; las respuestas y el JSON de la CLI van a stdout.
+Cómo responde
+  Cada comando produce una línea que empieza por ok o por error, y debajo,
+  indentado, el detalle si lo hay. En scripts (-c, --script) cada respuesta
+  lleva encima el comando que la produjo, precedido de ›.
 
-Formato de respuesta: una acción sin datos que devolver imprime "OK"; una
-consulta (status, get, config, health, transmission status, view status)
-imprime el valor o JSON solicitado; una acción con resultado (view start/open,
-await) imprime JSON con "ok". Cualquier fallo se reporta en stderr como
-"CLI ERROR: mensaje" y detiene los scripts (--script/-c).
+  La mayoría de los comandos solo encolan una acción y responden
+  "ok  en cola: ...". Que esté en cola no significa que esté hecho: para
+  saberlo usa wait o await, o mira el evento que llega cuando termina.
+
+  Las respuestas van por stdout. Los eventos -- lo que pasa mientras tanto --
+  van por stderr, con hora, nivel y subsistema en columnas:
+    21:54:06.931  error  goto      la montura no está sincronizada
+
+  Con --json, cualquier comando responde solo con el documento JSON.
+  Un script se detiene en el primer error y dice en qué comando.
+  El log completo de la sesión, con trazas, queda en terminal_output/logs/.
 """
 
 
@@ -426,28 +512,64 @@ class TerminalApp:
         *,
         images_dir: Path | str = DEFAULT_IMAGES_DIR,
         output: TextIO = sys.stdout,
-        error_output: TextIO = sys.stderr,
+        error_output: Optional[TextIO] = None,
         browser_open: Callable[[str], Any] = webbrowser.open,
+        echo_commands: bool = False,
     ) -> None:
         self.runner = runner
         self.images_dir = Path(images_dir).expanduser().resolve()
         self.output = output
-        self.error_output = error_output
+        # Los errores de un comando son su respuesta, asi que van por el mismo
+        # canal que el `ok`: si fueran por stderr, separar los canales dejaria el
+        # error lejos del comando que lo produjo. Se acepta un canal propio solo
+        # por compatibilidad.
+        self.error_output = error_output if error_output is not None else output
         self._browser_open = browser_open
+        self.echo_commands = bool(echo_commands)
         self.had_error = False
+        self._json = False
         self._pending_operations: dict[str, int] = {}
         self._live_view = LiveView(runner, self.images_dir)
 
-    def _print(self, message: str = "") -> None:
-        self.output.write(message + "\n")
-        self.output.flush()
-        self._live_view.append_console_entry("output", message)
+    # ------------------------------------------------------------- salida
 
-    def _error(self, message: str) -> None:
+    def _write(self, lines: Iterable[str], *, stream: Optional[TextIO] = None, kind: str = "output") -> None:
+        target = stream if stream is not None else self.output
+        lines = list(lines)
+        for line in lines:
+            target.write(line + "\n")
+        target.flush()
+        if lines:
+            self._live_view.append_console_entry(kind, "\n".join(lines))
+
+    def _print(self, message: str = "") -> None:
+        """Texto tal cual, para bloques de prosa (ayuda, informes)."""
+        self._write(message.split("\n") if message else [""])
+
+    def _ok(self, summary: str = "", detail: Any = None) -> None:
+        """Respuesta correcta. Con `--json`, solo el documento JSON."""
+        if self._json:
+            payload = detail if detail is not None else {"ok": True, "summary": summary}
+            self._write([json.dumps(_jsonable(payload), ensure_ascii=False, indent=2, sort_keys=True)])
+            return
+        self._write(result_lines(True, summary, _jsonable(detail) if detail is not None else None))
+
+    def _queued(self, what: str) -> None:
+        """Una orden aceptada, que todavia no se ha cumplido.
+
+        La mayoria de los comandos solo encolan una accion. Decirlo en la
+        respuesta evita leer `ok` como "ya esta hecho": para eso estan `wait` y
+        `await`, y el evento que llega por stderr cuando termina.
+        """
+        self._ok(f"en cola: {what}")
+
+    def _error(self, message: str, detail: Any = None) -> None:
         self.had_error = True
-        self.error_output.write(f"CLI ERROR: {message}\n")
-        self.error_output.flush()
-        self._live_view.append_console_entry("error", message)
+        self._write(
+            result_lines(False, message, _jsonable(detail) if detail is not None else None),
+            stream=self.error_output,
+            kind="error",
+        )
 
     def _state_json(self) -> dict[str, Any]:
         return _jsonable(self.runner.get_state())
@@ -455,61 +577,102 @@ class TerminalApp:
     def _status(self, *, as_json: bool) -> None:
         state = self.runner.get_state()
         if as_json:
-            self._print(json.dumps(_jsonable(state), ensure_ascii=False, indent=2, sort_keys=True))
+            self._json = True
+            self._ok(detail=state)
             return
-        self._print(
-            " | ".join(
-                [
-                    f"camera={state.camera.status.value} fps={state.camera.fps_capture:.1f}",
-                    f"mount={state.mount.status.value}",
-                    f"tracking={state.tracking.status.value}",
-                    f"stacking={state.stacking.status.value} frames={state.stacking.frames_used}",
-                    f"solve={state.platesolving.status.value}",
-                    f"goto={state.goto.status.value}",
-                ]
-            )
-        )
+
+        def failure(status, reason, explanation_source=None) -> str:
+            raw = code(status)
+            if raw not in {"error", "fail", "cancelled"}:
+                return ""
+            why = reason_text(reason) if reason else ""
+            text = explain(reason) if reason else ""
+            return "  ".join(part for part in (why, text) if part)
+
+        rows = []
+        cam = state.camera
+        rows.append(("camara", state_word("camara", cam.status),
+                     f"{cam.fps_capture:.1f} fps" if cam.connected else "", failure(cam.status, cam.last_error)))
+        goto = state.goto
+        where = ""
+        if goto.pointing_valid:
+            where = f"az {goto.pointing_az_deg:.3f}°  alt {goto.pointing_alt_deg:.3f}°"
+        sync = "sincronizada" if goto.synced else ("sin sincronizar" if state.mount.connected else "")
+        rows.append(("montura", state_word("montura", state.mount.status),
+                     "  ".join(x for x in (where, sync) if x), failure(state.mount.status, state.mount.last_error)))
+        trk = state.tracking
+        rows.append(("tracking", state_word("tracking", trk.status), "", failure(trk.status, trk.last_error)))
+        stk = state.stacking
+        rows.append(("apilado", state_word("apilado", stk.status),
+                     _count(int(stk.frames_used), "cuadro", "cuadros") if stk.enabled or stk.frames_used else "",
+                     failure(stk.status, stk.last_error)))
+        ps = state.platesolving
+        solved = ""
+        if code(ps.status) == "ok":
+            solved = (f"ra {ps.center_ra_deg:.4f}°  dec {ps.center_dec_deg:.4f}°  "
+                      f"{int(ps.n_inliers)} inliers")
+        rows.append(("solve", state_word("solve", ps.status), solved, failure(ps.status, ps.reason)))
+        rows.append(("goto", state_word("goto", goto.status),
+                     _count(int(goto.manual_samples), "muestra", "muestras") if goto.manual_samples else "",
+                     failure(goto.status, goto.reason)))
+
+        name_width = max(len(r[0]) for r in rows) + 2
+        width = max(len(r[1]) for r in rows)
+        lines = []
+        for name, word, extra, why in rows:
+            line = f"  {name:<{name_width}}{word:<{width}}"
+            tail = "  ".join(x for x in (extra, why) if x)
+            lines.append((line + "  " + tail).rstrip())
+        self._write(["ok"] + lines)
 
     def _health(self) -> None:
         state = self.runner.get_state()
-        camera_failed = state.camera.status.value == "ERROR"
-        mount_failed = state.mount.status.value == "ERROR"
-        tracking_failed = state.tracking.status.value == "ERROR"
-        stacking_failed = state.stacking.status.value == "ERROR"
-        platesolving_failed = state.platesolving.status.value == "FAIL"
-        goto_failed = state.goto.status.value in {"FAIL", "CANCELLED"}
+        failed = {
+            "camara": (state.camera.status, state.camera.last_error),
+            "montura": (state.mount.status, state.mount.last_error),
+            "tracking": (state.tracking.status, state.tracking.last_error),
+            "apilado": (state.stacking.status, state.stacking.last_error),
+            "solve": (state.platesolving.status, state.platesolving.reason),
+            "goto": (state.goto.status, state.goto.reason),
+        }
         errors = {
-            "camera": state.camera.last_error if camera_failed else None,
-            "mount": state.mount.last_error if mount_failed else None,
-            "tracking": state.tracking.last_error if tracking_failed else None,
-            "stacking": state.stacking.last_error if stacking_failed else None,
-            "platesolving": state.platesolving.reason if platesolving_failed else None,
-            "goto": state.goto.reason if goto_failed else None,
+            name: (reason_text(reason) if reason else code(status))
+            for name, (status, reason) in failed.items()
+            if code(status) in {"error", "fail", "cancelled"}
         }
-        active = {
-            "tracking": bool(state.tracking.enabled),
-            "stacking": bool(state.stacking.enabled),
-            "platesolving": bool(state.platesolving.busy),
-            "goto": bool(state.goto.busy),
-        }
-        performance_getter = getattr(self.runner, "get_performance_metrics", None)
-        performance = (
-            performance_getter()
-            if callable(performance_getter)
-            else None
-        )
-        self._print(
-            json.dumps(
-                {
-                    "active": active,
-                    "errors": errors,
-                    "performance": performance,
-                },
-                ensure_ascii=False,
-                indent=2,
-                sort_keys=True,
-            )
-        )
+        active = [
+            name for name, busy in (
+                ("tracking", state.tracking.enabled),
+                ("apilado", state.stacking.enabled),
+                ("solve", state.platesolving.busy),
+                ("goto", state.goto.busy),
+            ) if busy
+        ]
+        getter = getattr(self.runner, "get_performance_metrics", None)
+        performance = getter() if callable(getter) else None
+        if self._json:
+            self._ok(detail={"active": active, "errors": errors, "performance": performance})
+            return
+
+        summary = []
+        summary.append(f"{len(errors)} con error" if errors else "sin errores")
+        summary.append("en curso: " + ", ".join(active) if active else "nada en curso")
+        lines = ["ok  " + "; ".join(summary)]
+        for name, why in errors.items():
+            text = explain(why)
+            lines.append(f"  error     {name}: {why}" + (f"  {text}" if text else ""))
+        sections = (performance or {}).get("sections", {}) if isinstance(performance, dict) else {}
+        if sections:
+            lines.append(f"  latencia por ciclo (ms), {int((performance or {}).get('sample_count', 0))} muestras")
+            width = max(len(k) for k in sections)
+            for key, stats in sections.items():
+                if not isinstance(stats, dict):
+                    continue
+                cells = "  ".join(
+                    f"{q} {float(stats[q]):<8.3g}" for q in ("p50", "p95", "p99", "max") if q in stats
+                ).rstrip()
+                lines.append(f"    {key.removesuffix('_ms'):<{width}}  {cells}")
+        self._write(lines)
 
     def _wait(self, args: list[str]) -> None:
         if len(args) < 2:
@@ -519,26 +682,28 @@ class TerminalApp:
         if len(args) >= 3 and args[1] in operators:
             operator = args[1]
             expected_raw = args[2]
-            timeout_s = float(args[3]) if len(args) >= 4 else 10.0
+            timeout_s = _float_arg(args[3], "el timeout") if len(args) >= 4 else 10.0
         else:
             operator = "=="
             expected_raw = args[1]
-            timeout_s = float(args[2]) if len(args) >= 3 else 10.0
+            timeout_s = _float_arg(args[2], "el timeout") if len(args) >= 3 else 10.0
         expected = _parse_value(expected_raw)
-        deadline = time.monotonic() + max(0.0, timeout_s)
+        started = time.monotonic()
+        deadline = started + max(0.0, timeout_s)
         last_value: Any = None
         while True:
             last_value = _nested_value(self.runner.get_state(), path)
             try:
                 matched = _compare(last_value, operator, expected)
             except TypeError as exc:
-                raise CommandError(f"comparación inválida para {path}: {exc}") from exc
+                raise CommandError(f"no se puede comparar {path} con {expected_raw!r}: {exc}") from exc
             if matched:
-                self._print(f"OK {path}={last_value!r}")
+                self._ok(f"{path} = {render_value(_jsonable(last_value))}  ({time.monotonic() - started:.1f} s)")
                 return
             if time.monotonic() >= deadline:
                 raise CommandError(
-                    f"timeout esperando {path} {operator} {expected!r}; valor actual={last_value!r}"
+                    f"{path} no llegó a {operator} {render_value(expected)} en {timeout_s:g} s; "
+                    f"vale {render_value(_jsonable(last_value))}"
                 )
             time.sleep(0.05)
 
@@ -556,7 +721,7 @@ class TerminalApp:
 
     def _await_operation(self, args: list[str]) -> None:
         if not args:
-            raise CommandError("uso: await platesolving|goto|mount|record [TIMEOUT_SEG]")
+            raise CommandError("uso: await platesolving|goto|mount|record|focus [TIMEOUT_SEG]")
         aliases = {
             "solve": "platesolving",
             "platesolve": "platesolving",
@@ -564,57 +729,41 @@ class TerminalApp:
             "move": "mount_move",
             "record": "camera_record",
             "raw": "camera_record",
+            "focus": "focuser",
+            "autofocus": "focuser",
         }
         name = aliases.get(args[0].lower(), args[0].lower())
         if len(args) >= 2:
-            timeout_s = float(args[1])
+            timeout_s = _float_arg(args[1], "el timeout")
         elif name == "platesolving":
-            timeout_s = float(
-                getattr(self.runner.cfg.platesolving, "total_timeout_s", 120.0)
-            ) + 15.0
+            timeout_s = float(getattr(self.runner.cfg.platesolving, "total_timeout_s", 120.0)) + 15.0
         else:
             timeout_s = 120.0
         if name not in self._pending_operations:
-            raise CommandError(f"no hay una operación {name!r} pendiente desde esta consola")
+            raise CommandError(
+                f"no hay ninguna operación {name} lanzada desde esta consola; "
+                "await espera la última que lanzaste tú"
+            )
         baseline = int(self._pending_operations[name])
-        deadline = time.monotonic() + max(0.0, timeout_s)
+        began = time.monotonic()
+        deadline = began + max(0.0, timeout_s)
         while True:
             counters = self._operation_counters()
             values = counters.get(name)
             if values is None:
-                raise CommandError(f"operación desconocida: {name!r}")
+                raise CommandError(f"operación desconocida: {name}")
             started = int(values["started"])
             finished = int(values["finished"])
             if started > baseline and finished >= started:
                 if name == "platesolving":
-                    # A successful explicit solve queues automatic sample
-                    # validation in the runner. Do not let scripts observe the
-                    # transient SOLVING state after `await platesolving`.
+                    # Un solve explicito encola la validacion de la muestra en el
+                    # runner; no dejar que el script vea el estado SOLVING de paso.
                     while time.monotonic() < deadline:
-                        sample_reason = getattr(
-                            self.runner.get_state().goto,
-                            "sample_last_reason",
-                            None,
-                        )
-                        if sample_reason != "SOLVING":
+                        if getattr(self.runner.get_state().goto, "sample_last_reason", None) != "SOLVING":
                             break
                         time.sleep(0.01)
                 del self._pending_operations[name]
-                state = self.runner.get_state()
-                section_name = {
-                    "mount_move": "mount",
-                    "camera_record": "camera",
-                }.get(name, name)
-                section = getattr(state, section_name)
-                payload = {
-                    "ok": True,
-                    "operation": name,
-                    "started": started,
-                    "finished": finished,
-                    "status": _jsonable(getattr(section, "status", None)),
-                    "reason": _jsonable(getattr(section, "reason", None)),
-                }
-                self._print(json.dumps(payload, ensure_ascii=False, sort_keys=True))
+                self._report_operation(name, time.monotonic() - began)
                 return
             if time.monotonic() >= deadline:
                 if name == "platesolving":
@@ -622,10 +771,60 @@ class TerminalApp:
                     if callable(cancel):
                         cancel()
                 raise CommandError(
-                    f"timeout esperando operación {name}; cancelacion solicitada; "
-                    f"started={started} finished={finished} baseline={baseline}"
+                    f"{name} no terminó en {timeout_s:g} s"
+                    + ("; se pidió cancelarla" if name == "platesolving" else "")
                 )
             time.sleep(0.05)
+
+    def _report_operation(self, name: str, elapsed_s: float) -> None:
+        """Como acabo una operacion, con los numeros que importan de cada una.
+
+        Antes devolvia `"ok": true, "status": "FAIL"`: ok significaba que la
+        espera habia funcionado, no la operacion. Ahora el resultado es el de la
+        operacion, y un fallo detiene un script igual que cualquier otro error.
+        """
+        state = self.runner.get_state()
+        section = {
+            "mount_move": state.mount,
+            "camera_record": state.camera,
+            "focuser": state.focuser,
+        }.get(name, getattr(state, name, None))
+        status = getattr(section, "status", None)
+        reason = getattr(section, "reason", None) or getattr(section, "last_error", None)
+        failed = code(status) in {"fail", "error", "cancelled"}
+        label = {"platesolving": "solve", "mount_move": "movimiento", "camera_record": "grabación",
+                 "focuser": "foco"}.get(name, name)
+
+        detail: dict[str, Any] = {}
+        if name == "platesolving":
+            ps = state.platesolving
+            if not failed:
+                detail = {
+                    "ra_deg": round(float(ps.center_ra_deg), 5),
+                    "dec_deg": round(float(ps.center_dec_deg), 5),
+                    "inliers": int(ps.n_inliers),
+                    "rms_px": round(float(ps.rms_px), 3),
+                    "rotation_deg": round(float(ps.theta_deg), 2),
+                }
+        elif name == "goto":
+            goto = state.goto
+            detail = {"synced": bool(goto.synced), "samples": int(goto.manual_samples)}
+            if goto.pointing_valid:
+                detail["az_deg"] = round(float(goto.pointing_az_deg), 4)
+                detail["alt_deg"] = round(float(goto.pointing_alt_deg), 4)
+        elif name == "focuser":
+            detail = {"position": state.focuser.position, "best_position": state.focuser.best_position}
+        if reason:
+            detail["reason"] = reason_text(reason)
+        if failed and explain(reason):
+            detail["explanation"] = explain(reason)
+
+        took = f"{elapsed_s:.1f} s"
+        if failed:
+            why = reason_text(reason) if reason else code(status)
+            self._error(f"{label} falló: {why.removeprefix('err_')}  ({took})", detail or None)
+            return
+        self._ok(f"{label} terminó  ({took})", detail or None)
 
     def _emergency_stop(self) -> None:
         # MOUNT_STOP is the runner's atomic emergency action: it stops the
@@ -643,21 +842,21 @@ class TerminalApp:
             return state.stacking.preview_jpeg
         if source in {"platesolve", "plate", "solve"}:
             return state.platesolving.debug_jpeg
-        raise CommandError("fuente inválida; use live, stack o platesolve")
+        raise CommandError(f"fuente desconocida {source!r}; usa live, stack o platesolve")
 
     def _save_image(self, args: list[str]) -> None:
         if not args:
             raise CommandError("uso: image live|stack|platesolve [NOMBRE] [ESPERA_SEG]")
         source = args[0].lower()
         filename = args[1] if len(args) >= 2 else ""
-        timeout_s = float(args[2]) if len(args) >= 3 else 5.0
+        timeout_s = _float_arg(args[2], "la espera") if len(args) >= 3 else 5.0
         deadline = time.monotonic() + max(0.0, timeout_s)
         data = self._image_bytes(source)
         while not data and time.monotonic() < deadline:
             time.sleep(0.05)
             data = self._image_bytes(source)
         if not data:
-            raise CommandError(f"no hay imagen {source!r} disponible después de {timeout_s:g} s")
+            raise CommandError(f"no hay imagen {source} disponible tras esperar {timeout_s:g} s")
 
         self.images_dir.mkdir(parents=True, exist_ok=True)
         if filename:
@@ -681,13 +880,13 @@ class TerminalApp:
             json.dumps(metadata, ensure_ascii=False, indent=2, sort_keys=True) + "\n",
             encoding="utf-8",
         )
-        self._print(str(image_path))
+        self._ok(str(image_path), {"image": str(image_path), "metadata": str(metadata_path), "bytes": len(data)})
 
     def _view(self, args: list[str]) -> None:
         operation = args[0].lower() if args else "status"
         if operation == "start":
-            port = int(args[1]) if len(args) >= 2 else DEFAULT_LIVE_VIEW_PORT
-            fps = float(args[2]) if len(args) >= 3 else DEFAULT_LIVE_VIEW_FPS
+            port = _int_arg(args[1], "el puerto") if len(args) >= 2 else DEFAULT_LIVE_VIEW_PORT
+            fps = _float_arg(args[2], "los fps") if len(args) >= 3 else DEFAULT_LIVE_VIEW_FPS
             no_open = len(args) >= 4 and args[3].lower() in {"no-open", "noopen"}
             if len(args) > 4 or (len(args) >= 4 and not no_open):
                 raise CommandError("uso: view start [PUERTO] [FPS] [no-open]")
@@ -698,49 +897,39 @@ class TerminalApp:
                     opened = bool(self._browser_open(self._live_view.url))
                 except Exception:
                     opened = False
-            self._print(
-                json.dumps(
-                    {
-                        "ok": True,
-                        "url": self._live_view.url,
-                        "latest_image": str(self._live_view.latest_path),
-                        "fps": float(self._live_view.fps),
-                        "browser_opened": bool(opened),
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
+            self._ok(
+                f"visor en {self._live_view.url}",
+                {
+                    "url": self._live_view.url,
+                    "latest_image": str(self._live_view.latest_path),
+                    "fps": float(self._live_view.fps),
+                    "browser_opened": bool(opened),
+                },
             )
             return
         if operation == "stop":
             self._live_view.stop()
-            self._print("OK")
+            self._ok("visor detenido")
             return
         if operation == "open":
             if not self._live_view.running:
-                raise CommandError("el visor no esta activo; use view start")
+                raise CommandError("el visor no está activo; arráncalo con view start")
             opened = bool(self._browser_open(self._live_view.url))
-            self._print(
-                json.dumps(
-                    {"ok": opened, "url": self._live_view.url},
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
-            )
+            if not opened:
+                raise CommandError(f"no se pudo abrir el navegador; la dirección es {self._live_view.url}")
+            self._ok(f"abierto {self._live_view.url}")
             return
         if operation == "status" and len(args) <= 1:
-            self._print(
-                json.dumps(
-                    {
-                        "running": bool(self._live_view.running),
-                        "url": self._live_view.url if self._live_view.running else None,
-                        "latest_image": str(self._live_view.latest_path),
-                        "latest_available": bool(self._live_view.latest_path.exists()),
-                        "fps": float(self._live_view.fps),
-                    },
-                    ensure_ascii=False,
-                    sort_keys=True,
-                )
+            running = bool(self._live_view.running)
+            self._ok(
+                f"visor en {self._live_view.url}" if running else "visor detenido",
+                {
+                    "running": running,
+                    "url": self._live_view.url if running else None,
+                    "latest_image": str(self._live_view.latest_path),
+                    "latest_available": bool(self._live_view.latest_path.exists()),
+                    "fps": float(self._live_view.fps),
+                },
             )
             return
         raise CommandError("uso: view start [PUERTO] [FPS] [no-open] | status | open | stop")
@@ -755,7 +944,7 @@ class TerminalApp:
         if args[0].lower() == "altaz":
             if len(args) != 3:
                 raise CommandError("uso: ... altaz AZ_DEG ALT_DEG")
-            return {"az_deg": float(args[1]), "alt_deg": float(args[2])}
+            return {"az_deg": _float_arg(args[1], "el azimut"), "alt_deg": _float_arg(args[2], "la altura")}
         return " ".join(args)
 
     def _camera(self, args: list[str]) -> None:
@@ -763,14 +952,18 @@ class TerminalApp:
             raise CommandError("uso: camera connect|disconnect|set|record ...")
         operation = args[0].lower()
         if operation == "connect":
-            index = int(args[1]) if len(args) >= 2 else int(self.runner.cfg.camera.camera_index)
+            index = _int_arg(args[1], "el índice") if len(args) >= 2 else int(self.runner.cfg.camera.camera_index)
             self.runner.request_camera_connect(index)
+            self._queued(f"conectar cámara {index}")
         elif operation == "disconnect":
             self.runner.request_camera_disconnect()
+            self._queued("desconectar cámara")
         elif operation == "set" and len(args) == 3:
-            self.runner.request_camera_param(args[1], _parse_value(args[2]))
+            value = _parse_value(args[2])
+            self.runner.request_camera_param(args[1], value)
+            self._queued(f"cámara {args[1]} = {render_value(value)}")
         elif operation == "record":
-            duration_s = float(args[1]) if len(args) >= 2 else 20.0
+            duration_s = _float_arg(args[1], "la duración") if len(args) >= 2 else 20.0
             out_dir = args[2] if len(args) >= 3 else "raw_output"
             basename = args[3] if len(args) >= 4 else None
             self._mark_operation_pending("camera_record")
@@ -779,11 +972,12 @@ class TerminalApp:
                 out_dir=out_dir,
                 basename=basename,
             )
+            self._queued(f"grabar RAW {duration_s:g} s en {out_dir}  (await record)")
         elif operation == "stop":
             self.runner.request_camera_stop_record_raw()
+            self._queued("parar la grabación")
         else:
             raise CommandError("uso: camera connect [ÍNDICE] | disconnect | set NOMBRE VALOR | record [SEG] [DIR] [NOMBRE] | stop")
-        self._print("OK")
 
     def _mount(self, args: list[str]) -> None:
         if not args:
@@ -791,14 +985,20 @@ class TerminalApp:
         operation = args[0].lower()
         if operation == "connect":
             port = args[1] if len(args) >= 2 else str(self.runner.cfg.mount.port)
-            baud = int(args[2]) if len(args) >= 3 else int(self.runner.cfg.mount.baudrate)
+            baud = _int_arg(args[2], "los baudios") if len(args) >= 3 else int(self.runner.cfg.mount.baudrate)
             self.runner.request_mount_connect(port, baud)
+            self._queued(f"conectar montura en {port} a {baud} baudios")
+            return
         elif operation == "disconnect":
             self.runner.request_mount_disconnect()
+            self._queued("desconectar montura")
+            return
         elif operation == "move" and 4 <= len(args) <= 6:
-            axis = Axis(args[1].lower())
-            direction = int(args[2])
-            steps = int(args[3])
+            axis = _axis_arg(args[1])
+            direction = _direction_arg(args[2])
+            steps = _int_arg(args[3], "los pasos")
+            if steps <= 0:
+                raise CommandError(f"los pasos deben ser positivos; recibí {steps}. El sentido va en la dirección (1 o -1)")
             default_delay = (
                 self.runner.cfg.mount.slew_delay_us_az
                 if axis == Axis.AZ
@@ -810,11 +1010,11 @@ class TerminalApp:
                 if args[4].lower() in {"smooth", "direct"}:
                     profile = args[4].lower()
                 else:
-                    delay_us = int(args[4])
+                    delay_us = _int_arg(args[4], "el retardo en µs")
             if len(args) == 6:
                 profile = args[5].lower()
             if profile not in {"smooth", "direct"}:
-                raise CommandError("perfil debe ser smooth o direct")
+                raise CommandError(f"el perfil debe ser smooth o direct; recibí {profile!r}")
             self._mark_operation_pending("mount_move")
             self.runner.request_mount_move_steps(
                 axis,
@@ -823,30 +1023,264 @@ class TerminalApp:
                 delay_us,
                 profile,
             )
+            # Los grados ayudan a no confundir pasos con angulo: en altitud un
+            # ciclo de transmision (12800 pasos) son 4 grados, en azimut 8.
+            degrees = steps * abs(MountKinematics().deg_per_step(axis))
+            self._queued(
+                f"mover {axis.value} {'+' if direction > 0 else '-'}{steps} pasos "
+                f"({degrees:.3f}°), {profile}, {delay_us} µs  (await mount)"
+            )
         elif operation == "stop":
             self._emergency_stop()
+            self._ok("parada de emergencia: montura, goto y tracking detenidos")
         elif operation == "sync":
             self.runner.request_mount_sync()
+            self._queued("sincronizar la montura con el último solve")
         else:
             raise CommandError(
                 "uso: mount connect [PUERTO] [BAUD] | disconnect | "
-                "move az|alt +/-1 PASOS [DELAY_US] [smooth|direct] | stop | sync"
+                "move az|alt 1|-1 PASOS [DELAY_US] [smooth|direct] | stop | sync"
             )
-        self._print("OK")
+
+    def _focus(self, args: list[str]) -> None:
+        if not args:
+            raise CommandError(
+                "uso: focus in|out [PASOS] | auto [...] | cancel | home | "
+                "goto POS|PRESET | save NOMBRE [POS] | presets | forget NOMBRE | "
+                "zero | status | set nombre=valor ..."
+            )
+        operation = args[0].lower()
+        cfg = self.runner.cfg.focuser
+
+        if operation in {"in", "acercar", "near"}:
+            steps = _int_arg(args[1], "los pasos") if len(args) >= 2 else int(cfg.step_size)
+            self._mark_operation_pending("focuser")
+            self.runner.request_focuser_move(+1, steps)
+            self._queued(f"acercar el foco {steps} pasos  (await focus)")
+        elif operation in {"out", "alejar", "far"}:
+            steps = _int_arg(args[1], "los pasos") if len(args) >= 2 else int(cfg.step_size)
+            self._mark_operation_pending("focuser")
+            self.runner.request_focuser_move(-1, steps)
+            self._queued(f"alejar el foco {steps} pasos  (await focus)")
+        elif operation in {"auto", "autofocus", "buscar"}:
+            # "focus auto x2" fija el preset; sin nombre se deduce del preset
+            # mas cercano a la posicion actual.
+            rest = list(args[1:])
+            if rest and "=" not in rest[0]:
+                params = _parse_assignments(rest[1:])
+                params["preset"] = rest[0]
+            else:
+                params = _parse_assignments(rest)
+            self._mark_operation_pending("focuser")
+            self.runner.request_focuser_autofocus(params)
+            where = f" desde el preset {params['preset']}" if "preset" in params else ""
+            self._queued(f"buscar foco{where}  (await focus)")
+        elif operation in {"cancel", "cancelar"}:
+            self.runner.request_focuser_cancel()
+            self._queued("cancelar el enfoque")
+        elif operation == "goto":
+            if len(args) != 2:
+                raise CommandError("uso: focus goto POSICION|NOMBRE_DE_PRESET")
+            self._mark_operation_pending("focuser")
+            try:
+                position = int(args[1])
+            except ValueError:
+                # No es un numero: se interpreta como preset, que es como se
+                # escribe en la practica ("focus goto x2").
+                self.runner.request_focuser_preset(args[1])
+                self._queued(f"llevar el foco al preset {args[1]}  (await focus)")
+            else:
+                self.runner.request_focuser_goto(position)
+                self._queued(f"llevar el foco a {position:+d}  (await focus)")
+        elif operation in {"zero", "cero"}:
+            self.runner.request_focuser_zero()
+            self._queued("fijar el cero de sesión del foco aquí (no es homing)")
+        elif operation in {"home", "homing"}:
+            self._mark_operation_pending("focuser")
+            self.runner.request_focuser_home()
+            self._queued("homing del foco contra la zona de patinaje  (await focus)")
+        elif operation in {"save", "guardar"}:
+            if not (2 <= len(args) <= 3):
+                raise CommandError("uso: focus save NOMBRE [POSICION]")
+            position = _int_arg(args[2], "la posición") if len(args) == 3 else None
+            self.runner.request_focuser_save_preset(args[1], position)
+            where = f"{position:+d}" if position is not None else "la posición actual"
+            self._queued(f"guardar el preset {args[1]} en {where}")
+        elif operation in {"forget", "olvidar", "borrar"}:
+            if len(args) != 2:
+                raise CommandError("uso: focus forget NOMBRE")
+            self.runner.request_focuser_delete_preset(args[1])
+            self._queued(f"olvidar el preset {args[1]}")
+        elif operation in {"presets", "lista"}:
+            presets = self.runner.get_focus_presets()
+            if not presets:
+                self._ok("no hay presets de foco guardados")
+                return
+            homed = bool(self.runner.get_state().focuser.homed)
+            from focuser import FocusPresets
+
+            lines = [f"ok  {len(presets)} preset(s)"]
+            for name in sorted(presets):
+                entry = presets[name]
+                origin = "con homing" if entry["homed"] else "sin homing"
+                center, spread = FocusPresets.prior(entry)
+                n = len(entry.get("history", []))
+                if spread is None:
+                    learned = f"{n} medida(s)" if n else "sin historial"
+                else:
+                    learned = f"{n} noches, centro {center:+d}, dispersión ±{spread:.0f}"
+                mark = "" if bool(entry["homed"]) == homed else "  (origen distinto al actual)"
+                lines.append(f"  {name:<8} {int(entry['position']):+8d}  {origin}  {learned}{mark}")
+            self._write(lines)
+            return
+        elif operation in {"load", "usar", "aplicar"}:
+            if len(args) != 2:
+                raise CommandError("uso: focus load NOMBRE")
+            self._mark_operation_pending("focuser")
+            self.runner.request_focuser_preset(args[1])
+            self._queued(f"llevar el foco al preset {args[1]}  (await focus)")
+        elif operation in {"status", "estado"}:
+            focuser = self.runner.get_state().focuser
+            summary = (
+                f"posición {focuser.position:+d}" if focuser.position is not None else "posición desconocida"
+            ) + (", moviéndose" if focuser.moving else "") + (", con homing" if focuser.homed else ", sin homing")
+            self._ok(summary, focuser)
+            return
+        elif operation == "set":
+            params = _parse_assignments(args[1:])
+            if not params:
+                raise CommandError("uso: focus set nombre=valor ...")
+            self.runner.request_focuser_params(**params)
+            self._queued("parámetros del foco: " + ", ".join(f"{k}={render_value(v)}" for k, v in params.items()))
+        elif operation in {"reset", "defaults"}:
+            self.runner.request_focuser_reset_defaults()
+            self._queued("restaurar los parámetros del foco por defecto")
+        else:
+            raise CommandError(f"operación de foco desconocida: {operation!r}; usa focus sin argumentos para ver la sintaxis")
+
+    def _tracking_calib(self, args: list[str]) -> None:
+        if len(args) not in (4, 6):
+            raise CommandError(
+                "uso: tracking calib A00 A01 A10 A11 [b0 b1]   "
+                "(px/s por paso/s; columnas = ejes az, alt)"
+            )
+        names = ("A00", "A01", "A10", "A11", "b0", "b1")
+        values = [_float_arg(v, name) for v, name in zip(args, names)]
+        from actions import tracking_set_calib
+
+        self.runner.enqueue(tracking_set_calib(*values))
+
+    def _tracking_why(self) -> None:
+        """Por que el tracking no esta moviendo la montura.
+
+        El tracking puede estar encendido y comandando exactamente cero sin que
+        nada en la ventana lo delate: el chip queda verde y los motores quietos.
+        Esto recorre las compuertas en orden y dice cual es la que falta. El
+        veredicto va en la primera linea, que es lo primero que se lee.
+        """
+        state = self.runner.get_state()
+        tracking = state.tracking
+        rate_az = float(tracking.rate_az)
+        rate_alt = float(tracking.rate_alt)
+        moving = max(abs(rate_az), abs(rate_alt)) > 1e-6
+
+        def yes(flag: bool) -> str:
+            return "sí" if flag else "no"
+
+        if bool(getattr(tracking, "anchor_lost", False)):
+            anchor = "perdida, fuera de campo"
+        elif bool(getattr(tracking, "anchor_chained", False)):
+            anchor = f"encadenada, a {float(getattr(tracking, 'anchor_px', 0.0)):.1f} px"
+        else:
+            anchor = "en uso"
+        rows = [
+            ("montura conectada", yes(state.mount.connected)),
+            ("cámara conectada", yes(state.camera.connected)),
+            ("tracking activado", f"sí ({state_word('tracking', tracking.status)})" if tracking.enabled else "no"),
+            ("medida válida", "sí" if tracking.measurement_valid else f"no  ({reason_text(tracking.measurement_reason)})"),
+            ("fuentes detectadas", str(int(tracking.n_det))),
+            ("calibración", code(tracking.calib_src)),
+            ("referencia original", anchor),
+            ("montura sincronizada", "sí" if state.goto.synced else "no  (sin feed-forward)"),
+            ("feed-forward listo", yes(tracking.ff_ready)),
+            ("velocidad comandada", f"{rate_az:+.4f} / {rate_alt:+.4f} pasos/s"),
+        ]
+
+        if not state.mount.connected:
+            verdict = "falta conectar la montura"
+            advice = ""
+        elif not state.camera.connected:
+            verdict = "falta conectar la cámara"
+            advice = (
+                "El tracking es en lazo cerrado: mide la deriva de las estrellas en la "
+                "imagen, y sin imagen no tiene de dónde sacar la corrección."
+            )
+        elif tracking.status == TrackingStatus.ERROR:
+            verdict = f"el tracking se detuvo por errores: {tracking.last_error}"
+            advice = (
+                "Vuelve a activarlo; si se corta de nuevo enseguida, el fallo es "
+                "permanente y hay que mirar el log de la sesión."
+            )
+        elif not tracking.enabled:
+            verdict = "el tracking no está activado: usa tracking start"
+            advice = ""
+        elif moving:
+            period = 1.0 / max(abs(rate_az), abs(rate_alt))
+            verdict = "está comandando"
+            advice = (
+                f"A esta velocidad es un microstep cada {period:.1f} s: no se ve ni se oye "
+                "moverse. Para comprobarlo mira get tracking.rate_az, no los motores."
+            )
+        elif not tracking.measurement_valid and not tracking.ff_ready:
+            verdict = f"sin medida válida ({reason_text(tracking.measurement_reason)}) y sin feed-forward"
+            advice = (
+                "Sin ninguna de las dos el tracking comanda cero y no manda ni un MOVE. "
+                "Hacen falta estrellas que pueda seguir, o un plate solve que sincronice "
+                "la montura."
+            )
+        elif bool(getattr(tracking, "anchor_lost", False)):
+            verdict = "siguiendo, pero la referencia original quedó fuera de campo"
+            advice = (
+                "Ya no se puede volver a ella: lo que hace ahora es estabilizar el campo "
+                "actual, no el objetivo inicial."
+            )
+        elif not tracking.measurement_valid:
+            verdict = f"sin medida ({reason_text(tracking.measurement_reason)}); solo feed-forward sideral"
+            advice = ""
+        else:
+            verdict = "medida válida y velocidad cero: no hay deriva que corregir ahora"
+            advice = ""
+
+        width = max(len(label) for label, _ in rows)
+        lines = [f"ok  {verdict}"]
+        lines += [f"  {label:<{width}}  {value}" for label, value in rows]
+        if advice:
+            lines += [""] + _wrap(advice, indent=2)
+        self._write(lines)
 
     def _tracking(self, args: list[str]) -> None:
+        if args and args[0].lower() in {"why", "porque", "diagnose", "diag"}:
+            self._tracking_why()
+            return
+        if args and args[0].lower() in {"calib", "calibracion"}:
+            self._tracking_calib(args[1:])
+            self._queued("instalar la calibración de tracking indicada")
+            return
         if not args:
-            raise CommandError("uso: tracking start|stop|set ...")
+            raise CommandError("uso: tracking start|stop|why|set ...")
         operation = args[0].lower()
         if operation == "start":
             self.runner.request_tracking_start()
+            self._queued("arrancar el tracking  (tracking why si no se mueve)")
         elif operation == "stop":
             self.runner.request_tracking_stop()
+            self._queued("detener el tracking")
         elif operation == "set" and len(args) >= 2:
-            self.runner.request_tracking_params(**_parse_assignments(args[1:]))
+            params = _parse_assignments(args[1:])
+            self.runner.request_tracking_params(**params)
+            self._queued("parámetros de tracking: " + ", ".join(f"{k}={render_value(v)}" for k, v in params.items()))
         else:
-            raise CommandError("uso: tracking start | stop | set nombre=valor ...")
-        self._print("OK")
+            raise CommandError("uso: tracking start | stop | why | set nombre=valor ...")
 
     def _stacking(self, args: list[str]) -> None:
         if not args:
@@ -854,20 +1288,25 @@ class TerminalApp:
         operation = args[0].lower()
         if operation == "start":
             self.runner.request_stacking_start()
+            self._queued("arrancar el apilado")
         elif operation == "stop":
             self.runner.request_stacking_stop()
+            self._queued("detener el apilado")
         elif operation == "reset":
             self.runner.request_stacking_reset()
+            self._queued("vaciar el apilado")
         elif operation == "set" and len(args) >= 2:
-            self.runner.request_stacking_params(**_parse_assignments(args[1:]))
+            params = _parse_assignments(args[1:])
+            self.runner.request_stacking_params(**params)
+            self._queued("parámetros de apilado: " + ", ".join(f"{k}={render_value(v)}" for k, v in params.items()))
         elif operation == "save":
             out_dir = args[1] if len(args) >= 2 else "stack_output"
             basename = args[2] if len(args) >= 3 else "stack"
             fmt = args[3] if len(args) >= 4 else "png"
             self.runner.request_stacking_save(out_dir=out_dir, basename=basename, fmt=fmt)
+            self._queued(f"guardar el apilado en {out_dir}/ (raw, pesos y metadatos)")
         else:
             raise CommandError("uso: stacking start|stop|reset | set nombre=valor ... | save [DIR] [NOMBRE] [FMT]")
-        self._print("OK")
 
     def _platesolving(self, args: list[str]) -> None:
         if not args:
@@ -876,18 +1315,21 @@ class TerminalApp:
         if operation == "source" and len(args) == 2:
             source = str(args[1]).strip().lower()
             if source not in {"live", "stack"}:
-                raise CommandError("uso: platesolving source live|stack")
+                raise CommandError(f"la fuente debe ser live o stack; recibí {source!r}")
             self.runner.request_platesolving_params(source=source)
+            self._queued(f"resolver sobre {'el mosaico apilado' if source == 'stack' else 'el cuadro en vivo'}")
         elif operation == "set" and len(args) >= 2:
-            self.runner.request_platesolving_params(**_parse_assignments(args[1:]))
+            params = _parse_assignments(args[1:])
+            self.runner.request_platesolving_params(**params)
+            self._queued("parámetros del solve: " + ", ".join(f"{k}={render_value(v)}" for k, v in params.items()))
         elif operation == "download":
-            radius = float(args[1]) if len(args) >= 2 else None
+            radius = _float_arg(args[1], "el radio") if len(args) >= 2 else None
             self.runner.request_platesolving_download_current_field(radius)
+            self._queued("descargar el catálogo del campo actual" + (f" en {radius:g}°" if radius else ""))
         else:
             raise CommandError(
                 "uso: platesolving set nombre=valor ... | source live|stack | download [RADIO_DEG]"
             )
-        self._print("OK")
 
     def _goto(self, args: list[str]) -> None:
         if not args:
@@ -895,31 +1337,34 @@ class TerminalApp:
         operation = args[0].lower()
         if operation == "cancel":
             self._emergency_stop()
-        elif operation == "autocalibrate":
-            self._mark_operation_pending("goto")
-            self.runner.request_goto_autocalibrate(_parse_assignments(args[1:]))
-        elif operation == "roll":
-            self._mark_operation_pending("goto")
-            self.runner.request_goto_estimate_roll(_parse_assignments(args[1:]))
-        elif operation == "fit":
-            self._mark_operation_pending("goto")
-            self.runner.request_goto_fit_model(_parse_assignments(args[1:]))
-        elif operation == "samples":
-            self._mark_operation_pending("goto")
-            self.runner.request_goto_list_samples(_parse_assignments(args[1:]))
-        elif operation == "prune":
-            self._mark_operation_pending("goto")
-            self.runner.request_goto_prune_outliers(_parse_assignments(args[1:]))
-        elif operation == "restore":
-            self._mark_operation_pending("goto")
-            self.runner.request_goto_restore_last_log()
-        elif operation == "reset":
-            self._mark_operation_pending("goto")
-            self.runner.request_goto_reset()
+            self._ok("goto cancelado; la montura queda sin sincronizar si se movió a medias")
+            return
+        simple = {
+            "autocalibrate": (self.runner.request_goto_autocalibrate, True,
+                              "situar la montura por deriva y resolver (luego mount sync)"),
+            "roll": (self.runner.request_goto_estimate_roll, True, "estimar el giro de la cámara"),
+            "fit": (self.runner.request_goto_fit_model, True, "ajustar el modelo de apuntado"),
+            "samples": (self.runner.request_goto_list_samples, True, "listar las muestras del modelo"),
+            "prune": (self.runner.request_goto_prune_outliers, True, "descartar muestras atípicas"),
+            "restore": (self.runner.request_goto_restore_last_log, False, "restaurar el último modelo guardado"),
+            "reset": (self.runner.request_goto_reset, False, "borrar el modelo y la sincronización"),
+        }
+        self._mark_operation_pending("goto")
+        if operation in simple:
+            request, takes_params, what = simple[operation]
+            if takes_params:
+                request(_parse_assignments(args[1:]))
+            else:
+                request()
+            self._queued(f"{what}  (await goto)")
+            return
+        target = self._target(args)
+        self.runner.request_mount_goto(target)
+        if isinstance(target, dict):
+            where = f"az {target['az_deg']:g}°, alt {target['alt_deg']:g}°"
         else:
-            self._mark_operation_pending("goto")
-            self.runner.request_mount_goto(self._target(args))
-        self._print("OK")
+            where = str(target)
+        self._queued(f"goto a {where}  (await goto)")
 
     def _transmission(self, args: list[str]) -> None:
         operation = args[0].lower() if args else "status"
@@ -927,15 +1372,25 @@ class TerminalApp:
             getter = getattr(self.runner, "get_transmission_error_report", None)
             if not callable(getter):
                 raise CommandError("el runner no expone el aprendizaje de transmisión")
-            self._print(json.dumps(_jsonable(getter()), ensure_ascii=False, indent=2, sort_keys=True))
+            report = _jsonable(getter())
+            coverage = (report or {}).get("coverage", {}) if isinstance(report, dict) else {}
+            fitted = bool((report or {}).get("fitted")) if isinstance(report, dict) else False
+            summary = (
+                "rizado aprendido" if fitted
+                else f"aprendiendo: cobertura de fase {render_value(coverage.get('min', 0.0))} (hace falta 0.6)"
+            )
+            self._ok(summary, report)
             return
         if operation == "apply":
             apply = getattr(self.runner, "apply_learned_transmission_error", None)
             if not callable(apply):
                 raise CommandError("el runner no expone el aprendizaje de transmisión")
             if not apply():
-                raise CommandError("cobertura de fase insuficiente")
-            self._print("OK")
+                raise CommandError(
+                    "cobertura de fase insuficiente: sigue con el tracking activo, "
+                    "barre la fase solo; mira transmission status"
+                )
+            self._ok("rizado de transmisión instalado en el modelo")
             return
         raise CommandError("uso: transmission status | apply")
 
@@ -945,7 +1400,7 @@ class TerminalApp:
         kind = args[0].lower()
         enabled = _parse_value(args[1])
         if not isinstance(enabled, bool):
-            raise CommandError("el overlay debe indicarse como on u off")
+            raise CommandError(f"el overlay se activa con on u off; recibí {args[1]!r}")
         params = _parse_assignments(args[2:])
         params["enabled"] = enabled
         if kind == "sep":
@@ -953,8 +1408,8 @@ class TerminalApp:
         elif kind == "expected":
             self.runner.request_expected_stars_params(**params)
         else:
-            raise CommandError("overlay inválido; use sep o expected")
-        self._print("OK")
+            raise CommandError(f"overlay desconocido {kind!r}; usa sep o expected")
+        self._queued(f"overlay {kind} {'activado' if enabled else 'desactivado'}")
 
     def _advanced_action(self, args: list[str]) -> None:
         if not args:
@@ -962,130 +1417,186 @@ class TerminalApp:
         try:
             action_type = ActionType(args[0].upper())
         except ValueError as exc:
-            raise CommandError(f"ActionType desconocido: {args[0]!r}") from exc
+            raise CommandError(f"tipo de acción desconocido: {args[0]!r}") from exc
         payload: Any = {}
         if len(args) >= 2:
             try:
                 payload = json.loads(" ".join(args[1:]))
             except json.JSONDecodeError as exc:
-                raise CommandError(f"payload JSON inválido: {exc}") from exc
+                raise CommandError(f"el payload no es JSON válido: {exc}") from exc
         if not isinstance(payload, dict):
             raise CommandError("el payload debe ser un objeto JSON")
         self.runner.enqueue(Action(action_type, payload, time.perf_counter()))
-        self._print("OK")
+        self._queued(f"acción {code(action_type)}")
 
     def execute_line(self, line: str) -> bool:
-        """Ejecuta una línea. Retorna False solamente para salir de la consola."""
+        """Ejecuta una linea. Devuelve False solo para salir de la consola."""
         clean_line = line.strip()
-        if clean_line:
-            self._live_view.append_console_entry("command", clean_line)
+        if not clean_line or clean_line.startswith("#"):
+            return True
+        self._live_view.append_console_entry("command", clean_line)
+        self._json = False
         try:
-            # Preserve JSON quotes for the advanced action command. shlex is
-            # ideal for ordinary commands, but intentionally removes those
-            # quotes and would turn {"name":"gain"} into {name:gain}.
-            raw_parts = line.strip().split(None, 2)
+            # Las comillas del JSON de `action` se conservan: shlex las quitaria
+            # y convertiria {"name":"gain"} en {name:gain}.
+            raw_parts = clean_line.split(None, 2)
             if raw_parts and raw_parts[0].lower() == "action":
-                action_args = raw_parts[1:]
-                self._advanced_action(action_args)
+                self._echo(clean_line)
+                self._advanced_action(raw_parts[1:])
                 return True
-            tokens = shlex.split(line, comments=True)
+            try:
+                tokens = shlex.split(clean_line, comments=True)
+            except ValueError as exc:
+                self._echo(clean_line)
+                raise CommandError(f"no se pudo leer la línea: {exc}") from None
             if not tokens:
                 return True
+            # `--json` vale para cualquier comando: la respuesta pasa a ser solo
+            # el documento JSON, para quien prefiera parsear a leer.
+            if "--json" in tokens:
+                self._json = True
+                tokens = [t for t in tokens if t != "--json"]
+            if not self._json:
+                self._echo(clean_line)
             command, args = tokens[0].lower(), tokens[1:]
-            if command in {"quit", "exit", "salir"}:
-                return False
-            if command in {"help", "ayuda", "?"}:
-                self._print(HELP_TEXT.rstrip())
-            elif command in {"status", "state", "estado"}:
-                self._status(as_json="--json" in args or "json" in args)
-            elif command == "get":
-                if len(args) != 1:
-                    raise CommandError("uso: get RUTA_DE_ESTADO")
-                value = _nested_value(self.runner.get_state(), args[0])
-                self._print(json.dumps(_jsonable(value), ensure_ascii=False, sort_keys=True))
-            elif command == "config":
-                config_value: Any = self.runner.cfg
-                if args:
-                    section = args[0]
-                    if not hasattr(config_value, section):
-                        raise CommandError(f"sección de configuración desconocida: {section!r}")
-                    config_value = getattr(config_value, section)
-                self._print(json.dumps(_jsonable(config_value), ensure_ascii=False, indent=2, sort_keys=True))
-            elif command == "health":
-                self._health()
-            elif command == "wait":
-                self._wait(args)
-            elif command == "await":
-                self._await_operation(args)
-            elif command == "sleep":
-                if len(args) != 1:
-                    raise CommandError("uso: sleep SEGUNDOS")
-                time.sleep(max(0.0, float(args[0])))
-                self._print("OK")
-            elif command == "demo":
-                if len(args) != 1 or not isinstance(_parse_value(args[0]), bool):
-                    raise CommandError("uso: demo on|off")
-                self.runner.set_simulation_enabled(bool(_parse_value(args[0])))
-                self._print("OK")
-            elif command == "camera":
-                self._camera(args)
-            elif command == "mount":
-                self._mount(args)
-            elif command in {"stop", "emergency-stop", "estop"}:
-                self._emergency_stop()
-                self._print("OK")
-            elif command == "tracking":
-                self._tracking(args)
-            elif command == "stacking":
-                self._stacking(args)
-            elif command == "solve":
-                self._mark_operation_pending("platesolving")
-                self.runner.request_platesolving_run(self._target(args))
-                self._print("OK")
-            elif command in {"platesolving", "platesolve"}:
-                self._platesolving(args)
-            elif command == "goto":
-                self._goto(args)
-            elif command == "overlay":
-                self._overlay(args)
-            elif command in {"transmission", "transmision"}:
-                self._transmission(args)
-            elif command in {"image", "imagen", "snapshot"}:
-                self._save_image(args)
-            elif command in {"view", "live-view", "visor"}:
-                self._view(args)
-            elif command == "action":
-                self._advanced_action(args)
-            else:
-                raise CommandError(f"comando desconocido: {command!r}; use 'help'")
-            return True
-        except (CommandError, ValueError, TypeError, OSError) as exc:
+            return self._dispatch(command, args)
+        except CommandError as exc:
             self._error(str(exc))
-            return True
+        except (ValueError, TypeError) as exc:
+            self._error(f"valor inválido: {exc}")
+        except OSError as exc:
+            self._error(f"error del sistema: {exc}")
+        finally:
+            self._json = False
+        return True
+
+    def _echo(self, line: str) -> None:
+        if self.echo_commands:
+            self._write([f"› {line}"], kind="command")
+
+    def _dispatch(self, command: str, args: list[str]) -> bool:
+        if command in {"quit", "exit", "salir"}:
+            return False
+        if command in {"help", "ayuda", "?"}:
+            self._write(["ok  ayuda"] + ["  " + l if l else "" for l in HELP_TEXT.rstrip().splitlines()])
+        elif command in {"status", "state", "estado"}:
+            self._status(as_json=self._json or "json" in args)
+        elif command == "get":
+            if len(args) != 1:
+                raise CommandError("uso: get RUTA  (por ejemplo get tracking.rate_az)")
+            value = _jsonable(_nested_value(self.runner.get_state(), args[0]))
+            if isinstance(value, (dict, list)) and value and not self._json:
+                self._ok(args[0], value)
+            elif self._json:
+                self._ok(detail={"path": args[0], "value": value})
+            else:
+                self._ok(render_value(value))
+        elif command == "config":
+            config_value: Any = self.runner.cfg
+            if args:
+                section = args[0]
+                if not hasattr(config_value, section):
+                    options = ", ".join(_children(config_value))
+                    raise CommandError(f"no existe la sección {section!r}; hay: {options}")
+                config_value = getattr(config_value, section)
+            self._ok(f"configuración{' de ' + args[0] if args else ''}", config_value)
+        elif command == "health":
+            self._health()
+        elif command == "wait":
+            self._wait(args)
+        elif command == "await":
+            self._await_operation(args)
+        elif command == "sleep":
+            if len(args) != 1:
+                raise CommandError("uso: sleep SEGUNDOS")
+            seconds = max(0.0, _float_arg(args[0], "los segundos"))
+            time.sleep(seconds)
+            self._ok(f"esperé {seconds:g} s")
+        elif command == "demo":
+            if len(args) != 1 or not isinstance(_parse_value(args[0]), bool):
+                raise CommandError("uso: demo on|off")
+            enabled = bool(_parse_value(args[0]))
+            self.runner.set_simulation_enabled(enabled)
+            self._queued(f"modo demo {'activado' if enabled else 'desactivado'}")
+        elif command == "camera":
+            self._camera(args)
+        elif command == "mount":
+            self._mount(args)
+        elif command in {"focus", "focuser", "foco"}:
+            self._focus(args)
+        elif command in {"stop", "emergency-stop", "estop"}:
+            self._emergency_stop()
+            self._ok("parada de emergencia: montura, goto y tracking detenidos")
+        elif command == "tracking":
+            self._tracking(args)
+        elif command == "stacking":
+            self._stacking(args)
+        elif command == "solve":
+            self._mark_operation_pending("platesolving")
+            target = self._target(args)
+            self.runner.request_platesolving_run(target)
+            where = (f"cerca de az {target['az_deg']:g}°, alt {target['alt_deg']:g}°"
+                     if isinstance(target, dict) else f"cerca de {target}")
+            self._queued(f"resolver {where}  (await solve)")
+        elif command in {"platesolving", "platesolve"}:
+            self._platesolving(args)
+        elif command == "goto":
+            self._goto(args)
+        elif command == "overlay":
+            self._overlay(args)
+        elif command in {"transmission", "transmision"}:
+            self._transmission(args)
+        elif command in {"image", "imagen", "snapshot"}:
+            self._save_image(args)
+        elif command in {"view", "live-view", "visor"}:
+            self._view(args)
+        else:
+            raise CommandError(f"comando desconocido: {command!r}; usa help para ver la lista")
+        return True
 
     def run_interactive(self) -> None:
-        self._print("Astropanoptes terminal. Escriba 'help' para ver comandos.")
-        self._print(f"Imágenes: {self.images_dir}")
+        self._write([
+            "ok  consola de astropanoptes; escribe help para ver los comandos",
+            f"  imágenes  {self.images_dir}",
+        ])
         while True:
             try:
                 line = input("astropanoptes> ")
             except EOFError:
-                self._print()
+                self._write([""])
                 break
             except KeyboardInterrupt:
-                self._print("\nParada de emergencia solicitada. Use 'quit' para salir.")
                 self._emergency_stop()
+                self._write(["", "ok  parada de emergencia por Ctrl-C; escribe quit para salir"])
                 continue
             if not self.execute_line(line):
                 break
 
     def run_script(self, lines: Iterable[str]) -> bool:
-        for line in lines:
-            if not self.execute_line(line):
-                break
+        """Ejecuta comandos en orden y se detiene en el primer error.
+
+        Si se detiene, la ultima linea dice en que comando y cuantos quedaron sin
+        ejecutar: sin eso, quien lee la salida no sabe si el script acabo o se
+        corto.
+        """
+        commands = [line.rstrip("\n") for line in lines]
+        runnable = [c for c in commands if c.strip() and not c.strip().startswith("#")]
+        done = 0
+        for line in commands:
+            if not line.strip() or line.strip().startswith("#"):
+                continue
+            keep_going = self.execute_line(line)
+            done += 1
             if self.had_error:
+                left = len(runnable) - done
+                self._write([
+                    f"error  script detenido en el comando {done} de {len(runnable)}: {line.strip()}"
+                    + (f"; quedaron {left} sin ejecutar" if left else "")
+                ], stream=self.error_output, kind="error")
                 return False
-        return not self.had_error
+            if not keep_going:
+                break
+        return True
 
 
 def build_parser() -> argparse.ArgumentParser:
@@ -1109,8 +1620,12 @@ def main(argv: Optional[list[str]] = None) -> int:
     cfg.simulation.enabled = bool(args.demo)
     if args.seed is not None:
         cfg.simulation.seed = int(args.seed)
+    stamp = dt.datetime.now().strftime("%Y%m%d-%H%M%S")
+    log_path = set_log_file(Path("terminal_output") / "logs" / f"sesion-{stamp}.log")
     runner = AppRunner(cfg, out_log=sys.stderr)
-    terminal = TerminalApp(runner, images_dir=args.images_dir)
+    scripted = bool(args.command) or args.script is not None
+    terminal = TerminalApp(runner, images_dir=args.images_dir, echo_commands=scripted)
+    log_info(None, f"Runner: sesión iniciada{' en modo demo' if args.demo else ''}; log completo en {log_path}")
     runner.start()
     ok = True
     try:
@@ -1127,7 +1642,7 @@ def main(argv: Optional[list[str]] = None) -> int:
             terminal.run_interactive()
             ok = not terminal.had_error
     except KeyboardInterrupt:
-        terminal._error("interrumpido; cerrando de forma segura")
+        terminal._error("interrumpido con Ctrl-C; cerrando de forma segura")
         ok = False
     except OSError as exc:
         terminal._error(str(exc))

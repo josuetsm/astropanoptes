@@ -14,7 +14,8 @@ from config import AppConfig
 from imaging import ensure_raw16_bayer
 from logging_utils import log_error
 from preview import stretch_to_u8
-from raw_alignment import build_raw_alignment_signature, estimate_raw_translation
+from raw_alignment import RawAlignmentSignature, build_raw_alignment_signature, estimate_raw_translation
+from sep_utils import repair_bad_pixels, repair_isolated_pixels
 from workers import BaseWorker
 
 # ============================================================
@@ -45,6 +46,39 @@ def _odd_ksize(v: int, *, minimum: int = 1) -> int:
     if (k % 2) == 0:
         k += 1
     return k
+
+
+SOLID_COVERAGE_FRACTION = 0.85
+
+
+def flatten_mosaic_border(
+    mean_u16: np.ndarray, wgt: Optional[np.ndarray]
+) -> Tuple[np.ndarray, int]:
+    """Set the partly covered canvas edge to the sky level, for the detector.
+
+    As the field drifts, the canvas edge becomes a staircase between covered
+    and empty pixels. SEP reads those steps as sources, and because they are
+    bright relative to the sky they crowd out real stars from the brightest-N
+    list the solver actually uses. Measured on two real drifted stacks: 12 of
+    the 30 brightest "detections" were border artefacts on one (4 inliers ->
+    14), and 26 of 30 on another, where the solve only reached 16 inliers once
+    they were suppressed.
+
+    Returns the flattened image together with the sky level, which is also what
+    any padding around the result must use: a zero border reintroduces exactly
+    the hard edge removed here.
+    """
+    solid: Optional[np.ndarray] = None
+    if wgt is not None and wgt.size:
+        w_max = float(wgt.max())
+        if w_max > 0.0:
+            covered = wgt >= SOLID_COVERAGE_FRACTION * w_max
+            if covered.any():
+                solid = covered
+    sky_level = int(np.median(mean_u16[solid] if solid is not None else mean_u16))
+    if solid is not None and not solid.all():
+        mean_u16 = np.where(solid, mean_u16, sky_level).astype(np.uint16)
+    return mean_u16, sky_level
 
 
 def _bayer_to_gray_code(pattern: str) -> int:
@@ -83,6 +117,8 @@ class LiveMosaicStackerGray:
         drizzle_scale: float,
         bayer_to_gray_code: int,
         bayer_to_rgb_code: int,
+        motion_gate_px: float = 6.0,
+        lost_after_s: float = 3.0,
     ):
         self.color_mode: ColorMode = "rgb" if str(color_mode).lower() == "rgb" else "mono"
         self.resp_min = float(resp_min)
@@ -94,6 +130,13 @@ class LiveMosaicStackerGray:
         self.drizzle_scale = _normalize_drizzle_scale(drizzle_scale)
         self.bayer_to_gray_code = int(bayer_to_gray_code)
         self.bayer_to_rgb_code = int(bayer_to_rgb_code)
+        # Motion model. The sky moves smoothly under the sensor: at sidereal
+        # rate without tracking, near zero with it. A registration that jumps
+        # away from that is a false correlation peak, not motion. ``0``
+        # disables the gate (e.g. while dithering, whose steps are real jumps).
+        self.motion_gate_px = max(0.0, float(motion_gate_px))
+        self.lost_after_s = max(0.0, float(lost_after_s))
+        self.restarts = 0
         self.sum: Optional[np.ndarray] = None
         self.wgt: Optional[np.ndarray] = None
         self.canvas_h = 0
@@ -112,6 +155,40 @@ class LiveMosaicStackerGray:
         # "now", to convert the fitted center between AltAz and ICRS.
         self.ref_time_unix: Optional[float] = None
         self.last_time_unix: Optional[float] = None
+        # Top-left corner of the reference frame inside the canvas. Frames are
+        # aligned onto the first one, so this is the only anchor that ties the
+        # growing mosaic back to a real pointing.
+        self.ref_origin_x = 0
+        self.ref_origin_y = 0
+        self._reset_motion()
+
+    def _reset_motion(self) -> None:
+        # Velocity in alignment pixels per second (or per frame when frames
+        # carry no time), measured only from accepted frames.
+        self.vel_x: Optional[float] = None
+        self.vel_y: Optional[float] = None
+        self.last_accept_t: Optional[float] = None
+        self.rejected_since_t: Optional[float] = None
+        self._frame_clock = 0.0
+        self.last_reason = ""
+        self._restart_candidate: Optional[RawAlignmentSignature] = None
+
+    def _predicted_shift(self, now: float) -> tuple[float, float]:
+        """Displacement expected since the last placed frame."""
+        if self.vel_x is None or self.vel_y is None or self.last_accept_t is None:
+            return float(self.last_dx), float(self.last_dy)
+        dt = max(0.0, now - self.last_accept_t)
+        return float(self.vel_x) * dt, float(self.vel_y) * dt
+
+    def _note_rejection(self, now: float, reason: str) -> None:
+        self.last_reason = reason
+        if self.rejected_since_t is None:
+            self.rejected_since_t = now
+
+    def _lost_for(self, now: float) -> float:
+        if self.rejected_since_t is None or self.lost_after_s <= 0.0:
+            return 0.0
+        return max(0.0, now - self.rejected_since_t)
 
     def reset(self) -> None:
         self.sum = None
@@ -128,6 +205,9 @@ class LiveMosaicStackerGray:
         self.n = 0
         self.ref_time_unix = None
         self.last_time_unix = None
+        self.ref_origin_x = 0
+        self.ref_origin_y = 0
+        self._reset_motion()
 
     def has_data(self) -> bool:
         return self.sum is not None and self.wgt is not None and self.n > 0
@@ -195,6 +275,10 @@ class LiveMosaicStackerGray:
 
             self.pos_x += float(pad_l)
             self.pos_y += float(pad_t)
+            # Padding on the left/top shifts every existing pixel, including
+            # the reference frame's anchor.
+            self.ref_origin_x += int(pad_l)
+            self.ref_origin_y += int(pad_t)
 
             x0 += pad_l
             y0 += pad_t
@@ -238,9 +322,58 @@ class LiveMosaicStackerGray:
         ref_gray[~m] = 0.0
         return np.clip(ref_gray, 0.0, 65535.0).astype(np.uint16)
 
+    def _start_mosaic(self, stack_img: np.ndarray, now: float) -> bool:
+        """Begin a mosaic with this frame as the reference."""
+        keep_t = self.last_time_unix
+        restarts, clock = self.restarts, self._frame_clock
+        self.reset()
+        self.restarts, self._frame_clock = restarts, clock
+        h, w = stack_img.shape[:2]
+        self.sum = stack_img.astype(np.float32, copy=False)
+        self.wgt = np.ones((h, w), np.float32)
+        self.canvas_h = h
+        self.canvas_w = w
+        self.frame_h = h
+        self.frame_w = w
+        self.n = 1
+        self.last_resp = 1.0
+        self.last_time_unix = keep_t
+        self.ref_time_unix = keep_t
+        self.last_accept_t = now
+        return True
+
+    def _reject(self, now: float, reason: str, signature: RawAlignmentSignature, stack_img: np.ndarray) -> bool:
+        """Skip the frame; after a long loss, maybe restart the mosaic from it.
+
+        Nothing has matched for twice ``lost_after_s`` even with the widened
+        search: either the field changed (the mount was moved) or there is no
+        sky (cloud). Rejecting forever was the old behaviour. A new mosaic
+        starts instead -- but only once two consecutive frames agree with each
+        other, which sky does and cloud noise does not.
+        """
+        self._note_rejection(now, reason)
+        if self._lost_for(now) < 2.0 * self.lost_after_s or self.lost_after_s <= 0.0:
+            return False
+        candidate = self._restart_candidate
+        self._restart_candidate = signature
+        if candidate is None or not estimate_raw_translation(
+            candidate,
+            signature,
+            search_radius_px=float(self.max_shift_px),
+            min_response=float(self.resp_min),
+            use_subpixel=False,
+        ).ok:
+            return False
+        self.restarts += 1
+        return self._start_mosaic(stack_img, now)
+
     def add_frame(self, raw_u16: np.ndarray, t_unix: Optional[float] = None) -> bool:
         if t_unix is not None:
             self.last_time_unix = float(t_unix)
+        # Clock for the motion model: real time when the frame has it, the
+        # frame count otherwise (velocities are then per frame).
+        self._frame_clock += 1.0
+        now = float(t_unix) if t_unix is not None else self._frame_clock
         gray_align = self._raw_to_gray_align(raw_u16)
         current_signature = build_raw_alignment_signature(
             gray_align,
@@ -251,38 +384,17 @@ class LiveMosaicStackerGray:
         h, w = stack_img.shape[:2]
 
         if self.sum is None or self.wgt is None:
-            self.sum = stack_img.astype(np.float32, copy=False)
-            self.wgt = np.ones((h, w), np.float32)
-            self.canvas_h = h
-            self.canvas_w = w
-            self.frame_h = h
-            self.frame_w = w
-            self.n = 1
             self.last_dx = 0.0
             self.last_dy = 0.0
-            self.last_resp = 1.0
-            self.ref_time_unix = self.last_time_unix
-            return True
+            return self._start_mosaic(stack_img, now)
 
         if not current_signature.has_signal:
             self.last_resp = 0.0
-            return False
+            return self._reject(now, "no_signal", current_signature, stack_img)
 
         if (h != self.frame_h) or (w != self.frame_w):
             # ROI/binning changed while stacking: reinitialize to keep state consistent.
-            keep_t = self.last_time_unix
-            self.reset()
-            self.sum = stack_img.astype(np.float32, copy=False)
-            self.wgt = np.ones((h, w), np.float32)
-            self.canvas_h = h
-            self.canvas_w = w
-            self.frame_h = h
-            self.frame_w = w
-            self.n = 1
-            self.last_resp = 1.0
-            self.last_time_unix = keep_t
-            self.ref_time_unix = keep_t
-            return True
+            return self._start_mosaic(stack_img, now)
 
         x_ref = int(np.floor(self.pos_x))
         y_ref = int(np.floor(self.pos_y))
@@ -299,21 +411,49 @@ class LiveMosaicStackerGray:
             median_k=int(self.align_median_k),
             smooth_k=int(self.smooth_k),
         )
+        # Search where the motion model says the frame should be. Centering on
+        # the last per-frame shift instead ignored how long ago that frame
+        # was: after a run of rejections the sky had moved on, and one false
+        # jump (-43 px) became the center of every later search, so the stack
+        # rejected everything that followed.
+        pred_dx, pred_dy = self._predicted_shift(now)
+        # A run of misses (cloud, dropped frames) leaves the velocity valid but
+        # the extrapolation less certain: widen the window around it.
+        lost = self._lost_for(now) >= self.lost_after_s > 0.0
+        radius = float(self.max_shift_px) * (3.0 if lost else 1.0)
         alignment = estimate_raw_translation(
             reference_signature,
             current_signature,
-            center_dx=float(self.last_dx),
-            center_dy=float(self.last_dy),
-            search_radius_px=float(self.max_shift_px),
+            center_dx=pred_dx,
+            center_dy=pred_dy,
+            search_radius_px=radius,
             max_displacement_px=None,
             min_response=float(self.resp_min),
             use_subpixel=bool(self.use_subpixel),
         )
         self.last_resp = float(alignment.response)
         if not alignment.ok:
-            # Keep the last trusted motion estimate as the prediction center.
-            # A rejected/noisy frame must not steer the following search window.
-            return False
+            return self._reject(now, str(alignment.reason), current_signature, stack_img)
+
+        if self.motion_gate_px > 0.0 and self.vel_x is not None and not lost:
+            # The velocity is good to a few percent; the extrapolation error
+            # grows with it, but slowly.
+            gate = self.motion_gate_px + 0.1 * float(np.hypot(pred_dx, pred_dy))
+            if float(np.hypot(alignment.dx - pred_dx, alignment.dy - pred_dy)) > gate:
+                return self._reject(now, "motion_jump", current_signature, stack_img)
+
+        if self.last_accept_t is not None and now > self.last_accept_t:
+            dt = now - self.last_accept_t
+            vx, vy = float(alignment.dx) / dt, float(alignment.dy) / dt
+            if self.vel_x is None or self.vel_y is None:
+                self.vel_x, self.vel_y = vx, vy
+            else:
+                self.vel_x = 0.7 * self.vel_x + 0.3 * vx
+                self.vel_y = 0.7 * self.vel_y + 0.3 * vy
+        self.last_accept_t = now
+        self.rejected_since_t = None
+        self._restart_candidate = None
+        self.last_reason = "ok"
 
         self.last_dx = float(alignment.dx)
         self.last_dy = float(alignment.dy)
@@ -350,6 +490,12 @@ class LiveMosaicStackerGray:
         return True
 
     def get_mean_u16(self) -> Optional[np.ndarray]:
+        mean = self.get_mean_f32()
+        if mean is None:
+            return None
+        return np.clip(mean, 0.0, 65535.0).astype(np.uint16)
+
+    def get_mean_f32(self) -> Optional[np.ndarray]:
         if self.sum is None or self.wgt is None:
             return None
 
@@ -364,8 +510,7 @@ class LiveMosaicStackerGray:
             src_sum = self.sum[:h, :w, :]
             mean = np.zeros_like(src_sum, dtype=np.float32)
             np.divide(src_sum, src_wgt[..., None], out=mean, where=src_wgt[..., None] > 0)
-        mean = np.nan_to_num(mean, nan=0.0, posinf=65535.0, neginf=0.0)
-        return np.clip(mean, 0.0, 65535.0).astype(np.uint16)
+        return np.nan_to_num(mean, nan=0.0, posinf=65535.0, neginf=0.0)
 
     def get_weight_f32(self) -> Optional[np.ndarray]:
         if self.wgt is None:
@@ -394,27 +539,36 @@ class LiveMosaicStackerGray:
         space plus the absolute maximum. A fixed black point cannot work: under
         light pollution the sky background alone sits well above it, so the
         background rendered mid-grey. And a single hot pixel set the white
-        point. Percentiles adapt to the actual frame and ignore outliers;
-        ``preview_log_vmin`` is kept as a floor so existing configs still bite.
+        point. Percentiles adapt to the actual frame and ignore outliers.
+
+        ``preview_log_vmin`` is only a floor while it leaves real range above
+        it. With a low camera offset the whole sky sits below e^5 ~ 148 ADU,
+        and a floor above the 99.7th percentile collapsed the stretch to a
+        0/255 threshold: a two-colour image.
         """
         data = x[mask] if mask is not None else x.reshape(-1)
         if data.size == 0:
             return float(self.preview_log_vmin), float(self.preview_log_vmin) + 1.0
         lo = float(np.percentile(data, 30.0))
         hi = float(np.percentile(data, 99.7))
-        lo = max(lo, float(self.preview_log_vmin))
-        if not np.isfinite(lo):
-            lo = float(self.preview_log_vmin)
-        if (not np.isfinite(hi)) or hi <= lo:
+        if not (np.isfinite(lo) and np.isfinite(hi)):
+            return float(self.preview_log_vmin), float(self.preview_log_vmin) + 1.0
+        floor = float(self.preview_log_vmin)
+        if lo < floor < hi and (hi - floor) >= 0.5 * (hi - lo):
+            lo = floor
+        if hi <= lo:
             hi = lo + 1e-3
         return lo, hi
 
     def get_preview_u8(self) -> Optional[np.ndarray]:
-        mean = self.get_mean_u16()
+        # Float mean, not the uint16 one: averaging hundreds of frames gives
+        # sub-ADU precision, and rounding it back to integers leaves a faint
+        # sky with only a few dozen levels to stretch, which bands visibly.
+        mean = self.get_mean_f32()
         if mean is None:
             return None
 
-        x = np.log1p(mean.astype(np.float32, copy=False))
+        x = np.log1p(np.maximum(mean, 0.0).astype(np.float32, copy=False))
         mask = self._preview_valid_mask(x.shape[:2])
 
         if x.ndim == 3:
@@ -491,10 +645,12 @@ class StackEngine:
                 smooth_k=int(getattr(scfg, "smooth_k", 30)),
                 max_shift_px=int(getattr(scfg, "max_shift_px", 50)),
                 use_subpixel=bool(getattr(scfg, "use_subpixel", True)),
-                preview_log_vmin=float(getattr(scfg, "preview_log_vmin", 5.0)),
+                preview_log_vmin=float(getattr(scfg, "preview_log_vmin", 0.0)),
                 drizzle_scale=_normalize_drizzle_scale(getattr(scfg, "drizzle_scale", 1.0)),
                 bayer_to_gray_code=_bayer_to_gray_code(str(scfg.bayer_pattern)),
                 bayer_to_rgb_code=_bayer_to_rgb_code(str(scfg.bayer_pattern)),
+                motion_gate_px=float(getattr(scfg, "motion_gate_px", 6.0)),
+                lost_after_s=float(getattr(scfg, "lost_after_s", 3.0)),
             )
             self.metrics.scale = float(scfg.drizzle_scale)
             self.metrics.pixfrac = float(scfg.pixfrac)
@@ -632,15 +788,65 @@ class StackEngine:
                 return None
             if mean_u16.ndim == 3:
                 mean_u16 = mean_u16.mean(axis=2).astype(np.uint16)
+
+            # Re-centre on the reference frame without discarding anything.
+            #
+            # Plate solving is told "this image is centred near <target>", and
+            # the target corresponds to where the telescope pointed when the
+            # reference frame was taken. With the mount parked the canvas grows
+            # away from that frame, so the mosaic's geometric centre drifts off
+            # the pointing by half the accumulated drift and biases the fit.
+            # Padding symmetrically around the reference frame's centre puts the
+            # image centre back on the pointing while keeping every pixel of the
+            # extra sky the mosaic captured.
+            # Flatten the ragged mosaic border before it reaches the detector.
+            #
+            # As the field drifts, the canvas edge becomes a staircase between
+            # covered and empty pixels. SEP reads those steps as sources, and
+            # because they are bright relative to the sky they crowd out real
+            # stars from the brightest-N list the solver actually uses. Measured
+            # on a real drifted stack: 12 of the 30 brightest "detections" were
+            # border artefacts, and removing them took the solve from 4 inliers
+            # to 14. Partly-covered pixels are set to the sky level instead of
+            # zero, so no hard edge is introduced either.
+            #
+            # The sky level it returns is also what the re-centring pad below
+            # must use: padding with zeros would frame the image in black and
+            # put back exactly the hard edge this flattening removes.
+            mean_u16, sky_level = flatten_mosaic_border(mean_u16, wgt)
+
+            scale = float(eng.drizzle_scale)
+            ref_cx = (float(eng.ref_origin_x) + float(eng.frame_w) * 0.5) * scale
+            ref_cy = (float(eng.ref_origin_y) + float(eng.frame_h) * 0.5) * scale
+            h, w = mean_u16.shape[:2]
+            pad_l = int(round(max(0.0, w - 2.0 * ref_cx)))
+            pad_r = int(round(max(0.0, 2.0 * ref_cx - w)))
+            pad_t = int(round(max(0.0, h - 2.0 * ref_cy)))
+            pad_b = int(round(max(0.0, 2.0 * ref_cy - h)))
+            if pad_l or pad_r or pad_t or pad_b:
+                mean_u16 = np.pad(
+                    mean_u16,
+                    ((pad_t, pad_b), (pad_l, pad_r)),
+                    mode="constant",
+                    constant_values=sky_level,
+                )
+                if wgt is not None:
+                    wgt = np.pad(wgt, ((pad_t, pad_b), (pad_l, pad_r)), mode="constant")
+
             return {
                 "image": np.ascontiguousarray(mean_u16),
                 "weight": None if wgt is None else np.ascontiguousarray(wgt),
                 "obstime_unix": eng.ref_time_unix,
                 "last_time_unix": eng.last_time_unix,
-                "drizzle_scale": float(eng.drizzle_scale),
+                "drizzle_scale": scale,
                 "frames": int(eng.n),
                 "canvas": (int(eng.canvas_h), int(eng.canvas_w)),
                 "frame_shape": (int(eng.frame_h), int(eng.frame_w)),
+                "solve_shape": (int(mean_u16.shape[0]), int(mean_u16.shape[1])),
+                "reference_center_xy": (float(ref_cx), float(ref_cy)),
+                # Where the mosaic sits inside the padded image, so callers can
+                # map back to canvas coordinates.
+                "pad_offset_xy": (int(pad_l), int(pad_t)),
             }
 
     def get_latest_stack_frame(
@@ -681,10 +887,26 @@ class StackEngine:
 
             used = 0
             rejected = 0
+            restarts_before = int(self._live_gray.restarts)
 
             for item in batch:
                 try:
-                    raw16_work = ensure_raw16_bayer(item["raw16"])
+                    # Repair defective pixels *before* stacking, not after.
+                    #
+                    # A hot pixel is fixed on the sensor while the field drifts,
+                    # so alignment smears it into a streak across the mosaic.
+                    # The detector's 3x3 median erases an isolated sample but
+                    # leaves a streak almost untouched (~99% survives), which is
+                    # why defects reach the solver when the source is a stack
+                    # even though single frames look clean.
+                    #
+                    # The map can be stale or missing, so isolated defects it
+                    # does not list are repaired too: one such pixel was enough
+                    # to pin the alignment to the sensor (see
+                    # repair_isolated_pixels).
+                    raw16_work = repair_isolated_pixels(
+                        repair_bad_pixels(ensure_raw16_bayer(item["raw16"]))
+                    )
                     if self._live_gray.add_frame(raw16_work, t_unix=item.get("t")):
                         used += 1
                     else:
@@ -693,12 +915,18 @@ class StackEngine:
                     rejected += 1
                     log_error(
                         None,
-                        "Stacking: live-stacking frame failed",
+                        "Stacking: falló el apilado de un cuadro",
                         exc,
                         throttle_s=2.0,
                         throttle_key="stacking_live_frame_failed",
                     )
 
+            if int(self._live_gray.restarts) > restarts_before:
+                log_info(
+                    None,
+                    "Stacking: se perdió el registro (¿se movió la montura?); "
+                    "el apilado empezó de nuevo desde el cuadro actual",
+                )
             self.metrics.frames_used += used
             self.metrics.frames_rejected += rejected
             self.metrics.tiles_used = 1 if self._live_gray.has_data() else 0

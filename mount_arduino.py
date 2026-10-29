@@ -30,6 +30,9 @@ FIRMWARE_MOVE_MAX_RATE_STEPS_S = 12_000.0
 FIRMWARE_MOVE_SMOOTH_START_RATE_STEPS_S = 400.0
 FIRMWARE_MOVE_SMOOTH_MAX_ACCEL_STEPS_S2 = 4_000.0
 _SMOOTHERSTEP_MAX_DERIVATIVE = 1.875
+# Mirrors TEST_MAX_RATE_STEPS_S in the firmware: TEST runs the same profile
+# without the telescope's rate clamp, for motors with a different reduction.
+FIRMWARE_TEST_MAX_RATE_STEPS_S = 200_000.0
 
 
 def normalize_move_profile(profile: str) -> str:
@@ -44,11 +47,13 @@ def firmware_move_period_us(
     total_steps: int,
     remaining_steps: int,
     profile: str = "smooth",
+    *,
+    max_rate_steps_s: float = FIRMWARE_MOVE_MAX_RATE_STEPS_S,
 ) -> int:
     """Mirror the selectable, rate-limited firmware MOVE profile."""
     move_profile = normalize_move_profile(profile)
     requested_period = max(1, int(target_delay_us) + int(STEP_PULSE_US))
-    safe_min_period = int(math.ceil(1.0e6 / FIRMWARE_MOVE_MAX_RATE_STEPS_S))
+    safe_min_period = int(math.ceil(1.0e6 / float(max_rate_steps_s)))
     target_period = max(requested_period, safe_min_period)
     total = max(0, int(total_steps))
     remaining = max(0, int(remaining_steps))
@@ -103,6 +108,8 @@ def estimate_firmware_move_duration_s(
     steps: int,
     min_delay_us: int,
     profile: str = "smooth",
+    *,
+    max_rate_steps_s: float = FIRMWARE_MOVE_MAX_RATE_STEPS_S,
 ) -> float:
     """Estimate one firmware MOVE using the selected profile."""
     total = max(0, int(steps))
@@ -111,12 +118,13 @@ def estimate_firmware_move_duration_s(
     move_profile = normalize_move_profile(profile)
     if move_profile == "direct":
         period_sum_us = total * firmware_move_period_us(
-            min_delay_us, total, total, profile=move_profile
+            min_delay_us, total, total, profile=move_profile,
+            max_rate_steps_s=max_rate_steps_s,
         )
     else:
         requested_period = max(1, int(min_delay_us) + int(STEP_PULSE_US))
         safe_min_period = int(
-            math.ceil(1.0e6 / FIRMWARE_MOVE_MAX_RATE_STEPS_S)
+            math.ceil(1.0e6 / float(max_rate_steps_s))
         )
         target_period = max(requested_period, safe_min_period)
         target_rate = 1.0e6 / float(target_period)
@@ -139,6 +147,7 @@ def estimate_firmware_move_duration_s(
                 total,
                 total - completed,
                 profile=move_profile,
+                max_rate_steps_s=max_rate_steps_s,
             )
             for completed in range(ramp_count)
         )
@@ -148,6 +157,7 @@ def estimate_firmware_move_duration_s(
             total,
             total - ramp_count,
             profile=move_profile,
+            max_rate_steps_s=max_rate_steps_s,
         )
         period_sum_us = (2 * edge_sum_us) + (center_count * center_period)
     return float(period_sum_us / 1.0e6)
@@ -170,7 +180,7 @@ def _safe_lower(s: str) -> str:
     try:
         return (s or "").lower()
     except Exception as exc:
-        log_error(None, "Mount: failed to normalize string", exc, throttle_s=10.0, throttle_key="mount_safe_lower")
+        log_error(None, "Mount: no se pudo normalizar el texto", exc, throttle_s=10.0, throttle_key="mount_safe_lower")
         return ""
 
 
@@ -233,9 +243,14 @@ def resolve_common_microsteps(az_div: int, alt_div: int, *, default_ms: int = 64
     return int(FIXED_MICROSTEPS)
 
 
+MOUNT_AXIS_FW: dict[Axis, str] = {Axis.AZ: "A", Axis.ALT: "B"}
+FOCUS_AXIS_FW = "C"
+FIRMWARE_AXES: tuple[str, ...] = ("A", "B", "C")
+
+
 def _axis_to_fw(axis: Axis) -> str:
-    # Firmware: A=AZ, B=ALT
-    return "A" if axis == Axis.AZ else "B"
+    # Firmware: A=AZ, B=ALT, C=FOCUS
+    return MOUNT_AXIS_FW.get(axis, "A")
 
 
 def _dir_to_fw(direction: int) -> str:
@@ -299,6 +314,8 @@ class ArduinoController:
         self._ser: Optional[serial.Serial] = None
         self._lock = threading.Lock()
         self._move_profiles_supported: Optional[bool] = None
+        self._focuser_supported: Optional[bool] = None
+        self._test_mode_supported: Optional[bool] = None
 
     def _blueutil_path(self) -> str:
         found = str(shutil.which("blueutil") or "")
@@ -354,7 +371,7 @@ class ArduinoController:
             if err:
                 log_info(
                     None,
-                    f"Mount: BT device lookup hint ({err})",
+                    f"Mount: aviso al buscar el dispositivo Bluetooth ({err})",
                     throttle_s=2.0,
                     throttle_key="mount_blueutil_lookup_hint",
                 )
@@ -365,7 +382,7 @@ class ArduinoController:
         except Exception as exc:
             log_error(
                 None,
-                "Mount: failed to parse blueutil device JSON",
+                "Mount: no se pudo leer el JSON de dispositivos de blueutil",
                 exc,
                 throttle_s=10.0,
                 throttle_key="mount_blueutil_json",
@@ -447,13 +464,13 @@ class ArduinoController:
 
         rc_disc, _o_disc, e_disc = self._blueutil_run("--disconnect", device_id, timeout_s=4.0)
         if rc_disc != 0 and e_disc:
-            log_info(None, f"Mount: BT disconnect hint ({e_disc})", throttle_s=2.0, throttle_key="mount_bt_disconnect_hint")
+            log_info(None, f"Mount: aviso de desconexión Bluetooth ({e_disc})", throttle_s=2.0, throttle_key="mount_bt_disconnect_hint")
         else:
             self._blueutil_run("--wait-disconnect", device_id, "5", timeout_s=6.0)
 
         rc_unpair, _o_unpair, e_unpair = self._blueutil_run("--unpair", device_id, timeout_s=8.0)
         if rc_unpair != 0 and e_unpair:
-            log_info(None, f"Mount: BT unpair hint ({e_unpair})", throttle_s=2.0, throttle_key="mount_bt_unpair_hint")
+            log_info(None, f"Mount: aviso de desemparejado Bluetooth ({e_unpair})", throttle_s=2.0, throttle_key="mount_bt_unpair_hint")
 
         if float(self.cfg.bt_forget_retry_s) > 0.0:
             time.sleep(float(self.cfg.bt_forget_retry_s))
@@ -462,13 +479,13 @@ class ArduinoController:
             rc_pair, _o_pair, e_pair = self._blueutil_run("--pair", device_id, timeout_s=30.0)
             if rc_pair != 0:
                 message = e_pair or "pair failed"
-                log_info(None, f"Mount: BT pair hint ({message})", throttle_s=2.0, throttle_key="mount_bt_pair_hint")
+                log_info(None, f"Mount: aviso de emparejado Bluetooth ({message})", throttle_s=2.0, throttle_key="mount_bt_pair_hint")
                 return (False, f"no se pudo emparejar la montura: {message}")
 
         rc_conn, _o_conn, e_conn = self._blueutil_run("--connect", device_id, timeout_s=20.0)
         if rc_conn != 0:
             message = e_conn or "connect failed"
-            log_info(None, f"Mount: BT connect hint ({message})", throttle_s=2.0, throttle_key="mount_bt_connect_hint")
+            log_info(None, f"Mount: aviso de conexión Bluetooth ({message})", throttle_s=2.0, throttle_key="mount_bt_connect_hint")
             return (False, f"no se pudo conectar la montura por Bluetooth: {message}")
 
         rc_wait, _o_wait, e_wait = self._blueutil_run("--wait-connect", device_id, "15", timeout_s=16.0)
@@ -536,7 +553,7 @@ class ArduinoController:
                     if self._ser is not None:
                         self._ser.close()
                 except Exception as exc:
-                    log_error(None, "Mount: failed to close existing serial connection", exc, throttle_s=5.0, throttle_key="mount_close_existing")
+                    log_error(None, "Mount: no se pudo cerrar la conexión serie anterior", exc, throttle_s=5.0, throttle_key="mount_close_existing")
                 self._ser = None
 
                 try:
@@ -554,14 +571,16 @@ class ArduinoController:
                         ser.reset_input_buffer()
                         ser.reset_output_buffer()
                     except Exception as exc:
-                        log_error(None, "Mount: failed to reset serial buffers", exc, throttle_s=5.0, throttle_key="mount_reset_buffers")
+                        log_error(None, "Mount: no se pudieron vaciar los búferes del puerto serie", exc, throttle_s=5.0, throttle_key="mount_reset_buffers")
 
                     self._ser = ser
                     self._move_profiles_supported = None
+                    self._focuser_supported = None
+                    self._test_mode_supported = None
                     self.cfg.port = target_port
                 except Exception as e:
                     self._ser = None
-                    log_error(None, "Mount: failed to connect", e, throttle_s=5.0, throttle_key="mount_connect")
+                    log_error(None, "Mount: no se pudo conectar", e, throttle_s=5.0, throttle_key="mount_connect")
                     last_error = f"Mount error al conectar ({e})"
                     continue
 
@@ -610,13 +629,15 @@ class ArduinoController:
         except Exception as exc:
             log_error(
                 None,
-                "Mount: failed to close serial connection",
+                "Mount: no se pudo cerrar la conexión serie",
                 exc,
                 throttle_s=5.0,
                 throttle_key="mount_close_locked",
             )
         self._ser = None
         self._move_profiles_supported = None
+        self._focuser_supported = None
+        self._test_mode_supported = None
 
     def close(self) -> None:
         with self._lock:
@@ -657,7 +678,7 @@ class ArduinoController:
                     try:
                         b = ser.readline()
                     except Exception as exc:
-                        log_error(None, "Mount: failed to read serial line", exc, throttle_s=5.0, throttle_key="mount_readline")
+                        log_error(None, "Mount: no se pudo leer una línea del puerto serie", exc, throttle_s=5.0, throttle_key="mount_readline")
                         break
                     if not b:
                         break
@@ -669,7 +690,7 @@ class ArduinoController:
                     if old_timeout is not None:
                         ser.timeout = old_timeout
                 except Exception as exc:
-                    log_error(None, "Mount: failed to restore serial timeout", exc, throttle_s=5.0, throttle_key="mount_timeout_restore")
+                    log_error(None, "Mount: no se pudo restaurar el timeout del puerto serie", exc, throttle_s=5.0, throttle_key="mount_timeout_restore")
 
         return lines
 
@@ -691,7 +712,7 @@ class ArduinoController:
             return response.startswith("OK MS")
         if verb == "DEBUG":
             return response.startswith("OK DEBUG")
-        if verb in {"ENABLE", "STOP", "MOVE"}:
+        if verb in {"ENABLE", "STOP", "MOVE", "TEST"}:
             return response == "OK"
         return True
 
@@ -718,7 +739,7 @@ class ArduinoController:
                     try:
                         ser.reset_input_buffer()
                     except Exception as exc:
-                        log_error(None, "Mount: failed to reset input buffer", exc, throttle_s=5.0, throttle_key="mount_reset_input")
+                        log_error(None, "Mount: no se pudo vaciar el búfer de entrada", exc, throttle_s=5.0, throttle_key="mount_reset_input")
                         self._close_serial_locked(ser)
                         raise serial.SerialException("input buffer reset failed") from exc
 
@@ -727,21 +748,21 @@ class ArduinoController:
                     try:
                         ser.flush()
                     except Exception as exc:
-                        log_error(None, "Mount: failed to flush serial buffer", exc, throttle_s=5.0, throttle_key="mount_flush")
+                        log_error(None, "Mount: no se pudo vaciar el búfer del puerto serie", exc, throttle_s=5.0, throttle_key="mount_flush")
 
                 t0 = time.time()
                 while True:
                     try:
                         line = ser.readline().decode(errors="ignore").strip()
                     except Exception as exc:
-                        log_error(None, "Mount: failed to read serial response", exc, throttle_s=5.0, throttle_key="mount_read_response")
+                        log_error(None, "Mount: no se pudo leer la respuesta del puerto serie", exc, throttle_s=5.0, throttle_key="mount_read_response")
                         line = ""
                     if line and self._response_matches_command(cmd, line):
                         return line
                     if (time.time() - t0) > float(timeout_s):
                         return ""
             except Exception as exc:
-                log_error(None, "Mount: send failed", exc, throttle_s=5.0, throttle_key="mount_send")
+                log_error(None, "Mount: falló el envío", exc, throttle_s=5.0, throttle_key="mount_send")
                 self._close_serial_locked(ser)
                 raise
 
@@ -755,8 +776,36 @@ class ArduinoController:
     def enable(self, on: bool) -> str:
         return self.send(f"ENABLE {1 if on else 0}", timeout_s=0.80, reset_input=False)
 
-    def stop(self) -> str:
-        return self.send("STOP", timeout_s=0.80, reset_input=False)
+    def stop(self, axis: Optional[str] = None) -> str:
+        """Detiene todos los ejes, o solo uno.
+
+        Parar un eje suelto permite interrumpir el enfocador sin abortar un
+        slew en curso (y al reves), que es justo lo que hace falta cuando el
+        autofoco corre mientras la montura sigue apuntando.
+        """
+        if axis is None:
+            return self.send("STOP", timeout_s=0.80, reset_input=False)
+        ax = str(axis).strip().upper()
+        if ax not in FIRMWARE_AXES:
+            raise ValueError(f"eje desconocido para STOP: {axis!r}")
+        return self.send(f"STOP {ax}", timeout_s=0.80, reset_input=False)
+
+    def _refresh_capabilities(self) -> str:
+        status = self.status().upper()
+        self._move_profiles_supported = "MOVEPROFILES=1" in status
+        self._focuser_supported = "FOCUS=1" in status
+        self._test_mode_supported = "TESTMODE=1" in status
+        return status
+
+    def supports_focuser(self) -> bool:
+        if self._focuser_supported is None:
+            self._refresh_capabilities()
+        return bool(self._focuser_supported)
+
+    def supports_test_mode(self) -> bool:
+        if self._test_mode_supported is None:
+            self._refresh_capabilities()
+        return bool(self._test_mode_supported)
 
     def move(
         self,
@@ -765,12 +814,20 @@ class ArduinoController:
         steps: int,
         delay_us: int,
         profile: str = "smooth",
+        *,
+        unlimited: bool = False,
     ) -> str:
+        """MOVE de observacion, o TEST si ``unlimited``.
+
+        ``unlimited`` manda el mismo movimiento por el comando TEST, que corre
+        sin el tope de MOVE_MAX_RATE_STEPS_S. Es para banco de pruebas con
+        motores de otra reduccion; no para el tren de la montura.
+        """
         axis = (axis or "").strip().upper()
         direction = (direction or "").strip().upper()
 
-        if axis not in ("A", "B"):
-            axis = "A"
+        if axis not in FIRMWARE_AXES:
+            raise ValueError(f"eje desconocido: {axis!r} (esperado A, B o C)")
         if direction not in ("FWD", "REV"):
             direction = "FWD"
 
@@ -778,8 +835,28 @@ class ArduinoController:
         delay_i = max(0, int(delay_us))
         profile_i = normalize_move_profile(profile).upper()
         if self._move_profiles_supported is not True:
-            status = self.status().upper()
-            self._move_profiles_supported = "MOVEPROFILES=1" in status
+            self._refresh_capabilities()
+        if axis == FOCUS_AXIS_FW and not self._focuser_supported:
+            raise RuntimeError(
+                "el firmware no declara FOCUS=1; flashea el firmware con el "
+                "tercer eje antes de usar el enfocador"
+            )
+        if unlimited:
+            if not self._test_mode_supported:
+                raise RuntimeError(
+                    "el firmware no declara TESTMODE=1; flashea el firmware "
+                    "actualizado antes de usar el modo de prueba"
+                )
+            est_s = estimate_firmware_move_duration_s(
+                steps_i,
+                delay_i,
+                profile=profile_i.lower(),
+                max_rate_steps_s=FIRMWARE_TEST_MAX_RATE_STEPS_S,
+            )
+            return self.send(
+                f"TEST {axis} {direction} {steps_i} {delay_i} {profile_i}",
+                timeout_s=float(max(3.50, est_s + 1.5)),
+            )
         if not self._move_profiles_supported:
             if profile_i != "DIRECT":
                 raise RuntimeError(
@@ -850,9 +927,9 @@ class ArduinoMount:
         self.cfg.baud = int(baud)
         msg = self.ctrl.connect()
         if "error" in _safe_lower(msg):
-            log_error(None, f"Mount: connect failed ({msg})", throttle_s=5.0, throttle_key="mount_connect_result")
+            log_error(None, f"Mount: no se pudo conectar ({msg})", throttle_s=5.0, throttle_key="mount_connect_result")
         else:
-            log_info(None, f"Mount: connect result ({msg})", throttle_s=2.0, throttle_key="mount_connect_result_ok")
+            log_info(None, f"Mount: resultado de la conexión ({msg})", throttle_s=2.0, throttle_key="mount_connect_result_ok")
         return msg
 
     def disconnect(self) -> None:
@@ -860,7 +937,7 @@ class ArduinoMount:
             if self.ctrl.is_connected:
                 self.stop()
         except Exception as exc:
-            log_error(None, "Mount: stop failed during disconnect", exc, throttle_s=2.0, throttle_key="mount_stop_on_disconnect")
+            log_error(None, "Mount: falló la parada al desconectar", exc, throttle_s=2.0, throttle_key="mount_stop_on_disconnect")
         finally:
             self.ctrl.close()
 
@@ -869,6 +946,22 @@ class ArduinoMount:
 
     def stop(self) -> str:
         return self.ctrl.stop()
+
+    def stop_axis(self, axis_fw: str) -> str:
+        """Detiene un solo eje del firmware ('A', 'B' o 'C')."""
+        return self.ctrl.stop(str(axis_fw))
+
+    def supports_focuser(self) -> bool:
+        try:
+            return bool(self.ctrl.supports_focuser())
+        except Exception:
+            return False
+
+    def supports_test_mode(self) -> bool:
+        try:
+            return bool(self.ctrl.supports_test_mode())
+        except Exception:
+            return False
 
     def set_microsteps(self, az_div: int, alt_div: int) -> str:
         return self.ctrl.set_microsteps(int(az_div), int(alt_div))
@@ -924,7 +1017,7 @@ class ArduinoMount:
             except Exception as exc:
                 log_error(
                     None,
-                    "Mount: failed to stop before move",
+                    "Mount: no se pudo parar antes de mover",
                     exc,
                     throttle_s=5.0,
                     throttle_key="mount_stop_before_move",
@@ -945,6 +1038,77 @@ class ArduinoMount:
                 profile=move_profile,
             )
             # Small safety margin for serial/firmware jitter.
+            if wait_s > 0.0:
+                time.sleep(wait_s + 0.05)
+        return resp
+
+
+    def focus_steps(
+        self,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        *,
+        profile: str = "smooth",
+        blocking: bool = True,
+    ) -> str:
+        """Mueve el enfocador (eje C del firmware).
+
+        No lleva ``stop_before_move``: el enfocador es independiente de la
+        montura, y mandar STOP global aqui abortaria un slew o el tracking.
+        """
+        if int(steps) <= 0 or int(delay_us) <= 0:
+            return ""
+        move_profile = normalize_move_profile(profile)
+        resp = self.ctrl.move(
+            FOCUS_AXIS_FW,
+            _dir_to_fw(int(direction)),
+            int(steps),
+            int(delay_us),
+            profile=move_profile,
+        )
+        if bool(blocking):
+            wait_s = estimate_firmware_move_duration_s(
+                int(steps), int(delay_us), profile=move_profile
+            )
+            if wait_s > 0.0:
+                time.sleep(wait_s + 0.05)
+        return resp
+
+    def test_steps(
+        self,
+        axis_fw: str,
+        direction: int,
+        steps: int,
+        delay_us: int,
+        *,
+        profile: str = "smooth",
+        blocking: bool = True,
+    ) -> str:
+        """Movimiento de banco sin el tope de velocidad de MOVE.
+
+        Existe para probar motores con otra reduccion, no el tren de la
+        montura: a 200000 pasos/s el motor del telescopio simplemente perderia
+        pasos. El firmware aplica el mismo perfil de aceleracion y frenado.
+        """
+        if int(steps) <= 0 or int(delay_us) < 0:
+            return ""
+        move_profile = normalize_move_profile(profile)
+        resp = self.ctrl.move(
+            str(axis_fw).strip().upper(),
+            _dir_to_fw(int(direction)),
+            int(steps),
+            int(delay_us),
+            profile=move_profile,
+            unlimited=True,
+        )
+        if bool(blocking):
+            wait_s = estimate_firmware_move_duration_s(
+                int(steps),
+                int(delay_us),
+                profile=move_profile,
+                max_rate_steps_s=FIRMWARE_TEST_MAX_RATE_STEPS_S,
+            )
             if wait_s > 0.0:
                 time.sleep(wait_s + 0.05)
         return resp
@@ -1057,7 +1221,7 @@ class MountMoveWorker(BaseWorker):
                     "tracking": {"enabled": False, "status": TrackingStatus.OFF, "mode": TrackingMode.IDLE},
                 }
             )
-            log_error(self._out_log, "Mount: MOVE steps failed", exc)
+            log_error(self._out_log, "Mount: falló el MOVE", exc)
         finally:
             if self._operation_finished is not None:
                 self._operation_finished()
